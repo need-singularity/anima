@@ -1,0 +1,338 @@
+// edu_new/F_lattice_unified.hexa — F drill (NxN lattice + 1/r² attraction)
+//
+// PARADIGM REF: docs/new_paradigm_edu_lattice_unified_20260421.md §1.1 §11
+// ROLE: 2D lattice of unit-cells; per-cell attraction field sourced from
+//       remaining active-neighbour tension, falling off as 1/r².
+//
+// PAIRS WITH: edu_new/A_tension_drop.hexa (shares unit-cell encoding).
+// NOTE: hexa stage0 has brittle module import (fallback strips imports),
+//       so we INLINE the unit-cell primitives (same implementation as
+//       A_tension_drop.hexa) rather than `import`.  Consistency is
+//       enforced by keeping the helper block byte-identical across files.
+//
+// EXPORTED API (used by AF_unified_sim.hexa):
+//   make_lattice(size, tension0, seed)              -> [cell]   (row-major)
+//   lattice_idx(size, r, c)                          -> int
+//   attraction_at(lattice, size, r, c, k_numer)      -> int
+//   lattice_step(lattice, size, upper, lower, k_num) -> [cell]  (one tick)
+//   count_states(lattice)                            -> "act|drp|sld|tot"
+//   counts_get(counts, idx)                          -> int
+//   coherence(lattice, size)                         -> int   (per-mille)
+//
+// ATTRACTION MODEL:
+//   for each pair (i,j), Manhattan distance d = |dr|+|dc|  (d >= 1)
+//   contribution = sign(neighbour_gap) * T_neighbour / (d*d)
+//   attraction_at = sum over all j != i / k_numer (normalizing scalar).
+//   Only active cells attract / are attracted.
+//
+// DETERMINISM: pure function of (lattice, size).  No LLM, no random.
+
+// ─── INLINED: character code table + hash_proj (A_tension_drop.hexa) ──
+
+let ASCII_TABLE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-|.↔/+=() <>:;'\""
+
+fn char_code(c: string) -> int {
+    let t     = ASCII_TABLE
+    let n     = len(t)
+    let mut i = 0
+    while i < n {
+        if t.substring(i, i + 1) == c { return i + 1 }
+        i = i + 1
+    }
+    return 127
+}
+
+fn hash_proj(s: string) -> int {
+    let mut acc = 1469598103
+    let mut i   = 0
+    let n       = len(s)
+    while i < n {
+        let c = s.substring(i, i + 1)
+        acc   = acc * 31 + char_code(c)
+        acc   = acc % 2147483647
+        i     = i + 1
+    }
+    return acc
+}
+
+fn judge(seed: string, step: int) -> string {
+    let h = hash_proj(seed + "|k=" + str(step))
+    return "w_" + str(h)
+}
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+fn parse_int(s: string) -> int {
+    let n     = len(s)
+    if n == 0 { return 0 }
+    let sign  = if s.substring(0, 1) == "-" { -1 } else { 1 }
+    let start = if sign == -1 { 1 } else { 0 }
+    let mut acc = 0
+    let mut i   = start
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let d = digit_val(c)
+        if d >= 0 { acc = acc * 10 + d }
+        i = i + 1
+    }
+    return acc * sign
+}
+
+fn make_cell(a_id: string, b_id: string, t0: int, seed: int) -> string {
+    let raw_g = hash_proj(a_id + "|" + b_id + "|s=" + str(seed))
+    let g     = (raw_g % 2001) - 1000
+    return a_id + "|" + b_id + "|" + str(t0) + "|" + str(g) + "|active"
+}
+
+fn split5(cell: string) -> [string] {
+    let mut out = []
+    let mut buf = ""
+    let n       = len(cell)
+    let mut i   = 0
+    let mut cnt = 0
+    while i < n {
+        let c = cell.substring(i, i + 1)
+        if c == "|" && cnt < 4 {
+            out = out.push(buf)
+            buf = ""
+            cnt = cnt + 1
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    out = out.push(buf)
+    while len(out) < 5 { out = out.push("") }
+    return out
+}
+
+fn cell_a(c: string) -> string { return split5(c)[0] }
+fn cell_b(c: string) -> string { return split5(c)[1] }
+fn cell_t(c: string) -> int    { return parse_int(split5(c)[2]) }
+fn cell_g(c: string) -> int    { return parse_int(split5(c)[3]) }
+fn cell_s(c: string) -> string { return split5(c)[4] }
+
+fn rebuild(a: string, b: string, t: int, g: int, s: string) -> string {
+    return a + "|" + b + "|" + str(t) + "|" + str(g) + "|" + s
+}
+
+fn cell_set_t(c: string, t_new: int) -> string {
+    let p = split5(c)
+    return rebuild(p[0], p[1], t_new, parse_int(p[3]), p[4])
+}
+
+fn cell_set_s(c: string, s_new: string) -> string {
+    let p = split5(c)
+    return rebuild(p[0], p[1], parse_int(p[2]), parse_int(p[3]), s_new)
+}
+
+fn clamp_int(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn fixpoint_seal(cell: string) -> bool {
+    let seed = cell_a(cell) + "<->" + cell_b(cell) + "|g=" + str(cell_g(cell))
+    let w1   = judge(seed, 1)
+    let w2   = judge(w1,   2)
+    let w3   = judge(w2,   3)
+    return w2 == w3
+}
+
+fn tension_step(cell: string, attraction: int, upper: int, lower: int) -> string {
+    let s = cell_s(cell)
+    if s != "active" { return cell }
+    let t0    = cell_t(cell)
+    let g     = cell_g(cell)
+    // gap/2 → per-tick basin drift ±500 (gap in [-1000,+1000]).
+    let t_new = clamp_int(t0 + attraction + (g / 2), 0, 10000)
+    let c1    = cell_set_t(cell, t_new)
+    if t_new > upper {
+        return cell_set_s(c1, "drop")
+    }
+    if t_new < lower {
+        if fixpoint_seal(c1) { return cell_set_s(c1, "sealed") }
+    }
+    return c1
+}
+
+// ─── F drill: lattice primitives ──────────────────────────────────
+
+fn make_lattice(size: int, tension0: int, seed: int) -> [string] {
+    let mut cells = []
+    let mut r     = 0
+    while r < size {
+        let mut c = 0
+        while c < size {
+            let a_id = "n_" + str(r) + "_" + str(c) + "_a"
+            let b_id = "n_" + str(r) + "_" + str(c) + "_b"
+            let per  = seed + (r * size + c)
+            cells    = cells.push(make_cell(a_id, b_id, tension0, per))
+            c        = c + 1
+        }
+        r = r + 1
+    }
+    return cells
+}
+
+fn lattice_idx(size: int, r: int, c: int) -> int { return r * size + c }
+
+fn iabs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn sign_of(x: int) -> int {
+    if x > 0 { return 1 }
+    if x < 0 { return -1 }
+    return 0
+}
+
+fn attraction_at(lattice: [string], size: int, r: int, c: int,
+                 k_numer: int) -> int {
+    // Sum of neighbour contributions in 1/r² (Manhattan d=|dr|+|dc|>=1).
+    let mut acc = 0
+    let mut rr  = 0
+    while rr < size {
+        let mut cc = 0
+        while cc < size {
+            if rr != r || cc != c {
+                let j    = lattice_idx(size, rr, cc)
+                let cell = lattice[j]
+                if cell_s(cell) == "active" {
+                    let d   = iabs(rr - r) + iabs(cc - c)
+                    let d2  = d * d
+                    let g   = cell_g(cell)
+                    let t   = cell_t(cell)
+                    let contrib = (sign_of(g) * t) / d2
+                    acc = acc + contrib
+                }
+            }
+            cc = cc + 1
+        }
+        rr = rr + 1
+    }
+    if k_numer <= 0 { return 0 }
+    return acc / k_numer
+}
+
+fn lattice_step(lattice: [string], size: int, upper: int, lower: int,
+                k_numer: int) -> [string] {
+    let mut out = []
+    let mut r   = 0
+    while r < size {
+        let mut c = 0
+        while c < size {
+            let j    = lattice_idx(size, r, c)
+            let cell = lattice[j]
+            let a    = attraction_at(lattice, size, r, c, k_numer)
+            let next = tension_step(cell, a, upper, lower)
+            out      = out.push(next)
+            c        = c + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+fn count_states(lattice: [string]) -> string {
+    let mut act = 0
+    let mut drp = 0
+    let mut sld = 0
+    let n       = len(lattice)
+    let mut i   = 0
+    while i < n {
+        let s = cell_s(lattice[i])
+        if s == "active" { act = act + 1 }
+        if s == "drop"   { drp = drp + 1 }
+        if s == "sealed" { sld = sld + 1 }
+        i = i + 1
+    }
+    return str(act) + "|" + str(drp) + "|" + str(sld) + "|" + str(n)
+}
+
+fn counts_get(counts: string, idx: int) -> int {
+    let mut parts = []
+    let mut buf   = ""
+    let n         = len(counts)
+    let mut i     = 0
+    while i < n {
+        let c = counts.substring(i, i + 1)
+        if c == "|" {
+            parts = parts.push(buf)
+            buf   = ""
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    parts = parts.push(buf)
+    if idx < 0 || idx >= len(parts) { return 0 }
+    return parse_int(parts[idx])
+}
+
+fn coherence(lattice: [string], size: int) -> int {
+    let counts = count_states(lattice)
+    let sld    = counts_get(counts, 2)
+    let tot    = counts_get(counts, 3)
+    if tot == 0 { return 0 }
+    return (sld * 1000) / tot
+}
+
+// ─── self-test (F drill, reduced work) ────────────────────────────
+
+fn assert_f(name: string, cond: bool) -> int {
+    if cond { println("  OK  " + name) ; return 0 }
+    println("  FAIL " + name) ; return 1
+}
+
+fn main() {
+    println("F_lattice_unified selftest")
+    let mut fails = 0
+
+    // 3x3 lattice, seed=42, start tension 5000.  Small grid keeps
+    // the stage0 interpreter under its RSS cap.
+    let size = 3
+    let L0   = make_lattice(size, 5000, 42)
+    fails = fails + assert_f("lattice cardinality", len(L0) == size * size)
+    fails = fails + assert_f("all-active at t=0",
+        counts_get(count_states(L0), 0) == size * size)
+
+    // attraction is deterministic cross-run.
+    let a1 = attraction_at(L0, size, 1, 1, 100)
+    let a2 = attraction_at(L0, size, 1, 1, 100)
+    fails = fails + assert_f("attraction determ", a1 == a2)
+
+    // Step the lattice; purity check.
+    let La = lattice_step(L0, size, 9000, 1000, 100)
+    let Lb = lattice_step(L0, size, 9000, 1000, 100)
+    fails = fails + assert_f("step determ",
+        counts_get(count_states(La), 0) == counts_get(count_states(Lb), 0))
+
+    // Total conservation (cells never created / destroyed).
+    let counts_a = count_states(La)
+    fails = fails + assert_f("total conserved",
+        counts_get(counts_a, 3) == size * size)
+
+    // Coherence in [0, 1000].
+    let coh = coherence(La, size)
+    fails = fails + assert_f("coherence range", coh >= 0 && coh <= 1000)
+
+    if fails == 0 {
+        println("F_lattice_unified: PASS")
+        exit(0)
+    } else {
+        println("F_lattice_unified: FAIL (" + str(fails) + " assertions)")
+        exit(1)
+    }
+}
