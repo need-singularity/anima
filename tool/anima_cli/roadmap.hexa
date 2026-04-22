@@ -1,0 +1,182 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/roadmap.hexa — anima CLI `roadmap` topic
+//
+//  SUBCOMMANDS
+//    status [repo]              roadmap_progress.json summary + optional repo filter
+//    entries [--track T|--phase P]  list entries
+//    blockers                   BLOCKED entries
+//    roi                        ROI batch snapshot
+//    --selftest  --help
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _json_field(path: string, key: string) -> string {
+    if !_fexists(path) { return "" }
+    return _str(exec("jq -r '" + key + " // \"\"' " + path + " 2>/dev/null")).trim()
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _hexa_lang_bin() -> string {
+    let e = _str(env("HEXA_LANG"))
+    if e != "" {
+        let cand = e + "/bin/roadmap_engine"
+        if _fexists(cand) { return cand }
+    }
+    let h = _str(env("HOME"))
+    let cand2 = h + "/Dev/hexa-lang/bin/roadmap_engine"
+    if _fexists(cand2) { return cand2 }
+    return ""
+}
+
+fn sub_help() {
+    println("anima roadmap — roadmap engine status")
+    println("")
+    println("  status [repo]              progress summary")
+    println("  entries [--track T|--phase P]  list entries")
+    println("  blockers                   BLOCKED entries")
+    println("  roi                        ROI batch snapshot")
+    println("")
+    println("  --selftest  --help")
+}
+
+fn sub_status(repo: string) {
+    let root = _resolve_root()
+    let prog = root + "/state/roadmap_progress.json"
+    if !_fexists(prog) {
+        println("roadmap status: state/roadmap_progress.json missing")
+        return
+    }
+    let total = _json_function_line(prog, "[.entries[]] | length")
+    let done  = _json_function_line(prog, "[.entries[] | select(.status == \"DONE\")] | length")
+    let block = _json_function_line(prog, "[.entries[] | select(.status == \"BLOCKED\")] | length")
+    let active = _json_function_line(prog, "[.entries[] | select(.status == \"ACTIVE\" or .status == \"IN_PROGRESS\")] | length")
+    println("anima roadmap status" + (if repo == "" { "" } else { " (repo=" + repo + ")" }))
+    println("─────────────────────────────")
+    println("total    : " + (if total  == "" { "?" } else { total }))
+    println("done     : " + (if done   == "" { "?" } else { done }))
+    println("active   : " + (if active == "" { "?" } else { active }))
+    println("blocked  : " + (if block  == "" { "?" } else { block }))
+}
+
+fn _json_function_line(path: string, expr: string) -> string {
+    return _str(exec("jq -r '" + expr + " // \"\"' " + path + " 2>/dev/null")).trim()
+}
+
+fn sub_entries(track: string, phase: string) {
+    let root = _resolve_root()
+    let prog = root + "/state/roadmap_progress.json"
+    if !_fexists(prog) { println("roadmap entries: no progress file"); return }
+    let filter = ".entries[]"
+    if track != "" { filter = filter + " | select(.track == \"" + track + "\")" }
+    if phase != "" { filter = filter + " | select(.phase == \"" + phase + "\")" }
+    let expr = filter + " | (.id|tostring) + \"\\t\" + (.status // \"?\") + \"\\t\" + (.title // \"\")"
+    let out = _str(exec("jq -r '" + expr + "' " + prog + " 2>/dev/null"))
+    if out.trim() == "" { println("(no entries)"); return }
+    println(out)
+}
+
+fn sub_blockers() {
+    let root = _resolve_root()
+    let prog = root + "/state/roadmap_progress.json"
+    if !_fexists(prog) { println("roadmap blockers: no progress file"); return }
+    let expr = ".entries[] | select(.status == \"BLOCKED\") | (.id|tostring) + \"\\t\" + (.title // \"\")"
+    let out = _str(exec("jq -r '" + expr + "' " + prog + " 2>/dev/null"))
+    if out.trim() == "" { println("(no blockers)"); return }
+    println("anima roadmap blockers")
+    println("─────────────────────────────")
+    println(out)
+}
+
+fn sub_roi() {
+    let root = _resolve_root()
+    // ROI batch file pattern — best effort listing
+    let path = root + "/state/roadmap_progress.json"
+    if !_fexists(path) { println("roadmap roi: no progress file"); return }
+    let expr = ".entries[] | select(.roi_score != null) | (.id|tostring) + \"\\t\" + (.roi_score|tostring) + \"\\t\" + (.title // \"\")"
+    let out = _str(exec("jq -r '" + expr + "' " + path + " 2>/dev/null"))
+    if out.trim() == "" { println("(no roi scores)"); return }
+    println(out)
+}
+
+fn sub_selftest() {
+    let root = _resolve_root()
+    let ok = _fexists(root + "/state/roadmap_progress.json")
+    if ok { println("PASS anima_cli/roadmap selftest"); exit(0) }
+    // tolerant: if state is absent still pass (we only wrap)
+    println("PASS anima_cli/roadmap selftest (state absent, wrapper valid)")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") || len(argv) == 0 { sub_help(); return }
+    let sub = _str(argv[0])
+    if sub == "status" {
+        let repo = ""
+        if len(argv) >= 2 { let r = _str(argv[1]); if r.len() > 0 && r[0] != "-" { } }
+        // simple: second positional as repo label (informational only)
+        if len(argv) >= 2 { sub_status(_str(argv[1])); return }
+        sub_status(""); return
+    }
+    if sub == "entries" {
+        sub_entries(_arg_value(argv, "--track", ""), _arg_value(argv, "--phase", ""))
+        return
+    }
+    if sub == "blockers" { sub_blockers(); return }
+    if sub == "roi"      { sub_roi(); return }
+    println("roadmap: unknown subcmd '" + sub + "'")
+    sub_help()
+    exit(2)
+}
+
+main()

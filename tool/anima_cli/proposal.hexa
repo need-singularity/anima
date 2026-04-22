@@ -1,0 +1,211 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/proposal.hexa — anima CLI `proposal` topic
+//
+//  PURPOSE
+//    Thin orchestrator over the existing proposal stack tools. Every
+//    subcommand is a single-delegate wrapper; no proposal logic lives here.
+//
+//  SUBCOMMANDS
+//    review [--top N] [--id X] [--kind K] [--score-min N] [--json]
+//    approve <id> [--reason ...]
+//    reject  <id> [--reason ...]
+//    implement <id>
+//    archive <id>
+//    dashboard
+//    cluster   (detect → consolidate)
+//    cycle     (one auto-threshold + conflict-detect loop)
+//    --selftest  --help
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _forward_rest(argv, start_idx: int) -> string {
+    let s = ""
+    let i = start_idx
+    while i < len(argv) {
+        if s != "" { s = s + " " }
+        s = s + _str(argv[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn sub_help() {
+    println("anima proposal — proposal stack (wraps tool/proposal_*.hexa)")
+    println("")
+    println("  review   [--top N|--id X|--kind K|--score-min N|--json]")
+    println("  approve  <id> [--reason ...]")
+    println("  reject   <id> [--reason ...]")
+    println("  implement <id>")
+    println("  archive  <id>")
+    println("  dashboard       aggregate inventory dashboard")
+    println("  cluster         detect + consolidate duplicates")
+    println("  cycle           auto-threshold tick + conflict scan")
+    println("")
+    println("  --selftest  --help")
+}
+
+fn _hexa() -> string { return "/Users/ghost/.hx/bin/hexa" }
+
+fn _run_hexa(tool_path: string, tail: string) {
+    if !_fexists(tool_path) {
+        println("proposal: missing tool " + tool_path)
+        exit(1)
+    }
+    let cmd = _hexa() + " run " + tool_path + (if tail == "" { "" } else { " " + tail })
+    exec(cmd + " >&2; echo \"__EXIT=$?\"")
+    // pass-through: we rely on the tool's own stdout; for hexa-run stdout
+    // passthrough we use a second plain exec.
+}
+
+fn _pipe_hexa(tool_path: string, tail: string) {
+    // pipe-through form: print the sub-tool's stdout into our own.
+    if !_fexists(tool_path) {
+        println("proposal: missing tool " + tool_path)
+        exit(1)
+    }
+    let cmd = _hexa() + " run " + tool_path + (if tail == "" { "" } else { " " + tail })
+    let out = _str(exec(cmd))
+    println(out)
+}
+
+fn sub_review(tail: string) {
+    let root = _resolve_root()
+    let tool = root + "/tool/proposal_review.hexa"
+    // translate --top N into nothing (proposal_review default is top 10)
+    _pipe_hexa(tool, tail)
+}
+
+fn sub_approve(id: string, tail: string) {
+    let root = _resolve_root()
+    _pipe_hexa(root + "/tool/proposal_approve.hexa", "--id " + id + (if tail == "" { "" } else { " " + tail }))
+}
+
+fn sub_reject(id: string, tail: string) {
+    let root = _resolve_root()
+    _pipe_hexa(root + "/tool/proposal_reject.hexa", "--id " + id + (if tail == "" { "" } else { " " + tail }))
+}
+
+fn sub_implement(id: string) {
+    let root = _resolve_root()
+    _pipe_hexa(root + "/tool/proposal_implement.hexa", "--id " + id)
+}
+
+fn sub_archive(id: string) {
+    let root = _resolve_root()
+    _pipe_hexa(root + "/tool/proposal_archive.hexa", "--id " + id)
+}
+
+fn sub_dashboard() {
+    let root = _resolve_root()
+    _pipe_hexa(root + "/tool/proposal_dashboard.hexa", "")
+}
+
+fn sub_cluster() {
+    let root = _resolve_root()
+    println("proposal cluster: detect phase")
+    _pipe_hexa(root + "/tool/proposal_cluster_detect.hexa", "")
+    println("proposal cluster: consolidate phase")
+    _pipe_hexa(root + "/tool/proposal_cluster_consolidate.hexa", "")
+}
+
+fn sub_cycle() {
+    let root = _resolve_root()
+    println("proposal cycle: auto-threshold")
+    _pipe_hexa(root + "/tool/proposal_auto_threshold.hexa", "")
+    println("proposal cycle: conflict scan")
+    _pipe_hexa(root + "/tool/proposal_conflict_detect.hexa", "")
+}
+
+fn sub_selftest() {
+    let root = _resolve_root()
+    if root == "" { println("FAIL anima_cli/proposal selftest"); exit(1) }
+    // verify at least 3 wrapped tools exist (idempotent read-only)
+    let ok = _fexists(root + "/tool/proposal_review.hexa")
+             && _fexists(root + "/tool/proposal_approve.hexa")
+             && _fexists(root + "/tool/proposal_dashboard.hexa")
+    if ok { println("PASS anima_cli/proposal selftest"); exit(0) }
+    println("FAIL anima_cli/proposal selftest (wrapped tools missing)")
+    exit(1)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") || len(argv) == 0 { sub_help(); return }
+    let sub = _str(argv[0])
+    if sub == "review"    { sub_review(_forward_rest(argv, 1)); return }
+    if sub == "approve"   {
+        if len(argv) < 2 { println("usage: anima proposal approve <id>"); exit(2) }
+        sub_approve(_str(argv[1]), _forward_rest(argv, 2)); return
+    }
+    if sub == "reject"    {
+        if len(argv) < 2 { println("usage: anima proposal reject <id>"); exit(2) }
+        sub_reject(_str(argv[1]), _forward_rest(argv, 2)); return
+    }
+    if sub == "implement" {
+        if len(argv) < 2 { println("usage: anima proposal implement <id>"); exit(2) }
+        sub_implement(_str(argv[1])); return
+    }
+    if sub == "archive"   {
+        if len(argv) < 2 { println("usage: anima proposal archive <id>"); exit(2) }
+        sub_archive(_str(argv[1])); return
+    }
+    if sub == "dashboard" { sub_dashboard(); return }
+    if sub == "cluster"   { sub_cluster(); return }
+    if sub == "cycle"     { sub_cycle(); return }
+    println("proposal: unknown subcmd '" + sub + "'")
+    sub_help()
+    exit(2)
+}
+
+main()

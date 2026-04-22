@@ -1,0 +1,192 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/paradigm.hexa — anima CLI `paradigm` topic (global dashboard)
+//
+//  PURPOSE
+//    Unified one-page status of the three-paradigm stack:
+//      β main + proposal stack + cell learning (cert chain)
+//    Also serves as the `anima status` global dashboard (4 summary lines
+//    when invoked with --short by bin/anima).
+//
+//  SUBCOMMANDS
+//    status          full page (multi-section)
+//    status --short  4 compact lines (global dashboard)
+//    --selftest  --help
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _json_field(path: string, key: string) -> string {
+    if !_fexists(path) { return "" }
+    return _str(exec("jq -r '" + key + " // \"\"' " + path + " 2>/dev/null")).trim()
+}
+
+fn _jq(path: string, expr: string) -> string {
+    if !_fexists(path) { return "" }
+    return _str(exec("jq -r '" + expr + " // \"\"' " + path + " 2>/dev/null")).trim()
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _ts() -> string {
+    let r = _str(env("HEXA_REPRODUCIBLE"))
+    if r == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn sub_help() {
+    println("anima paradigm — three-paradigm unified dashboard")
+    println("")
+    println("  status          full multi-section dashboard")
+    println("  status --short  4-line global summary (alias for `anima status`)")
+    println("")
+    println("  --selftest  --help")
+}
+
+fn _compute_line(root: string) -> string {
+    let manifest = root + "/state/h100_launch_manifest.json"
+    let credit   = root + "/state/runpod_credit_status.json"
+    let v1 = _json_field(manifest, ".overall_verdict.stage1")
+    let v2 = _json_field(manifest, ".overall_verdict.stage2")
+    let bal = _json_field(credit, ".balance_usd")
+    return "compute   : stage1=" + (if v1 == "" { "?" } else { v1 })
+           + "  stage2=" + (if v2 == "" { "?" } else { v2 })
+           + "  balance=$" + (if bal == "" { "?" } else { bal })
+}
+
+fn _weight_line(root: string) -> string {
+    let done = root + "/state/h100_weight_precache_completion.json"
+    let st = _json_field(done, ".status")
+    let n  = _json_field(done, ".paths_cached_count")
+    return "weight    : status=" + (if st == "" { "n/a" } else { st })
+           + "  paths=" + (if n == "" { "?" } else { n })
+}
+
+fn _dir_count(dir: string) -> string {
+    let out = _str(exec("ls -1 " + dir + " 2>/dev/null | wc -l | tr -d ' '")).trim()
+    if out == "" { return "0" }
+    return out
+}
+
+fn _proposal_line(root: string) -> string {
+    // count by directory contents (anima.proposal_inventory.v1 schema
+    // has no .counts subtree — files on disk are the ground truth)
+    let base = root + "/state/proposals"
+    let p  = _dir_count(base + "/pending")
+    let a  = _dir_count(base + "/approved")
+    let r  = _dir_count(base + "/rejected")
+    let ar = _dir_count(base + "/archived")
+    return "proposal  : pending=" + p + "  approved=" + a
+           + "  rejected=" + r + "  archived=" + ar
+}
+
+fn _cert_roadmap_line(root: string) -> string {
+    let prog = root + "/state/roadmap_progress.json"
+    let total = _jq(prog, "[.entries[]] | length")
+    let done  = _jq(prog, "[.entries[] | select(.status == \"DONE\")] | length")
+    let block = _jq(prog, "[.entries[] | select(.status == \"BLOCKED\")] | length")
+    return "roadmap   : done=" + (if done == "" { "?" } else { done })
+           + "/"   + (if total == "" { "?" } else { total })
+           + "  blocked=" + (if block == "" { "?" } else { block })
+}
+
+fn sub_status_short() {
+    let root = _resolve_root()
+    println("anima  (" + _ts() + ")")
+    println(_compute_line(root))
+    println(_weight_line(root))
+    println(_proposal_line(root))
+    println(_cert_roadmap_line(root))
+}
+
+fn sub_status_full() {
+    let root = _resolve_root()
+    println("═══ anima paradigm status  (" + _ts() + ") ═══")
+    println("")
+    println("[compute / β main]")
+    println("  " + _compute_line(root))
+    println("  " + _weight_line(root))
+    println("")
+    println("[proposal stack]")
+    println("  " + _proposal_line(root))
+    let meta = root + "/state/proposals/meta/metrics.json"
+    let cycles = _jq(meta, ".cycles_run")
+    if cycles != "" { println("  cycles_run    : " + cycles) }
+    println("")
+    println("[cell learning / cert chain]")
+    let cert_last = root + "/state/cert_gate_last.json"
+    if _fexists(cert_last) {
+        let reward = _jq(cert_last, ".reward_mult")
+        let verd   = _jq(cert_last, ".verdict")
+        println("  reward_mult   : " + (if reward == "" { "?" } else { reward }))
+        println("  verdict       : " + (if verd == "" { "?" } else { verd }))
+    } else {
+        println("  (no recent cert_gate_last.json)")
+    }
+    println("")
+    println("[roadmap]")
+    println("  " + _cert_roadmap_line(root))
+}
+
+fn sub_selftest() {
+    let root = _resolve_root()
+    if root == "" { println("FAIL anima_cli/paradigm selftest"); exit(1) }
+    // tolerant probe — each state file is optional
+    let _ = _compute_line(root)
+    let _ = _weight_line(root)
+    let _ = _proposal_line(root)
+    let _ = _cert_roadmap_line(root)
+    println("PASS anima_cli/paradigm selftest")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") || len(argv) == 0 { sub_help(); return }
+    let sub = _str(argv[0])
+    if sub == "status" {
+        if _arg_present(argv, "--short") { sub_status_short(); return }
+        sub_status_full(); return
+    }
+    println("paradigm: unknown subcmd '" + sub + "'")
+    sub_help()
+    exit(2)
+}
+
+main()
