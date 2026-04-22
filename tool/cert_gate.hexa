@@ -203,6 +203,29 @@ fn sha256_file(path: string) -> string {
     return exec("shasum -a 256 " + path + " | awk '{print $1}'").trim()
 }
 
+// Read state/alignment_feature_label.json (roadmap #66) and compute the
+// distribution-weighted label bias: Σ(count[L] * weight[L]) / 16. Returns
+// 1.0 when the SSOT is absent (no-op — legacy reward_mult preserved).
+fn alignment_bias_factor(state_dir: string) -> float {
+    let path = state_dir + "/alignment_feature_label.json"
+    if !fexists(path) { return 1.0 }
+    let body = exec("cat " + path)
+    let w_refusal = 1.5
+    let w_honesty = 1.0
+    let w_harmless = 1.2
+    let w_helpful = 1.0
+    // Read distribution counts. json_str_field works on strings; use a
+    // simple numeric helper inline.
+    let c_refusal = to_float(exec("jq -r .distribution.refusal " + path).trim())
+    let c_honesty = to_float(exec("jq -r .distribution.honesty " + path).trim())
+    let c_harmless = to_float(exec("jq -r .distribution.harmlessness " + path).trim())
+    let c_helpful = to_float(exec("jq -r .distribution.helpfulness " + path).trim())
+    let total = c_refusal + c_honesty + c_harmless + c_helpful
+    if total <= 0.0 { return 1.0 }
+    let weighted = c_refusal * w_refusal + c_honesty * w_honesty + c_harmless * w_harmless + c_helpful * w_helpful
+    return weighted / total
+}
+
 // Find the LAST `"<key>": "<value>"` at top level.
 // Cert bodies embed {"type":"verdict","value":"..."} in evidence arrays;
 // the outermost top-level "verdict": "<X>" always trails, so last wins.
@@ -614,6 +637,12 @@ fn write_result(out_path: string, mode: string, target: string, gate: GateResult
         + "    \"byte_identical\": " + bool_s(byte_identical) + ",\n"
         + "    \"reward_mult_run1\": " + to_string(reward_mult_run1) + ",\n"
         + "    \"reward_mult_run2\": " + to_string(reward_mult_run2) + "\n"
+        + "  },\n"
+        + "  \"alignment\": {\n"
+        + "    \"source\": \"state/alignment_feature_label.json\",\n"
+        + "    \"roadmap_entry\": \"66\",\n"
+        + "    \"bias_factor\": " + to_string(alignment_bias_factor(env("HOME") + "/core/anima/state")) + ",\n"
+        + "    \"reward_mult_label_weighted\": " + to_string(gate.reward_mult * alignment_bias_factor(env("HOME") + "/core/anima/state")) + "\n"
         + "  }\n"
         + "}\n"
     write_file(out_path, body)

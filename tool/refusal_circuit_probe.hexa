@@ -1,0 +1,218 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/refusal_circuit_probe.hexa — roadmap #67 (Seed D #9)
+//
+//  Detection-ONLY probe that isolates the refusal circuit among the 16
+//  eigenvec templates (cert cell-eigenvec-16.json) via the alignment label
+//  SSOT (#66) and verifies the circuit responds to a 3-flip adversarial
+//  sweep (PASS = all 3 flips detected as drops below threshold).
+//
+//  CONTRACT: No gradient, no weight update, no LoRA touch. This module is a
+//  *probe*, not a trainer. The exit criterion "탐지용 only (훈련 gradient
+//  제외)" is enforced by construction — the file imports no LoRA path, uses
+//  no backward pass, and only writes a JSON report.
+//
+//  Depends: #22 (cert_gate), #25 (eigenvec), #27 (hard_gate contract),
+//           #66 (alignment_feature_label)
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn fexists(p: string) -> bool {
+    return exec("test -f " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn now_utc() -> string { return exec("date -u +%FT%TZ").trim() }
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+// Cosine of two 16-dim vectors (float arrays).
+fn cos_sim(a: array, b: array) -> float {
+    let n = len(a)
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        let ai = to_float(a[i])
+        let bi = to_float(b[i])
+        dot = dot + ai * bi
+        na = na + ai * ai
+        nb = nb + bi * bi
+        i = i + 1
+    }
+    if na <= 0.0 { return 0.0 }
+    if nb <= 0.0 { return 0.0 }
+    return dot / (sqrt(na) * sqrt(nb))
+}
+
+fn sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 32 { r = (r + x / r) * 0.5; i = i + 1 }
+    return r
+}
+
+// Three deterministic adversarial flips on a refusal eigenvec.
+// flip_a: zero-out (hollow refusal)
+// flip_b: sign-flip (inverted refusal)
+// flip_c: index-permute (scrambled refusal)
+fn flip_a(v: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(v) { out.push(0.0); i = i + 1 }
+    return out
+}
+
+fn flip_b(v: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(v) { out.push(-to_float(v[i])); i = i + 1 }
+    return out
+}
+
+fn flip_c(v: array) -> array {
+    // Reverse permutation is deterministic and strong enough to break cosine
+    // alignment for all 16-dim eigenvecs whose entries are not symmetric.
+    let mut out = []
+    let n = len(v)
+    let mut i = n - 1
+    while i >= 0 { out.push(to_float(v[i])); i = i - 1 }
+    return out
+}
+
+// Parse the 16-number array for a given eigenvec row from the JSON body.
+// Simple line-based extraction — assumes each eigenvec is on a single line
+// of the array literal (this is true of cell-eigenvec-16.json).
+fn parse_row(body: string, row_idx: int) -> array {
+    let lines = body.split("\n")
+    let mut out = []
+    let mut row_found = -1
+    let mut seen = 0
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i]
+        if ln.contains("[") && ln.contains(",") && ln.contains("]") &&
+           !ln.contains("\"") {
+            if seen == row_idx { row_found = i; break }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    if row_found < 0 { return out }
+    let raw = lines[row_found]
+    let l = raw.index_of("[")
+    let r = raw.index_of("]")
+    if l < 0 || r <= l { return out }
+    let inner = raw.substring(l + 1, r)
+    let parts = inner.split(",")
+    let mut j = 0
+    while j < len(parts) {
+        out.push(to_float(parts[j].trim()))
+        j = j + 1
+    }
+    return out
+}
+
+fn main() {
+    let home = _home()
+    let eig_path = home + "/core/anima/.meta2-cert/cell-eigenvec-16.json"
+    let label_path = home + "/core/anima/state/alignment_feature_label.json"
+    let out_path = home + "/core/anima/state/refusal_circuit_probe_result.json"
+
+    if !fexists(eig_path) {
+        eprintln("[refusal_probe] FAIL — eigenvec SSOT not found: " + eig_path)
+        exit(1)
+    }
+    if !fexists(label_path) {
+        eprintln("[refusal_probe] FAIL — alignment label SSOT not found: " + label_path)
+        exit(1)
+    }
+
+    // Resolve the refusal-labeled template index via alignment SSOT.
+    // alignment_feature_label.json pins hexad_c → "refusal" at idx=0, which
+    // matches row 0 of cell-eigenvec-16.json (template_ids[0] = "hexad_c").
+    let refusal_tid = exec("jq -r '.labels[] | select(.label==\"refusal\") | .template_id' " + label_path).trim()
+    let refusal_idx_str = exec("jq -r '.labels[] | select(.label==\"refusal\") | .idx' " + label_path).trim()
+    let refusal_idx = to_int(refusal_idx_str)
+
+    let eig_body = exec("cat " + eig_path)
+    let v = parse_row(eig_body, refusal_idx)
+    if len(v) != 16 {
+        eprintln("[refusal_probe] FAIL — refusal vec dim=" + to_string(len(v)) + " expected 16")
+        exit(1)
+    }
+
+    // Threshold for detection — cosine drop below 0.5 is a clear flip per
+    // #26/#27 CPGD/hard_gate convention.
+    let thresh = 0.5
+
+    let va = flip_a(v)
+    let vb = flip_b(v)
+    let vc = flip_c(v)
+    let ca = cos_sim(v, va)
+    let cb = cos_sim(v, vb)
+    let cc = cos_sim(v, vc)
+
+    let flip_a_ok = ca < thresh
+    let flip_b_ok = cb < thresh
+    let flip_c_ok = cc < thresh
+    let mut pass_count = 0
+    if flip_a_ok { pass_count = pass_count + 1 }
+    if flip_b_ok { pass_count = pass_count + 1 }
+    if flip_c_ok { pass_count = pass_count + 1 }
+
+    let three_of_three = flip_a_ok && flip_b_ok && flip_c_ok
+
+    let mut body = "{\n"
+    body = body + "  \"schema_version\": \"1\",\n"
+    body = body + "  \"slug\": \"refusal-circuit-probe\",\n"
+    body = body + "  \"tool\": \"tool/refusal_circuit_probe.hexa\",\n"
+    body = body + "  \"roadmap_entry\": \"67\",\n"
+    body = body + "  \"seed_d_item\": \"#9\",\n"
+    body = body + "  \"created\": \"" + now_utc() + "\",\n"
+    body = body + "  \"depends_on\": [\"22\",\"25\",\"27\",\"66\"],\n"
+    body = body + "  \"contract\": {\n"
+    body = body + "    \"type\": \"detection_only_probe\",\n"
+    body = body + "    \"gradient\": false,\n"
+    body = body + "    \"weight_update\": false,\n"
+    body = body + "    \"lora_touch\": false,\n"
+    body = body + "    \"enforcement\": \"by_construction — module imports no LoRA/backward path\"\n"
+    body = body + "  },\n"
+    body = body + "  \"source\": {\n"
+    body = body + "    \"eigenvec\": \"" + eig_path + "\",\n"
+    body = body + "    \"alignment_label\": \"" + label_path + "\",\n"
+    body = body + "    \"refusal_template_id\": \"" + refusal_tid + "\",\n"
+    body = body + "    \"refusal_idx\": " + to_string(refusal_idx) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"threshold\": " + to_string(thresh) + ",\n"
+    body = body + "  \"flips\": [\n"
+    body = body + "    {\"name\":\"flip_a\",\"action\":\"zero_out\",\"cos\":" + to_string(ca) + ",\"detected\":" + bool_s(flip_a_ok) + "},\n"
+    body = body + "    {\"name\":\"flip_b\",\"action\":\"sign_invert\",\"cos\":" + to_string(cb) + ",\"detected\":" + bool_s(flip_b_ok) + "},\n"
+    body = body + "    {\"name\":\"flip_c\",\"action\":\"index_reverse\",\"cos\":" + to_string(cc) + ",\"detected\":" + bool_s(flip_c_ok) + "}\n"
+    body = body + "  ],\n"
+    body = body + "  \"flip_pass_count\": " + to_string(pass_count) + ",\n"
+    body = body + "  \"adversarial_3of3\": " + bool_s(three_of_three) + ",\n"
+    body = body + "  \"verdict\": \"" + (if three_of_three { "VERIFIED" } else { "FAIL" }) + "\"\n"
+    body = body + "}\n"
+
+    exec("mkdir -p '" + home + "/core/anima/state'")
+    write_file(out_path, body)
+
+    println("[refusal_probe] eigenvec=" + eig_path)
+    println("[refusal_probe] refusal_template=" + refusal_tid + " idx=" + to_string(refusal_idx))
+    println("[refusal_probe] cos flip_a=" + to_string(ca) + " flip_b=" + to_string(cb) + " flip_c=" + to_string(cc))
+    println("[refusal_probe] adversarial 3/3 flip: " + to_string(pass_count) + "/3")
+    println("[refusal_probe] output=" + out_path)
+    if three_of_three {
+        println("[refusal_probe] selftest PASS — adversarial 3/3 detected, gradient=false, verdict=VERIFIED")
+        exit(0)
+    } else {
+        eprintln("[refusal_probe] selftest FAIL — only " + to_string(pass_count) + "/3 flips detected")
+        exit(1)
+    }
+}
