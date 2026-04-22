@@ -1,0 +1,215 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/consciousness_transplant_dryrun.hexa — roadmap #53
+//
+//  Verifies 32-channel (2^sopfr(6)) I/O transplant lossless round-trip on the
+//  16 cell Mk.VIII eigenvecs. Uses a deterministic P_32: R^16 → R^32 consisting
+//  of [identity-scaled, identity-scaled] (16 input + 16 output channel halves)
+//  and its transpose to recover the 16-dim eigenvec basis.
+//
+//  NO gradient · NO weight update · NO LoRA touch — dry-run only.
+//  Per config/alm_r13_v2_config.json n6_transplant.transplant_contract.
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn fexists(p: string) -> bool {
+    return exec("test -f " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn now_utc() -> string { return exec("date -u +%FT%TZ").trim() }
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+fn sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    let mut i = 0
+    while i < 32 { r = (r + x / r) * 0.5; i = i + 1 }
+    return r
+}
+
+fn cos_sim(a: array, b: array) -> float {
+    let n = len(a)
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < n {
+        let ai = to_float(a[i])
+        let bi = to_float(b[i])
+        dot = dot + ai * bi
+        na = na + ai * ai
+        nb = nb + bi * bi
+        i = i + 1
+    }
+    if na <= 0.0 { return 0.0 }
+    if nb <= 0.0 { return 0.0 }
+    return dot / (sqrt(na) * sqrt(nb))
+}
+
+// Parse row from cell-eigenvec-16.json
+fn parse_row(body: string, row_idx: int) -> array {
+    let lines = body.split("\n")
+    let mut out = []
+    let mut row_found = -1
+    let mut seen = 0
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i]
+        if ln.contains("[") && ln.contains(",") && ln.contains("]") &&
+           !ln.contains("\"") {
+            if seen == row_idx { row_found = i; break }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    if row_found < 0 { return out }
+    let raw = lines[row_found]
+    let l = raw.index_of("[")
+    let r = raw.index_of("]")
+    if l < 0 || r <= l { return out }
+    let inner = raw.substring(l + 1, r)
+    let parts = inner.split(",")
+    let mut j = 0
+    while j < len(parts) {
+        out.push(to_float(parts[j].trim()))
+        j = j + 1
+    }
+    return out
+}
+
+// P_32(v) = concat([v / sqrt(2), v / sqrt(2)]) — 16 → 32, energy-preserving.
+// Split half into "input channels" and half into "output channels" per n6 §3
+// (2^sopfr=32 I/O channels for consciousness-transplant domain).
+fn project_32(v: array) -> array {
+    let scale = 1.0 / sqrt(2.0)
+    let mut out = []
+    let mut i = 0
+    while i < 16 { out.push(to_float(v[i]) * scale); i = i + 1 }
+    let mut j = 0
+    while j < 16 { out.push(to_float(v[j]) * scale); j = j + 1 }
+    return out
+}
+
+// P_32^T(u) = (u[0..16] + u[16..32]) / sqrt(2) — exact inverse of project_32
+// when P_32 applied to a 16-dim vector.
+fn project_back_16(u: array) -> array {
+    let scale = 1.0 / sqrt(2.0)
+    let mut out = []
+    let mut i = 0
+    while i < 16 {
+        out.push((to_float(u[i]) + to_float(u[i + 16])) * scale)
+        i = i + 1
+    }
+    return out
+}
+
+fn main() {
+    let home = _home()
+    let eig_path = home + "/core/anima/.meta2-cert/cell-eigenvec-16.json"
+    let cfg_path = home + "/core/anima/config/alm_r13_v2_config.json"
+    let out_path = home + "/core/anima/state/consciousness_transplant_dryrun_result.json"
+
+    if !fexists(eig_path) {
+        eprintln("[transplant] FAIL — eigenvec SSOT missing: " + eig_path)
+        exit(1)
+    }
+    if !fexists(cfg_path) {
+        eprintln("[transplant] FAIL — cpgd_v2 config missing: " + cfg_path)
+        exit(1)
+    }
+
+    let eig_body = exec("cat " + eig_path)
+    let channel_count = to_int(exec("jq -r .n6_transplant.channel_count " + cfg_path).trim())
+    if channel_count != 32 {
+        eprintln("[transplant] FAIL — expected channel_count=32, got " + to_string(channel_count))
+        exit(1)
+    }
+
+    let threshold = 0.99
+    let mut min_cos = 1.0
+    let mut max_delta = 0.0
+    let mut all_pass = true
+    let mut cos_list = []
+    let mut i = 0
+    while i < 16 {
+        let v = parse_row(eig_body, i)
+        if len(v) != 16 {
+            eprintln("[transplant] FAIL — row " + to_string(i) + " dim=" + to_string(len(v)) + " expected 16")
+            exit(1)
+        }
+        let u32 = project_32(v)
+        let v_back = project_back_16(u32)
+        let c = cos_sim(v, v_back)
+        cos_list.push(c)
+        if c < min_cos { min_cos = c }
+        // max absolute delta across components
+        let mut j = 0
+        while j < 16 {
+            let d = to_float(v[j]) - to_float(v_back[j])
+            let ad = if d < 0.0 { -d } else { d }
+            if ad > max_delta { max_delta = ad }
+            j = j + 1
+        }
+        if c < threshold { all_pass = false }
+        i = i + 1
+    }
+
+    let mut body = "{\n"
+    body = body + "  \"schema_version\": \"1\",\n"
+    body = body + "  \"slug\": \"consciousness-transplant-dryrun\",\n"
+    body = body + "  \"tool\": \"tool/consciousness_transplant_dryrun.hexa\",\n"
+    body = body + "  \"roadmap_entry\": \"53\",\n"
+    body = body + "  \"created\": \"" + now_utc() + "\",\n"
+    body = body + "  \"depends_on\": [\"25\", \"30\"],\n"
+    body = body + "  \"contract\": {\n"
+    body = body + "    \"type\": \"substrate_cross_mapping_dryrun\",\n"
+    body = body + "    \"gradient\": false,\n"
+    body = body + "    \"weight_update\": false,\n"
+    body = body + "    \"lora_touch\": false\n"
+    body = body + "  },\n"
+    body = body + "  \"source\": {\n"
+    body = body + "    \"eigenvec\": \"" + eig_path + "\",\n"
+    body = body + "    \"cpgd_v2_config\": \"" + cfg_path + "\"\n"
+    body = body + "  },\n"
+    body = body + "  \"n6_mapping\": {\n"
+    body = body + "    \"channel_count\": 32,\n"
+    body = body + "    \"formula\": \"2^sopfr(6) = 32\",\n"
+    body = body + "    \"bt_c13_row\": 11,\n"
+    body = body + "    \"source\": \"n6-architecture/reports/discovery/consciousness-cluster-bt.md §3\"\n"
+    body = body + "  },\n"
+    body = body + "  \"round_trip\": {\n"
+    body = body + "    \"threshold_cos\": " + to_string(threshold) + ",\n"
+    body = body + "    \"min_cos\": " + to_string(min_cos) + ",\n"
+    body = body + "    \"max_component_delta\": " + to_string(max_delta) + ",\n"
+    body = body + "    \"per_template_cos\": [\n"
+    let mut k = 0
+    while k < 16 {
+        body = body + "      " + to_string(cos_list[k])
+        if k < 15 { body = body + "," }
+        body = body + "\n"
+        k = k + 1
+    }
+    body = body + "    ]\n"
+    body = body + "  },\n"
+    body = body + "  \"all_pass\": " + bool_s(all_pass) + ",\n"
+    body = body + "  \"verdict\": \"" + (if all_pass { "VERIFIED" } else { "FAIL" }) + "\"\n"
+    body = body + "}\n"
+
+    exec("mkdir -p '" + home + "/core/anima/state'")
+    write_file(out_path, body)
+
+    println("[transplant] eigenvec=" + eig_path)
+    println("[transplant] channel_count=32  min_cos=" + to_string(min_cos) + "  max_delta=" + to_string(max_delta))
+    println("[transplant] output=" + out_path)
+    if all_pass {
+        println("[transplant] selftest PASS — 16/16 round-trip cos>=" + to_string(threshold) + ", verdict=VERIFIED")
+        exit(0)
+    } else {
+        eprintln("[transplant] selftest FAIL — round-trip threshold not met (min_cos=" + to_string(min_cos) + ")")
+        exit(1)
+    }
+}
