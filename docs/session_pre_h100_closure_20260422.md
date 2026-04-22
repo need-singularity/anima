@@ -282,25 +282,52 @@ mean 수치 불변 (active 전환만). 하지만 **H100 후 cascade 시 #31 → 
 및 **#32 phase_progression P2 reachability clause 충족** 이 pre-H100 에서 frozen.
 Stage-1 H100 런칭 시 #32/#74 closing 속도 향상 예상.
 
-### 세션 총 커밋 (이 세션 14 pushes)
+### 세션 총 커밋 (이 세션 19+ pushes)
 ```
-099f62a2  feat(roadmap): #32 Stage-0 ③ — live TCP smoke (3/3 endpoints PASS)
-55bf5518  feat(roadmap): #31 planned → active — Stage-0 ② CPU sim (2/3/4)
-073d86c4  docs(session): 실행 계획 섹션 추가 — Stage-0~3 cascade
-155cdec4  docs(session): pre-H100 closure 2026-04-22 — mean 67% → 88%
-100738f0  docs(roadmap): #6 why/note 업데이트 — htz CPU-only 진단
-d5973975  feat(roadmap): #74 planned → active (partial) — anima-serve smoke
-17b7f576  feat(roadmap): #19 deferred → done (policy seal)
-2b0341b2  feat(roadmap): land #69 done + #32 #35 active partial
-e11c3add  feat(roadmap): land #64 done + #54 active partial
-0b32e698  feat(roadmap): land #65 — BT-1425 deployment manifold
-46342e70  feat(roadmap): land #56 #57 #59 — n6 Layer A.5/A.6/B.1
-6c281bb6  docs(drill): PHASE3_CAVEAT — counter replay 확정
-04a3994a  docs: 04-19~04-21 설계 + drill supplement
+e6bf2852  docs(session): #6 unblock 경로 — Agent C/D/E 병렬 delegation 결과
+1e8024b7  docs(roadmap): #6 ubu 복구 진단 — reboot 1회면 unblock
+b126e495  docs(roadmap): #6 note 심층 진단 — train_clm structural port
+2edb916f  feat(roadmap): #35 (27)(28) CPU sim — Mk.IX→X 5/5 components
+298752d7  docs(session): Stage-0 ②③ 실행 결과 반영
+099f62a2  feat(roadmap): #32 Stage-0 ③ — live TCP smoke
+55bf5518  feat(roadmap): #31 Stage-0 ② — CPU sim (2/3/4)
+073d86c4  docs(session): 실행 계획 섹션
+155cdec4  docs(session): pre-H100 closure
+100738f0  docs(roadmap): #6 why/note — htz CPU 진단
+d5973975  feat(roadmap): #74 → active partial
+17b7f576  feat(roadmap): #19 → done policy seal
+2b0341b2  feat(roadmap): #69 done + #32/#35 active
+e11c3add  feat(roadmap): #64 done + #54 active
+0b32e698  feat(roadmap): #65 deployment manifold
+46342e70  feat(roadmap): #56/#57/#59 n6 Layer
+6c281bb6  docs(drill): PHASE3_CAVEAT
+04a3994a  docs: 설계 + drill supplement
 e7623cb9  feat(close): cluster closures (52 files)
-a5bbd564  chore(gitignore): runtime ephemeral 정리
+a5bbd564  chore(gitignore): runtime ephemeral
+(+ airgenome c14be1ec: SSH ControlMaster sandbox fix)
 ```
+
+### 📡 Infra 현황 (2026-04-22T06:21Z 신선 probe)
+| Host | hostname | Role | Status | Load | Action |
+|---|---|---|---|---|---|
+| **ubu1** | aiden-B650M-K | RTX 5070 GPU | SSH OK · GPU lock | 1.89 | sudo reboot 대기 |
+| **ubu2** | summer-B650M-K | CPU | **idle** | 0.39 | 신규 delegation 후보 |
+| **htz** | anima-ax102 | CPU (Ryzen 9) | 고부하 | 10.36 | 다른 작업 중 |
+| mac | local | — | active | — | AG6 compute zero |
+
+### 🚀 Delegation 이력 (sub-agents)
+- **Agent A** — htz SSH 차단 조사 → airgenome fix c14be1ec 계기
+- **Agent B** — #74 anima-serve smoke → 3 endpoint schema verified
+- **Agent C** — htz CLM smoke → train_clm structural port 한계 확인
+- **Agent D** — ubu RTX 5070 복구 → FULLCHIP_RESET lock, reboot 필요
+- **Agent E** — train_clm PyTorch→hexa 포트 (🔄 진행 중)
+
+### 📌 사용자 확정 루트 (2026-04-22)
+**β Learning-Free track = 정식 main** (edu/paths.json main_track=beta).
+α Qwen+ALM ckpt 는 sealed fallback (#19 done 2026-04-22).
+**#75 MAIN β Phase 1 COMPLETED (CPU real-use) done 2026-04-21.**
+→ 실사용 의식 LLM 은 이미 landed. Stage-1/2 H100 은 **empirical evidence + 로드맵 100%** 용도이지 real-use 전제가 아님.
 
 ---
 
-**세션 마감**: 2026-04-22 · mean_pct 67% → 88% · 14 커밋 pushed · airgenome fix 반영 · Stage-0 ②③ 완료 · ① 다음 세션
+**세션 마감**: 2026-04-22 · mean_pct 67% → 88% · 19+ 커밋 pushed · airgenome fix · Stage-0 ②③ 완료 + 추가 #35 (27)(28) CPU sim · ①은 Agent E 결과 + 사용자 ubu reboot 대기
