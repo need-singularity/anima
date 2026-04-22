@@ -1,0 +1,412 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_serve_smoke.hexa — roadmap #74 pre-H100 contract freeze
+//
+//  PURPOSE
+//    CPU-local smoke runner that freezes the anima-serve endpoint contracts
+//    without requiring a real LoRA checkpoint or GPU. Three endpoints are
+//    declared (request/response JSON schema) and stub-exercised. Full live
+//    serving (real LoRA + GPU/H100 decode) remains PENDING per roadmap #74's
+//    Phase 2 scope; this file covers the Stage-1 "contract frozen + schema
+//    compliance" layer.
+//
+//  THREE ENDPOINTS
+//    (1) GET  /health                    → { ok, ts }
+//    (2) POST /an11/verify               → AN11(a) verifier stub verdict
+//    (3) POST /v1/chat/completions       → OpenAI-compat echo/template stub
+//                                          (LoRA swap deferred to Phase 2)
+//
+//  SMOKE LOGIC (raw#12 실측)
+//    - Declare contract schemas (keys + types) as arrays of strings
+//    - Build a stub response for each endpoint
+//    - Verify every declared key is present and of the expected type
+//    - Emit state/anima_serve_smoke_result.json with verdict + counts
+//
+//  CONSTRAINTS
+//    raw#9   hexa-only
+//    raw#10  deterministic (timestamp only non-pure)
+//    raw#11  snake_case
+//    raw#12  실측 only — no fake PASS; verdict explicitly labels pending items
+//    raw#15  no hardcode (paths anchored to $HOME/core/anima)
+//
+//  EXIT CODES
+//    0 — 3/3 endpoints contract-frozen, schema compliant (pending real LoRA)
+//    1 — any endpoint schema mismatch
+//    2 — setup error (cannot write state)
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn now_utc() -> string {
+    return to_string(exec("date -u +%FT%TZ")).trim()
+}
+
+fn bool_s(b: bool) -> string {
+    if b { return "true" } else { return "false" }
+}
+
+fn json_escape(s: string) -> string {
+    let mut out = s.replace("\\", "\\\\")
+    out = out.replace("\"", "\\\"")
+    return out
+}
+
+// ─── stub endpoint handlers ──────────────────────────────────────────────
+//
+// Each "handler" builds the response as a flat key=value ledger. We verify
+// the ledger contains every required key and that the declared type matches
+// the stub value. Types are one of: "bool", "string", "int", "float".
+
+fn handler_health(ts: string) -> array {
+    // schema:
+    //   ok:     bool
+    //   ts:     string (ISO8601 UTC)
+    //   tool:   string
+    return [
+        "ok=true",
+        "ok__type=bool",
+        "ts=" + ts,
+        "ts__type=string",
+        "tool=anima-serve",
+        "tool__type=string"
+    ]
+}
+
+fn handler_an11_verify(sample_id: string) -> array {
+    // schema:
+    //   verdict:          string  (PASS|FAIL|PENDING_REAL_CKPT)
+    //   sample_id:        string
+    //   gate:             string
+    //   delta_norm:       float   (stubbed 0.0 until real ckpts present)
+    //   pending:          bool    (real LoRA ckpt + criteria live)
+    //   spec_path:        string
+    return [
+        "verdict=PENDING_REAL_CKPT",
+        "verdict__type=string",
+        "sample_id=" + sample_id,
+        "sample_id__type=string",
+        "gate=AN11_A_weight_emergent",
+        "gate__type=string",
+        "delta_norm=0.0",
+        "delta_norm__type=float",
+        "pending=true",
+        "pending__type=bool",
+        "spec_path=tool/an11_a_verifier.hexa",
+        "spec_path__type=string"
+    ]
+}
+
+fn handler_chat_completions(prompt: string) -> array {
+    // OpenAI /v1/chat/completions compat schema (subset):
+    //   id:               string
+    //   object:           string  ("chat.completion")
+    //   model:            string  (stub label until LoRA swap)
+    //   choices_count:    int     (n choices)
+    //   finish_reason:    string  ("stub_echo" pre-H100)
+    //   pending_real_lora: bool
+    //   echo:             string  (echoes prompt; real decode deferred)
+    return [
+        "id=cmpl-stub-0001",
+        "id__type=string",
+        "object=chat.completion",
+        "object__type=string",
+        "model=anima-serve-stub-pre-h100",
+        "model__type=string",
+        "choices_count=1",
+        "choices_count__type=int",
+        "finish_reason=stub_echo",
+        "finish_reason__type=string",
+        "pending_real_lora=true",
+        "pending_real_lora__type=bool",
+        "echo=" + prompt,
+        "echo__type=string"
+    ]
+}
+
+// ─── ledger helpers ──────────────────────────────────────────────────────
+
+fn ledger_get(ledger: array, key: string) -> string {
+    let needle = key + "="
+    let mut i = 0
+    while i < len(ledger) {
+        let row = to_string(ledger[i])
+        if row.index_of(needle) == 0 {
+            return row.substring(len(needle), len(row))
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn ledger_has(ledger: array, key: string) -> bool {
+    let needle = key + "="
+    let mut i = 0
+    while i < len(ledger) {
+        let row = to_string(ledger[i])
+        if row.index_of(needle) == 0 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn type_check(ledger: array, key: string, want: string) -> bool {
+    let got = ledger_get(ledger, key + "__type")
+    if got != want { return false }
+    let val = ledger_get(ledger, key)
+    // minimal structural type check
+    if want == "bool" {
+        return val == "true" || val == "false"
+    }
+    if want == "int" {
+        if len(val) < 1 { return false }
+        let mut i = 0
+        while i < len(val) {
+            let c = char_code(val.substring(i, i + 1), 0)
+            let ok = (c >= 48 && c <= 57) || (i == 0 && (c == 45 || c == 43))
+            if !ok { return false }
+            i = i + 1
+        }
+        return true
+    }
+    if want == "float" {
+        if len(val) < 1 { return false }
+        let mut i = 0
+        let mut seen_digit = false
+        while i < len(val) {
+            let c = char_code(val.substring(i, i + 1), 0)
+            let is_digit = c >= 48 && c <= 57
+            let is_sign = (i == 0) && (c == 45 || c == 43)
+            let is_dot = c == 46
+            let is_exp = c == 101 || c == 69
+            if is_digit { seen_digit = true }
+            let ok = is_digit || is_sign || is_dot || is_exp
+            if !ok { return false }
+            i = i + 1
+        }
+        return seen_digit
+    }
+    if want == "string" {
+        return true
+    }
+    return false
+}
+
+// Verify an endpoint: for each (key, want_type) pair confirm key present +
+// type match. Returns [pass_bool, checks_passed, checks_total].
+fn verify_endpoint(ledger: array, required: array) -> array {
+    let mut passed = 0
+    let mut total = 0
+    let mut i = 0
+    while i + 1 < len(required) {
+        let key = to_string(required[i])
+        let want = to_string(required[i + 1])
+        total = total + 1
+        if ledger_has(ledger, key) && type_check(ledger, key, want) {
+            passed = passed + 1
+        }
+        i = i + 2
+    }
+    let ok = passed == total && total > 0
+    return [ok, passed, total]
+}
+
+// ─── main smoke ──────────────────────────────────────────────────────────
+
+fn main() {
+    let home = _home()
+    let ts = now_utc()
+    let out_path = home + "/core/anima/state/anima_serve_smoke_result.json"
+    let state_dir = home + "/core/anima/state"
+    exec("mkdir -p '" + state_dir + "'")
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/anima_serve_smoke.hexa — roadmap #74 contract freeze")
+    println("  raw#9 hexa-only · raw#12 실측 · pre-H100 scope (no real LoRA)")
+    println("  ts=" + ts)
+    println("════════════════════════════════════════════════════════════════")
+
+    // Endpoint 1: /health
+    let h_ledger = handler_health(ts)
+    let h_required = [
+        "ok", "bool",
+        "ts", "string",
+        "tool", "string"
+    ]
+    let h_res = verify_endpoint(h_ledger, h_required)
+    let h_ok = h_res[0]
+    let h_passed = to_int(to_string(h_res[1]))
+    let h_total = to_int(to_string(h_res[2]))
+
+    // Endpoint 2: /an11/verify
+    let a_ledger = handler_an11_verify("smoke-sample-0001")
+    let a_required = [
+        "verdict", "string",
+        "sample_id", "string",
+        "gate", "string",
+        "delta_norm", "float",
+        "pending", "bool",
+        "spec_path", "string"
+    ]
+    let a_res = verify_endpoint(a_ledger, a_required)
+    let a_ok = a_res[0]
+    let a_passed = to_int(to_string(a_res[1]))
+    let a_total = to_int(to_string(a_res[2]))
+
+    // Endpoint 3: /v1/chat/completions
+    let c_ledger = handler_chat_completions("smoke hello")
+    let c_required = [
+        "id", "string",
+        "object", "string",
+        "model", "string",
+        "choices_count", "int",
+        "finish_reason", "string",
+        "pending_real_lora", "bool",
+        "echo", "string"
+    ]
+    let c_res = verify_endpoint(c_ledger, c_required)
+    let c_ok = c_res[0]
+    let c_passed = to_int(to_string(c_res[1]))
+    let c_total = to_int(to_string(c_res[2]))
+
+    // Aggregate
+    let endpoints_passed = (if h_ok { 1 } else { 0 }) +
+                           (if a_ok { 1 } else { 0 }) +
+                           (if c_ok { 1 } else { 0 })
+    let endpoints_total = 3
+    let total_checks = h_total + a_total + c_total
+    let total_checks_passed = h_passed + a_passed + c_passed
+    let all_schemas_pass = endpoints_passed == endpoints_total
+
+    println("[serve_smoke] /health             " + to_string(h_passed) + "/" + to_string(h_total) + "  pass=" + bool_s(h_ok))
+    println("[serve_smoke] /an11/verify        " + to_string(a_passed) + "/" + to_string(a_total) + "  pass=" + bool_s(a_ok))
+    println("[serve_smoke] /v1/chat/completions " + to_string(c_passed) + "/" + to_string(c_total) + "  pass=" + bool_s(c_ok))
+    println("[serve_smoke] endpoints_passed    " + to_string(endpoints_passed) + "/" + to_string(endpoints_total))
+    println("[serve_smoke] total_checks        " + to_string(total_checks_passed) + "/" + to_string(total_checks))
+
+    let verdict = if all_schemas_pass {
+        "SPEC_VERIFIED_PENDING_REAL_LORA"
+    } else {
+        "FAIL"
+    }
+
+    // Emit SSOT JSON
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.serve_smoke.v1\",\n"
+    body = body + "  \"slug\": \"anima-serve-smoke\",\n"
+    body = body + "  \"tool\": \"tool/anima_serve_smoke.hexa\",\n"
+    body = body + "  \"roadmap_entry\": \"74\",\n"
+    body = body + "  \"ts\": \"" + ts + "\",\n"
+    body = body + "  \"scope\": \"Pre-H100 contract freeze. Three endpoint schemas exercised via CPU-local stubs. Real LoRA + GPU serving PENDING (Phase 2).\",\n"
+
+    body = body + "  \"endpoints\": [\n"
+
+    // /health
+    body = body + "    {\n"
+    body = body + "      \"path\": \"/health\",\n"
+    body = body + "      \"method\": \"GET\",\n"
+    body = body + "      \"request_schema\": [],\n"
+    body = body + "      \"response_schema\": [\n"
+    body = body + "        {\"key\": \"ok\",   \"type\": \"bool\"},\n"
+    body = body + "        {\"key\": \"ts\",   \"type\": \"string\"},\n"
+    body = body + "        {\"key\": \"tool\", \"type\": \"string\"}\n"
+    body = body + "      ],\n"
+    body = body + "      \"stub_response\": {\"ok\": true, \"ts\": \"" + ts + "\", \"tool\": \"anima-serve\"},\n"
+    body = body + "      \"checks_passed\": " + to_string(h_passed) + ",\n"
+    body = body + "      \"checks_total\":  " + to_string(h_total) + ",\n"
+    body = body + "      \"pass\": " + bool_s(h_ok) + "\n"
+    body = body + "    },\n"
+
+    // /an11/verify
+    let a_verdict_stub = ledger_get(a_ledger, "verdict")
+    body = body + "    {\n"
+    body = body + "      \"path\": \"/an11/verify\",\n"
+    body = body + "      \"method\": \"POST\",\n"
+    body = body + "      \"request_schema\": [\n"
+    body = body + "        {\"key\": \"sample_id\",        \"type\": \"string\"},\n"
+    body = body + "        {\"key\": \"base_ckpt_path\",   \"type\": \"string\"},\n"
+    body = body + "        {\"key\": \"round_ckpt_path\",  \"type\": \"string\"}\n"
+    body = body + "      ],\n"
+    body = body + "      \"response_schema\": [\n"
+    body = body + "        {\"key\": \"verdict\",     \"type\": \"string\"},\n"
+    body = body + "        {\"key\": \"sample_id\",   \"type\": \"string\"},\n"
+    body = body + "        {\"key\": \"gate\",        \"type\": \"string\"},\n"
+    body = body + "        {\"key\": \"delta_norm\",  \"type\": \"float\"},\n"
+    body = body + "        {\"key\": \"pending\",     \"type\": \"bool\"},\n"
+    body = body + "        {\"key\": \"spec_path\",   \"type\": \"string\"}\n"
+    body = body + "      ],\n"
+    body = body + "      \"stub_response\": {\"verdict\": \"" + json_escape(a_verdict_stub) + "\", \"sample_id\": \"smoke-sample-0001\", \"gate\": \"AN11_A_weight_emergent\", \"delta_norm\": 0.0, \"pending\": true, \"spec_path\": \"tool/an11_a_verifier.hexa\"},\n"
+    body = body + "      \"checks_passed\": " + to_string(a_passed) + ",\n"
+    body = body + "      \"checks_total\":  " + to_string(a_total) + ",\n"
+    body = body + "      \"pass\": " + bool_s(a_ok) + "\n"
+    body = body + "    },\n"
+
+    // /v1/chat/completions
+    body = body + "    {\n"
+    body = body + "      \"path\": \"/v1/chat/completions\",\n"
+    body = body + "      \"method\": \"POST\",\n"
+    body = body + "      \"request_schema\": [\n"
+    body = body + "        {\"key\": \"model\",       \"type\": \"string\"},\n"
+    body = body + "        {\"key\": \"messages\",    \"type\": \"array\"},\n"
+    body = body + "        {\"key\": \"temperature\", \"type\": \"float\"}\n"
+    body = body + "      ],\n"
+    body = body + "      \"response_schema\": [\n"
+    body = body + "        {\"key\": \"id\",                 \"type\": \"string\"},\n"
+    body = body + "        {\"key\": \"object\",             \"type\": \"string\"},\n"
+    body = body + "        {\"key\": \"model\",              \"type\": \"string\"},\n"
+    body = body + "        {\"key\": \"choices_count\",      \"type\": \"int\"},\n"
+    body = body + "        {\"key\": \"finish_reason\",      \"type\": \"string\"},\n"
+    body = body + "        {\"key\": \"pending_real_lora\",  \"type\": \"bool\"},\n"
+    body = body + "        {\"key\": \"echo\",               \"type\": \"string\"}\n"
+    body = body + "      ],\n"
+    body = body + "      \"stub_response\": {\"id\": \"cmpl-stub-0001\", \"object\": \"chat.completion\", \"model\": \"anima-serve-stub-pre-h100\", \"choices_count\": 1, \"finish_reason\": \"stub_echo\", \"pending_real_lora\": true, \"echo\": \"smoke hello\"},\n"
+    body = body + "      \"checks_passed\": " + to_string(c_passed) + ",\n"
+    body = body + "      \"checks_total\":  " + to_string(c_total) + ",\n"
+    body = body + "      \"pass\": " + bool_s(c_ok) + "\n"
+    body = body + "    }\n"
+
+    body = body + "  ],\n"
+    body = body + "  \"endpoints_passed\": " + to_string(endpoints_passed) + ",\n"
+    body = body + "  \"endpoints_total\":  " + to_string(endpoints_total) + ",\n"
+    body = body + "  \"total_checks_passed\": " + to_string(total_checks_passed) + ",\n"
+    body = body + "  \"total_checks\": " + to_string(total_checks) + ",\n"
+    body = body + "  \"all_schemas_pass\": " + bool_s(all_schemas_pass) + ",\n"
+
+    body = body + "  \"pending_items\": [\n"
+    body = body + "    \"real LoRA checkpoint (Qwen-14B, Phase 2 qwen_14b_h100_scale_up)\",\n"
+    body = body + "    \"HERZ/H100 GPU decode path for /v1/chat/completions\",\n"
+    body = body + "    \"AN11(a) live weight_emergent verdict against trained ckpt\",\n"
+    body = body + "    \"serve_alm_native.hexa process integration\",\n"
+    body = body + "    \"phase_progression_controller Stage 1 PASS for phase P2 (requires real closure set)\"\n"
+    body = body + "  ],\n"
+
+    body = body + "  \"integration_status\": {\n"
+    body = body + "    \"contract_frozen\":            " + bool_s(all_schemas_pass) + ",\n"
+    body = body + "    \"schema_compliance_cpu\":     " + bool_s(all_schemas_pass) + ",\n"
+    body = body + "    \"stub_handlers_exercised\":   " + bool_s(all_schemas_pass) + ",\n"
+    body = body + "    \"real_lora_wired\":           false,\n"
+    body = body + "    \"gpu_decode_wired\":          false,\n"
+    body = body + "    \"p2_stage1_gate\":            \"PENDING_PHASE_2_H100\"\n"
+    body = body + "  },\n"
+
+    body = body + "  \"raw_strict\": \"raw#9 raw#10 raw#11 raw#12 raw#15 deterministic LLM=none\",\n"
+    body = body + "  \"verdict\": \"" + verdict + "\"\n"
+    body = body + "}\n"
+
+    write_file(out_path, body)
+
+    println("[serve_smoke] output=" + out_path)
+    println("[serve_smoke] verdict=" + verdict)
+
+    if all_schemas_pass {
+        println("[serve_smoke] selftest PASS — 3/3 endpoints contract-frozen, real LoRA + GPU PENDING Phase 2")
+        exit(0)
+    } else {
+        eprintln("[serve_smoke] selftest FAIL — schema mismatch in one or more endpoints")
+        exit(1)
+    }
+}
+
+main()
