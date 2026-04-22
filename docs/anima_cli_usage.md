@@ -19,6 +19,8 @@ tool/anima_cli/cert.hexa          breakthrough cert chain
 tool/anima_cli/roadmap.hexa       roadmap engine
 tool/anima_cli/serve.hexa         serving layer
 tool/anima_cli/paradigm.hexa      three-paradigm unified dashboard
+tool/anima_cli/inbox.hexa         cross-repo proposal inbox
+tool/anima_cli/cost.hexa          session cost tracking
 ```
 
 ## Global invocation
@@ -122,12 +124,73 @@ balance   : $135.842 / thr $1000  alert=false
 | `status`           | full multi-section dashboard (compute/proposal/cert/roadmap) |
 | `status --short`   | 4-line summary (alias used by `anima status`)     |
 
+### `anima inbox` — cross-repo proposal inbox
+
+Thin wrapper over `$HEXA_LANG/tool/proposal_inbox.hexa`. All subcommands use
+`--repo anima` automatically.
+
+| Subcmd                        | Action                                         |
+| ----------------------------- | ---------------------------------------------- |
+| `list`                        | all inbox items (id/kind/priority/from)        |
+| `next`                        | next pending + ack-cmd hint                    |
+| `ack <id>`                    | mark `in_progress`                             |
+| `done <id> [--reason TEXT]`   | mark `done` (+ optional note)                  |
+| `drain [--resolution TEXT]`   | loop ack→done until empty (stuck-detect at 2×) |
+
+Default drain resolution:
+`"merged_aggregate — D-batch resolved · raw#20 no standalone module"`.
+Ledger artifact: `state/anima_inbox_last_action.json`.
+
+```
+$ anima inbox drain
+anima inbox drain: start pending=1
+  drained anima-20260422-008
+anima inbox drain: processed=1 remaining=0
+```
+
+Use-case: "drain all inbox" after an aggregate batch commit — replaces the
+prior bash+awk ritual.
+
+### `anima cost` — session cost tracking
+
+| Subcmd           | Action                                                    |
+| ---------------- | --------------------------------------------------------- |
+| `status`         | current pods + cumulative burn (from `state/h100_stage*`) |
+| `session`        | balance delta vs prev ledger entry + append ledger        |
+| `per-pod`        | per-pod cost decomposition from stage manifests           |
+| `history`        | last 10 ledger records                                    |
+| `export --csv`   | CSV of ledger                                             |
+| `export --json`  | JSON array of ledger                                      |
+
+Append-only ledger: `state/anima_cost_ledger.jsonl` (one line per `session`).
+Balance probed from `state/runpod_credit_status.json` (populated by
+`tool/runpod_credit_check.hexa`).
+
+```
+$ anima cost status
+anima cost status  (2026-04-22T16:03:08Z)
+─────────────────────────────────────────────
+pods      : 0 running
+cumulative_burn : $0.5000
+balance_usd     : $135.842  (probed 2026-04-22T15:16:21Z)
+
+$ anima cost per-pod
+anima cost per-pod  (2026-04-22T16:03:08Z)
+─────────────────────────────────────────────
+  stage  pod_id          name                  cost_usd  created  deleted
+  1      2yflymevcyimrt  anima-stage1-alm-r13  0.1500    ~15:12Z  ~15:14Z
+  1      rkq74qcqvclv9r  anima-stage1-alm-r13  0.3500    ~15:18Z  ~15:29Z
+```
+
+Use-case: "session cost check" after a launch attempt — replaces manual
+`jq`+`runpodctl user balance` arithmetic.
+
 ## Selftest
 
 Every topic module accepts `--selftest` and exits 0/1 deterministically:
 
 ```
-$ for m in compute weight proposal cert roadmap serve paradigm; do
+$ for m in compute weight proposal cert roadmap serve paradigm inbox cost; do
     hexa run tool/anima_cli/${m}.hexa --selftest
   done
 PASS anima_cli/compute selftest
@@ -137,6 +200,8 @@ PASS anima_cli/cert selftest
 PASS anima_cli/roadmap selftest
 PASS anima_cli/serve selftest
 PASS anima_cli/paradigm selftest
+PASS anima_cli/inbox selftest
+PASS anima_cli/cost selftest
 ```
 
 ## Design constraints

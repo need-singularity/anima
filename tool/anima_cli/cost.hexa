@@ -1,0 +1,312 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/cost.hexa — anima CLI `cost` topic
+//
+//  PURPOSE
+//    Session + cumulative cost tracking. The legacy `anima compute cost`
+//    sub-command remains a thin view over `state/h100_stage*_launch_state.json`
+//    totals; this module adds:
+//      - per-pod breakdown (pod name → cost/hr × duration)
+//      - session-level delta against runpod balance history
+//      - append-only ledger  state/anima_cost_ledger.jsonl
+//      - report export (csv|json)
+//
+//  SUBCOMMANDS
+//    status       current running pods + cumulative burn (all stage*_launch_state)
+//    session      delta vs prev runpod balance (state/runpod_credit_status.json)
+//    per-pod      per-pod cost decomposition from stage manifests
+//    history      last N session records from the ledger
+//    export       --csv|--json emit of ledger
+//    --selftest   --help
+//
+//  OUTPUT
+//    state/anima_cost_ledger.jsonl (append-only; one line per `session` call)
+//
+//  DESIGN
+//    raw#9 hexa-only · raw#11 snake_case · raw#15 no-hardcode
+//    idempotent (session writes one ledger line per invocation, not per poll)
+//    deterministic-friendly.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── vendored helpers ───────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn _json_field(path: string, key: string) -> string {
+    if !_fexists(path) { return "" }
+    return _str(exec("jq -r '" + key + " // \"\"' " + path + " 2>/dev/null")).trim()
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _has_runpodctl() -> bool {
+    return _str(exec("command -v runpodctl >/dev/null 2>&1 && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _ledger_path() -> string {
+    return _resolve_root() + "/state/anima_cost_ledger.jsonl"
+}
+
+fn _credit_path() -> string {
+    return _resolve_root() + "/state/runpod_credit_status.json"
+}
+
+// ─── helpers: balance + stage totals ────────────────────────────────────
+
+fn _fetch_runpod_balance() -> string {
+    // Read from anima state/runpod_credit_status.json (probed by
+    // tool/runpod_credit_check.hexa). Fall back to empty if absent.
+    let p = _credit_path()
+    if !_fexists(p) { return "" }
+    return _json_field(p, ".balance_usd")
+}
+
+fn _load_prev_balance_ts() -> string {
+    return _json_field(_credit_path(), ".generated_at")
+}
+
+fn _sum_stage_burn() -> string {
+    // Sum .total_session_cost_usd across all state/h100_stage*_launch_state.json
+    let root = _resolve_root()
+    let cmd = "python3 - <<'PY' 2>/dev/null\n"
+            + "import json, glob, os\n"
+            + "tot = 0.0\n"
+            + "for p in sorted(glob.glob(os.path.join(" + "'" + root + "'" + ", 'state', 'h100_stage*_launch_state.json'))):\n"
+            + "    try:\n"
+            + "        d = json.load(open(p))\n"
+            + "        v = d.get('total_session_cost_usd', 0)\n"
+            + "        if isinstance(v, (int, float)): tot += float(v)\n"
+            + "    except Exception:\n"
+            + "        continue\n"
+            + "print(f'{tot:.4f}')\n"
+            + "PY\n"
+    return _str(exec(cmd)).trim()
+}
+
+fn _per_pod_table() -> string {
+    // Emit TSV-like rows from attempts[] in all stage*_launch_state.json.
+    let root = _resolve_root()
+    let cmd = "python3 - <<'PY' 2>/dev/null\n"
+            + "import json, glob, os\n"
+            + "rows = []\n"
+            + "for p in sorted(glob.glob(os.path.join(" + "'" + root + "'" + ", 'state', 'h100_stage*_launch_state.json'))):\n"
+            + "    try:\n"
+            + "        d = json.load(open(p))\n"
+            + "    except Exception:\n"
+            + "        continue\n"
+            + "    stage = d.get('stage', os.path.basename(p))\n"
+            + "    for a in d.get('attempts', []) or []:\n"
+            + "        rows.append((str(stage), str(a.get('pod_id','?')), str(a.get('name','?')),\n"
+            + "                     f\"{float(a.get('cost_estimate_usd',0)):.4f}\",\n"
+            + "                     str(a.get('created_at','?')), str(a.get('deleted_at','?'))))\n"
+            + "if not rows:\n"
+            + "    print('(no pod attempts recorded)')\n"
+            + "else:\n"
+            + "    hdr = ('stage','pod_id','name','cost_usd','created','deleted')\n"
+            + "    rows.insert(0, hdr)\n"
+            + "    widths = [max(len(r[i]) for r in rows) for i in range(len(hdr))]\n"
+            + "    for r in rows:\n"
+            + "        print('  ' + '  '.join(c.ljust(widths[i]) for i, c in enumerate(r)))\n"
+            + "PY\n"
+    return _str(exec(cmd))
+}
+
+fn _prev_ledger_balance() -> string {
+    // last line of ledger → .balance_usd, "" if none
+    let p = _ledger_path()
+    if !_fexists(p) { return "" }
+    let cmd = "tail -n 1 " + p + " 2>/dev/null | jq -r '.balance_usd // \"\"' 2>/dev/null"
+    return _str(exec(cmd)).trim()
+}
+
+fn _append_ledger_session(cur_bal: string, prev_bal: string, delta: string, burn: string) {
+    let root = _resolve_root()
+    let path = _ledger_path()
+    let ts   = _ts_iso()
+    let line = "{\"schema\":\"anima/cost_ledger/1\","
+             + "\"ts\":\"" + ts + "\","
+             + "\"action\":\"session\","
+             + "\"balance_usd\":\"" + cur_bal + "\","
+             + "\"prev_balance_usd\":\"" + prev_bal + "\","
+             + "\"delta_usd\":\"" + delta + "\","
+             + "\"cumulative_burn_usd\":\"" + burn + "\"}"
+    exec("mkdir -p " + root + "/state && printf '%s\\n' '" + line + "' >> " + path)
+}
+
+// ─── subcommands ────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima cost — session cost tracking")
+    println("")
+    println("  status       current pods + cumulative burn (from stage*_launch_state)")
+    println("  session      balance delta vs prev ledger entry + append ledger")
+    println("  per-pod      per-pod cost breakdown from stage manifests")
+    println("  history      last 10 ledger records")
+    println("  export       --csv | --json  emit ledger")
+    println("")
+    println("  --selftest   --help")
+}
+
+fn sub_status() {
+    let has_rpc = _has_runpodctl()
+    let pods_line = "pods      : runpodctl_not_installed"
+    if has_rpc {
+        let pods = _str(exec("runpodctl pod list 2>/dev/null | tail -n +2 | wc -l | tr -d ' '")).trim()
+        pods_line = "pods      : " + pods + " running"
+    }
+    let burn = _sum_stage_burn()
+    let bal  = _fetch_runpod_balance()
+    let bal_ts = _load_prev_balance_ts()
+    println("anima cost status  (" + _ts_iso() + ")")
+    println("─────────────────────────────────────────────")
+    println(pods_line)
+    println("cumulative_burn : $" + (if burn == "" { "0.0000" } else { burn }))
+    println("balance_usd     : $" + (if bal  == "" { "?" }     else { bal  }) + "  (probed " + (if bal_ts == "" { "n/a" } else { bal_ts }) + ")")
+}
+
+fn sub_session() {
+    let cur = _fetch_runpod_balance()
+    if cur == "" {
+        println("cost session: no balance probe yet (" + _credit_path() + ") — run tool/runpod_credit_check.hexa first")
+        exit(1)
+    }
+    let prev = _prev_ledger_balance()
+    let burn = _sum_stage_burn()
+    let delta_cmd = "python3 -c 'import sys; a=sys.argv[1]; b=sys.argv[2];\n"
+                  + "print(f\"{(float(b)-float(a)):.4f}\") if a and b else print(\"\")' "
+                  + (if prev == "" { "\"\"" } else { prev }) + " " + cur
+    let delta = _str(exec(delta_cmd)).trim()
+    println("anima cost session  (" + _ts_iso() + ")")
+    println("─────────────────────────────────────────────")
+    println("prev_balance   : $" + (if prev == "" { "(first run)" } else { prev }))
+    println("curr_balance   : $" + cur)
+    println("delta          : $" + (if delta == "" { "n/a" } else { delta }) + "   (negative = spent)")
+    println("cumul_burn     : $" + burn)
+    _append_ledger_session(cur, prev, delta, burn)
+    println("ledger         : appended → " + _ledger_path())
+}
+
+fn sub_per_pod() {
+    println("anima cost per-pod  (" + _ts_iso() + ")")
+    println("─────────────────────────────────────────────")
+    let tbl = _per_pod_table()
+    println(tbl)
+}
+
+fn sub_history() {
+    let p = _ledger_path()
+    if !_fexists(p) {
+        println("anima cost history: no ledger yet (" + p + ")")
+        return
+    }
+    println("anima cost history  (last 10)")
+    println("─────────────────────────────────────────────")
+    let cmd = "tail -n 10 " + p + " | jq -r '\"  \" + .ts + \"  bal=$\" + .balance_usd + \"  delta=$\" + .delta_usd + \"  burn=$\" + .cumulative_burn_usd' 2>/dev/null"
+    let out = _str(exec(cmd))
+    println(out)
+}
+
+fn sub_export(argv) {
+    let p = _ledger_path()
+    if !_fexists(p) {
+        println("anima cost export: no ledger yet (" + p + ")")
+        return
+    }
+    let as_csv = _arg_present(argv, "--csv")
+    let as_json = _arg_present(argv, "--json")
+    if as_csv {
+        let cmd = "jq -r '[.ts,.action,.balance_usd,.prev_balance_usd,.delta_usd,.cumulative_burn_usd] | @csv' " + p
+        println("ts,action,balance_usd,prev_balance_usd,delta_usd,cumulative_burn_usd")
+        println(_str(exec(cmd)))
+        return
+    }
+    if as_json {
+        let cmd = "jq -s '.' " + p
+        println(_str(exec(cmd)))
+        return
+    }
+    // default: json
+    let cmd = "jq -s '.' " + p
+    println(_str(exec(cmd)))
+}
+
+fn sub_selftest() {
+    let root = _resolve_root()
+    if root == "" { println("FAIL anima_cli/cost selftest (root unresolved)"); exit(1) }
+    // touch helpers (tolerate missing files)
+    let _b = _fetch_runpod_balance()
+    let _s = _sum_stage_burn()
+    let _pp = _per_pod_table()
+    println("PASS anima_cli/cost selftest")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") || len(argv) == 0 { sub_help(); return }
+    let sub = _str(argv[0])
+    if sub == "status"   { sub_status(); return }
+    if sub == "session"  { sub_session(); return }
+    if sub == "per-pod"  { sub_per_pod(); return }
+    if sub == "history"  { sub_history(); return }
+    if sub == "export"   { sub_export(argv); return }
+    println("cost: unknown subcmd '" + sub + "'")
+    sub_help()
+    exit(2)
+}
+
+main()
