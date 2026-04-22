@@ -33,7 +33,7 @@ readonly RUNPODCTL="/opt/homebrew/bin/runpodctl"
 readonly HF_CLI="/opt/homebrew/bin/hf"
 
 readonly STAGE2_IMAGE="runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
-readonly BUDGET_USD_HARD_CAP=1500
+readonly BUDGET_USD_HARD_CAP=0  # 0 = unlimited (no cap policy 2026-04-22, user-absorbed)
 readonly NUMERICAL_DRIFT_BOUND="0.0002"
 readonly IDLE_MINUTES_MAX=30
 readonly PHI_REL_DELTA_MAX="0.05"
@@ -153,7 +153,7 @@ fi
 log ""
 log "pre-flight summary: fail_n=${FAIL_N} / 6 checks"
 log "abort_thresholds:"
-log "  budget_usd_hard_cap    = ${BUDGET_USD_HARD_CAP}"
+log "  budget_usd_hard_cap    = ${BUDGET_USD_HARD_CAP} (0 = unlimited, no cap policy 2026-04-22)"
 log "  numerical_drift_bound  = ${NUMERICAL_DRIFT_BOUND}"
 log "  idle_minutes_max       = ${IDLE_MINUTES_MAX}"
 log "  phi_rel_delta_max      = ${PHI_REL_DELTA_MAX}"

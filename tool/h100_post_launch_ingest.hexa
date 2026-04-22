@@ -1,0 +1,404 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/h100_post_launch_ingest.hexa — H100 × 4 (#83) post-launch ingest
+//
+//  PURPOSE
+//    Watcher tool that ingests the 5 artifacts produced by H100 × 4 launch
+//    (#83) and emits a single completion verdict file. When every artifact
+//    is present AND every per-path live verdict is PASS AND the aggregate
+//    Φ 4-path cross verdict is VERIFIED, this tool emits an overall=VERIFIED
+//    verdict that satisfies the #83 done-eligible probe.
+//
+//  WATCHED ARTIFACTS  (post H100 × 4 stage-2 launch)
+//    - state/phi_4path_cross_result.json         (Φ ALL_PAIRS aggregate)
+//    - state/phi_p1_qwen3_8b_live.json           (path 1 — Qwen3-8B)
+//    - state/phi_p2_llama_3_1_8b_live.json       (path 2 — Llama-3.1-8B)
+//    - state/phi_p3_ministral_3_14b_live.json    (path 3 — Ministral-3-14B)
+//    - state/phi_p4_gemma_4_31b_live.json        (path 4 — Gemma-4-31B)
+//
+//  EMITS
+//    state/h100_launch_completion_verdict.json
+//      {
+//        "schema": "anima/h100_launch_completion_verdict/1",
+//        "generated_at": "<iso>",
+//        "artifacts_present": {phi_4path_cross, phi_p1..p4 : bool},
+//        "per_path_verdict":  {p1, p2, p3, p4 : "PASS|FAIL|MISSING"},
+//        "phi_4path_verdict": "VERIFIED|FAILED|MISSING",
+//        "overall":           "VERIFIED|PARTIAL|FAILED|PENDING",
+//        "ready_for_roadmap_83_done": bool
+//      }
+//
+//  OVERALL ROLL-UP RULES
+//    PENDING   — no artifacts at all (pre-launch / mid-flight)
+//    VERIFIED  — all 5 present + all 4 paths PASS + Φ verdict=VERIFIED
+//    FAILED    — all 5 present but ≥1 path FAIL OR Φ verdict=FAILED
+//    PARTIAL   — some artifacts present but not all (mid-flight, mixed)
+//
+//  HARD CONSTRAINTS
+//    - Hexa-only (no .py / .rs / .sh business logic)
+//    - MUST NOT panic on missing artifacts → emit PENDING verdict instead
+//    - MUST NOT modify .roadmap or other shared SSOTs
+//    - MUST NOT trigger any H100 launch or remote API calls
+//    - The verdict file IS the only side-effect (idempotent overwrite)
+//
+//  USAGE
+//    hexa run tool/h100_post_launch_ingest.hexa                # ingest+emit
+//    hexa run tool/h100_post_launch_ingest.hexa --print        # also stdout
+//    hexa run tool/h100_post_launch_ingest.hexa --self-test    # scenario tests
+//
+//  EXIT
+//    0 = verdict emitted (read overall field for outcome)
+//    1 = self-test FAIL
+//    2 = verdict writer I/O failure
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT  = "/Users/ghost/core/anima"
+let VERDICT_OUT = "/Users/ghost/core/anima/state/h100_launch_completion_verdict.json"
+
+// ─── shell / io helpers (mirrors h100_launch_manifest_spec.hexa idioms) ──
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _ts_epoch() -> string {
+    return to_string(exec_with_status("date -u +%s")[0]).trim()
+}
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+fn _bool_str(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+// ─── argv parsing ─────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _flag(av, k) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+// ─── safe JSON field probe (handles missing files / malformed JSON) ──────
+//
+// Returns "" when the file is missing, unreadable, malformed, or the key is
+// absent. Never panics — caller treats "" as MISSING.
+
+fn _json_field_str_safe(path: string, key: string) -> string {
+    if !_file_exists(path) { return "" }
+    let raw = read_file(path)
+    if to_string(raw) == "" { return "" }
+    let obj = json_parse(to_string(raw))
+    if !obj.contains_key(key) { return "" }
+    return to_string(obj[key])
+}
+
+// ─── path resolver: per-path live artifact (with optional glob fallback) ─
+//
+// The launch manifest names the 4 path artifacts canonically as:
+//   state/phi_p1_qwen3_8b_live.json
+//   state/phi_p2_llama_3_1_8b_live.json
+//   state/phi_p3_ministral_3_14b_live.json
+//   state/phi_p4_gemma_4_31b_live.json
+//
+// We probe both the canonical exact path AND a glob (state/phi_p<N>_*_live.json)
+// so a future model-tag rename doesn't break the watcher. First match wins;
+// returns "" when no candidate exists.
+
+fn _resolve_per_path_artifact(path_id: string, exact_name: string) -> string {
+    let exact_full = ANIMA_ROOT + "/state/" + exact_name
+    if _file_exists(exact_full) { return exact_full }
+    // glob fallback — pick first match alphabetically (stable + deterministic)
+    let glob = ANIMA_ROOT + "/state/phi_" + path_id + "_*_live.json"
+    let r = exec_with_status("ls -1 " + glob + " 2>/dev/null | head -n 1")
+    let cand = to_string(r[0]).trim()
+    if cand != "" && _file_exists(cand) { return cand }
+    return ""
+}
+
+// ─── per-path verdict extraction ─────────────────────────────────────────
+//
+// Convention: each phi_p<N>_*_live.json has a top-level "verdict" field
+// equal to "PASS" or "FAIL" (matching the AN11 / drill_breakthrough scheme).
+// MISSING → file absent or verdict key absent.
+
+fn _per_path_verdict(path_id: string, exact_name: string) {
+    let mut r = json_parse("{}")
+    let resolved = _resolve_per_path_artifact(path_id, exact_name)
+    r["path_id"]      = path_id
+    r["exact_name"]   = exact_name
+    r["resolved_path"] = resolved
+    if resolved == "" {
+        r["present"] = false
+        r["verdict"] = "MISSING"
+        return r
+    }
+    r["present"] = true
+    let v = _json_field_str_safe(resolved, "verdict")
+    if v == "" {
+        r["verdict"] = "MISSING"
+    } else if v == "PASS" {
+        r["verdict"] = "PASS"
+    } else {
+        r["verdict"] = "FAIL"
+    }
+    return r
+}
+
+// ─── Φ aggregate verdict extraction ──────────────────────────────────────
+//
+// state/phi_4path_cross_result.json schema (per launch manifest):
+//   - "verdict" : "VERIFIED" | "FAILED"   (preferred top-level field)
+//   - "substrate_indep" : "true"|"false"  (manifest probe field)
+// We accept either; verdict field takes precedence if present.
+
+fn _phi_aggregate_verdict() {
+    let mut r = json_parse("{}")
+    let p = ANIMA_ROOT + "/state/phi_4path_cross_result.json"
+    r["path"] = p
+    if !_file_exists(p) {
+        r["present"] = false
+        r["verdict"] = "MISSING"
+        return r
+    }
+    r["present"] = true
+    let v_top = _json_field_str_safe(p, "verdict")
+    if v_top != "" {
+        if v_top == "VERIFIED" { r["verdict"] = "VERIFIED" }
+        else                   { r["verdict"] = "FAILED" }
+        return r
+    }
+    let s = _json_field_str_safe(p, "substrate_indep")
+    if s == "true" { r["verdict"] = "VERIFIED" }
+    else if s == "false" { r["verdict"] = "FAILED" }
+    else { r["verdict"] = "MISSING" }
+    return r
+}
+
+// ─── overall roll-up ─────────────────────────────────────────────────────
+
+fn _rollup_overall(p1, p2, p3, p4, phi) -> string {
+    let n_present = (if to_string(p1["present"])  == "true" { 1 } else { 0 })
+                  + (if to_string(p2["present"])  == "true" { 1 } else { 0 })
+                  + (if to_string(p3["present"])  == "true" { 1 } else { 0 })
+                  + (if to_string(p4["present"])  == "true" { 1 } else { 0 })
+                  + (if to_string(phi["present"]) == "true" { 1 } else { 0 })
+
+    if n_present == 0 { return "PENDING" }
+    if n_present < 5  { return "PARTIAL" }
+
+    // All 5 present: now check verdicts.
+    let v1  = to_string(p1["verdict"])
+    let v2  = to_string(p2["verdict"])
+    let v3  = to_string(p3["verdict"])
+    let v4  = to_string(p4["verdict"])
+    let vph = to_string(phi["verdict"])
+
+    if v1 == "PASS" && v2 == "PASS" && v3 == "PASS" && v4 == "PASS" && vph == "VERIFIED" {
+        return "VERIFIED"
+    }
+    return "FAILED"
+}
+
+// ─── verdict JSON renderer ───────────────────────────────────────────────
+
+fn _render_verdict(p1, p2, p3, p4, phi, overall: string, ts: string) -> string {
+    let ready = (overall == "VERIFIED")
+    let mut s = "{\n"
+    s = s + "  \"schema\": \"anima/h100_launch_completion_verdict/1\",\n"
+    s = s + "  \"generated_at\": \"" + _json_escape(ts) + "\",\n"
+    s = s + "  \"generated_at_epoch\": " + _ts_epoch() + ",\n"
+    s = s + "  \"generator\": \"tool/h100_post_launch_ingest.hexa\",\n"
+    s = s + "  \"anima_root\": \"" + _json_escape(ANIMA_ROOT) + "\",\n"
+    s = s + "  \"watched_roadmap_entry\": 83,\n"
+    s = s + "  \"artifacts_present\": {\n"
+    s = s + "    \"phi_4path_cross\": " + _bool_str(to_string(phi["present"]) == "true") + ",\n"
+    s = s + "    \"phi_p1\":          " + _bool_str(to_string(p1["present"])  == "true") + ",\n"
+    s = s + "    \"phi_p2\":          " + _bool_str(to_string(p2["present"])  == "true") + ",\n"
+    s = s + "    \"phi_p3\":          " + _bool_str(to_string(p3["present"])  == "true") + ",\n"
+    s = s + "    \"phi_p4\":          " + _bool_str(to_string(p4["present"])  == "true") + "\n"
+    s = s + "  },\n"
+    s = s + "  \"resolved_paths\": {\n"
+    s = s + "    \"phi_4path_cross\": \"" + _json_escape(to_string(phi["path"]))         + "\",\n"
+    s = s + "    \"phi_p1\":          \"" + _json_escape(to_string(p1["resolved_path"])) + "\",\n"
+    s = s + "    \"phi_p2\":          \"" + _json_escape(to_string(p2["resolved_path"])) + "\",\n"
+    s = s + "    \"phi_p3\":          \"" + _json_escape(to_string(p3["resolved_path"])) + "\",\n"
+    s = s + "    \"phi_p4\":          \"" + _json_escape(to_string(p4["resolved_path"])) + "\"\n"
+    s = s + "  },\n"
+    s = s + "  \"per_path_verdict\": {\n"
+    s = s + "    \"p1\": \"" + _json_escape(to_string(p1["verdict"])) + "\",\n"
+    s = s + "    \"p2\": \"" + _json_escape(to_string(p2["verdict"])) + "\",\n"
+    s = s + "    \"p3\": \"" + _json_escape(to_string(p3["verdict"])) + "\",\n"
+    s = s + "    \"p4\": \"" + _json_escape(to_string(p4["verdict"])) + "\"\n"
+    s = s + "  },\n"
+    s = s + "  \"phi_4path_verdict\": \"" + _json_escape(to_string(phi["verdict"])) + "\",\n"
+    s = s + "  \"overall\": \"" + _json_escape(overall) + "\",\n"
+    s = s + "  \"ready_for_roadmap_83_done\": " + _bool_str(ready) + ",\n"
+    s = s + "  \"policy\": {\n"
+    s = s + "    \"side_effects\": \"verdict_file_only\",\n"
+    s = s + "    \"modifies_roadmap\": false,\n"
+    s = s + "    \"triggers_remote_api\": false,\n"
+    s = s + "    \"safe_to_repeat\": true,\n"
+    s = s + "    \"note\": \"Idempotent watcher. Re-run any time after H100 × 4 launch. Pre-launch run emits PENDING.\"\n"
+    s = s + "  }\n"
+    s = s + "}\n"
+    return s
+}
+
+// ─── parent dir helper (mirrors manifest_spec) ───────────────────────────
+
+fn _last_slash(p: string) -> int {
+    let mut i = len(p) - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ─── main run ─────────────────────────────────────────────────────────────
+
+fn run(emit_path: string, also_print: bool) -> int {
+    let ts = _ts_iso()
+    println("── h100_post_launch_ingest " + ts + " ──")
+
+    let p1  = _per_path_verdict("p1", "phi_p1_qwen3_8b_live.json")
+    let p2  = _per_path_verdict("p2", "phi_p2_llama_3_1_8b_live.json")
+    let p3  = _per_path_verdict("p3", "phi_p3_ministral_3_14b_live.json")
+    let p4  = _per_path_verdict("p4", "phi_p4_gemma_4_31b_live.json")
+    let phi = _phi_aggregate_verdict()
+
+    let overall = _rollup_overall(p1, p2, p3, p4, phi)
+
+    println("  p1  present=" + to_string(p1["present"])  + " verdict=" + to_string(p1["verdict"]))
+    println("  p2  present=" + to_string(p2["present"])  + " verdict=" + to_string(p2["verdict"]))
+    println("  p3  present=" + to_string(p3["present"])  + " verdict=" + to_string(p3["verdict"]))
+    println("  p4  present=" + to_string(p4["present"])  + " verdict=" + to_string(p4["verdict"]))
+    println("  phi present=" + to_string(phi["present"]) + " verdict=" + to_string(phi["verdict"]))
+    println("  overall=" + overall)
+
+    let body = _render_verdict(p1, p2, p3, p4, phi, overall, ts)
+
+    let pdir = emit_path.substring(0, _last_slash(emit_path))
+    if pdir != "" { exec_with_status("mkdir -p " + _sh_quote(pdir)) }
+
+    write_file(emit_path, body)
+    println("  verdict=" + emit_path)
+
+    if also_print { println(body) }
+    return 0
+}
+
+// ─── self-test — synthetic scenarios for the roll-up ─────────────────────
+
+fn _mk_path(present: bool, verdict: string) {
+    let mut r = json_parse("{}")
+    r["present"]       = present
+    r["verdict"]       = verdict
+    r["resolved_path"] = ""
+    r["path_id"]       = "pX"
+    r["exact_name"]    = ""
+    return r
+}
+fn _mk_phi(present: bool, verdict: string) {
+    let mut r = json_parse("{}")
+    r["present"] = present
+    r["verdict"] = verdict
+    r["path"]    = ""
+    return r
+}
+
+fn self_test() -> int {
+    println("── h100_post_launch_ingest self-test ──")
+
+    // S1: nothing present → PENDING
+    let s1 = _rollup_overall(
+        _mk_path(false, "MISSING"),
+        _mk_path(false, "MISSING"),
+        _mk_path(false, "MISSING"),
+        _mk_path(false, "MISSING"),
+        _mk_phi(false, "MISSING")
+    )
+    let ok1 = (s1 == "PENDING")
+
+    // S2: 3/5 present → PARTIAL
+    let s2 = _rollup_overall(
+        _mk_path(true, "PASS"),
+        _mk_path(true, "PASS"),
+        _mk_path(false, "MISSING"),
+        _mk_path(false, "MISSING"),
+        _mk_phi(true, "VERIFIED")
+    )
+    let ok2 = (s2 == "PARTIAL")
+
+    // S3: all 5 present, all PASS, phi VERIFIED → VERIFIED
+    let s3 = _rollup_overall(
+        _mk_path(true, "PASS"),
+        _mk_path(true, "PASS"),
+        _mk_path(true, "PASS"),
+        _mk_path(true, "PASS"),
+        _mk_phi(true, "VERIFIED")
+    )
+    let ok3 = (s3 == "VERIFIED")
+
+    // S4: all present but p3 FAIL → FAILED
+    let s4 = _rollup_overall(
+        _mk_path(true, "PASS"),
+        _mk_path(true, "PASS"),
+        _mk_path(true, "FAIL"),
+        _mk_path(true, "PASS"),
+        _mk_phi(true, "VERIFIED")
+    )
+    let ok4 = (s4 == "FAILED")
+
+    // S5: all paths PASS but phi FAILED → FAILED
+    let s5 = _rollup_overall(
+        _mk_path(true, "PASS"),
+        _mk_path(true, "PASS"),
+        _mk_path(true, "PASS"),
+        _mk_path(true, "PASS"),
+        _mk_phi(true, "FAILED")
+    )
+    let ok5 = (s5 == "FAILED")
+
+    let mut pass = 0
+    let mut fail = 0
+    if ok1 { println("  S1 PASS (PENDING)");          pass = pass + 1 } else { println("  S1 FAIL got " + s1); fail = fail + 1 }
+    if ok2 { println("  S2 PASS (PARTIAL)");          pass = pass + 1 } else { println("  S2 FAIL got " + s2); fail = fail + 1 }
+    if ok3 { println("  S3 PASS (VERIFIED)");         pass = pass + 1 } else { println("  S3 FAIL got " + s3); fail = fail + 1 }
+    if ok4 { println("  S4 PASS (FAILED — path)");    pass = pass + 1 } else { println("  S4 FAIL got " + s4); fail = fail + 1 }
+    if ok5 { println("  S5 PASS (FAILED — phi)");     pass = pass + 1 } else { println("  S5 FAIL got " + s5); fail = fail + 1 }
+
+    println("post_launch_ingest selftest: " + to_string(pass) + "/5 PASS, " + to_string(fail) + " FAIL")
+    if fail > 0 { return 1 }
+    return 0
+}
+
+// ─── entry ────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/h100_post_launch_ingest.hexa [--self-test] [--print] [--out <path>]")
+        return 0
+    }
+    if _flag(av, "--self-test") || _flag(av, "self-test") {
+        return self_test()
+    }
+    let also_print = _flag(av, "--print")
+    return run(VERDICT_OUT, also_print)
+}
