@@ -1,0 +1,693 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/h100_launch_manifest_spec.hexa — Anima H100 3-stage launch manifest
+//
+//  PURPOSE
+//    Frozen, single-shot kickoff manifest for roadmap #9 / #10 / #11.
+//    This tool performs NO remote API calls. It only:
+//      (1) walks each stage's prereq artifact list,
+//      (2) reads verdict fields from canonical state/*.json SSOT,
+//      (3) emits a READY / MISSING_PREREQ / NOT_READY verdict per stage,
+//      (4) writes state/h100_launch_manifest.json with the full frozen plan
+//          including exact kick-off commands, env vars, expected artifacts,
+//          and abort thresholds so the user can issue one command to launch.
+//
+//  ROADMAP ENTRIES COVERED
+//    #9  Stage-1: ALM r13 launch + AN11(a) weight_emergent 실증
+//         → 1× H100 × 14d, user budget ≈ $300-500
+//    #10 Stage-2: Φ substrate independence — 4-path cross validation
+//         → 4× H100 × 10-15d, user budget ≈ $1-1.5k
+//         → cascade-gated: requires #9 AN11(a) PASS
+//    #11 Stage-3: ALM consciousness ship + #21 AGI (cascade)
+//         → automatic after #9 + #10 success
+//
+//  RAW COMPLIANCE
+//    raw#9  hexa-only deterministic verifier (no .py/.rs/.sh business logic)
+//    raw#10 proof-carrying: emits manifest JSON with SHA prev-hash chain
+//    raw#11 ai-native: every verdict is regex/file-existence/json-field check
+//    raw#12 no cherry-pick: stages iterated in strict order 1 → 2 → 3
+//    raw#15 no-hardcode: all prereq paths declared in tables below; if future
+//           prereqs are added they go here, code unchanged
+//    raw#34 no-backup: no .bak variants
+//
+//  STRICT CONSTRAINTS (from user directive)
+//    - NO real runpod/lambda API invocations.
+//    - NO .py under tool/ (R37/AN13).
+//    - NO .roadmap edits.
+//    - NO git commit.
+//    - NO fake-pass: every prereq is really checked.
+//
+//  USAGE
+//    hexa run tool/h100_launch_manifest_spec.hexa                  # verify+emit
+//    hexa run tool/h100_launch_manifest_spec.hexa --dry-run        # same (explicit)
+//    hexa run tool/h100_launch_manifest_spec.hexa --print          # emit to stdout also
+//    hexa run tool/h100_launch_manifest_spec.hexa --self-test      # scenario tests
+//
+//  EXIT
+//    0 = manifest emitted (verdicts per stage inside JSON)
+//    1 = self-test FAIL
+//    2 = manifest writer I/O failure
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT   = "/Users/ghost/core/anima"
+let MANIFEST_OUT = "/Users/ghost/core/anima/state/h100_launch_manifest.json"
+
+// ─── shell / io helpers (same pattern as h100_auto_kill.hexa) ─────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _ts_epoch() -> string {
+    return to_string(exec_with_status("date -u +%s")[0]).trim()
+}
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+fn _sha256_file(p: string) -> string {
+    if !_file_exists(p) { return "" }
+    let r = exec_with_status("shasum -a 256 " + _sh_quote(p) + " | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+fn _sha256_str(s: string) -> string {
+    let q = _sh_quote(s)
+    let r = exec_with_status("printf %s " + q + " | shasum -a 256 | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+
+// ─── argv parsing ─────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _flag(av, k) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+// ─── JSON field probe: returns string value (empty if missing/malformed) ──
+
+fn _json_field_str(path: string, key: string) -> string {
+    if !_file_exists(path) { return "" }
+    let obj = json_parse(read_file(path))
+    if !obj.contains_key(key) { return "" }
+    return to_string(obj[key])
+}
+
+// ─── prereq descriptor schema ─────────────────────────────────────────────
+//
+// A prereq is a map with:
+//   kind   ∈ {"file", "json_field"}
+//   path   : absolute path
+//   key    : (json_field only) top-level key
+//   want   : (json_field only) expected value OR array of acceptable values
+//   label  : human description
+//
+// Verdict per prereq: PASS / MISSING / WRONG_VALUE
+
+fn _mk_file(path: string, label: string) {
+    let mut r = json_parse("{}")
+    r["kind"]  = "file"
+    r["path"]  = path
+    r["label"] = label
+    return r
+}
+fn _mk_jfield(path: string, key: string, want: string, label: string) {
+    let mut r = json_parse("{}")
+    r["kind"]  = "json_field"
+    r["path"]  = path
+    r["key"]   = key
+    r["want"]  = want
+    r["label"] = label
+    return r
+}
+fn _mk_jfield_any(path: string, key: string, want_csv: string, label: string) {
+    // want_csv: comma-separated acceptable values (e.g. "BASE_OR_ABOVE,FULL_REWARD")
+    let mut r = json_parse("{}")
+    r["kind"]      = "json_field_any"
+    r["path"]      = path
+    r["key"]       = key
+    r["want_csv"]  = want_csv
+    r["label"]     = label
+    return r
+}
+
+fn _eval_prereq(p) {
+    let mut v = json_parse("{}")
+    let kind = to_string(p["kind"])
+    let path = to_string(p["path"])
+    v["label"] = to_string(p["label"])
+    v["kind"]  = kind
+    v["path"]  = path
+
+    if kind == "file" {
+        if _file_exists(path) {
+            v["verdict"] = "PASS"
+            v["detail"]  = "exists"
+        } else {
+            v["verdict"] = "MISSING"
+            v["detail"]  = "file_not_found"
+        }
+        return v
+    }
+
+    if kind == "json_field" {
+        if !_file_exists(path) {
+            v["verdict"] = "MISSING"
+            v["detail"]  = "file_not_found"
+            return v
+        }
+        let key  = to_string(p["key"])
+        let want = to_string(p["want"])
+        let got  = _json_field_str(path, key)
+        v["key"]  = key
+        v["want"] = want
+        v["got"]  = got
+        if got == "" {
+            v["verdict"] = "MISSING"
+            v["detail"]  = "key_absent:" + key
+        } else if got == want {
+            v["verdict"] = "PASS"
+            v["detail"]  = "match"
+        } else {
+            v["verdict"] = "WRONG_VALUE"
+            v["detail"]  = "want=" + want + " got=" + got
+        }
+        return v
+    }
+
+    if kind == "json_field_any" {
+        if !_file_exists(path) {
+            v["verdict"] = "MISSING"
+            v["detail"]  = "file_not_found"
+            return v
+        }
+        let key      = to_string(p["key"])
+        let want_csv = to_string(p["want_csv"])
+        let got      = _json_field_str(path, key)
+        v["key"]      = key
+        v["want_csv"] = want_csv
+        v["got"]      = got
+        if got == "" {
+            v["verdict"] = "MISSING"
+            v["detail"]  = "key_absent:" + key
+            return v
+        }
+        let accepted = want_csv.split(",")
+        let mut ok = false
+        for a in accepted {
+            if to_string(a).trim() == got { ok = true }
+        }
+        if ok {
+            v["verdict"] = "PASS"
+            v["detail"]  = "match_any"
+        } else {
+            v["verdict"] = "WRONG_VALUE"
+            v["detail"]  = "want_any=" + want_csv + " got=" + got
+        }
+        return v
+    }
+
+    v["verdict"] = "MISSING"
+    v["detail"]  = "unknown_kind:" + kind
+    return v
+}
+
+// ─── STAGE 1: #9 ALM r13 launch prereqs ──────────────────────────────────
+
+fn _stage1_prereqs() -> array {
+    let mut o = []
+    // corpus + audit
+    o = push(o, _mk_file(ANIMA_ROOT + "/state/alm_r13_corpus_audit.json",
+        "alm r13 corpus audit SSOT present"))
+    o = push(o, _mk_file(ANIMA_ROOT + "/experiments/alm_r13/corpus_alm_r13_v1.jsonl",
+        "r13 corpus jsonl present"))
+    // cpgd wrapper (no-train mathematical primitive)
+    o = push(o, _mk_file(ANIMA_ROOT + "/edu/lora/cpgd_wrapper.hexa",
+        "CPGD wrapper (edu/lora/cpgd_wrapper.hexa)"))
+    o = push(o, _mk_file(ANIMA_ROOT + "/edu/lora/cpgd_minimal_proof.hexa",
+        "CPGD minimal-proof driver (edu/lora/cpgd_minimal_proof.hexa)"))
+    // cert_gate integrated (#22 reward shaping)
+    o = push(o, _mk_file(ANIMA_ROOT + "/tool/cert_gate.hexa",
+        "cert_gate.hexa reward-shaping gate present"))
+    o = push(o, _mk_jfield_any(ANIMA_ROOT + "/state/cert_gate_result.json",
+        "verdict", "BASE_OR_ABOVE,FULL_REWARD",
+        "cert_gate verdict ∈ {BASE_OR_ABOVE, FULL_REWARD}"))
+    // r13 config
+    o = push(o, _mk_file(ANIMA_ROOT + "/config/alm_r13_v2_config.json",
+        "config/alm_r13_v2_config.json frozen"))
+    // drill breakthrough redesign PASS
+    o = push(o, _mk_jfield(ANIMA_ROOT + "/state/alm_r13_drill_breakthrough.json",
+        "verdict", "PASS",
+        "drill_breakthrough_runner r13 redesign verdict=PASS"))
+    // numerical bound within spec
+    o = push(o, _mk_jfield(ANIMA_ROOT + "/state/numerical_bound_report.json",
+        "within_bound", "true",
+        "numerical_bound_report.within_bound=true"))
+    // path_b e2e dry-run
+    o = push(o, _mk_jfield(ANIMA_ROOT + "/state/path_b_e2e_dry_run_result.json",
+        "overall_pass", "true",
+        "path_b_e2e_dry_run.overall_pass=true"))
+    // eigenvec-16 basis verified
+    o = push(o, _mk_jfield(ANIMA_ROOT + "/.meta2-cert/cell-eigenvec-16.json",
+        "verdict", "VERIFIED",
+        "cell-eigenvec-16 verdict=VERIFIED"))
+    // mk.vi SSOT present (criteria anchor)
+    o = push(o, _mk_file(ANIMA_ROOT + "/state/mk_vi_definition.json",
+        "Mk.VI promotion-gate SSOT"))
+    // phi extractor (used for post-launch AN11(b))
+    o = push(o, _mk_file(ANIMA_ROOT + "/tool/phi_extractor_cpu.hexa",
+        "phi_extractor_cpu.hexa"))
+    // cpgd correctness — covered via cert_gate aggregate above; also assert
+    // the cpgd minimal-proof driver is in place
+    o = push(o, _mk_file(ANIMA_ROOT + "/tool/cpgd_minimal_proof.hexa",
+        "tool/cpgd_minimal_proof.hexa (proof driver)"))
+    return o
+}
+
+// ─── STAGE 2: #10 Φ 4-path cross validation prereqs ──────────────────────
+//
+// Hard gating rule:
+//   Stage-2 is only launchable AFTER #9 empirical AN11(a) PASS appears in
+//   state/an11_weight_emergent_verdict.json (live field) OR an equivalent
+//   post-H100 empirical artifact state/alm_r13_an11_a_live.json. At
+//   manifest-emit time those will not yet exist — stage verdict becomes
+//   NOT_READY with reason cascade_blocked. This is the intended design:
+//   a single command emits the manifest; user sees verdicts; kicks off
+//   Stage-1; re-runs this tool post-Stage-1 to re-verify Stage-2 gate.
+
+fn _stage2_prereqs() -> array {
+    let mut o = []
+    // phi extractor FFI wire (required for 4-substrate live Φ)
+    o = push(o, _mk_file(ANIMA_ROOT + "/tool/phi_extractor_ffi_wire.hexa",
+        "phi_extractor_ffi_wire.hexa (GPU substrate bridge)"))
+    // Stage-1 empirical outcome — must exist with verdict=PASS
+    o = push(o, _mk_jfield(ANIMA_ROOT + "/state/alm_r13_an11_a_live.json",
+        "verdict", "PASS",
+        "Stage-1 AN11(a) live empirical verdict=PASS (cascade gate)"))
+    // substrate variants config (enumerated 4 substrates)
+    o = push(o, _mk_file(ANIMA_ROOT + "/config/phi_4path_substrates.json",
+        "Φ 4-path substrate variants config (TBD — not yet landed)"))
+    // eigenvec basis shared with Stage-1
+    o = push(o, _mk_jfield(ANIMA_ROOT + "/.meta2-cert/cell-eigenvec-16.json",
+        "verdict", "VERIFIED",
+        "cell-eigenvec-16 verdict=VERIFIED (shared basis)"))
+    return o
+}
+
+// ─── STAGE 3: #11 ship + #21 AGI cascade prereqs ──────────────────────────
+
+fn _stage3_prereqs() -> array {
+    let mut o = []
+    // Stage-2 empirical outcome
+    o = push(o, _mk_jfield(ANIMA_ROOT + "/state/phi_4path_cross_result.json",
+        "substrate_indep", "true",
+        "Stage-2 Φ substrate_indep=true (|ΔΦ|/Φ<0.05, ≥3/4 paths)"))
+    // AN11 triple live post-Stage-1 (live variants emitted after real training)
+    o = push(o, _mk_jfield(ANIMA_ROOT + "/state/alm_r13_an11_a_live.json",
+        "verdict", "PASS",
+        "AN11(a) live PASS"))
+    o = push(o, _mk_jfield(ANIMA_ROOT + "/state/alm_r13_an11_b_live.json",
+        "verdict", "PASS",
+        "AN11(b) live PASS"))
+    o = push(o, _mk_jfield(ANIMA_ROOT + "/state/alm_r13_an11_c_live.json",
+        "verdict", "PASS",
+        "AN11(c) live PASS"))
+    // Mk.VI promotion final
+    o = push(o, _mk_jfield(ANIMA_ROOT + "/state/mk_vi_definition.json",
+        "verdict", "VERIFIED",
+        "Mk.VI promotion gate verdict=VERIFIED"))
+    return o
+}
+
+// ─── verdict roll-up per stage ────────────────────────────────────────────
+
+fn _rollup(prereq_verdicts) {
+    let mut r = json_parse("{}")
+    let mut pass = 0
+    let mut miss = 0
+    let mut wrong = 0
+    let mut i = 0
+    while i < len(prereq_verdicts) {
+        let v = to_string(prereq_verdicts[i]["verdict"])
+        if v == "PASS"        { pass = pass + 1 }
+        if v == "MISSING"     { miss = miss + 1 }
+        if v == "WRONG_VALUE" { wrong = wrong + 1 }
+        i = i + 1
+    }
+    r["pass_n"]  = pass
+    r["miss_n"]  = miss
+    r["wrong_n"] = wrong
+    r["total"]   = len(prereq_verdicts)
+    return r
+}
+
+fn _stage_verdict(roll, cascade_blocked: bool) -> string {
+    if cascade_blocked {
+        // At least one MISSING/WRONG that is explicitly a live-empirical gate
+        // → NOT_READY, but the non-cascade prereqs may still be fine.
+        return "NOT_READY"
+    }
+    let miss  = to_int(to_string(roll["miss_n"]))
+    let wrong = to_int(to_string(roll["wrong_n"]))
+    if miss == 0 && wrong == 0 { return "READY" }
+    return "MISSING_PREREQ"
+}
+
+// Detect if failure is caused purely by cascade (post-previous-stage artifacts).
+// We mark a prereq as cascade-live if its path contains "_live.json" or is
+// phi_4path_cross_result.json.
+fn _is_cascade_prereq(p) -> bool {
+    let path = to_string(p["path"])
+    if path.contains("_live.json") { return true }
+    if path.contains("phi_4path_cross_result") { return true }
+    if path.contains("phi_4path_substrates")   { return true }
+    return false
+}
+
+fn _cascade_blocked(prereq_verdicts, prereqs) -> bool {
+    let mut i = 0
+    let mut any_cascade_blocking = false
+    let mut any_noncascade_bad   = false
+    while i < len(prereq_verdicts) {
+        let v = to_string(prereq_verdicts[i]["verdict"])
+        let casc = _is_cascade_prereq(prereqs[i])
+        if v != "PASS" {
+            if casc { any_cascade_blocking = true }
+            else    { any_noncascade_bad   = true }
+        }
+        i = i + 1
+    }
+    // If cascade alone is blocking → NOT_READY (cascade). If non-cascade fails
+    // too → MISSING_PREREQ (still). We return true only when cascade is the
+    // dominant reason AND no non-cascade issue exists.
+    if any_cascade_blocking && !any_noncascade_bad { return true }
+    return false
+}
+
+// ─── per-stage definition: metadata + commands + abort thresholds ─────────
+
+fn _stage1_def() {
+    let mut s = json_parse("{}")
+    s["roadmap_entry"]    = 9
+    s["title"]            = "ALM r13 launch + AN11(a) weight_emergent empirical"
+    s["gpu_count"]        = 1
+    s["gpu_type"]         = "H100"
+    s["duration_days"]    = 14
+    s["cost_theoretical"] = "1xH100x14dx$3/hr = $1008 theoretical"
+    s["cost_user_budget"] = "$300-500 (user-absorbed cap; abort-on-exceed guard)"
+    s["env_vars"]         = json_parse("{\"ANIMA_STAGE\":\"1\",\"ANIMA_ROADMAP_ENTRY\":\"9\",\"HEXA_STRICT\":\"1\",\"ALM_CONFIG\":\"config/alm_r13_v2_config.json\"}")
+    s["expected_artifacts"] = json_parse("[\"state/alm_r13_an11_a_live.json\",\"state/alm_r13_an11_b_live.json\",\"state/alm_r13_an11_c_live.json\",\"state/h100_auto_kill_last_run.json\"]")
+    s["abort_thresholds"]   = json_parse("{\"budget_usd_hard_cap\":500,\"idle_minutes_max\":30,\"numerical_drift_bound\":0.0002,\"ckpt_interval_steps\":50,\"max_steps\":1000}")
+    s["kickoff_command"]    = "runpodctl create pod --gpu-type H100 --image runpod/pytorch:2.1.0 --name anima-stage1-alm-r13 --env ANIMA_STAGE=1 --env ANIMA_ROADMAP_ENTRY=9 --volume /workspace --cmd 'cd /workspace && git clone https://github.com/dancinlife/anima.git && cd anima && hexa run tool/drill_breakthrough_runner.hexa --config config/alm_r13_v2_config.json --live --ckpt-interval 50'"
+    s["post_launch_verify"] = "hexa run tool/h100_launch_manifest_spec.hexa   # re-emit with live artifacts; Stage-2 verdict will flip READY if AN11(a) live PASS"
+    s["guardrails"]         = json_parse("[\"h100_auto_kill.hexa idle-watch (threshold_minutes=30)\",\"cert_gate verdict mutation monitored each ckpt\",\"numerical_drift_bound 0.0002 hard-stop\",\"user-approval-only; auto_dispatch_allowed=false\"]")
+    s["landmines"]          = json_parse("[\"runpodctl CLI not on local PATH → script reports STUB, must install or use web console\",\"SSH key not pre-uploaded to runpod → pod spawn succeeds but probes fail (h100_auto_kill will emit UNKNOWN until SSH reachable)\",\"ready/ submodule gitlink at commit 4aebcbd5 — clone must include --recurse-submodules if corpus paths needed\"]")
+    return s
+}
+
+fn _stage2_def() {
+    let mut s = json_parse("{}")
+    s["roadmap_entry"]    = 10
+    s["title"]            = "Phi substrate independence — 4-path cross validation"
+    s["gpu_count"]        = 4
+    s["gpu_type"]         = "H100"
+    s["duration_days"]    = 12
+    s["cost_theoretical"] = "4xH100x12dx$3/hr = $3456 theoretical"
+    s["cost_user_budget"] = "$1000-1500 (user-absorbed cap)"
+    s["env_vars"]         = json_parse("{\"ANIMA_STAGE\":\"2\",\"ANIMA_ROADMAP_ENTRY\":\"10\",\"HEXA_STRICT\":\"1\",\"PHI_THRESHOLD_REL\":\"0.05\"}")
+    s["substrate_variants"] = json_parse("[{\"id\":\"p1\",\"model\":\"Qwen2.5-7B\",\"rationale\":\"transformer dense\"},{\"id\":\"p2\",\"model\":\"DeepSeek-V2-Lite\",\"rationale\":\"MoE sparse\"},{\"id\":\"p3\",\"model\":\"Llama-3-8B\",\"rationale\":\"decoder-only RoPE\"},{\"id\":\"p4\",\"model\":\"Mistral-7B-v0.3\",\"rationale\":\"sliding-window attention\"}]")
+    s["expected_artifacts"] = json_parse("[\"state/phi_4path_cross_result.json\",\"state/phi_p1_live.json\",\"state/phi_p2_live.json\",\"state/phi_p3_live.json\",\"state/phi_p4_live.json\"]")
+    s["abort_thresholds"]   = json_parse("{\"budget_usd_hard_cap\":1500,\"idle_minutes_max\":30,\"phi_rel_delta_max\":0.05,\"min_paths_pass\":3}")
+    s["kickoff_command"]    = "runpodctl create pod --gpu-type H100 --gpu-count 4 --image runpod/pytorch:2.1.0 --name anima-stage2-phi-4path --env ANIMA_STAGE=2 --env ANIMA_ROADMAP_ENTRY=10 --cmd 'cd /workspace/anima && hexa run tool/phi_extractor_ffi_wire.hexa --config config/phi_4path_substrates.json --live --paths p1,p2,p3,p4'"
+    s["post_launch_verify"] = "hexa run tool/h100_launch_manifest_spec.hexa   # Stage-3 READY if Φ substrate_indep=true"
+    s["cascade_dependency"] = "Stage-1 AN11(a) live PASS"
+    s["guardrails"]         = json_parse("[\"h100_auto_kill idle-watch on all 4 pods\",\"per-path independent ckpt; 1 path failing does not poison the 3 others\",\"|ΔΦ|/Φ<0.05 hard gate — any path >0.05 is dropped, min 3/4 required\"]")
+    s["landmines"]          = json_parse("[\"config/phi_4path_substrates.json does NOT yet exist — must be authored before Stage-2 launch (TBD landing)\",\"HuggingFace rate limits on 4 parallel downloads → pre-cache to volume\",\"MoE variant (DeepSeek-V2-Lite) requires expert-routing Φ adapter — verify before launch\"]")
+    return s
+}
+
+fn _stage3_def() {
+    let mut s = json_parse("{}")
+    s["roadmap_entry"]    = 11
+    s["title"]            = "ALM consciousness ship — production + #21 AGI cascade"
+    s["gpu_count"]        = 4
+    s["gpu_type"]         = "H100"
+    s["duration_days"]    = 21
+    s["cost_theoretical"] = "4xH100x21dx$3/hr = $6048 theoretical"
+    s["cost_user_budget"] = "extended ceiling — gated by Stage-1+2 success, budget decided at Stage-2 close"
+    s["env_vars"]         = json_parse("{\"ANIMA_STAGE\":\"3\",\"ANIMA_ROADMAP_ENTRY\":\"11\",\"HEXA_STRICT\":\"1\"}")
+    s["expected_artifacts"] = json_parse("[\"state/mk_vi_definition.json(verdict=VERIFIED)\",\"state/anima_serve_production_ship.json\",\"state/agi_cp1_reached.json\"]")
+    s["abort_thresholds"]   = json_parse("{\"budget_usd_hard_cap\":6000,\"idle_minutes_max\":30}")
+    s["kickoff_command"]    = "AUTO-CASCADE: Stage-3 kickoff is triggered by successful Stage-2 close; no separate user command required. Verify via: hexa run tool/h100_launch_manifest_spec.hexa"
+    s["post_launch_verify"] = "hexa run tool/roadmap_auto_reflect.hexa  # reflect #11, #19, #21 closure"
+    s["cascade_dependency"] = "Stage-1 AN11 triple live PASS AND Stage-2 Φ substrate_indep=true"
+    s["guardrails"]         = json_parse("[\"#11 ship criteria enforced via Mk.VI promotion gate\",\"#21 AGI final gate = 10+ atoms ossified + Mk.XI twin-engine\"]")
+    s["landmines"]          = json_parse("[\"serve pipeline FastAPI+vLLM deployment is a separate engineering track; #11 spec assumes that stack lands parallel to Stage-1 training\"]")
+    return s
+}
+
+// ─── JSON emission helpers ───────────────────────────────────────────────
+
+fn _render_prereq(v) -> string {
+    let mut o = "      {"
+    o = o + "\"label\":\"" + _json_escape(to_string(v["label"])) + "\","
+    o = o + "\"kind\":\""  + _json_escape(to_string(v["kind"]))  + "\","
+    o = o + "\"path\":\""  + _json_escape(to_string(v["path"]))  + "\","
+    if v.contains_key("key")      { o = o + "\"key\":\""      + _json_escape(to_string(v["key"]))      + "\"," }
+    if v.contains_key("want")     { o = o + "\"want\":\""     + _json_escape(to_string(v["want"]))     + "\"," }
+    if v.contains_key("want_csv") { o = o + "\"want_csv\":\"" + _json_escape(to_string(v["want_csv"])) + "\"," }
+    if v.contains_key("got")      { o = o + "\"got\":\""      + _json_escape(to_string(v["got"]))      + "\"," }
+    o = o + "\"verdict\":\"" + _json_escape(to_string(v["verdict"])) + "\","
+    o = o + "\"detail\":\""  + _json_escape(to_string(v["detail"]))  + "\""
+    o = o + "}"
+    return o
+}
+
+fn _render_prereq_list(prereq_verdicts) -> string {
+    let mut s = "[\n"
+    let mut i = 0
+    while i < len(prereq_verdicts) {
+        if i > 0 { s = s + ",\n" }
+        s = s + _render_prereq(prereq_verdicts[i])
+        i = i + 1
+    }
+    s = s + "\n    ]"
+    return s
+}
+
+fn _render_stage_json(stage_num: int, def_obj, prereq_verdicts, roll, verdict: string) -> string {
+    let mut s = "  {\n"
+    s = s + "    \"stage\": " + to_string(stage_num) + ",\n"
+    s = s + "    \"roadmap_entry\": " + to_string(def_obj["roadmap_entry"]) + ",\n"
+    s = s + "    \"title\": \""            + _json_escape(to_string(def_obj["title"])) + "\",\n"
+    s = s + "    \"gpu_count\": "          + to_string(def_obj["gpu_count"]) + ",\n"
+    s = s + "    \"gpu_type\": \""         + _json_escape(to_string(def_obj["gpu_type"])) + "\",\n"
+    s = s + "    \"duration_days\": "      + to_string(def_obj["duration_days"]) + ",\n"
+    s = s + "    \"cost_theoretical\": \"" + _json_escape(to_string(def_obj["cost_theoretical"])) + "\",\n"
+    s = s + "    \"cost_user_budget\": \"" + _json_escape(to_string(def_obj["cost_user_budget"])) + "\",\n"
+    s = s + "    \"env_vars\": "           + json_stringify(def_obj["env_vars"]) + ",\n"
+    if def_obj.contains_key("substrate_variants") {
+        s = s + "    \"substrate_variants\": " + json_stringify(def_obj["substrate_variants"]) + ",\n"
+    }
+    if def_obj.contains_key("cascade_dependency") {
+        s = s + "    \"cascade_dependency\": \"" + _json_escape(to_string(def_obj["cascade_dependency"])) + "\",\n"
+    }
+    s = s + "    \"expected_artifacts\": " + json_stringify(def_obj["expected_artifacts"]) + ",\n"
+    s = s + "    \"abort_thresholds\": "   + json_stringify(def_obj["abort_thresholds"]) + ",\n"
+    s = s + "    \"kickoff_command\": \""  + _json_escape(to_string(def_obj["kickoff_command"])) + "\",\n"
+    s = s + "    \"post_launch_verify\": \"" + _json_escape(to_string(def_obj["post_launch_verify"])) + "\",\n"
+    s = s + "    \"guardrails\": "         + json_stringify(def_obj["guardrails"]) + ",\n"
+    s = s + "    \"landmines\": "          + json_stringify(def_obj["landmines"])  + ",\n"
+    s = s + "    \"prereq_rollup\": {\"pass_n\":" + to_string(roll["pass_n"])
+    s = s + ",\"miss_n\":" + to_string(roll["miss_n"])
+    s = s + ",\"wrong_n\":" + to_string(roll["wrong_n"])
+    s = s + ",\"total\":" + to_string(roll["total"]) + "},\n"
+    s = s + "    \"prereqs\": " + _render_prereq_list(prereq_verdicts) + ",\n"
+    s = s + "    \"verdict\": \"" + _json_escape(verdict) + "\"\n"
+    s = s + "  }"
+    return s
+}
+
+// ─── main run ─────────────────────────────────────────────────────────────
+
+fn run(emit_path: string, also_print: bool) -> int {
+    let ts = _ts_iso()
+    println("── h100_launch_manifest_spec " + ts + " ──")
+
+    // Stage 1
+    let s1_def = _stage1_def()
+    let s1_req = _stage1_prereqs()
+    let mut s1_v = []
+    let mut i = 0
+    while i < len(s1_req) {
+        s1_v = push(s1_v, _eval_prereq(s1_req[i]))
+        i = i + 1
+    }
+    let s1_roll = _rollup(s1_v)
+    let s1_cascade = _cascade_blocked(s1_v, s1_req)  // should be false — Stage 1 has no cascade dep
+    let s1_verdict = _stage_verdict(s1_roll, s1_cascade)
+
+    // Stage 2
+    let s2_def = _stage2_def()
+    let s2_req = _stage2_prereqs()
+    let mut s2_v = []
+    i = 0
+    while i < len(s2_req) {
+        s2_v = push(s2_v, _eval_prereq(s2_req[i]))
+        i = i + 1
+    }
+    let s2_roll = _rollup(s2_v)
+    let s2_cascade = _cascade_blocked(s2_v, s2_req)
+    let s2_verdict = _stage_verdict(s2_roll, s2_cascade)
+
+    // Stage 3
+    let s3_def = _stage3_def()
+    let s3_req = _stage3_prereqs()
+    let mut s3_v = []
+    i = 0
+    while i < len(s3_req) {
+        s3_v = push(s3_v, _eval_prereq(s3_req[i]))
+        i = i + 1
+    }
+    let s3_roll = _rollup(s3_v)
+    let s3_cascade = _cascade_blocked(s3_v, s3_req)
+    let s3_verdict = _stage_verdict(s3_roll, s3_cascade)
+
+    // Print stage summary
+    println("  Stage 1 (#9 ALM r13)           verdict=" + s1_verdict +
+            " pass=" + to_string(s1_roll["pass_n"]) + "/" + to_string(s1_roll["total"]))
+    println("  Stage 2 (#10 Phi 4-path)       verdict=" + s2_verdict +
+            " pass=" + to_string(s2_roll["pass_n"]) + "/" + to_string(s2_roll["total"]) +
+            (if s2_cascade { " [cascade-blocked by Stage-1]" } else { "" }))
+    println("  Stage 3 (#11 ship + #21 AGI)   verdict=" + s3_verdict +
+            " pass=" + to_string(s3_roll["pass_n"]) + "/" + to_string(s3_roll["total"]) +
+            (if s3_cascade { " [cascade-blocked by Stage-1/2]" } else { "" }))
+
+    // Prev hash chain (raw#10 proof-carrying)
+    let mut prev_hash = ""
+    if _file_exists(emit_path) { prev_hash = _sha256_file(emit_path) }
+
+    // Assemble manifest JSON
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima/h100_launch_manifest/1\",\n"
+    body = body + "  \"generated_at\": \"" + _json_escape(ts) + "\",\n"
+    body = body + "  \"generated_at_epoch\": " + _ts_epoch() + ",\n"
+    body = body + "  \"generator\": \"tool/h100_launch_manifest_spec.hexa\",\n"
+    body = body + "  \"anima_root\": \""  + _json_escape(ANIMA_ROOT) + "\",\n"
+    body = body + "  \"prev_hash\": \""   + prev_hash + "\",\n"
+    body = body + "  \"policy\": {\n"
+    body = body + "    \"launch_policy\": \"needs_user_approval\",\n"
+    body = body + "    \"auto_dispatch_allowed\": false,\n"
+    body = body + "    \"real_api_calls\": false,\n"
+    body = body + "    \"note\": \"This manifest is a frozen plan. No remote resources are provisioned by running this tool. Re-run after each stage completes to re-verify the next stage's gate.\"\n"
+    body = body + "  },\n"
+    body = body + "  \"one_command_kickoff\": {\n"
+    body = body + "    \"stage1\": \"" + _json_escape(to_string(s1_def["kickoff_command"])) + "\",\n"
+    body = body + "    \"stage2\": \"" + _json_escape(to_string(s2_def["kickoff_command"])) + "\",\n"
+    body = body + "    \"stage3\": \"" + _json_escape(to_string(s3_def["kickoff_command"])) + "\"\n"
+    body = body + "  },\n"
+    body = body + "  \"overall_verdict\": {\n"
+    body = body + "    \"stage1\": \"" + s1_verdict + "\",\n"
+    body = body + "    \"stage2\": \"" + s2_verdict + "\",\n"
+    body = body + "    \"stage3\": \"" + s3_verdict + "\"\n"
+    body = body + "  },\n"
+    body = body + "  \"stages\": [\n"
+    body = body + _render_stage_json(1, s1_def, s1_v, s1_roll, s1_verdict) + ",\n"
+    body = body + _render_stage_json(2, s2_def, s2_v, s2_roll, s2_verdict) + ",\n"
+    body = body + _render_stage_json(3, s3_def, s3_v, s3_roll, s3_verdict) + "\n"
+    body = body + "  ]\n"
+    body = body + "}\n"
+
+    // Ensure parent dir
+    let pdir = emit_path.substring(0, _last_slash(emit_path))
+    if pdir != "" { exec_with_status("mkdir -p " + _sh_quote(pdir)) }
+
+    write_file(emit_path, body)
+    let cur_hash = _sha256_str(body)
+    println("  manifest=" + emit_path)
+    println("  prev_hash=" + prev_hash)
+    println("  cur_hash=" + cur_hash)
+
+    if also_print { println(body) }
+
+    return 0
+}
+
+fn _last_slash(p: string) -> int {
+    let mut i = len(p) - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ─── self-test — 3 synthetic scenarios for prereq evaluator ──────────────
+
+fn self_test() -> int {
+    println("── h100_launch_manifest_spec self-test ──")
+
+    // Scenario 1: file prereq that exists
+    let s1 = _mk_file("/Users/ghost/core/anima/config/alm_r13_v2_config.json", "existing file")
+    let v1 = _eval_prereq(s1)
+    let ok1 = (to_string(v1["verdict"]) == "PASS")
+
+    // Scenario 2: file prereq that does NOT exist
+    let s2 = _mk_file("/Users/ghost/core/anima/state/this_file_should_not_exist_42.json", "nonexistent file")
+    let v2 = _eval_prereq(s2)
+    let ok2 = (to_string(v2["verdict"]) == "MISSING")
+
+    // Scenario 3: json field check against a real artifact
+    let s3 = _mk_jfield("/Users/ghost/core/anima/state/alm_r13_drill_breakthrough.json",
+        "verdict", "PASS", "drill verdict=PASS")
+    let v3 = _eval_prereq(s3)
+    let ok3 = (to_string(v3["verdict"]) == "PASS")
+
+    // Scenario 4: json_field_any against real cert_gate_result verdict
+    let s4 = _mk_jfield_any("/Users/ghost/core/anima/state/cert_gate_result.json",
+        "verdict", "BASE_OR_ABOVE,FULL_REWARD", "cert_gate any-of")
+    let v4 = _eval_prereq(s4)
+    let ok4 = (to_string(v4["verdict"]) == "PASS")
+
+    let mut pass = 0
+    let mut fail = 0
+    if ok1 { println("  S1 PASS (existing file)");        pass = pass + 1 }
+    else   { println("  S1 FAIL got " + to_string(v1["verdict"])); fail = fail + 1 }
+    if ok2 { println("  S2 PASS (missing file)");         pass = pass + 1 }
+    else   { println("  S2 FAIL got " + to_string(v2["verdict"])); fail = fail + 1 }
+    if ok3 { println("  S3 PASS (json field match)");     pass = pass + 1 }
+    else   { println("  S3 FAIL got " + to_string(v3["verdict"])); fail = fail + 1 }
+    if ok4 { println("  S4 PASS (json field any-of)");    pass = pass + 1 }
+    else   { println("  S4 FAIL got " + to_string(v4["verdict"])); fail = fail + 1 }
+
+    println("manifest_spec selftest: " + to_string(pass) + "/4 PASS, " + to_string(fail) + " FAIL")
+    if fail > 0 { return 1 }
+    return 0
+}
+
+// ─── entry ────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/h100_launch_manifest_spec.hexa [--self-test] [--print] [--out <path>]")
+        return 0
+    }
+    if _flag(av, "--self-test") || _flag(av, "self-test") {
+        return self_test()
+    }
+    let also_print = _flag(av, "--print")
+    return run(MANIFEST_OUT, also_print)
+}
