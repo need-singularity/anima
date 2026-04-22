@@ -1,0 +1,258 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/mk_ix_x_cluster_cpu_sim.hexa — roadmap #35 improvements (27)(28)
+//
+//  Pre-H100 CPU 시뮬레이션 — Mk.IX→X 연계 cluster 의 2개 trajectory-based
+//  component 를 합성 입력에 대해 검증. 실제 trained trajectory 는 H100.
+//
+//  (27) Kuramoto V_sync grad descent
+//      N 개 oscillator, 초기 phase 임의. r(t) = |mean(exp(i·θ_k))|.
+//      sync potential V_sync(θ) = -r(θ). grad descent 로 r 증가 (sync 강화)
+//      를 확인. sync order parameter 수렴 검증.
+//
+//  (28) V_RG hierarchical regularizer
+//      L 계층 weight pyramid w_l (l=1..L). RG flow: coarser layer 는 fine
+//      layer 의 moving average 로 근사. V_RG = Σ_l ||w_l - MA(w_{l+1})||².
+//      grad descent 로 V_RG 감소. 위계적 consistency 검증.
+//
+//  verdict=SPEC_VERIFIED_PRE_H100_SIM — 실제 trained weight trajectory 가 아님을
+//  명시. H100 시 trained weight 로 동일 mechanism 재측정.
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+fn now_utc() -> string { return exec("date -u +%FT%TZ").trim() }
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+fn abs_f(x: float) -> float { if x < 0.0 { return -x } else { return x } }
+
+// sin/cos 근사 (Taylor degree 5, |x| ≤ π 범위에서 작은 오차).
+fn sin_taylor(x: float) -> float {
+    // normalize x to [-π, π] roughly via wrapping
+    let mut y = x
+    let two_pi = 6.28318530717958
+    while y > 3.14159265358979 { y = y - two_pi }
+    while y < -3.14159265358979 { y = y + two_pi }
+    let y2 = y * y
+    return y * (1.0 - y2 / 6.0 + y2 * y2 / 120.0)
+}
+fn cos_taylor(x: float) -> float {
+    let mut y = x
+    let two_pi = 6.28318530717958
+    while y > 3.14159265358979 { y = y - two_pi }
+    while y < -3.14159265358979 { y = y + two_pi }
+    let y2 = y * y
+    return 1.0 - y2 / 2.0 + y2 * y2 / 24.0 - y2 * y2 * y2 / 720.0
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut r = x
+    if r < 1.0 { r = 1.0 }
+    let mut i = 0
+    while i < 20 {
+        r = 0.5 * (r + x / r)
+        i = i + 1
+    }
+    return r
+}
+
+// ─── (27) Kuramoto V_sync grad descent ─────────────────────────────────
+// N=8 oscillator, seed phases, grad descent on V_sync = -r.
+// ∂V/∂θ_k = -∂r/∂θ_k. r = sqrt(X² + Y²) / N, X=Σcos(θ_k), Y=Σsin(θ_k).
+// ∂r/∂θ_k = (-X·sin(θ_k) + Y·cos(θ_k)) / (N · r)
+// θ_k ← θ_k - lr · ∂V/∂θ_k = θ_k + lr · ∂r/∂θ_k
+fn sim_v_sync_descent() -> array {
+    let n = 8
+    // seed phases — spread out
+    let mut theta = [0.1, 0.8, 1.9, 2.5, 3.3, 4.2, 5.0, 5.8]
+    let steps = 60
+    let lr = 0.2
+
+    let mut r_history = []
+    let mut s = 0
+    while s < steps {
+        // compute X, Y
+        let mut x_sum = 0.0
+        let mut y_sum = 0.0
+        let mut k = 0
+        while k < n {
+            x_sum = x_sum + cos_taylor(to_float(theta[k]))
+            y_sum = y_sum + sin_taylor(to_float(theta[k]))
+            k = k + 1
+        }
+        let r_raw = sqrt_newton(x_sum * x_sum + y_sum * y_sum) / to_float(n)
+        r_history.push(r_raw)
+
+        if r_raw < 1.0e-6 { s = s + 1; continue }
+
+        // grad update
+        let mut new_theta = []
+        let mut j = 0
+        while j < n {
+            let t = to_float(theta[j])
+            let grad = (0.0 - x_sum * sin_taylor(t) + y_sum * cos_taylor(t)) / (to_float(n) * r_raw)
+            new_theta.push(t + lr * grad)
+            j = j + 1
+        }
+        theta = new_theta
+        s = s + 1
+    }
+
+    let r0 = to_float(r_history[0])
+    let r_final = to_float(r_history[len(r_history) - 1])
+    let sync_increased = r_final > r0
+    let r_delta = r_final - r0
+    // sync must exceed 0.9 by end (strong sync)
+    let strong_sync = r_final > 0.9
+
+    return [n, steps, r0, r_final, r_delta, sync_increased, strong_sync]
+}
+
+// ─── (28) V_RG hierarchical regularizer ────────────────────────────────
+// L=4 계층. 각 계층 weight w_l (dim=4). MA 는 인접 계층의 평균.
+// V_RG = Σ_{l=1..L-1} ||w_l - w_{l+1}||²  (하위 -> 상위 coarse 일치)
+// grad descent 로 감소.
+fn sim_v_rg_descent() -> array {
+    let layer_count = 4
+    let dim = 4
+    // 초기 weights (seed — 각 계층 random-ish spread)
+    let mut w = [
+        [1.0, 0.3, -0.5, 0.8],
+        [0.7, 0.5, -0.2, 0.4],
+        [0.4, 0.1, 0.1, 0.2],
+        [0.2, 0.0, 0.0, 0.1]
+    ]
+    let steps = 40
+    let lr = 0.1
+
+    fn compute_v_rg(wt: array, layer_count: int, dim: int) -> float {
+        let mut total = 0.0
+        let mut l = 0
+        while l < layer_count - 1 {
+            let mut d = 0
+            while d < dim {
+                let diff = to_float(wt[l][d]) - to_float(wt[l + 1][d])
+                total = total + diff * diff
+                d = d + 1
+            }
+            l = l + 1
+        }
+        return total
+    }
+
+    let v0 = compute_v_rg(w, layer_count, dim)
+
+    let mut s = 0
+    while s < steps {
+        // grad: ∂V/∂w_l[d] = 2·(w_l[d] - w_{l+1}[d]) - 2·(w_{l-1}[d] - w_l[d])
+        //                   = 2·(w_l[d] - w_{l+1}[d]) + 2·(w_l[d] - w_{l-1}[d])  l-1 term
+        let mut new_w = []
+        let mut l = 0
+        while l < layer_count {
+            let mut nl = []
+            let mut d = 0
+            while d < dim {
+                let cur = to_float(w[l][d])
+                let mut grad = 0.0
+                if l > 0 {
+                    grad = grad + 2.0 * (cur - to_float(w[l - 1][d]))
+                }
+                if l < layer_count - 1 {
+                    grad = grad + 2.0 * (cur - to_float(w[l + 1][d]))
+                }
+                nl.push(cur - lr * grad)
+                d = d + 1
+            }
+            new_w.push(nl)
+            l = l + 1
+        }
+        w = new_w
+        s = s + 1
+    }
+
+    let v_final = compute_v_rg(w, layer_count, dim)
+    let decreased = v_final < v0
+    let reduction_ratio = 0.0
+    let v_reduction = v0 - v_final
+    let strong_reduction = v_final < v0 * 0.3
+
+    return [layer_count, dim, steps, v0, v_final, v_reduction, decreased, strong_reduction]
+}
+
+fn main() {
+    let home = _home()
+    let out_path = home + "/core/anima/state/mk_ix_x_cluster_cpu_sim_result.json"
+
+    let r27 = sim_v_sync_descent()
+    let r28 = sim_v_rg_descent()
+
+    let c27_increased = to_int(r27[5]) == 1
+    let c27_strong = to_int(r27[6]) == 1
+    let c27_pass = c27_increased && c27_strong
+
+    let c28_decreased = to_int(r28[6]) == 1
+    let c28_strong = to_int(r28[7]) == 1
+    let c28_pass = c28_decreased && c28_strong
+
+    let all_pass = c27_pass && c28_pass
+
+    let mut body = "{\n"
+    body = body + "  \"schema_version\": \"1\",\n"
+    body = body + "  \"slug\": \"mk-ix-x-cluster-cpu-sim\",\n"
+    body = body + "  \"tool\": \"tool/mk_ix_x_cluster_cpu_sim.hexa\",\n"
+    body = body + "  \"roadmap_entry\": \"35\",\n"
+    body = body + "  \"created\": \"" + now_utc() + "\",\n"
+    body = body + "  \"scope\": \"Pre-H100 CPU 시뮬레이션 (27)(28). 실제 trained trajectory 는 H100 launch 후 재실측.\",\n"
+    body = body + "  \"disclaimer\": \"Synthetic oscillator lattice + layer pyramid, deterministic grad descent only. Real V_sync/V_RG from trained ALM r13 PENDING H100.\",\n"
+
+    // improvement (27)
+    body = body + "  \"improvement_27_kuramoto_v_sync\": {\n"
+    body = body + "    \"n_oscillators\": " + to_string(r27[0]) + ",\n"
+    body = body + "    \"steps\": " + to_string(r27[1]) + ",\n"
+    body = body + "    \"r_initial\": " + to_string(r27[2]) + ",\n"
+    body = body + "    \"r_final\": " + to_string(r27[3]) + ",\n"
+    body = body + "    \"r_delta\": " + to_string(r27[4]) + ",\n"
+    body = body + "    \"sync_increased\": " + bool_s(c27_increased) + ",\n"
+    body = body + "    \"strong_sync_r_gt_0_9\": " + bool_s(c27_strong) + "\n"
+    body = body + "  },\n"
+
+    // improvement (28)
+    body = body + "  \"improvement_28_v_rg_hierarchical\": {\n"
+    body = body + "    \"layer_count\": " + to_string(r28[0]) + ",\n"
+    body = body + "    \"dim\": " + to_string(r28[1]) + ",\n"
+    body = body + "    \"steps\": " + to_string(r28[2]) + ",\n"
+    body = body + "    \"v_rg_initial\": " + to_string(r28[3]) + ",\n"
+    body = body + "    \"v_rg_final\": " + to_string(r28[4]) + ",\n"
+    body = body + "    \"reduction\": " + to_string(r28[5]) + ",\n"
+    body = body + "    \"decreased\": " + bool_s(c28_decreased) + ",\n"
+    body = body + "    \"strong_reduction_lt_30pct\": " + bool_s(c28_strong) + "\n"
+    body = body + "  },\n"
+
+    body = body + "  \"mk_ix_x_progression\": {\n"
+    body = body + "    \"spec_landed_pre_h100\": [\"(26) arrow cusp detector\", \"(27) Kuramoto V_sync [this sim]\", \"(28) V_RG hierarchical [this sim]\", \"(29) Mk.X T10 atom via #56\", \"(30) Mk.XI twin-engine via #57\"],\n"
+    body = body + "    \"pending_h100\": [\"live trained trajectory for real V_sync/V_RG measurement\"],\n"
+    body = body + "    \"pre_h100_landed_count\": 5,\n"
+    body = body + "    \"pre_h100_total\": 5\n"
+    body = body + "  },\n"
+
+    body = body + "  \"all_pass\": " + bool_s(all_pass) + ",\n"
+    body = body + "  \"verdict\": \"" + (if all_pass { "SPEC_VERIFIED_PRE_H100_SIM" } else { "FAIL" }) + "\"\n"
+    body = body + "}\n"
+
+    exec("mkdir -p '" + home + "/core/anima/state'")
+    write_file(out_path, body)
+
+    println("[mk_ix_x_sim] (27) Kuramoto n=" + to_string(r27[0]) + " r0=" + to_string(r27[2]) + " rf=" + to_string(r27[3]) + " strong=" + bool_s(c27_strong))
+    println("[mk_ix_x_sim] (28) V_RG L=" + to_string(r28[0]) + " v0=" + to_string(r28[3]) + " vf=" + to_string(r28[4]) + " strong=" + bool_s(c28_strong))
+    println("[mk_ix_x_sim] output=" + out_path)
+    if all_pass {
+        println("[mk_ix_x_sim] selftest PASS — 2/2 CPU sims verified, verdict=SPEC_VERIFIED_PRE_H100_SIM")
+        exit(0)
+    } else {
+        eprintln("[mk_ix_x_sim] selftest FAIL — sync_strong=" + bool_s(c27_strong) + " rg_strong=" + bool_s(c28_strong))
+        exit(1)
+    }
+}
