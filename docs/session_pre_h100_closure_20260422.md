@@ -240,17 +240,35 @@ tool/anima_serve_live_smoke.hexa — 실제 localhost HTTP listening:
 phase_progression_controller Stage 1 P2 "endpoint reachability" clause 충족.
 Python stub 은 /tmp 상주 (R37/AN13 .py ban — tool/ 하위 .py 차단 우회).
 
-### ① #6 entry 분할 — ⏸ 보류 (다음 세션)
-**미진행 사유:**
-- htz 에 anima+hexa-lang 전체 리포 sync 필요 (현재 /root/anima/ 에 .roadmap 없음)
-- train_clm.c 소스 → libhxblas 링크 AOT 빌드 필요 (htz 에 빌드 환경 부재)
-- `.roadmap` 정책 변경 (entry split) 은 사용자 명시 승인 필요
-- 예상 소요: 30-60분 + policy decision
+### ① #6 entry 분할 — 🔴 구조적 한계 진단 후 유지 (sub-agents 2 delegation)
+**실행 내역:**
 
-**다음 세션 인입:**
-1. 사용자 #6 분할 승인
-2. Agent delegation: htz rsync + AOT build + 50-step CPU smoke
-3. `.roadmap` 에 #6a done (CPU clause) + #6b blocked (GPU clause) 분리
+**Agent C (htz CLM smoke)** — `b126e495` 진단:
+- htz 연결 OK (airgenome fix + SSH) · libhxblas.so + /root/.hx/bin/hexa + /root/anima/training/train_clm.hexa 모두 존재
+- 하지만 `train_clm.hexa` = "Phase 2c structural port, PyTorch ops → TODO comments"
+  (`use anima_quantum_clm` disabled per hexa 0.1.0-stage1 multi-file import bug)
+- smoke-safe stub 만 실행, 실제 CE descent 연산 부재 → exit_criteria 관측 불가
+- fake-pass 회피 (raw#12) · state 파일 생성 안 함
+
+**Agent D (ubu RTX 5070 복구)** — `1e8024b7` 진단:
+- ubu=aiden-B650M-K, Linux 6.17.0-20-generic, uptime 2d 15h
+- RTX 5070 H/W 인식 OK · driver 580.126.09 · CUDA 13.0 정상
+- **실제 차단 원인**: 2026-04-20 06:47 KST `nvidia-persistenced` OOM-kill → GPU `FULLCHIP_RESET` lock
+- dmesg 8초마다 `krcWatchdog_IMPL: GPU is probably locked!` + `nvAssertFailed NV_ERR_GPU_IN_FULLCHIP_RESET`
+- 서비스 레이어 복구 성공 (persistenced active, pm=On); 컴퓨트 패스는 hot-reset 불가 (primary display, gnome-shell 점유)
+- **해법: 사용자 `sudo reboot` 1회** — H/W 차단 아님, kernel-state lock
+- 예방: `systemctl edit nvidia-persistenced` → `Restart=on-failure`
+- state/ubu_gpu_diagnosis_result.json verdict=PARTIAL 생성
+
+**Agent E (train_clm PyTorch→hexa 최소 포트)** — 🔄 백그라운드 진행 중
+- 옵션 B 권장: tool/clm_r6_cpu_forward_smoke.hexa 신규 (기존 train_clm.hexa 수정 최소화)
+- 50-step CE descent + phi_holo/phi_gwt + NaN + seed reproduce
+- 완료 시 #6 CPU clause 해금 가능성
+
+**#6 unblock 경로 업데이트:**
+- (a) ubu reboot (사용자 액션 1회) — **최단 경로**, Agent D 확인
+- (b) H100 gate 통과
+- (c) Agent E 포트 완료 → CPU clause 해금 → #6 분할 승인
 
 ### Stage-0 최종 effects
 | 시점 | mean | done | active | planned | blocked |
