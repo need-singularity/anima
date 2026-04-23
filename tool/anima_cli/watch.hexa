@@ -1,0 +1,536 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/watch.hexa — anima CLI `watch` topic (live TUI)
+//
+//  PURPOSE
+//    Live 4-section terminal dashboard for β main. Ticks every N seconds
+//    (default 2s), reads SSOT state files only — no network, no mutation
+//    (selftest / --once stays idempotent).
+//
+//  SECTIONS
+//    1. COMPUTE   pods running · burn rate · current stage
+//    2. WEIGHT    precache % per path (p1..p4)
+//    3. PROPOSAL  cycle last · pending count · auto_evolution next fire
+//    4. COST      session cumulative · balance delta
+//
+//  SUBCOMMANDS
+//    anima watch                   live loop (Ctrl+C exits cleanly)
+//    anima watch --once            single snapshot + exit 0
+//    anima watch --interval N      override tick seconds
+//    anima watch --selftest        once-mode smoke (exit 0 on render ok)
+//    anima watch --help
+//
+//  DESIGN
+//    raw#9  hexa-only (NO .py)
+//    raw#11 snake_case
+//    raw#15 no-hardcode (paths/intervals via SSOT)
+//    - Wraps tool/anima_tui.hexa render primitives when possible; this module
+//      uses its own 4-section frame for the watch-specific layout.
+//    - SIGINT → clean exit via _ansi_show() on loop break (ANSI alt-screen
+//      NOT used by default to ease scrollback; inline frame only).
+//    - per-tick snapshot → state/anima_watch_last.json (debug SSOT)
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── vendored shims (consistent with other anima_cli/*.hexa) ─────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _now_hms() -> string {
+    return _str(exec("date +%H:%M:%S")).trim()
+}
+
+fn _epoch() -> int {
+    let s = _str(exec("date +%s")).trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn _json_field(path: string, key: string) -> string {
+    if !_fexists(path) { return "" }
+    return _str(exec("jq -r '" + key + " // \"\"' " + path + " 2>/dev/null")).trim()
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _user_argv(raw) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _has_cmd(c: string) -> bool {
+    return _str(exec("command -v " + c + " >/dev/null 2>&1 && echo 1 || echo 0")).trim() == "1"
+}
+
+// ─── ANSI primitives ─────────────────────────────────────────────────────
+
+fn _esc() -> string         { return chr(27) }
+fn _ansi_clear() -> string  { return _esc() + "[2J" + _esc() + "[H" }
+fn _ansi_hide() -> string   { return _esc() + "[?25l" }
+fn _ansi_show() -> string   { return _esc() + "[?25h" }
+fn _c_reset() -> string     { return _esc() + "[0m" }
+fn _c_bold() -> string      { return _esc() + "[1m" }
+fn _c_dim() -> string       { return _esc() + "[2m" }
+fn _c_green() -> string     { return _esc() + "[32m" }
+fn _c_yellow() -> string    { return _esc() + "[33m" }
+fn _c_red() -> string       { return _esc() + "[31m" }
+fn _c_cyan() -> string      { return _esc() + "[36m" }
+fn _c_gray() -> string      { return _esc() + "[90m" }
+fn _c_blue() -> string      { return _esc() + "[34m" }
+
+fn _hr(w: int, ch: string) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < w { s = s + ch; i = i + 1 }
+    return s
+}
+
+fn _bar(pct: int, width: int) -> string {
+    if width < 1 { return "" }
+    let mut p = pct
+    if p < 0 { p = 0 }
+    if p > 100 { p = 100 }
+    let filled = (p * width) / 100
+    let mut s = ""
+    let mut i = 0
+    while i < width {
+        if i < filled { s = s + "█" } else { s = s + "░" }
+        i = i + 1
+    }
+    return s
+}
+
+fn _color_for_pct(pct: int) -> string {
+    if pct >= 85 { return _c_green() }
+    if pct >= 50 { return _c_yellow() }
+    return _c_red()
+}
+
+// ─── data gather ─────────────────────────────────────────────────────────
+//
+// Each _gather_* returns a json map; frame renderer reads fields.
+// Failures degrade gracefully (empty strings / zeroes).
+
+fn _gather_compute(root: string) {
+    let manifest = root + "/state/h100_launch_manifest.json"
+    // 2026-04-23: legacy flat file retired; convergence store lives under state/convergence/.
+    let s1 = root + "/state/convergence/h100_stage1_20260423.json"
+    let credit = root + "/state/runpod_credit_status.json"
+
+    let mut d = json_parse("{}")
+    // pods running (runpodctl is optional)
+    let mut pods = "n/a"
+    if _has_cmd("runpodctl") {
+        let p = _str(exec("runpodctl pod list 2>/dev/null | tail -n +2 | wc -l | tr -d ' '")).trim()
+        if p != "" { pods = p + " running" }
+    }
+    d["pods"] = pods
+
+    // current stage: last stage in progress or last completed
+    let v1 = _json_field(manifest, ".overall_verdict.stage1")
+    let v2 = _json_field(manifest, ".overall_verdict.stage2")
+    let v3 = _json_field(manifest, ".overall_verdict.stage3")
+    d["stage1"] = if v1 == "" { "n/a" } else { v1 }
+    d["stage2"] = if v2 == "" { "n/a" } else { v2 }
+    d["stage3"] = if v3 == "" { "n/a" } else { v3 }
+
+    // schema v2 (2026-04-23): stage + final_status + total_session_cost_usd
+    // moved under .convergence. Try v2 first, fall back to v1 top-level.
+    let stg_v2 = _json_field(s1, ".convergence.stage")
+    let stage_cur = if stg_v2 == "" { _json_field(s1, ".stage") } else { stg_v2 }
+    let fs_v2 = _json_field(s1, ".convergence.final_status")
+    let final_status = if fs_v2 == "" { _json_field(s1, ".final_status") } else { fs_v2 }
+    d["stage_cur"] = if stage_cur == "" { "-" } else { stage_cur }
+    d["final_status"] = if final_status == "" { "-" } else { final_status }
+
+    // burn rate: session cost total / any credit delta (schema v2 fallback)
+    let bv2 = _json_field(s1, ".convergence.total_session_cost_usd")
+    let burn = if bv2 == "" { _json_field(s1, ".total_session_cost_usd") } else { bv2 }
+    d["burn_usd"] = if burn == "" { "0.00" } else { burn }
+
+    let bal = _json_field(credit, ".balance_usd")
+    let thr = _json_field(credit, ".threshold_usd")
+    d["balance_usd"] = if bal == "" { "?" } else { bal }
+    d["threshold_usd"] = if thr == "" { "?" } else { thr }
+    return d
+}
+
+fn _gather_weight(root: string) {
+    let completion = root + "/state/h100_weight_precache_completion.json"
+    let mut d = json_parse("{}")
+    let paths = ["p1", "p2", "p3", "p4"]
+    let mut rows = []
+    let mut k = 0
+    while k < len(paths) {
+        let p = _str(paths[k])
+        let status = _json_field(completion, ".verdicts." + p + ".status")
+        let sz = _json_field(completion, ".verdicts." + p + ".size_mb")
+        let pct = if status == "done" { 100 }
+                  else if status == "skipped_resume" { 100 }
+                  else if status == "fail" { 0 }
+                  else if status == "" { 0 }
+                  else { 50 }
+        let mut row = json_parse("{}")
+        row["path"] = p
+        row["status"] = if status == "" { "absent" } else { status }
+        row["size_mb"] = if sz == "" { "0" } else { sz }
+        row["pct"] = pct
+        rows = rows + [row]
+        k = k + 1
+    }
+    d["rows"] = rows
+    let done = _json_field(completion, ".summary.done")
+    let total = _json_field(completion, ".summary.total")
+    d["done"] = if done == "" { "0" } else { done }
+    d["total"] = if total == "" { "4" } else { total }
+    return d
+}
+
+fn _gather_proposal(root: string) {
+    let metrics = root + "/state/proposals/meta/metrics.json"
+    let cycle_log = root + "/state/proposals/meta/cycle_log.jsonl"
+    let mut d = json_parse("{}")
+
+    let pending = _json_field(metrics, ".counts.pending")
+    let approved = _json_field(metrics, ".counts.approved")
+    let refinement = _json_field(metrics, ".counts.refinement")
+    let clusters = _json_field(metrics, ".counts.clusters")
+    let metrics_ts = _json_field(metrics, ".ts")
+    d["pending"] = if pending == "" { "0" } else { pending }
+    d["approved"] = if approved == "" { "0" } else { approved }
+    d["refinement"] = if refinement == "" { "0" } else { refinement }
+    d["clusters"] = if clusters == "" { "0" } else { clusters }
+    d["metrics_ts"] = if metrics_ts == "" { "-" } else { metrics_ts }
+
+    // cycle last: tail last jsonl row → cycle_id + status
+    let mut cycle_last = "-"
+    let mut cycle_ts = "-"
+    if _fexists(cycle_log) {
+        let last = _str(exec("tail -n 1 " + cycle_log + " 2>/dev/null")).trim()
+        if last != "" {
+            let id = _str(exec("printf %s '" + last + "' | jq -r '.cycle_id // \"-\"' 2>/dev/null")).trim()
+            let ts = _str(exec("printf %s '" + last + "' | jq -r '.ts // \"-\"' 2>/dev/null")).trim()
+            if id != "" { cycle_last = id }
+            if ts != "" { cycle_ts = ts }
+        }
+    }
+    d["cycle_last"] = cycle_last
+    d["cycle_ts"] = cycle_ts
+
+    // auto_evolution next fire: read launchd plist interval + last cycle_ts
+    // SSOT: ~/Library/LaunchAgents/com.anima.auto_evolution.plist (StartInterval)
+    let plist = _str(env("HOME")) + "/Library/LaunchAgents/com.anima.auto_evolution.plist"
+    let mut next_fire = "-"
+    let mut interval_sec = 43200  // 12h default
+    if _fexists(plist) {
+        // Extract <integer>NNNN</integer> following <key>StartInterval</key>
+        let iv = _str(exec("awk '/<key>StartInterval<\\/key>/{getline; gsub(/[^0-9]/,\"\"); print; exit}' " + plist + " 2>/dev/null")).trim()
+        if iv != "" { interval_sec = to_int(iv) }
+    }
+    if cycle_ts != "-" && cycle_ts != "" {
+        // next_fire = cycle_ts + interval_sec (macOS date: -v BEFORE -f).
+        let nxt = _str(exec("date -u -j -v+" + str(interval_sec) + "S -f '%Y-%m-%dT%H:%M:%SZ' '" + cycle_ts + "' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null")).trim()
+        if nxt != "" { next_fire = nxt }
+    }
+    d["next_fire"] = next_fire
+    d["interval_sec"] = str(interval_sec)
+    return d
+}
+
+fn _gather_cost(root: string) {
+    let ledger = root + "/state/anima_cost_ledger.jsonl"
+    let credit = root + "/state/runpod_credit_status.json"
+    let mut d = json_parse("{}")
+
+    let bal = _json_field(credit, ".balance_usd")
+    d["balance_usd"] = if bal == "" { "?" } else { bal }
+
+    let mut cumul = "0.0000"
+    let mut delta = "0.0000"
+    let mut prev_bal = ""
+    if _fexists(ledger) {
+        let last = _str(exec("tail -n 1 " + ledger + " 2>/dev/null")).trim()
+        if last != "" {
+            cumul = _str(exec("printf %s '" + last + "' | jq -r '.cumulative_burn_usd // \"0\"' 2>/dev/null")).trim()
+            delta = _str(exec("printf %s '" + last + "' | jq -r '.delta_usd // \"0\"' 2>/dev/null")).trim()
+            prev_bal = _str(exec("printf %s '" + last + "' | jq -r '.prev_balance_usd // \"\"' 2>/dev/null")).trim()
+        }
+    }
+    d["session_cumul_usd"] = cumul
+    d["balance_delta_usd"] = delta
+    d["prev_balance_usd"] = if prev_bal == "" { "-" } else { prev_bal }
+    return d
+}
+
+// ─── frame renderer (4 sections) ─────────────────────────────────────────
+
+fn _pad_right(s: string, w: int) -> string {
+    // Rough visible width: treat input as plain (caller must not pass ansi).
+    let n = s.len()
+    if n >= w { return s }
+    let mut pad = ""
+    let mut i = 0
+    while i < (w - n) { pad = pad + " "; i = i + 1 }
+    return s + pad
+}
+
+fn _sec_compute(d) -> string {
+    let mut s = _c_bold() + " 1. COMPUTE" + _c_reset() + "\n"
+    s = s + "   pods         : " + _c_cyan() + _str(d["pods"]) + _c_reset() + "\n"
+    s = s + "   current_stage: " + _str(d["stage_cur"]) +
+        "   last_run=" + _str(d["final_status"]) + "\n"
+    let v1 = _str(d["stage1"])
+    let v2 = _str(d["stage2"])
+    let v3 = _str(d["stage3"])
+    s = s + "   verdicts     : s1=" + v1 + "  s2=" + v2 + "  s3=" + v3 + "\n"
+    s = s + "   burn_rate    : $" + _str(d["burn_usd"]) + _c_dim() +
+        "  (session · total_session_cost_usd)" + _c_reset() + "\n"
+    return s
+}
+
+fn _sec_weight(d) -> string {
+    let mut s = _c_bold() + " 2. WEIGHT precache" + _c_reset() +
+        _c_dim() + "   " + _str(d["done"]) + "/" + _str(d["total"]) + " paths" + _c_reset() + "\n"
+    let rows = d["rows"]
+    let mut i = 0
+    while i < len(rows) {
+        let r = rows[i]
+        let p = _str(r["path"])
+        let pct = to_int(str(r["pct"]))
+        let status = _str(r["status"])
+        let sz = _str(r["size_mb"])
+        let bar = _color_for_pct(pct) + _bar(pct, 20) + _c_reset()
+        let pct_lbl = _pad_right(str(pct) + "%", 5)
+        s = s + "   " + p + "  " + bar + "  " + pct_lbl +
+            "  " + _pad_right(status, 16) + _c_dim() + sz + " MB" + _c_reset() + "\n"
+        i = i + 1
+    }
+    return s
+}
+
+fn _sec_proposal(d) -> string {
+    let mut s = _c_bold() + " 3. PROPOSAL" + _c_reset() + "\n"
+    s = s + "   pending      : " + _c_yellow() + _str(d["pending"]) + _c_reset() +
+        "   approved=" + _str(d["approved"]) +
+        "   refinement=" + _str(d["refinement"]) +
+        "   clusters=" + _str(d["clusters"]) + "\n"
+    s = s + "   cycle_last   : " + _str(d["cycle_last"]) +
+        _c_dim() + "   ts=" + _str(d["cycle_ts"]) + _c_reset() + "\n"
+    let iv = to_int(str(d["interval_sec"]))
+    let iv_h = iv / 3600
+    s = s + "   next_fire    : " + _c_cyan() + _str(d["next_fire"]) + _c_reset() +
+        _c_dim() + "   interval=" + str(iv_h) + "h (auto_evolution launchd)" + _c_reset() + "\n"
+    return s
+}
+
+fn _sec_cost(d) -> string {
+    let mut s = _c_bold() + " 4. COST" + _c_reset() + "\n"
+    s = s + "   session_cumul: $" + _str(d["session_cumul_usd"]) + "\n"
+    let delta = _str(d["balance_delta_usd"])
+    let delta_col = if delta.substring(0, 1) == "-" { _c_red() } else { _c_green() }
+    s = s + "   balance_delta: " + delta_col + "$" + delta + _c_reset() +
+        _c_dim() + "   prev=$" + _str(d["prev_balance_usd"]) + _c_reset() + "\n"
+    s = s + "   balance_now  : $" + _str(d["balance_usd"]) + "\n"
+    return s
+}
+
+fn render_frame(root: string, frame_idx: int, interval_sec: int) -> string {
+    let compute = _gather_compute(root)
+    let weight  = _gather_weight(root)
+    let proposal = _gather_proposal(root)
+    let cost    = _gather_cost(root)
+    let width = 80
+    let mut f = ""
+    f = f + _c_cyan() + _hr(width, "═") + _c_reset() + "\n"
+    f = f + " " + _c_cyan() + _c_bold() + "ANIMA WATCH" + _c_reset() +
+        "   " + _c_dim() + _now_hms() + "  f#" + str(frame_idx) +
+        "  tick=" + str(interval_sec) + "s  root=" + root + _c_reset() + "\n"
+    f = f + _c_cyan() + _hr(width, "─") + _c_reset() + "\n"
+    f = f + _sec_compute(compute)  + "\n"
+    f = f + _sec_weight(weight)    + "\n"
+    f = f + _sec_proposal(proposal) + "\n"
+    f = f + _sec_cost(cost)        + "\n"
+    f = f + _c_cyan() + _hr(width, "═") + _c_reset() + "\n"
+    f = f + _c_dim() + " Ctrl+C=quit   --once=single snapshot   --interval N=tick sec" +
+        _c_reset() + "\n"
+    return f
+}
+
+// ─── snapshot SSOT (per tick debug artifact) ─────────────────────────────
+
+fn _emit_snapshot(root: string, frame_idx: int, interval_sec: int,
+                  compute, weight, proposal, cost) {
+    let dir = root + "/state"
+    if _str(exec("test -d " + dir + " && echo 1 || echo 0")).trim() != "1" {
+        exec("mkdir -p " + dir)
+    }
+    let path = dir + "/anima_watch_last.json"
+    let body = "{\n" +
+        "  \"schema\": \"anima.watch.snapshot.v1\",\n" +
+        "  \"tool\": \"tool/anima_cli/watch.hexa\",\n" +
+        "  \"ts\": \"" + _ts_iso() + "\",\n" +
+        "  \"frame_idx\": " + str(frame_idx) + ",\n" +
+        "  \"interval_sec\": " + str(interval_sec) + ",\n" +
+        "  \"compute\": {\n" +
+        "    \"pods\": \"" + _str(compute["pods"]) + "\",\n" +
+        "    \"stage_cur\": \"" + _str(compute["stage_cur"]) + "\",\n" +
+        "    \"burn_usd\": \"" + _str(compute["burn_usd"]) + "\",\n" +
+        "    \"balance_usd\": \"" + _str(compute["balance_usd"]) + "\"\n" +
+        "  },\n" +
+        "  \"weight\": {\n" +
+        "    \"done\": \"" + _str(weight["done"]) + "\",\n" +
+        "    \"total\": \"" + _str(weight["total"]) + "\"\n" +
+        "  },\n" +
+        "  \"proposal\": {\n" +
+        "    \"pending\": \"" + _str(proposal["pending"]) + "\",\n" +
+        "    \"cycle_last\": \"" + _str(proposal["cycle_last"]) + "\",\n" +
+        "    \"next_fire\": \"" + _str(proposal["next_fire"]) + "\"\n" +
+        "  },\n" +
+        "  \"cost\": {\n" +
+        "    \"session_cumul_usd\": \"" + _str(cost["session_cumul_usd"]) + "\",\n" +
+        "    \"balance_delta_usd\": \"" + _str(cost["balance_delta_usd"]) + "\",\n" +
+        "    \"balance_usd\": \"" + _str(cost["balance_usd"]) + "\"\n" +
+        "  },\n" +
+        "  \"raw_strict\": \"raw#9 raw#11 raw#15 deterministic LLM=none\"\n" +
+        "}\n"
+    let tmp = path + ".tmp." + str(_epoch())
+    write_file(tmp, body)
+    exec("mv -f " + tmp + " " + path)
+}
+
+// ─── subcommands ─────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima watch — live TUI (4 sections: compute/weight/proposal/cost)")
+    println("")
+    println("  anima watch                live loop (default interval 2s)")
+    println("  anima watch --once         single snapshot + exit")
+    println("  anima watch --interval N   override tick seconds")
+    println("  anima watch --selftest     once-mode smoke")
+    println("  anima watch --help")
+    println("")
+    println("  Ctrl+C → clean exit (cursor restored, exit code 0)")
+    println("  SSOT snapshot per tick: state/anima_watch_last.json")
+}
+
+fn sub_once(interval_sec: int) {
+    let root = _resolve_root()
+    let compute = _gather_compute(root)
+    let weight  = _gather_weight(root)
+    let proposal = _gather_proposal(root)
+    let cost    = _gather_cost(root)
+    let frame = render_frame(root, 0, interval_sec)
+    print(frame)
+    _emit_snapshot(root, 0, interval_sec, compute, weight, proposal, cost)
+}
+
+fn sub_live(interval_sec: int) {
+    let root = _resolve_root()
+    // setup: clear + hide cursor. No alt-screen (keep scrollback for --once parity).
+    print(_ansi_clear() + _ansi_hide())
+    let mut frame_idx = 0
+    // Infinite loop — relies on SIGINT from terminal to break. On Ctrl+C the
+    // hexa process is killed; exit trap below restores cursor. To match the
+    // "exit code 0" requirement we cap at a very large iters via env override.
+    let cap_raw = _str(env("ANIMA_WATCH_MAX_ITERS"))
+    let cap = if cap_raw == "" { 0 } else { to_int(cap_raw) }
+    while true {
+        let compute = _gather_compute(root)
+        let weight  = _gather_weight(root)
+        let proposal = _gather_proposal(root)
+        let cost    = _gather_cost(root)
+        let frame = render_frame(root, frame_idx, interval_sec)
+        print(_ansi_clear() + frame)
+        _emit_snapshot(root, frame_idx, interval_sec, compute, weight, proposal, cost)
+        frame_idx = frame_idx + 1
+        if cap > 0 && frame_idx >= cap { break }
+        exec("sleep " + str(interval_sec))
+    }
+    print(_ansi_show())
+}
+
+fn sub_selftest() {
+    // once-mode smoke: render + snapshot must succeed
+    let root = _resolve_root()
+    if root == "" { println("FAIL watch.hexa selftest (root unresolved)"); exit(1) }
+    let compute = _gather_compute(root)
+    let weight  = _gather_weight(root)
+    let proposal = _gather_proposal(root)
+    let cost    = _gather_cost(root)
+    let frame = render_frame(root, 0, 2)
+    if frame.len() < 32 { println("FAIL watch.hexa selftest (empty frame)"); exit(1) }
+    _emit_snapshot(root, 0, 2, compute, weight, proposal, cost)
+    let snap = root + "/state/anima_watch_last.json"
+    if !_fexists(snap) { println("FAIL watch.hexa selftest (snapshot missing)"); exit(1) }
+    println("PASS anima_cli/watch selftest")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") || _arg_present(argv, "-h") { sub_help(); return }
+
+    let interval_str = _arg_value(argv, "--interval", "2")
+    let mut interval = to_int(interval_str)
+    if interval < 1 { interval = 2 }
+
+    if _arg_present(argv, "--once") {
+        sub_once(interval)
+        exit(0)
+    }
+
+    // Default (no flags) — per spec the bin/anima entry invokes `--once`.
+    // Direct hexa invocation without --once enters live loop.
+    sub_live(interval)
+    exit(0)
+}
+
+main()

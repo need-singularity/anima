@@ -1,0 +1,347 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/dep_vuln_scan.hexa — ROI #67 (security/compliance)
+//
+//  PURPOSE
+//    Read requirements.txt + scan tool/*.hexa imports → for each dependency,
+//    check against offline stub advisory list (real OSV/GHSA query MARKED PENDING).
+//
+//  DESIGN
+//    raw#9   hexa-only
+//    raw#15  no-hardcode (config/dep_vuln_scan_config.json)
+//    NO outbound network calls — stub-only deterministic scan.
+//
+//  USAGE
+//    hexa tool/dep_vuln_scan.hexa
+//    hexa tool/dep_vuln_scan.hexa --selftest
+//    hexa tool/dep_vuln_scan.hexa --config <path>
+//
+//  EXIT CODES
+//    0  no vuln  1  LOW only  2  MEDIUM/HIGH/CRITICAL  3  setup error
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/dep_vuln_scan_config.json"
+
+// ─── sys helpers ─────────────────────────────────────────────────────
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    return _exec_code("mkdir -p " + _sh_quote(dir)) == 0
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+// ─── argv ────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av {
+        if to_string(x) == k { return true }
+    }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) {
+            return to_string(av[i + 1])
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── config ──────────────────────────────────────────────────────────
+
+fn _load_config(path: string) {
+    if !_file_exists(path) {
+        eprintln("dep_vuln_scan: SETUP_ERROR — config missing: " + path)
+        exit(3)
+    }
+    return json_parse(read_file(path))
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ─── parse requirements.txt ──────────────────────────────────────────
+//
+// Each line: `package` | `package==1.2.3` | `package>=1.2.3` | `package<2`
+// Comments after `#`.  Blank/comment-only lines skipped.
+// We split out package name + raw spec for downstream policy.
+
+fn _parse_requirement_line(raw: string, comment_prefix: string) -> array {
+    // Trim comment
+    let cidx = raw.index_of(comment_prefix)
+    let body = if cidx >= 0 { raw.substring(0, cidx) } else { raw }
+    let line = body.trim()
+    if len(line) == 0 { return [] }
+    // Split on operator chars
+    let mut name = line
+    let mut spec = ""
+    let ops = ["==", ">=", "<=", "~=", "!=", ">", "<"]
+    for op in ops {
+        let opS = to_string(op)
+        let k = line.index_of(opS)
+        if k > 0 {
+            name = line.substring(0, k).trim()
+            spec = line.substring(k, len(line)).trim()
+            break
+        }
+    }
+    return [name, spec]
+}
+
+fn _parse_manifest(path: string, comment_prefix: string) -> array {
+    if !_file_exists(path) { return [] }
+    let body = read_file(path)
+    let lines = split(body, "\n")
+    let mut out = []
+    for l in lines {
+        let parsed = _parse_requirement_line(to_string(l), comment_prefix)
+        if len(parsed) == 2 {
+            let mut d = #{}
+            d["name"] = parsed[0]
+            d["spec"] = parsed[1]
+            d["source"] = path
+            out.push(d)
+        }
+    }
+    return out
+}
+
+// ─── scan hexa imports (best-effort) ─────────────────────────────────
+
+fn _list_hexa_files(repo_root: string, root: string) -> array {
+    let full = repo_root + "/" + root
+    if !_file_exists(full) { return [] }
+    let cmd = "find " + _sh_quote(full) + " -type f -name '*.hexa' 2>/dev/null"
+    let out = _exec_out(cmd)
+    let lines = split(out, "\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if len(t) > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+fn _scan_imports_in_file(path: string) -> array {
+    let body = read_file(path)
+    let lines = split(body, "\n")
+    let mut imports = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if t.index_of("use \"") == 0 {
+            // use "name"
+            let after = t.substring(5, len(t))
+            let q = after.index_of("\"")
+            if q > 0 {
+                let imp = after.substring(0, q)
+                imports.push(imp)
+            }
+        }
+    }
+    return imports
+}
+
+// ─── advisory match ─────────────────────────────────────────────────
+//
+// Stub semantics: each advisory `affected_below` is a marker — we record
+// "POTENTIALLY_AFFECTED" if a dep with that name exists. Real version
+// comparison would require a SemVer parser + live spec evaluation.
+
+fn _match_advisories(deps: array, advisories: array) -> array {
+    let mut findings = []
+    for d in deps {
+        let dname = to_string(d["name"])
+        for a in advisories {
+            let aname = to_string(a["package"])
+            if dname == aname {
+                let mut f = #{}
+                f["package"] = dname
+                f["dep_spec"] = to_string(d["spec"])
+                f["dep_source"] = to_string(d["source"])
+                f["cve"] = to_string(a["cve"])
+                f["severity"] = to_string(a["severity"])
+                f["affected_below"] = to_string(a["affected_below"])
+                f["status"] = "POTENTIALLY_AFFECTED_STUB"
+                f["note"] = to_string(a["note"])
+                findings.push(f)
+            }
+        }
+    }
+    return findings
+}
+
+// ─── output ──────────────────────────────────────────────────────────
+
+fn _emit_result(out_path: string, deps: array, hexa_imports: array, findings: array, real_db, ts: string) {
+    let mut crit = 0
+    let mut high = 0
+    let mut med = 0
+    let mut low = 0
+    for f in findings {
+        let s = to_string(f["severity"])
+        if s == "CRITICAL" { crit = crit + 1 }
+        else if s == "HIGH" { high = high + 1 }
+        else if s == "MEDIUM" { med = med + 1 }
+        else if s == "LOW" { low = low + 1 }
+    }
+
+    let mut p = []
+    p.push("{\n")
+    p.push("  \"schema\": \"anima.dep_vuln_scan_result.v1\",\n")
+    p.push("  \"tool\": \"tool/dep_vuln_scan.hexa\",\n")
+    p.push("  \"ts\": \"" + ts + "\",\n")
+    p.push("  \"deps_count\": " + to_string(len(deps)) + ",\n")
+    p.push("  \"hexa_imports_count\": " + to_string(len(hexa_imports)) + ",\n")
+    p.push("  \"findings_count\": " + to_string(len(findings)) + ",\n")
+    p.push("  \"by_severity\": {\"CRITICAL\": " + to_string(crit) + ", \"HIGH\": " + to_string(high) + ", \"MEDIUM\": " + to_string(med) + ", \"LOW\": " + to_string(low) + "},\n")
+    p.push("  \"real_cve_db_status\": \"" + to_string(real_db["status"]) + "\",\n")
+    p.push("  \"real_cve_db_pending_rationale\": \"" + _json_escape(to_string(real_db["rationale_pending"])) + "\",\n")
+    p.push("  \"deps\": [\n")
+    let mut i = 0
+    while i < len(deps) {
+        let d = deps[i]
+        let comma = if i + 1 < len(deps) { "," } else { "" }
+        p.push("    {\"name\": \"" + _json_escape(to_string(d["name"])) + "\", \"spec\": \"" + _json_escape(to_string(d["spec"])) + "\", \"source\": \"" + _json_escape(to_string(d["source"])) + "\"}" + comma + "\n")
+        i = i + 1
+    }
+    p.push("  ],\n")
+    p.push("  \"findings\": [\n")
+    let mut j = 0
+    while j < len(findings) {
+        let f = findings[j]
+        let comma2 = if j + 1 < len(findings) { "," } else { "" }
+        p.push("    {\"package\": \"" + _json_escape(to_string(f["package"])) + "\"")
+        p.push(", \"cve\": \"" + _json_escape(to_string(f["cve"])) + "\"")
+        p.push(", \"severity\": \"" + to_string(f["severity"]) + "\"")
+        p.push(", \"affected_below\": \"" + _json_escape(to_string(f["affected_below"])) + "\"")
+        p.push(", \"dep_spec\": \"" + _json_escape(to_string(f["dep_spec"])) + "\"")
+        p.push(", \"status\": \"" + to_string(f["status"]) + "\"")
+        p.push(", \"note\": \"" + _json_escape(to_string(f["note"])) + "\"}" + comma2 + "\n")
+        j = j + 1
+    }
+    p.push("  ]\n}\n")
+    let _ = _mkdir_p("/Users/ghost/core/anima/state")
+    let _ = write_file(out_path, p.join(""))
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa tool/dep_vuln_scan.hexa [opts]")
+        println("  --selftest       run with built-in fixture")
+        println("  --config <path>  override config")
+        return 0
+    }
+
+    let cfg_path = _opt(av, "--config", DEFAULT_CONFIG)
+    let cfg = _load_config(cfg_path)
+    let repo_root = to_string(cfg["repo_root"])
+    let manifests = cfg["manifests"]
+    let advisories = cfg["offline_stub_advisories"]
+    let real_db = cfg["real_db_integration"]
+    let import_scan = cfg["import_scan"]
+    let output = cfg["output"]
+    let out_path = repo_root + "/" + to_string(output["result_path"])
+
+    // Collect deps
+    let mut deps = []
+    for m in manifests {
+        let kind = to_string(m["kind"])
+        let path = repo_root + "/" + to_string(m["path"])
+        let cprefix = to_string(m["comment_prefix"])
+        let parsed = _parse_manifest(path, cprefix)
+        for d in parsed { deps.push(d) }
+    }
+
+    // Scan hexa imports (informational)
+    let mut hexa_imports = []
+    if to_string(import_scan["enabled"]) == "true" {
+        let roots = import_scan["roots"]
+        for r in roots {
+            let files = _list_hexa_files(repo_root, to_string(r))
+            for f in files {
+                let imps = _scan_imports_in_file(to_string(f))
+                for i in imps { hexa_imports.push(to_string(i)) }
+            }
+        }
+    }
+
+    // Match advisories
+    let findings = _match_advisories(deps, advisories)
+
+    let ts = _ts_iso()
+    _emit_result(out_path, deps, hexa_imports, findings, real_db, ts)
+
+    let mut crit = 0
+    let mut high = 0
+    let mut med = 0
+    let mut low = 0
+    for f in findings {
+        let s = to_string(f["severity"])
+        if s == "CRITICAL" { crit = crit + 1 }
+        else if s == "HIGH" { high = high + 1 }
+        else if s == "MEDIUM" { med = med + 1 }
+        else if s == "LOW" { low = low + 1 }
+    }
+
+    println("── dep_vuln_scan ──")
+    println("  deps_count:          " + to_string(len(deps)))
+    println("  hexa_imports_count:  " + to_string(len(hexa_imports)))
+    println("  findings_count:      " + to_string(len(findings)))
+    println("  CRITICAL/HIGH:       " + to_string(crit) + "/" + to_string(high))
+    println("  MEDIUM/LOW:          " + to_string(med) + "/" + to_string(low))
+    println("  real_cve_db:         " + to_string(real_db["status"]) + " (no outbound API call)")
+    println("  result_path:         " + out_path)
+
+    let exit_pol = cfg["exit_policy"]
+    if crit + high + med > 0 { return to_int(to_string(exit_pol["medium_or_high_or_critical"])) }
+    if low > 0 { return to_int(to_string(exit_pol["low_only"])) }
+    return to_int(to_string(exit_pol["no_vuln"]))
+}
+
+main()

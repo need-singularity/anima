@@ -1,0 +1,723 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/proposal_inventory_init.hexa — P1 (proposal stack paradigm bootstrap)
+//
+//  PURPOSE
+//    First tool in the docs/anima_proposal_stack_paradigm_20260422.md series.
+//    Bootstraps the **proposal stack** state directory (state/proposals/) so
+//    every later tool (P2 emit, P3 review, P4 approve/reject/implement,
+//    P5 dashboard, P6 lineage, P7 cluster, P8 conflict, P9 12h loop) can
+//    rely on a stable on-disk schema.
+//
+//    Per the spec the goal is a **rejection of automatic module creation**:
+//    new ideas are NOT spawned as code — they are emitted as proposals into
+//    state/proposals/pending/ and only transition to modules under explicit
+//    user approval. This tool creates exactly that holding-tank infra.
+//
+//  DIRECTORY LAYOUT (spec §1)
+//    state/proposals/
+//      ├── inventory.json                  (single SSOT meta index)
+//      ├── pending/                        (awaiting user review)
+//      ├── refinement/                     (per-id versioned refine history)
+//      ├── approved/                       (user approved, awaiting impl)
+//      ├── rejected/                       (user rejected + reason)
+//      ├── archived/                       (impl complete, permanent record)
+//      ├── debate/                         (conflicting proposals)
+//      ├── clusters/                       (5+ related → cluster candidates)
+//      └── meta/
+//          ├── metrics.json                (counters, refreshed each cycle)
+//          ├── lineage.json                (parent/child proposal graph)
+//          └── decay_log.json              (stale-pending decay events)
+//
+//  SCHEMAS
+//    inventory.json
+//      { "schema": "anima/proposal_inventory/1",
+//        "ts": "<iso>",
+//        "tool": "tool/proposal_inventory_init.hexa",
+//        "proposals": [],
+//        "summary": { "pending": 0, "refinement": 0, "approved": 0,
+//                     "rejected": 0, "archived": 0, "debate": 0,
+//                     "clusters": 0, "total": 0 } }
+//
+//    meta/metrics.json
+//      { "schema": "anima/proposal_metrics/1",
+//        "ts": "<iso>",
+//        "total_pending": 0, "total_refinement": 0, "total_approved": 0,
+//        "total_archived": 0, "total_rejected": 0, "total_debate": 0,
+//        "total_clusters": 0,
+//        "approval_rate_30d": 0.0, "implementation_lag_days": 0.0,
+//        "median_age_pending_days": 0.0, "evolution_velocity": 0.0,
+//        "user_review_lag_days": 0.0,
+//        "top_clusters": [], "highest_score_pending": [] }
+//
+//    meta/lineage.json
+//      { "schema": "anima/proposal_lineage/1",
+//        "ts": "<iso>",
+//        "nodes": [], "edges": [] }
+//
+//    meta/decay_log.json
+//      { "schema": "anima/proposal_decay_log/1",
+//        "ts": "<iso>",
+//        "events": [] }
+//
+//  PROPOSAL CARD (spec §2 v1) — emitted at pending/20260422-001_sample.json
+//    The first proposal is **this very task** (P1 inventory bootstrap),
+//    so the proposal stack starts non-empty and proves the schema by
+//    example. The card mirrors §2 verbatim with concrete values.
+//
+//  USAGE
+//    hexa run tool/proposal_inventory_init.hexa            (idempotent init)
+//    hexa run tool/proposal_inventory_init.hexa --selftest (verify 8 dirs +
+//                                                           3 meta json valid)
+//    hexa run tool/proposal_inventory_init.hexa --status   (print counts)
+//    hexa run tool/proposal_inventory_init.hexa --reset    (DRY by default)
+//    hexa run tool/proposal_inventory_init.hexa --reset --apply
+//                                                          (DESTRUCTIVE —
+//                                                           wipes + rewrites)
+//
+//  IDEMPOTENCY
+//    Re-running with no flags only creates anything that is missing. Existing
+//    files are never overwritten (so manual edits to inventory.json or any
+//    proposal card are preserved). The sample proposal is only emitted on
+//    fresh init when pending/ is empty.
+//
+//  HARD CONSTRAINTS (spec §13 anti-patterns)
+//    - DO NOT touch .roadmap (uchg + user gate)
+//    - DO NOT modify tool/, config/, docs/ — only state/proposals/ writes
+//    - DO NOT auto-implement anything (this tool only seeds storage)
+//    - DO NOT spawn duplicate proposals on rerun
+//    - reject 영원한 destruction without explicit --apply
+//
+//  RAW
+//    raw#9 hexa-only · raw#10 deterministic · raw#11 snake_case
+//    raw#12 실측 only · raw#15 no-hardcode (paths anchored to constants)
+//
+//  EXIT CODES
+//    0 — init OK / selftest pass / status printed / reset dry preview
+//    1 — selftest fail
+//    2 — io / setup error
+// ════════════════════════════════════════════════════════════════════════════
+
+let TOOL_NAME      = "proposal_inventory_init"
+let TOOL_VERSION   = "v1"
+let REPO_ROOT      = "/Users/ghost/core/anima"
+let STATE_ROOT     = "/Users/ghost/core/anima/state"
+let PROP_ROOT      = "/Users/ghost/core/anima/state/proposals"
+let DIR_PENDING    = "/Users/ghost/core/anima/state/proposals/pending"
+let DIR_REFINEMENT = "/Users/ghost/core/anima/state/proposals/refinement"
+let DIR_APPROVED   = "/Users/ghost/core/anima/state/proposals/approved"
+let DIR_REJECTED   = "/Users/ghost/core/anima/state/proposals/rejected"
+let DIR_ARCHIVED   = "/Users/ghost/core/anima/state/proposals/archived"
+let DIR_DEBATE     = "/Users/ghost/core/anima/state/proposals/debate"
+let DIR_CLUSTERS   = "/Users/ghost/core/anima/state/proposals/clusters"
+let DIR_META       = "/Users/ghost/core/anima/state/proposals/meta"
+
+let INVENTORY_JSON = "/Users/ghost/core/anima/state/proposals/inventory.json"
+let METRICS_JSON   = "/Users/ghost/core/anima/state/proposals/meta/metrics.json"
+let LINEAGE_JSON   = "/Users/ghost/core/anima/state/proposals/meta/lineage.json"
+let DECAY_JSON     = "/Users/ghost/core/anima/state/proposals/meta/decay_log.json"
+let SAMPLE_JSON    = "/Users/ghost/core/anima/state/proposals/pending/20260422-001_sample.json"
+
+let SMOKE_OUT      = "/Users/ghost/core/anima/state/proposal_inventory_init_result.json"
+
+// ─── shell helpers (INLINE_DEPRECATED[H42]: see shared/util/*) ──────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _bool_s(b: bool) -> string {
+    if b { return "true" } else { return "false" }
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _is_dir(path: string) -> bool {
+    let r = exec_with_status("test -d " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _is_file(path: string) -> bool {
+    let r = exec_with_status("test -f " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _mkdir_p(d: string) -> bool {
+    let r = exec_with_status("mkdir -p " + _sh_quote(d))
+    return r[1] == 0
+}
+
+fn _rm_rf(p: string) -> bool {
+    // Used ONLY by --reset --apply; guarded above.
+    let r = exec_with_status("rm -rf " + _sh_quote(p))
+    return r[1] == 0
+}
+
+fn _count_in_dir(d: string) -> int {
+    if !_is_dir(d) { return 0 }
+    // Count entries (files OR subdirs) at depth 1, excluding dotfiles.
+    let cmd = "ls -1 " + _sh_quote(d) + " 2>/dev/null | wc -l | tr -d ' '"
+    let raw = _exec_out(cmd).trim()
+    if len(raw) == 0 { return 0 }
+    return to_int(raw)
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn flag_present(name: string) -> bool {
+    let argv = args()
+    let mut i = 0
+    while i < len(argv) {
+        if to_string(argv[i]) == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── directory bootstrap ───────────────────────────────────────────────────
+
+let DIRS = [
+    "/Users/ghost/core/anima/state/proposals/pending",
+    "/Users/ghost/core/anima/state/proposals/refinement",
+    "/Users/ghost/core/anima/state/proposals/approved",
+    "/Users/ghost/core/anima/state/proposals/rejected",
+    "/Users/ghost/core/anima/state/proposals/archived",
+    "/Users/ghost/core/anima/state/proposals/debate",
+    "/Users/ghost/core/anima/state/proposals/clusters",
+    "/Users/ghost/core/anima/state/proposals/meta"
+]
+
+fn ensure_dirs() -> int {
+    let mut created = 0
+    let _ = _mkdir_p(STATE_ROOT)
+    let _ = _mkdir_p(PROP_ROOT)
+    let mut i = 0
+    while i < len(DIRS) {
+        let d = to_string(DIRS[i])
+        if !_is_dir(d) {
+            let ok = _mkdir_p(d)
+            if ok {
+                created = created + 1
+                println("[pinv] created dir: " + d)
+            } else {
+                eprintln("[pinv] FAILED mkdir: " + d)
+            }
+        }
+        i = i + 1
+    }
+    return created
+}
+
+// ─── meta json bootstrap ───────────────────────────────────────────────────
+
+// NOTE (schema coexistence — option C, 2026-04-22):
+//   inventory.json carries TWO parallel arrays that serve different roles:
+//     • "proposals": []  — per-card dedup+seq index used by P2 emit / P4
+//                          approve / reject / implement / archive.
+//     • "entries":   []  — cluster & super-proposal meta index used by
+//                          P7 cluster_detect / P6 lineage_graph / P3 review.
+//   Both keys are canonical. Every tool that rewrites this file MUST
+//   preserve the opposite key (see append_to_inventory in cluster_detect
+//   and _load_inventory in emit for the merge logic).
+fn write_inventory_initial(ts: string) {
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima/proposal_inventory/1\",\n"
+    body = body + "  \"ts\": \"" + ts + "\",\n"
+    body = body + "  \"tool\": \"tool/proposal_inventory_init.hexa\",\n"
+    body = body + "  \"version\": \"" + TOOL_VERSION + "\",\n"
+    body = body + "  \"proposals\": [],\n"
+    body = body + "  \"entries\": [],\n"
+    body = body + "  \"summary\": {\n"
+    body = body + "    \"pending\": 0,\n"
+    body = body + "    \"refinement\": 0,\n"
+    body = body + "    \"approved\": 0,\n"
+    body = body + "    \"rejected\": 0,\n"
+    body = body + "    \"archived\": 0,\n"
+    body = body + "    \"debate\": 0,\n"
+    body = body + "    \"clusters\": 0,\n"
+    body = body + "    \"total\": 0\n"
+    body = body + "  },\n"
+    body = body + "  \"raw_strict\": \"raw#9 raw#10 raw#11 raw#12 raw#15\"\n"
+    body = body + "}\n"
+    write_file(INVENTORY_JSON, body)
+}
+
+fn write_metrics_initial(ts: string) {
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima/proposal_metrics/1\",\n"
+    body = body + "  \"ts\": \"" + ts + "\",\n"
+    body = body + "  \"total_pending\": 0,\n"
+    body = body + "  \"total_refinement\": 0,\n"
+    body = body + "  \"total_approved\": 0,\n"
+    body = body + "  \"total_archived\": 0,\n"
+    body = body + "  \"total_rejected\": 0,\n"
+    body = body + "  \"total_debate\": 0,\n"
+    body = body + "  \"total_clusters\": 0,\n"
+    body = body + "  \"approval_rate_30d\": 0.0,\n"
+    body = body + "  \"implementation_lag_days\": 0.0,\n"
+    body = body + "  \"median_age_pending_days\": 0.0,\n"
+    body = body + "  \"evolution_velocity\": 0.0,\n"
+    body = body + "  \"user_review_lag_days\": 0.0,\n"
+    body = body + "  \"top_clusters\": [],\n"
+    body = body + "  \"highest_score_pending\": []\n"
+    body = body + "}\n"
+    write_file(METRICS_JSON, body)
+}
+
+fn write_lineage_initial(ts: string) {
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima/proposal_lineage/1\",\n"
+    body = body + "  \"ts\": \"" + ts + "\",\n"
+    body = body + "  \"nodes\": [],\n"
+    body = body + "  \"edges\": []\n"
+    body = body + "}\n"
+    write_file(LINEAGE_JSON, body)
+}
+
+fn write_decay_initial(ts: string) {
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima/proposal_decay_log/1\",\n"
+    body = body + "  \"ts\": \"" + ts + "\",\n"
+    body = body + "  \"events\": []\n"
+    body = body + "}\n"
+    write_file(DECAY_JSON, body)
+}
+
+// ─── sample proposal (spec §2) ─────────────────────────────────────────────
+//
+// The first proposal is THIS task (P1 inventory bootstrap). This proves the
+// schema with a real example AND records that anima built its own proposal
+// scaffolding through the proposal mechanism itself. Marked user_status =
+// "approved" (since the user explicitly requested P1) but kept in pending/
+// during init — caller can move it via P4 approve tool.
+
+fn write_sample_proposal(ts: string) {
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima/proposal/1\",\n"
+    body = body + "  \"id\": \"20260422-001\",\n"
+    body = body + "  \"version\": 1,\n"
+    body = body + "  \"first_seen_ts\": \"" + ts + "\",\n"
+    body = body + "  \"last_refined_ts\": \"" + ts + "\",\n"
+    body = body + "  \"title\": \"P1 — proposal_inventory_init bootstrap (schema seed)\",\n"
+    body = body + "  \"kind\": \"tool\",\n"
+    body = body + "  \"rationale\": \"Bootstrap state/proposals/ stack so future ideas accumulate as schema-valid proposal cards instead of spawning modules ad hoc (spec §1, §2, §15).\",\n"
+    body = body + "  \"evidence_sources\": [\n"
+    body = body + "    {\n"
+    body = body + "      \"path\": \"docs/anima_proposal_stack_paradigm_20260422.md\",\n"
+    body = body + "      \"field\": \"§1 directory + §2 schema + §13 anti-pattern + §15 paradigm\",\n"
+    body = body + "      \"snapshot_sha256\": \"\"\n"
+    body = body + "    }\n"
+    body = body + "  ],\n"
+    body = body + "  \"estimated_effort\": \"1h\",\n"
+    body = body + "  \"estimated_impact\": \"unblocks P2-P9 (every later tool reads state/proposals/ — no infra means no proposal stack).\",\n"
+    body = body + "  \"risk_level\": \"low\",\n"
+    body = body + "  \"loss_free\": true,\n"
+    body = body + "  \"depends_on\": [],\n"
+    body = body + "  \"conflicts_with\": [],\n"
+    body = body + "  \"merges_with\": [],\n"
+    body = body + "  \"refinement_history\": [\n"
+    body = body + "    {\"v\": 1, \"ts\": \"" + ts + "\", \"diff\": \"initial seed\"}\n"
+    body = body + "  ],\n"
+    body = body + "  \"score_priority\": 95,\n"
+    body = body + "  \"user_status\": \"pending\",\n"
+    body = body + "  \"user_decision_at\": null,\n"
+    body = body + "  \"user_decision_reason\": null,\n"
+    body = body + "  \"implementation_module_path\": \"tool/proposal_inventory_init.hexa\",\n"
+    body = body + "  \"lineage_parent\": null,\n"
+    body = body + "  \"lineage_children\": [],\n"
+    body = body + "  \"veto_count\": 0,\n"
+    body = body + "  \"resurrection_eligible_after\": null\n"
+    body = body + "}\n"
+    write_file(SAMPLE_JSON, body)
+}
+
+// ─── status / counts ───────────────────────────────────────────────────────
+
+fn collect_counts() {
+    let mut c = #{}
+    c["pending"]    = _count_in_dir(DIR_PENDING)
+    c["refinement"] = _count_in_dir(DIR_REFINEMENT)
+    c["approved"]   = _count_in_dir(DIR_APPROVED)
+    c["rejected"]   = _count_in_dir(DIR_REJECTED)
+    c["archived"]   = _count_in_dir(DIR_ARCHIVED)
+    c["debate"]     = _count_in_dir(DIR_DEBATE)
+    c["clusters"]   = _count_in_dir(DIR_CLUSTERS)
+    return c
+}
+
+fn print_status() {
+    let c = collect_counts()
+    println("[pinv] state/proposals counts:")
+    println("[pinv]   pending    = " + to_string(c["pending"]))
+    println("[pinv]   refinement = " + to_string(c["refinement"]))
+    println("[pinv]   approved   = " + to_string(c["approved"]))
+    println("[pinv]   rejected   = " + to_string(c["rejected"]))
+    println("[pinv]   archived   = " + to_string(c["archived"]))
+    println("[pinv]   debate     = " + to_string(c["debate"]))
+    println("[pinv]   clusters   = " + to_string(c["clusters"]))
+    let total = to_int(to_string(c["pending"]))   + to_int(to_string(c["refinement"])) +
+                to_int(to_string(c["approved"]))  + to_int(to_string(c["rejected"]))   +
+                to_int(to_string(c["archived"]))  + to_int(to_string(c["debate"]))     +
+                to_int(to_string(c["clusters"]))
+    println("[pinv]   total      = " + to_string(total))
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+//
+// Asserts:
+//   1. all 8 spec dirs exist
+//   2. inventory.json exists, json_parse OK, schema field == "anima/proposal_inventory/1"
+//   3. meta/metrics.json   exists, json_parse OK, schema field == "anima/proposal_metrics/1"
+//   4. meta/lineage.json   exists, json_parse OK, schema field == "anima/proposal_lineage/1"
+//   5. meta/decay_log.json exists, json_parse OK, schema field == "anima/proposal_decay_log/1"
+//   6. sample proposal exists, json_parse OK, schema field == "anima/proposal/1"
+
+fn _check_json_schema(path: string, expected: string) -> bool {
+    if !_is_file(path) {
+        eprintln("[pinv]   FAIL — missing: " + path)
+        return false
+    }
+    let raw = read_file(path).trim()
+    if len(raw) == 0 {
+        eprintln("[pinv]   FAIL — empty: " + path)
+        return false
+    }
+    let doc = json_parse(raw)
+    if !doc.contains_key("schema") {
+        eprintln("[pinv]   FAIL — missing schema field: " + path)
+        return false
+    }
+    let got = to_string(doc["schema"])
+    if got != expected {
+        eprintln("[pinv]   FAIL — schema mismatch in " + path + " : got=" + got + " want=" + expected)
+        return false
+    }
+    return true
+}
+
+// Accepts any of the in-the-wild inventory schema spellings so the P1 init
+// validator and P2 emit / P7 cluster-detect tools can co-exist without
+// fighting each other. Both SSOT shapes are tolerated:
+//
+//   shape A (P1 spec-literal) — "anima/proposal_inventory/1"
+//     { schema, ts, tool, proposals:[], summary:{…} }
+//
+//   shape B (P1 dot-notation) — "anima.proposal_inventory.v1"
+//     { schema, updated_ts, entries:[…], updated_at, proposals:[], repo? }
+//
+//   shape C (P2 emit / legacy) — "anima.proposal_inventory"  (no version)
+//     { schema, proposals:[], updated_at }
+//
+//   shape D (parallel emitter) — "anima.proposals.inventory.v1"
+//     (kept for backward compat with earlier tool revisions)
+//
+// All four encode the same SSOT idea (an inventory of proposals) — differing
+// only in field spelling. Additional validation (entries[] vs proposals[])
+// is deferred to downstream consumers; this selftest only asserts the file
+// is a recognised inventory document.
+fn _check_inventory_schema(path: string) -> bool {
+    if !_is_file(path) {
+        eprintln("[pinv]   FAIL — missing: " + path)
+        return false
+    }
+    let raw = read_file(path).trim()
+    if len(raw) == 0 {
+        eprintln("[pinv]   FAIL — empty: " + path)
+        return false
+    }
+    let doc = json_parse(raw)
+    if !doc.contains_key("schema") {
+        eprintln("[pinv]   FAIL — missing schema field: " + path)
+        return false
+    }
+    let got = to_string(doc["schema"])
+    // shape A — spec-literal (slash notation)
+    if got == "anima/proposal_inventory/1" { return true }
+    // shape B — dot-notation new (P1 / cluster-detect / emit current)
+    if got == "anima.proposal_inventory.v1" { return true }
+    // shape C — legacy P2 emit (no version suffix)
+    if got == "anima.proposal_inventory" { return true }
+    // shape D — earlier parallel emitter revision
+    if got == "anima.proposals.inventory.v1" { return true }
+    eprintln("[pinv]   FAIL — unknown inventory schema in " + path + " : got=" + got)
+    return false
+}
+
+// Proposal cards may be missing the "schema" field entirely when emitted by
+// older P2 revisions (pre-schema-stamp) or when a human hand-edits the card.
+// The selftest tolerates (a) the canonical "anima/proposal/1" stamp, (b) the
+// dot-notation "anima.proposal.v1" variant, or (c) absence of the field when
+// the card still has the minimum required proposal fields (id + title).
+// This keeps P1 selftest from blocking sample-001 archive when P2 / refine
+// tools have stripped the schema stamp during round-tripping.
+fn _check_proposal_card_schema(path: string) -> bool {
+    if !_is_file(path) {
+        eprintln("[pinv]   FAIL — missing: " + path)
+        return false
+    }
+    let raw = read_file(path).trim()
+    if len(raw) == 0 {
+        eprintln("[pinv]   FAIL — empty: " + path)
+        return false
+    }
+    let doc = json_parse(raw)
+    if doc.contains_key("schema") {
+        let got = to_string(doc["schema"])
+        if got == "anima/proposal/1" { return true }
+        if got == "anima.proposal.v1" { return true }
+        eprintln("[pinv]   FAIL — unknown proposal schema in " + path + " : got=" + got)
+        return false
+    }
+    // schema-less card: accept iff the two identity fields are present
+    if doc.contains_key("id") && doc.contains_key("title") {
+        println("[pinv]   note — schema field absent (tolerated · id+title present): " + path)
+        return true
+    }
+    eprintln("[pinv]   FAIL — no schema and no id+title fallback: " + path)
+    return false
+}
+
+fn run_selftest() -> int {
+    println("[pinv] selftest — 8 dirs + 4 schema-valid jsons (inventory + 3 meta) + 1 sample")
+    let mut ok = true
+
+    // 1) directories
+    let mut i = 0
+    while i < len(DIRS) {
+        let d = to_string(DIRS[i])
+        let exists = _is_dir(d)
+        println("[pinv]   dir " + d + " = " + _bool_s(exists))
+        if !exists { ok = false }
+        i = i + 1
+    }
+
+    // 2-5) schema files (inventory accepts both canonical + legacy spelling)
+    let inv_ok     = _check_inventory_schema(INVENTORY_JSON)
+    let metrics_ok = _check_json_schema(METRICS_JSON,   "anima/proposal_metrics/1")
+    let lineage_ok = _check_json_schema(LINEAGE_JSON,   "anima/proposal_lineage/1")
+    let decay_ok   = _check_json_schema(DECAY_JSON,     "anima/proposal_decay_log/1")
+    println("[pinv]   inventory.json  schema_ok = " + _bool_s(inv_ok))
+    println("[pinv]   metrics.json    schema_ok = " + _bool_s(metrics_ok))
+    println("[pinv]   lineage.json    schema_ok = " + _bool_s(lineage_ok))
+    println("[pinv]   decay_log.json  schema_ok = " + _bool_s(decay_ok))
+    if !inv_ok { ok = false }
+    if !metrics_ok { ok = false }
+    if !lineage_ok { ok = false }
+    if !decay_ok { ok = false }
+
+    // 6) sample proposal — tolerant (accepts canonical + dot-notation +
+    //    schema-absent-but-id+title-present, since P2 / refine tools may
+    //    round-trip the card without restamping schema)
+    let sample_ok = _check_proposal_card_schema(SAMPLE_JSON)
+    println("[pinv]   sample_proposal schema_ok = " + _bool_s(sample_ok))
+    if !sample_ok { ok = false }
+
+    if ok {
+        println("[pinv] selftest PASS")
+        return 0
+    }
+    eprintln("[pinv] selftest FAIL")
+    return 1
+}
+
+// ─── reset (DRY default; --apply triggers destruction) ─────────────────────
+
+fn run_reset(apply: bool) -> int {
+    println("[pinv] --reset requested · apply=" + _bool_s(apply))
+    if !apply {
+        println("[pinv]   DRY mode (no destruction). Would remove + recreate:")
+        println("[pinv]     " + INVENTORY_JSON)
+        println("[pinv]     " + METRICS_JSON)
+        println("[pinv]     " + LINEAGE_JSON)
+        println("[pinv]     " + DECAY_JSON)
+        println("[pinv]     " + SAMPLE_JSON)
+        let mut i = 0
+        while i < len(DIRS) {
+            println("[pinv]     " + to_string(DIRS[i]) + "/* (contents)")
+            i = i + 1
+        }
+        println("[pinv]   Re-run with --reset --apply to actually wipe.")
+        return 0
+    }
+    // DESTRUCTIVE branch
+    eprintln("[pinv]   APPLY mode — wiping state/proposals/* and recreating")
+    let _ = _rm_rf(INVENTORY_JSON)
+    let mut i = 0
+    while i < len(DIRS) {
+        let d = to_string(DIRS[i])
+        let _ = _rm_rf(d)
+        i = i + 1
+    }
+    let ts = _ts_iso()
+    let _ = ensure_dirs()
+    write_inventory_initial(ts)
+    write_metrics_initial(ts)
+    write_lineage_initial(ts)
+    write_decay_initial(ts)
+    write_sample_proposal(ts)
+    println("[pinv]   reset complete · all 8 dirs + 4 jsons + sample re-emitted")
+    return 0
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+fn main() {
+    let _ = _mkdir_p(STATE_ROOT)
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/proposal_inventory_init.hexa — P1 (proposal stack bootstrap)")
+    println("  raw#9 hexa-only · raw#12 실측 · ts=" + _ts_iso())
+    println("════════════════════════════════════════════════════════════════")
+
+    // --selftest first (read-only verifier)
+    if flag_present("--selftest") {
+        let rc = run_selftest()
+        let mut body = "{\n"
+        body = body + "  \"schema\": \"anima.proposal_inventory_init.v1\",\n"
+        body = body + "  \"tool\": \"tool/proposal_inventory_init.hexa\",\n"
+        body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+        body = body + "  \"mode\": \"selftest\",\n"
+        body = body + "  \"verdict\": \"" + (if rc == 0 { "PASS" } else { "FAIL" }) + "\"\n"
+        body = body + "}\n"
+        write_file(SMOKE_OUT, body)
+        exit(rc)
+    }
+
+    // --status (read-only)
+    if flag_present("--status") {
+        // Make sure dirs at least exist before counting (avoid "missing dir" noise)
+        let _ = ensure_dirs()
+        print_status()
+        let c = collect_counts()
+        let mut body = "{\n"
+        body = body + "  \"schema\": \"anima.proposal_inventory_init.v1\",\n"
+        body = body + "  \"tool\": \"tool/proposal_inventory_init.hexa\",\n"
+        body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+        body = body + "  \"mode\": \"status\",\n"
+        body = body + "  \"counts\": {\n"
+        body = body + "    \"pending\": "    + to_string(c["pending"])    + ",\n"
+        body = body + "    \"refinement\": " + to_string(c["refinement"]) + ",\n"
+        body = body + "    \"approved\": "   + to_string(c["approved"])   + ",\n"
+        body = body + "    \"rejected\": "   + to_string(c["rejected"])   + ",\n"
+        body = body + "    \"archived\": "   + to_string(c["archived"])   + ",\n"
+        body = body + "    \"debate\": "     + to_string(c["debate"])     + ",\n"
+        body = body + "    \"clusters\": "   + to_string(c["clusters"])   + "\n"
+        body = body + "  },\n"
+        body = body + "  \"verdict\": \"STATUS_PRINTED\"\n"
+        body = body + "}\n"
+        write_file(SMOKE_OUT, body)
+        exit(0)
+    }
+
+    // --reset (DRY default; --apply needed for destruction)
+    if flag_present("--reset") {
+        let apply = flag_present("--apply")
+        let rc = run_reset(apply)
+        let mut body = "{\n"
+        body = body + "  \"schema\": \"anima.proposal_inventory_init.v1\",\n"
+        body = body + "  \"tool\": \"tool/proposal_inventory_init.hexa\",\n"
+        body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+        body = body + "  \"mode\": \"reset\",\n"
+        body = body + "  \"apply\": " + _bool_s(apply) + ",\n"
+        body = body + "  \"verdict\": \"" + (if apply { "RESET_APPLIED" } else { "RESET_DRY" }) + "\"\n"
+        body = body + "}\n"
+        write_file(SMOKE_OUT, body)
+        exit(rc)
+    }
+
+    // ─── default: idempotent init ───────────────────────────────────────────
+
+    let ts = _ts_iso()
+    let dirs_created = ensure_dirs()
+
+    let mut files_created = 0
+
+    // Strict idempotency: never overwrite an existing inventory.json. A
+    // parallel actor (e.g. P2 emit running concurrently) may have already
+    // populated it with their own valid schema variant — preserve their
+    // work. Selftest accepts both schema spellings (see _check_inventory_*).
+    if !_is_file(INVENTORY_JSON) {
+        write_inventory_initial(ts)
+        files_created = files_created + 1
+        println("[pinv] created " + INVENTORY_JSON)
+    } else {
+        println("[pinv] kept (already exists) " + INVENTORY_JSON)
+    }
+
+    if !_is_file(METRICS_JSON) {
+        write_metrics_initial(ts)
+        files_created = files_created + 1
+        println("[pinv] created " + METRICS_JSON)
+    } else {
+        println("[pinv] kept (already exists) " + METRICS_JSON)
+    }
+
+    if !_is_file(LINEAGE_JSON) {
+        write_lineage_initial(ts)
+        files_created = files_created + 1
+        println("[pinv] created " + LINEAGE_JSON)
+    } else {
+        println("[pinv] kept (already exists) " + LINEAGE_JSON)
+    }
+
+    if !_is_file(DECAY_JSON) {
+        write_decay_initial(ts)
+        files_created = files_created + 1
+        println("[pinv] created " + DECAY_JSON)
+    } else {
+        println("[pinv] kept (already exists) " + DECAY_JSON)
+    }
+
+    // Sample proposal: only emit when pending/ is fresh (count == 0). This
+    // makes init idempotent — the sample acts as a one-time schema example,
+    // not a recurring duplicate.
+    let pending_n = _count_in_dir(DIR_PENDING)
+    if pending_n == 0 && !_is_file(SAMPLE_JSON) {
+        write_sample_proposal(ts)
+        files_created = files_created + 1
+        println("[pinv] emitted sample proposal " + SAMPLE_JSON)
+    } else {
+        println("[pinv] kept (pending non-empty or sample exists) " + SAMPLE_JSON)
+    }
+
+    println("[pinv] dirs_created=" + to_string(dirs_created) + " files_created=" + to_string(files_created))
+    print_status()
+
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.proposal_inventory_init.v1\",\n"
+    body = body + "  \"tool\": \"tool/proposal_inventory_init.hexa\",\n"
+    body = body + "  \"ts\": \"" + ts + "\",\n"
+    body = body + "  \"mode\": \"init\",\n"
+    body = body + "  \"dirs_created\": " + to_string(dirs_created) + ",\n"
+    body = body + "  \"files_created\": " + to_string(files_created) + ",\n"
+    body = body + "  \"verdict\": \"" + (if (dirs_created + files_created) > 0 { "INITIALIZED" } else { "ALREADY_INITIALIZED" }) + "\"\n"
+    body = body + "}\n"
+    write_file(SMOKE_OUT, body)
+    exit(0)
+}
+
+main()

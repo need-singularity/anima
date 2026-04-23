@@ -1,0 +1,295 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/l3_pre_launch_validate.hexa — ROI item E27
+//
+//  PURPOSE
+//    Pre-launch (PRE-H100) sanity check that the L3 emergence pre-registered
+//    criteria are intact AND that the synthetic discriminative protocol still
+//    passes on this exact tree, BEFORE H100 × 4 kickoff.  Eliminates
+//    "post-launch surprise" where the criteria file is stale or the protocol
+//    has regressed undetected.
+//
+//  CHECKS
+//    1. state/l3_emergence_criteria.json exists, well-formed, has rev field.
+//    2. tool/l3_emergence_protocol_spec.hexa runs cleanly (exit 0) AND emits
+//       state/l3_emergence_protocol_spec.json with
+//       verdict == SPEC_VERIFIED_PENDING_TRAINED_POPULATION.
+//    3. discrimination_summary.all == true in the emitted protocol JSON.
+//
+//  EMIT
+//    state/l3_pre_launch_validate.json
+//      {
+//        "schema": "anima/l3_pre_launch_validate/1",
+//        "generated_at": "<iso>",
+//        "criteria_present": bool,
+//        "criteria_rev":     "<int>",
+//        "protocol_exit":    int,
+//        "protocol_verdict": "<str>",
+//        "discrimination_all": bool,
+//        "verdict": "PRE_LAUNCH_OK | PRE_LAUNCH_BLOCK"
+//      }
+//
+//  USAGE
+//    hexa run tool/l3_pre_launch_validate.hexa
+//    hexa run tool/l3_pre_launch_validate.hexa --print
+//    hexa run tool/l3_pre_launch_validate.hexa --dry-run    (skips protocol exec)
+//
+//  EXIT
+//    0 = PRE_LAUNCH_OK
+//    1 = PRE_LAUNCH_BLOCK
+//    3 = --dry-run
+//
+//  HARD CONSTRAINTS
+//    - Hexa-only, deterministic
+//    - Read-only on every input (criteria.json) and on the protocol spec tool
+//    - Idempotent: same inputs → same output bytes (modulo timestamp)
+//    - Side-effect: writes ONLY state/l3_pre_launch_validate.json (and the
+//      protocol tool itself writes state/l3_emergence_protocol_spec.json,
+//      which is its existing canonical SSOT — no extra side-effects from us).
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT     = "/Users/ghost/core/anima"
+let CRITERIA_PATH  = "/Users/ghost/core/anima/state/l3_emergence_criteria.json"
+let PROTOCOL_TOOL  = "/Users/ghost/core/anima/tool/l3_emergence_protocol_spec.hexa"
+let PROTOCOL_OUT   = "/Users/ghost/core/anima/state/l3_emergence_protocol_spec.json"
+let OUT_PATH       = "/Users/ghost/core/anima/state/l3_pre_launch_validate.json"
+let HEXA_BIN       = "/Users/ghost/Dev/hexa-lang/hexa"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return to_string(x)
+}
+
+// Native primitive honors SOURCE_DATE_EPOCH / HEXA_REPRODUCIBLE=1 (hexa-lang PR #23).
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _ts_iso() -> string { return _str(utc_iso_now()) }
+
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool {
+    return _str(exec("test -e " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _bool_str(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// argv
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) {
+        o.push(a[i])
+        i = i + 1
+    }
+    return o
+}
+
+fn _has_flag(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// tolerant JSON field read — copy of an11_ensemble._field_str (stage1
+// index_of(s,from) ignores `from`, so we hand-search after the key).
+
+fn _field_str(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let n0 = len(blob)
+    let key_end = k + len(needle)
+    let mut colon = -1
+    let mut ci = key_end
+    while ci < n0 {
+        if blob.substring(ci, ci + 1) == ":" {
+            colon = ci
+            break
+        }
+        ci = ci + 1
+    }
+    if colon < 0 { return "" }
+    let mut i = colon + 1
+    let n = len(blob)
+    while i < n {
+        let c = blob.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 } else { break }
+    }
+    if i >= n { return "" }
+    let first = blob.substring(i, i + 1)
+    if first != "\"" { return "" }
+    let start = i + 1
+    let mut j = start
+    while j < n {
+        let cc = blob.substring(j, j + 1)
+        if cc == "\\" { j = j + 2 } else {
+            if cc == "\"" { return blob.substring(start, j) }
+            j = j + 1
+        }
+    }
+    return ""
+}
+
+// extract numeric (rev) — search for "rev" key, then read int after colon
+fn _field_int_after(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let n0 = len(blob)
+    let key_end = k + len(needle)
+    let mut colon = -1
+    let mut ci = key_end
+    while ci < n0 {
+        if blob.substring(ci, ci + 1) == ":" {
+            colon = ci
+            break
+        }
+        ci = ci + 1
+    }
+    if colon < 0 { return "" }
+    let mut i = colon + 1
+    let n = len(blob)
+    while i < n {
+        let c = blob.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 } else { break }
+    }
+    let start = i
+    while i < n {
+        let c2 = blob.substring(i, i + 1)
+        let code = char_code(c2, 0)
+        if code >= 48 && code <= 57 { i = i + 1 } else { break }
+    }
+    if i == start { return "" }
+    return blob.substring(start, i)
+}
+
+fn _bool_field(blob: string, key: string) -> bool {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return false }
+    let n0 = len(blob)
+    let key_end = k + len(needle)
+    let mut colon = -1
+    let mut ci = key_end
+    while ci < n0 {
+        if blob.substring(ci, ci + 1) == ":" {
+            colon = ci
+            break
+        }
+        ci = ci + 1
+    }
+    if colon < 0 { return false }
+    let mut i = colon + 1
+    let n = len(blob)
+    while i < n {
+        let c = blob.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 } else { break }
+    }
+    if i + 4 > n { return false }
+    return blob.substring(i, i + 4) == "true"
+}
+
+fn _emit(out: string, ts: string, criteria_present: bool, criteria_rev: string, protocol_exit: int, protocol_verdict: string, discrimination_all: bool, verdict: string, dry: bool, note: string) {
+    let mut s = "{\n"
+    s = s + "  \"schema\":               \"anima/l3_pre_launch_validate/1\",\n"
+    s = s + "  \"tool\":                 \"tool/l3_pre_launch_validate.hexa\",\n"
+    s = s + "  \"generated_at\":         \"" + _json_escape(ts) + "\",\n"
+    s = s + "  \"dry_run\":              " + _bool_str(dry) + ",\n"
+    s = s + "  \"criteria_path\":        \"" + _json_escape(CRITERIA_PATH) + "\",\n"
+    s = s + "  \"criteria_present\":     " + _bool_str(criteria_present) + ",\n"
+    s = s + "  \"criteria_rev\":         \"" + _json_escape(criteria_rev) + "\",\n"
+    s = s + "  \"protocol_tool\":        \"" + _json_escape(PROTOCOL_TOOL) + "\",\n"
+    s = s + "  \"protocol_out\":         \"" + _json_escape(PROTOCOL_OUT) + "\",\n"
+    s = s + "  \"protocol_exit\":        " + to_string(protocol_exit) + ",\n"
+    s = s + "  \"protocol_verdict\":     \"" + _json_escape(protocol_verdict) + "\",\n"
+    s = s + "  \"discrimination_all\":   " + _bool_str(discrimination_all) + ",\n"
+    s = s + "  \"verdict\":              \"" + _json_escape(verdict) + "\",\n"
+    s = s + "  \"note\":                 \"" + _json_escape(note) + "\",\n"
+    s = s + "  \"policy\": {\n"
+    s = s + "    \"side_effects\":      \"verdict_file_only\",\n"
+    s = s + "    \"modifies_roadmap\":  false,\n"
+    s = s + "    \"safe_to_repeat\":    true,\n"
+    s = s + "    \"deterministic\":     true\n"
+    s = s + "  }\n"
+    s = s + "}\n"
+    write_file(out, s)
+}
+
+fn main() {
+    let av = _argv()
+    let dry = _has_flag(av, "--dry-run")
+    let also_print = _has_flag(av, "--print")
+    let ts = _ts_iso()
+
+    println("[l3_pre_launch] " + ts + "  dry=" + _bool_str(dry))
+
+    // ── 1) criteria file presence + rev
+    let criteria_present = _file_exists(CRITERIA_PATH)
+    let mut criteria_rev = ""
+    if criteria_present {
+        let c_blob = _str(read_file(CRITERIA_PATH))
+        criteria_rev = _field_int_after(c_blob, "rev")
+        println("  criteria: present=true rev=" + criteria_rev)
+    } else {
+        println("  criteria: present=false")
+    }
+
+    // ── 2) run protocol spec (skip in --dry-run)
+    let mut protocol_exit = 0
+    let mut protocol_verdict = ""
+    let mut discrimination_all = false
+    let mut note = "live_inputs"
+
+    if dry {
+        protocol_verdict = "SPEC_VERIFIED_PENDING_TRAINED_POPULATION"
+        discrimination_all = true
+        note = "synthetic_dry_run (protocol exec skipped)"
+        println("  protocol: skipped (dry-run)")
+    } else {
+        let cmd = HEXA_BIN + " run " + PROTOCOL_TOOL + " 2>&1"
+        let out_str = _str(exec(cmd))
+        // exec() does not return exit code — infer from emitted file presence.
+        if _file_exists(PROTOCOL_OUT) {
+            let p_blob = _str(read_file(PROTOCOL_OUT))
+            protocol_verdict = _field_str(p_blob, "verdict")
+            // discrimination_summary.all is boolean; tolerate either inner or outer.
+            discrimination_all = _bool_field(p_blob, "all")
+            // overall protocol exit: 0 if verdict is SPEC_VERIFIED, else 1
+            if protocol_verdict == "SPEC_VERIFIED_PENDING_TRAINED_POPULATION" {
+                protocol_exit = 0
+            } else {
+                protocol_exit = 1
+            }
+        } else {
+            protocol_exit = 1
+            note = "protocol_out_missing"
+        }
+        println("  protocol: exit=" + to_string(protocol_exit) + " verdict=" + protocol_verdict + " discriminative=" + _bool_str(discrimination_all))
+    }
+
+    // ── verdict
+    let mut verdict = "PRE_LAUNCH_BLOCK"
+    if criteria_present && discrimination_all && protocol_exit == 0 {
+        verdict = "PRE_LAUNCH_OK"
+    }
+
+    _emit(OUT_PATH, ts, criteria_present, criteria_rev, protocol_exit, protocol_verdict, discrimination_all, verdict, dry, note)
+    println("  emit=" + OUT_PATH)
+    println("  verdict=" + verdict)
+    if also_print {
+        let body = _str(read_file(OUT_PATH))
+        println(body)
+    }
+
+    if dry { exit(3) }
+    if verdict == "PRE_LAUNCH_OK" { exit(0) }
+    exit(1)
+}

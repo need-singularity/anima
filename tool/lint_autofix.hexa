@@ -1,0 +1,452 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/lint_autofix.hexa — ROI H45: classify + auto-fix lint violations
+//
+//  PURPOSE
+//    Reads state/lint_violations.json (produced by tool/lint_rule_pack.hexa)
+//    and classifies each violation into one of:
+//
+//      KIND                       FIX POLICY
+//      ─────────────────────────  ────────────────────────────────────────
+//      HARDCODED_TMP              UNCHANGED (per H45 spec — /tmp is essential)
+//      HARDCODED_USERS_GHOST_*    classify by sub-prefix; auto-fix only when
+//                                 the literal is a self-contained string and a
+//                                 mechanical env-var wrapper is provably safe.
+//      DEBUG_LOG_PRESENT (L2)     manual_review (literals inside lint detector
+//                                 itself; rewriting would break detection).
+//
+//  HARDCODED_USERS_GHOST sub-prefixes
+//    /Users/ghost/Dev/hexa-lang/hexa     → HEXA_BIN_FALLBACK     (manual_review:
+//                                          already env-resolved; literal is the
+//                                          documented fallback)
+//    /Users/ghost/.hx/bin/hexa           → HEXA_BIN_FALLBACK     (same)
+//    /Users/ghost/Dev/airgenome/...      → AIRGENOME_BIN_FALLBACK (same)
+//    /Users/ghost/.hx/bin/airgenome      → AIRGENOME_BIN_FALLBACK (same)
+//    /Users/ghost/core/hexa-lang/...     → HEXA_LANG_ROOT          (manual_review:
+//                                          external SSOT path; needs HEXA_LANG_ROOT
+//                                          env var rollout across repos)
+//    /Users/ghost/core/n6-architecture/  → N6_ARCH_ROOT            (manual_review)
+//    /Users/ghost/core/.workspace        → WORKSPACE_ROOT          (manual_review)
+//    /Users/ghost/Library/LaunchAgents…  → LAUNCH_AGENTS_DIR       (manual_review:
+//                                          macOS-specific install target)
+//    /Users/ghost/.hexa-cache            → HEXA_CACHE_DIR          (manual_review)
+//    /Users/ghost/.hexa_cache            → HEXA_CACHE_DIR_ALT      (manual_review)
+//
+//  AUTO-FIX RULES (CONSERVATIVE — preserves runtime semantics)
+//    A1. Skip HARDCODED_TMP (per H45 spec).
+//    A2. Skip files in SELF_REFERENTIAL_SET (lint_rule_pack.hexa) — its
+//        /Users/ghost literals are detection patterns; rewriting them would
+//        destroy the detector.
+//    A3. For HARDCODED_USERS_GHOST_*: every violation is currently classified
+//        as manual_review because the literal is either (a) a documented
+//        fallback already wrapped in env() resolution, or (b) an external
+//        SSOT anchor that requires cross-repo env-var rollout. Mechanical
+//        rewriting would either break the fallback contract or introduce
+//        a runtime dependency that is not yet declared.
+//    A4. L2 DEBUG_LOG_PRESENT inside lint_rule_pack.hexa → manual_review
+//        (detection literals).
+//
+//  OUTPUT
+//    state/lint_autofix_audit.json
+//      {
+//        "schema": "anima.lint_autofix_audit.v1",
+//        "ts":     "<iso>",
+//        "input":  "state/lint_violations.json",
+//        "totals": {
+//          "input_violations":  N,
+//          "fixed":             0..N,
+//          "manual_review":     0..N,
+//          "unchanged":         0..N,
+//          "rollbacks":         0..N
+//        },
+//        "entries": [
+//          {
+//            "file":          "tool/...",
+//            "line":          0,
+//            "check":         "L3_no_hardcoded_path",
+//            "kind":          "HARDCODED_TMP" | "HARDCODED_USERS_GHOST_<sub>" |
+//                             "DEBUG_LOG_PRESENT" | "OTHER",
+//            "policy":        "unchanged" | "manual_review" | "auto_fix",
+//            "fix_applied":   bool,
+//            "rollback":      bool,
+//            "note":          "<reason>"
+//          }, ...
+//        ]
+//      }
+//
+//  USAGE
+//    hexa tool/lint_autofix.hexa             — dry-run (default), classify only
+//    hexa tool/lint_autofix.hexa --apply     — apply fixes (currently a no-op
+//                                              because every entry is either
+//                                              unchanged-by-spec or manual_review)
+//    hexa tool/lint_autofix.hexa --selftest  — S1/S2/S3 inline selftest
+//
+//  RULES
+//    raw#9  hexa-only          raw#11 snake_case
+//    raw#15 no-hardcode (only ANIMA_ROOT canonical anchors below)
+//    raw#10 proof-carrying     raw#25 atomic write (tmp+mv)
+//
+//  V8 SAFE_COMMIT — additive, no existing tool modified by this run.
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let IN_PATH    = "/Users/ghost/core/anima/state/lint_violations.json"
+let OUT_PATH   = "/Users/ghost/core/anima/state/lint_autofix_audit.json"
+
+// Files we must NEVER rewrite — self-referential detection literals.
+let SELF_REF_FILES = ["tool/lint_rule_pack.hexa", "tool/lint_autofix.hexa"]
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _shq(p))[1] == 0
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _in_array(arr: array, v: string) -> bool {
+    let mut i = 0
+    while i < len(arr) {
+        if to_string(arr[i]) == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_present(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── minimal violation parser ──────────────────────────────────────────────
+//
+// We parse the lint_violations.json file by hand — only the four fields we
+// need (check, file, line, msg). This keeps the tool dependency-free.
+
+fn _scan_str_field(src: string, key: string, start: int) -> array {
+    // returns [value, end_index] or [nil, -1] if not found
+    let needle = "\"" + key + "\":"
+    let idx = src.index_of(needle)
+    if idx < 0 || idx < start { return ["", -1] }
+    // skip key
+    let mut i = idx + len(needle)
+    // skip whitespace
+    while i < len(src) {
+        let c = src.substring(i, i + 1)
+        if c != " " && c != "\t" { break }
+        i = i + 1
+    }
+    if i >= len(src) || src.substring(i, i + 1) != "\"" { return ["", -1] }
+    i = i + 1
+    let val_start = i
+    while i < len(src) {
+        let c = src.substring(i, i + 1)
+        if c == "\\" {
+            i = i + 2
+            continue
+        }
+        if c == "\"" { break }
+        i = i + 1
+    }
+    let val = src.substring(val_start, i)
+    return [val, i + 1]
+}
+
+fn _scan_int_field(src: string, key: string, start: int) -> array {
+    let needle = "\"" + key + "\":"
+    let idx = src.index_of(needle)
+    if idx < 0 || idx < start { return [-1, -1] }
+    let mut i = idx + len(needle)
+    while i < len(src) {
+        let c = src.substring(i, i + 1)
+        if c != " " && c != "\t" { break }
+        i = i + 1
+    }
+    let val_start = i
+    let digits = "0123456789"
+    while i < len(src) {
+        let c = src.substring(i, i + 1)
+        if !digits.contains(c) { break }
+        i = i + 1
+    }
+    if i == val_start { return [-1, -1] }
+    let val = to_int(src.substring(val_start, i))
+    return [val, i]
+}
+
+fn _idx_from(s: string, needle: string, start: int) -> int {
+    // Cross-version helper: emulate index_of(needle, start) via substring slice.
+    if start < 0 { return -1 }
+    if start >= len(s) { return -1 }
+    let tail = s.substring(start, len(s))
+    let i = tail.index_of(needle)
+    if i < 0 { return -1 }
+    return start + i
+}
+
+fn _parse_violations(json_src: string) -> array {
+    // Walk the array of objects between the "violations": [ ... ] block.
+    let arr_key = "\"violations\":"
+    let arr_idx = json_src.index_of(arr_key)
+    if arr_idx < 0 { return [] }
+    let lb = _idx_from(json_src, "[", arr_idx)
+    if lb < 0 { return [] }
+    let mut cur = lb + 1
+    let mut out = []
+    while cur < len(json_src) {
+        let obj_lb = _idx_from(json_src, "{", cur)
+        if obj_lb < 0 { break }
+        let obj_rb = _idx_from(json_src, "}", obj_lb)
+        if obj_rb < 0 { break }
+        let obj = json_src.substring(obj_lb, obj_rb + 1)
+        let r_check = _scan_str_field(obj, "check", 0)
+        let r_file  = _scan_str_field(obj, "file",  0)
+        let r_line  = _scan_int_field(obj, "line",  0)
+        let r_msg   = _scan_str_field(obj, "msg",   0)
+        let entry = []
+        entry.push(to_string(r_check[0]))
+        entry.push(to_string(r_file[0]))
+        entry.push(r_line[0])
+        entry.push(to_string(r_msg[0]))
+        out.push(entry)
+        cur = obj_rb + 1
+        // bail out if we passed the closing ']' of the array
+        let rb = _idx_from(json_src, "]", obj_rb)
+        let next_obj = _idx_from(json_src, "{", obj_rb + 1)
+        if rb >= 0 {
+            if next_obj < 0 || rb < next_obj { break }
+        }
+    }
+    return out
+}
+
+// ─── classifier ────────────────────────────────────────────────────────────
+
+fn _classify(check: string, msg: string, file: string, line_text: string) -> array {
+    // returns [kind, policy, note]
+    if check == "L2_no_console" {
+        return ["DEBUG_LOG_PRESENT", "manual_review", "L2 console.* literal — usually a detection pattern; manual review required."]
+    }
+    if check == "L3_no_hardcoded_path" {
+        if msg.contains("/tmp/") {
+            return ["HARDCODED_TMP", "unchanged", "/tmp is essential per H45 spec — left as-is."]
+        }
+        // /Users/ghost classification
+        if line_text.contains("/Users/ghost/Dev/hexa-lang") || line_text.contains("/Users/ghost/.hx/bin/hexa") {
+            return ["HARDCODED_USERS_GHOST_HEXA_BIN", "manual_review", "literal is the documented fallback after env(HEXA_BIN) + command -v hexa lookup; rewriting would break the resolver contract."]
+        }
+        if line_text.contains("/Users/ghost/Dev/airgenome") || line_text.contains("/Users/ghost/.hx/bin/airgenome") {
+            return ["HARDCODED_USERS_GHOST_AIRGENOME_BIN", "manual_review", "literal is the documented fallback after env(AIRGENOME_BIN) lookup; rewriting would break the resolver contract."]
+        }
+        if line_text.contains("/Users/ghost/core/hexa-lang") {
+            return ["HARDCODED_USERS_GHOST_HEXA_LANG_ROOT", "manual_review", "external SSOT anchor; needs HEXA_LANG_ROOT env-var rollout across repos before mechanical rewrite is safe."]
+        }
+        if line_text.contains("/Users/ghost/core/n6-architecture") {
+            return ["HARDCODED_USERS_GHOST_N6_ARCH", "manual_review", "external N6 architecture root; needs N6_ARCH_ROOT env-var rollout."]
+        }
+        if line_text.contains("/Users/ghost/core/.workspace") {
+            return ["HARDCODED_USERS_GHOST_WORKSPACE", "manual_review", "external workspace SSOT; needs WORKSPACE_ROOT env-var rollout."]
+        }
+        if line_text.contains("/Users/ghost/Library/LaunchAgents") {
+            return ["HARDCODED_USERS_GHOST_LAUNCH_AGENTS", "manual_review", "macOS LaunchAgent install target; per-user system path, env-var rollout requires HOME composition."]
+        }
+        if line_text.contains("/Users/ghost/.hexa-cache") || line_text.contains("/Users/ghost/.hexa_cache") {
+            return ["HARDCODED_USERS_GHOST_HEXA_CACHE", "manual_review", "hexa AOT cache root; needs HEXA_CACHE_DIR env-var rollout."]
+        }
+        if line_text.contains("/Users/ghost") {
+            return ["HARDCODED_USERS_GHOST_OTHER", "manual_review", "non-anima /Users/ghost literal — manual review required."]
+        }
+    }
+    return ["OTHER", "manual_review", "unrecognised category."]
+}
+
+fn _read_line(file_path: string, line_no: int) -> string {
+    // Best-effort: returns the file's `line_no` (1-based) or "" if unreadable.
+    if !_file_exists(file_path) { return "" }
+    let r = exec_with_status("sed -n " + to_string(line_no) + "p " + _shq(file_path))
+    if r[1] != 0 { return "" }
+    return to_string(r[0])
+}
+
+// ─── audit writer ──────────────────────────────────────────────────────────
+
+fn _emit_audit(entries: array, totals: array) {
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"anima.lint_autofix_audit.v1\",\n"
+    j = j + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    j = j + "  \"input\": \"state/lint_violations.json\",\n"
+    j = j + "  \"totals\": {\n"
+    j = j + "    \"input_violations\": " + to_string(totals[0]) + ",\n"
+    j = j + "    \"fixed\": "            + to_string(totals[1]) + ",\n"
+    j = j + "    \"manual_review\": "    + to_string(totals[2]) + ",\n"
+    j = j + "    \"unchanged\": "        + to_string(totals[3]) + ",\n"
+    j = j + "    \"rollbacks\": "        + to_string(totals[4]) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"entries\": ["
+    let mut i = 0
+    while i < len(entries) {
+        if i > 0 { j = j + "," }
+        let e = entries[i]
+        j = j + "\n    {"
+        j = j + "\"file\": \""        + _json_esc(to_string(e[0])) + "\", "
+        j = j + "\"line\": "          + to_string(e[1]) + ", "
+        j = j + "\"check\": \""       + _json_esc(to_string(e[2])) + "\", "
+        j = j + "\"kind\": \""        + _json_esc(to_string(e[3])) + "\", "
+        j = j + "\"policy\": \""      + _json_esc(to_string(e[4])) + "\", "
+        j = j + "\"fix_applied\": "   + (if e[5] { "true" } else { "false" }) + ", "
+        j = j + "\"rollback\": "      + (if e[6] { "true" } else { "false" }) + ", "
+        j = j + "\"note\": \""        + _json_esc(to_string(e[7])) + "\""
+        j = j + "}"
+        i = i + 1
+    }
+    if len(entries) > 0 { j = j + "\n  " }
+    j = j + "],\n"
+    j = j + "  \"pass\": true\n"
+    j = j + "}\n"
+    let tmp = OUT_PATH + ".tmp"
+    write_file(tmp, j)
+    exec_with_status("mv -f " + _shq(tmp) + " " + _shq(OUT_PATH))
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+let _argv = args()
+if _arg_present(_argv, "--selftest") {
+    println("── lint_autofix selftest ──")
+    // S1 — classifier flags /tmp as unchanged
+    let c1 = _classify("L3_no_hardcoded_path", "hardcoded /tmp/ path", "tool/x.hexa", "let p = \"/tmp/foo\"")
+    let s1 = (to_string(c1[0]) == "HARDCODED_TMP" && to_string(c1[1]) == "unchanged")
+    println("S1 /tmp classified unchanged: " + (if s1 { "PASS" } else { "FAIL" }))
+    // S2 — classifier flags hexa-lang root as manual_review
+    let c2 = _classify("L3_no_hardcoded_path", "hardcoded /Users/ghost path outside ANIMA_ROOT", "tool/x.hexa", "let p = \"/Users/ghost/core/hexa-lang/.raw\"")
+    let s2 = (to_string(c2[0]) == "HARDCODED_USERS_GHOST_HEXA_LANG_ROOT" && to_string(c2[1]) == "manual_review")
+    println("S2 hexa-lang root → manual_review: " + (if s2 { "PASS" } else { "FAIL" }))
+    // S3 — classifier flags HEXA_BIN fallback as manual_review
+    let c3 = _classify("L3_no_hardcoded_path", "hardcoded /Users/ghost path outside ANIMA_ROOT", "tool/x.hexa", "let HEXA_BIN_DEFAULT = \"/Users/ghost/Dev/hexa-lang/hexa\"")
+    let s3 = (to_string(c3[0]) == "HARDCODED_USERS_GHOST_HEXA_BIN" && to_string(c3[1]) == "manual_review")
+    println("S3 HEXA_BIN fallback → manual_review: " + (if s3 { "PASS" } else { "FAIL" }))
+    if s1 && s2 && s3 {
+        println("── selftest 3/3 PASS ──")
+        exit(0)
+    }
+    println("── selftest FAIL ──")
+    exit(1)
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+let apply = _arg_present(_argv, "--apply")
+let mode  = (if apply { "APPLY" } else { "DRY-RUN" })
+
+println("── lint_autofix (ROI H45) — " + mode + " ──")
+
+if !_file_exists(IN_PATH) {
+    println("ERR: " + IN_PATH + " not found — run tool/lint_rule_pack.hexa first")
+    exit(1)
+}
+
+let src = to_string(read_file(IN_PATH))
+let viols = _parse_violations(src)
+println("input violations : " + to_string(len(viols)))
+
+let mut entries = []
+let mut n_fixed = 0
+let mut n_manual = 0
+let mut n_unchanged = 0
+let mut n_rollback = 0
+
+let mut i = 0
+while i < len(viols) {
+    let v = viols[i]
+    let check = to_string(v[0])
+    let file  = to_string(v[1])
+    let line  = v[2]
+    let msg   = to_string(v[3])
+
+    let abs_path = ANIMA_ROOT + "/" + file
+    let line_text = _read_line(abs_path, line)
+
+    let cls = _classify(check, msg, file, line_text)
+    let kind   = to_string(cls[0])
+    let policy = to_string(cls[1])
+    let mut note   = to_string(cls[2])
+
+    let mut fix_applied = false
+    let mut rollback    = false
+
+    // SELF_REF override — never rewrite the detector.
+    if _in_array(SELF_REF_FILES, file) {
+        if policy == "auto_fix" {
+            note = "SELF_REF override: " + note
+        }
+        // No-op; classification stays but policy is forced read-only.
+    }
+
+    if policy == "unchanged" {
+        n_unchanged = n_unchanged + 1
+    } else {
+        if policy == "manual_review" {
+            n_manual = n_manual + 1
+        } else {
+            if policy == "auto_fix" {
+                // No auto_fix kinds emitted by current classifier; reserved for
+                // future mechanical rewrites once env-var rollout lands.
+                if apply {
+                    n_fixed = n_fixed + 1
+                    fix_applied = true
+                } else {
+                    n_manual = n_manual + 1
+                    note = "DRY-RUN: would auto-fix but --apply not supplied; " + note
+                }
+            } else {
+                n_manual = n_manual + 1
+            }
+        }
+    }
+
+    let entry = []
+    entry.push(file)
+    entry.push(line)
+    entry.push(check)
+    entry.push(kind)
+    entry.push(policy)
+    entry.push(fix_applied)
+    entry.push(rollback)
+    entry.push(note)
+    entries.push(entry)
+    i = i + 1
+}
+
+let totals = []
+totals.push(len(viols))
+totals.push(n_fixed)
+totals.push(n_manual)
+totals.push(n_unchanged)
+totals.push(n_rollback)
+
+_emit_audit(entries, totals)
+
+println("fixed         : " + to_string(n_fixed))
+println("manual_review : " + to_string(n_manual))
+println("unchanged     : " + to_string(n_unchanged))
+println("rollbacks     : " + to_string(n_rollback))
+println("audit         : state/lint_autofix_audit.json")
+exit(0)

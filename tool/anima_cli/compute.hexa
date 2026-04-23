@@ -1,0 +1,325 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/compute.hexa — anima CLI `compute` topic
+//
+//  PURPOSE
+//    COMPUTE-AGNOSTIC pod lifecycle orchestrator. Generalizes the legacy
+//    h100_* tool family into a `compute` namespace so future accelerator
+//    classes (H100, H200, B200, MI300X, TPU, …) plug in without renaming
+//    the CLI surface. The underlying tools retain their h100_* filenames
+//    per "do not touch existing tools"; this module is a thin wrapper.
+//
+//  SUBCOMMANDS
+//    status               1-page table (pod list + stage + burn + balance)
+//    status --statusline  1-line burn summary (delegates to statusline_h100_burn.hexa --live)
+//    status --statusline --json
+//                         machine-readable snapshot (schema anima/statusline_h100_burn/1)
+//    start <stage>        kickoff after user approval gate check
+//    stop <pod|all>       runpodctl pod delete
+//    watch                idle/credit/drift continuous poll (5m tick)
+//    cost                 session/cumulative spend + balance delta
+//    recover <pod>        wrap h100_pod_resume.bash
+//    ingest               wrap h100_post_launch_ingest.hexa
+//    preflight            wrap h100_stage2_unified_launch.bash dry-run
+//    --selftest           synthetic verify (no network)
+//    --help
+//
+//  DESIGN
+//    raw#9 hexa-only  raw#11 snake_case  raw#15 no-hardcode
+//    LLM=none. Idempotent. All remote calls are surfaced to the user's
+//    existing tool/* scripts — no duplicated runpodctl parsing here.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── shared helpers (vendored from _common.hexa) ──────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn _json_field(path: string, key: string) -> string {
+    if !_fexists(path) { return "" }
+    return _str(exec("jq -r '" + key + " // \"\"' " + path + " 2>/dev/null")).trim()
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _has_runpodctl() -> bool {
+    return _str(exec("command -v runpodctl >/dev/null 2>&1 && echo 1 || echo 0")).trim() == "1"
+}
+
+// ─── subcommands ──────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima compute — pod lifecycle (compute-agnostic)")
+    println("")
+    println("  status           1-page summary (pods + stage + burn + balance)")
+    println("  status --statusline [--json]   1-line burn (live runpodctl → manifest fallback)")
+    println("  start <stage>    kickoff (stage1|stage2|stage2_p1..p4) after approval")
+    println("  stop <pod|all>   delete pod(s)")
+    println("  watch [--arm]    idle/credit/drift poll (--arm → --apply: live runpodctl stop)")
+    println("  cost             session + cumulative spend")
+    println("  recover <pod>    resume pod via h100_pod_resume.bash")
+    println("  ingest           post-launch ingest cascade")
+    println("  preflight        stage2 dry-run (14 checks)")
+    println("  pods-sync        refresh config/h100_pods.json from runpodctl (auto-kill target)")
+    println("")
+    println("  --selftest       synthetic verify  --help  this text")
+}
+
+fn sub_status_statusline(as_json: bool) {
+    // Delegate to tool/statusline_h100_burn.hexa --live (with --json if asked).
+    // This is the canonical 1-line wrapper for shell/tmux/Claude-Code statuslines.
+    let root = _resolve_root()
+    let tool = root + "/tool/statusline_h100_burn.hexa"
+    if !_fexists(tool) {
+        println("compute status --statusline: tool missing (" + tool + ")")
+        exit(1)
+    }
+    let flags = if as_json { "--live --json" } else { "--live" }
+    let out = _str(exec("/Users/ghost/.hx/bin/hexa run " + tool + " " + flags + " 2>&1"))
+    println(out.trim())
+}
+
+fn sub_status() {
+    let root = _resolve_root()
+    let manifest = root + "/state/h100_launch_manifest.json"
+    let stage1   = root + "/state/convergence/h100_stage1_20260423.json"
+    let credit   = root + "/state/runpod_credit_status.json"
+
+    let v1 = _json_field(manifest, ".overall_verdict.stage1")
+    let v2 = _json_field(manifest, ".overall_verdict.stage2")
+    let v3 = _json_field(manifest, ".overall_verdict.stage3")
+    // schema v2 (2026-04-23): final_status moved under .convergence; fall back to v1 top-level for older writers.
+    let fs_v2 = _json_field(stage1, ".convergence.final_status")
+    let final_status = if fs_v2 == "" { _json_field(stage1, ".final_status") } else { fs_v2 }
+    let bal = _json_field(credit, ".balance_usd")
+    let thr = _json_field(credit, ".threshold_usd")
+    let alert = _json_field(credit, ".alert")
+
+    let has_rpc = _has_runpodctl()
+    let pods_line = "pods      : runpodctl_not_installed"
+    if has_rpc {
+        // runpodctl 1.x emits JSON array (default -o json); count via jq not line wc.
+        let pods = _str(exec("runpodctl pod list 2>/dev/null | jq 'length' 2>/dev/null | tr -d ' '")).trim()
+        pods_line = "pods      : " + pods + " running"
+    }
+
+    println("anima compute status  (" + _ts_iso() + ")")
+    println("─────────────────────────────────────────────")
+    println(pods_line)
+    println("stage1    : " + (if v1 == "" { "n/a" } else { v1 }))
+    println("stage2    : " + (if v2 == "" { "n/a" } else { v2 }))
+    println("stage3    : " + (if v3 == "" { "n/a" } else { v3 }))
+    println("last_run  : " + (if final_status == "" { "n/a" } else { final_status }))
+    println("balance   : $" + (if bal == "" { "?" } else { bal }) + " / thr $" + (if thr == "" { "?" } else { thr }) + "  alert=" + (if alert == "" { "?" } else { alert }))
+}
+
+fn sub_start(stage: string) {
+    let root = _resolve_root()
+    let gate = root + "/memory/feedback_h100_gate.md"
+    if !_fexists(gate) {
+        println("compute start: no user approval file (" + gate + ")")
+        println("  create the gate file with explicit 'launch go' before start.")
+        exit(1)
+    }
+    let manifest = root + "/state/h100_launch_manifest.json"
+    if !_fexists(manifest) {
+        println("compute start: manifest missing — run `hexa run tool/h100_launch_manifest_spec.hexa` first")
+        exit(1)
+    }
+    let key = ".one_command_kickoff." + stage
+    let cmd = _json_field(manifest, key)
+    if cmd == "" {
+        println("compute start: no kickoff command for stage=" + stage)
+        exit(1)
+    }
+    println("compute start: stage=" + stage + " — would execute:")
+    println("  " + cmd)
+    println("(dry echo — remove guard + re-run to apply; manual eval preserved)")
+}
+
+fn sub_stop(target: string) {
+    if !_has_runpodctl() {
+        println("compute stop: runpodctl not found")
+        exit(1)
+    }
+    if target == "all" {
+        // runpodctl 1.x JSON array (default -o json); extract .[].id via jq.
+        let ids = _str(exec("runpodctl pod list 2>/dev/null | jq -r '.[].id' 2>/dev/null")).trim()
+        if ids == "" { println("compute stop: no pods to stop"); return }
+        println("compute stop: deleting all pods:")
+        println(ids)
+        exec("runpodctl pod list 2>/dev/null | jq -r '.[].id' 2>/dev/null | xargs -I{} runpodctl pod delete {}")
+        return
+    }
+    println("compute stop: deleting pod " + target)
+    exec("runpodctl pod delete " + target)
+}
+
+fn sub_pods_sync() {
+    let root = _resolve_root()
+    let tool = root + "/tool/h100_pods_sync.bash"
+    if !_fexists(tool) {
+        println("compute pods-sync: h100_pods_sync.bash missing")
+        exit(1)
+    }
+    let out = _str(exec("bash " + tool + " 2>&1"))
+    println(out.trim())
+}
+
+fn sub_watch(arm: bool) {
+    let root = _resolve_root()
+    let tool = root + "/tool/h100_auto_kill.hexa"
+    if !_fexists(tool) {
+        println("compute watch: h100_auto_kill.hexa missing")
+        exit(1)
+    }
+    let mode = if arm { "--apply (ARMED — live runpodctl stop on idle)" } else { "dry-run" }
+    println("compute watch: delegating to h100_auto_kill.hexa · " + mode)
+    let flag = if arm { " --apply" } else { "" }
+    let out = _str(exec("/Users/ghost/.hx/bin/hexa run " + tool + flag + " 2>&1"))
+    println(out)
+}
+
+fn sub_cost() {
+    let root = _resolve_root()
+    // 2026-04-23: legacy state/h100_stage1_launch_state.json retired; convergence store lives under state/convergence/.
+    let s1 = root + "/state/convergence/h100_stage1_20260423.json"
+    let s2 = root + "/state/h100_stage2_launch_state.json"
+    let credit = root + "/state/runpod_credit_status.json"
+    // schema v2 path: .convergence.total_session_cost_usd. Fallback to legacy flat top-level for s2 (not yet migrated).
+    let c1v2 = _json_field(s1, ".convergence.total_session_cost_usd")
+    let c1 = if c1v2 == "" { _json_field(s1, ".total_session_cost_usd") } else { c1v2 }
+    let c2 = _json_field(s2, ".total_session_cost_usd")
+    let bal = _json_field(credit, ".balance_usd")
+    println("anima compute cost  (" + _ts_iso() + ")")
+    println("─────────────────────────────────────────────")
+    println("stage1 session : $" + (if c1 == "" { "0.00" } else { c1 }))
+    println("stage2 session : $" + (if c2 == "" { "0.00" } else { c2 }))
+    println("balance        : $" + (if bal == "" { "?" } else { bal }))
+}
+
+fn sub_recover(pod: string) {
+    let root = _resolve_root()
+    let tool = root + "/tool/h100_pod_resume.bash"
+    if !_fexists(tool) { println("compute recover: tool missing"); exit(1) }
+    println("compute recover: pod=" + pod)
+    let out = _str(exec("bash " + tool + " " + pod + " 2>&1"))
+    println(out)
+}
+
+fn sub_ingest() {
+    let root = _resolve_root()
+    let tool = root + "/tool/h100_post_launch_ingest.hexa"
+    if !_fexists(tool) { println("compute ingest: tool missing"); exit(1) }
+    println("compute ingest: delegating")
+    let out = _str(exec("/Users/ghost/.hx/bin/hexa run " + tool + " 2>&1"))
+    println(out)
+}
+
+fn sub_preflight() {
+    let root = _resolve_root()
+    let tool = root + "/tool/h100_stage2_unified_launch.bash"
+    if !_fexists(tool) { println("compute preflight: tool missing"); exit(1) }
+    println("compute preflight: stage2 dry-run")
+    // capture stdout + stderr and emit for the caller
+    let out = _str(exec("bash " + tool + " --dry-run 2>&1"))
+    println(out)
+}
+
+fn sub_selftest() {
+    // selftest is read-only: verify helper behavior + state paths resolvable
+    let root = _resolve_root()
+    if root == "" { println("FAIL compute.hexa selftest (root unresolved)"); exit(1) }
+    let manifest = root + "/state/h100_launch_manifest.json"
+    let _ = _json_field(manifest, ".overall_verdict.stage1")  // tolerate missing
+    println("PASS anima_cli/compute selftest")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") || len(argv) == 0 { sub_help(); return }
+    let sub = _str(argv[0])
+    if sub == "status" {
+        if _arg_present(argv, "--statusline") {
+            sub_status_statusline(_arg_present(argv, "--json"))
+            return
+        }
+        sub_status(); return
+    }
+    if sub == "start" {
+        if len(argv) < 2 { println("usage: anima compute start <stage>"); exit(2) }
+        sub_start(_str(argv[1])); return
+    }
+    if sub == "stop" {
+        if len(argv) < 2 { println("usage: anima compute stop <pod|all>"); exit(2) }
+        sub_stop(_str(argv[1])); return
+    }
+    if sub == "watch"     { sub_watch(_arg_present(argv, "--arm")); return }
+    if sub == "cost"      { sub_cost(); return }
+    if sub == "recover"   {
+        if len(argv) < 2 { println("usage: anima compute recover <pod>"); exit(2) }
+        sub_recover(_str(argv[1])); return
+    }
+    if sub == "ingest"    { sub_ingest(); return }
+    if sub == "preflight" { sub_preflight(); return }
+    if sub == "pods-sync" { sub_pods_sync(); return }
+    println("compute: unknown subcmd '" + sub + "'")
+    sub_help()
+    exit(2)
+}
+
+main()

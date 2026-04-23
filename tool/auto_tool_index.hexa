@@ -1,0 +1,344 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/auto_tool_index.hexa — auto-generated tool index for anima/tool/
+//
+//  PURPOSE
+//    Scan tool/*.hexa, extract the first comment block (one-line description
+//    derived from the leading `// tool/<name>.hexa — <desc>` header), and
+//    emit docs/tool_index_auto.md (alphabetized, timestamped). Idempotent:
+//    re-running on the same input set produces byte-identical output.
+//
+//  USAGE
+//    hexa run tool/auto_tool_index.hexa
+//    hexa run tool/auto_tool_index.hexa --tool-dir <dir> --out <file>
+//    hexa run tool/auto_tool_index.hexa --selftest
+//
+//  OUTPUT
+//    docs/tool_index_auto.md
+//      AUTO-GENERATED, DO NOT EDIT. Source: tool/auto_tool_index.hexa
+//      Generated: <UTC ts>
+//      | tool | description |
+//      | ---- | ----------- |
+//      ...
+//
+//  RULES
+//    raw#9 hexa-only · raw#11 snake_case · raw#15 no-hardcode (paths via flags)
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_TOOL_DIR = "/Users/ghost/core/anima/tool"
+let DEFAULT_OUT_PATH = "/Users/ghost/core/anima/docs/tool_index_auto.md"
+
+let HDR_LINE_1 = "<!-- AUTO-GENERATED, DO NOT EDIT — source: tool/auto_tool_index.hexa -->"
+let TITLE      = "# anima tool index (auto)"
+
+// ─── shell helpers ───────────────────────────────────────────────────────
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(path: string) -> bool {
+    return _exec_code("test -e " + _sh_quote(path)) == 0
+}
+
+fn _dir_exists(path: string) -> bool {
+    return _exec_code("test -d " + _sh_quote(path)) == 0
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    return _exec_code("mkdir -p " + _sh_quote(dir)) == 0
+}
+
+fn _rm_rf(path: string) -> bool {
+    return _exec_code("rm -rf " + _sh_quote(path)) == 0
+}
+
+fn _utc_now() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _basename(path: string) -> string {
+    let parts = path.split("/")
+    if len(parts) == 0 { return path }
+    return to_string(parts[len(parts) - 1])
+}
+
+fn _parent_of(path: string) -> string {
+    let parts = path.split("/")
+    if len(parts) <= 1 { return "." }
+    let mut out = ""
+    let mut i = 0
+    let cap = len(parts) - 1
+    while i < cap {
+        if i > 0 { out = out + "/" }
+        out = out + to_string(parts[i])
+        i = i + 1
+    }
+    if out == "" { return "/" }
+    return out
+}
+
+// List *.hexa files in tool dir (non-recursive), LC_ALL=C sort.
+fn _list_hexa(dir: string) -> array {
+    if !_dir_exists(dir) { return [] }
+    let cmd = "find " + _sh_quote(dir) + " -maxdepth 1 -type f -name '*.hexa' 2>/dev/null | LC_ALL=C sort"
+    let out = _exec_out(cmd)
+    let lines = out.split("\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if t.len() > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+// ─── description extraction ──────────────────────────────────────────────
+//
+// Strategy: first non-empty comment line of form
+//   `// tool/<name>.hexa — <desc>`
+// otherwise the first non-empty `// <text>` line. Strip leading `//` /
+// `////` runs and any leading `═` border characters. Returns "" if none.
+//
+fn _starts_with_slashes(s: string) -> bool {
+    if s.len() < 2 { return false }
+    return s.substring(0, 2) == "//"
+}
+
+fn _strip_comment_prefix(s: string) -> string {
+    let mut i = 0
+    let n = s.len()
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "/" { i = i + 1 } else { break }
+    }
+    let body = s.substring(i, n).trim()
+    // Drop leading box-drawing / hash markers used by some tools.
+    let mut t = body
+    while t.len() > 0 {
+        let c0 = t.substring(0, 1)
+        if c0 == "#" || c0 == "*" {
+            t = t.substring(1, t.len()).trim()
+        } else {
+            break
+        }
+    }
+    return t
+}
+
+fn extract_description(body: string) -> string {
+    let lines = body.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    let mut best = ""
+    while i < n {
+        let raw = to_string(lines[i]).trim()
+        if raw.len() == 0 { i = i + 1; continue }
+        if !_starts_with_slashes(raw) { return best }
+        let payload = _strip_comment_prefix(raw)
+        // Skip pure border lines (e.g. ════════ or ──────).
+        if payload.len() == 0 { i = i + 1; continue }
+        let head = payload.substring(0, 1)
+        if head == "═" || head == "─" || head == "━" || head == "=" {
+            i = i + 1; continue
+        }
+        // Prefer "tool/<name>.hexa — <desc>" form.
+        let idx = payload.index_of(" — ")
+        if idx >= 0 {
+            let after = payload.substring(idx + 3, payload.len()).trim()
+            if after.len() > 0 { return after }
+        }
+        let idx2 = payload.index_of(" - ")
+        if idx2 >= 0 {
+            let after2 = payload.substring(idx2 + 3, payload.len()).trim()
+            if after2.len() > 0 { return after2 }
+        }
+        // Otherwise return the first comment payload encountered.
+        if best == "" { best = payload }
+        // keep scanning a few lines in case the next has em-dash form
+        i = i + 1
+        if i > 10 { break }
+    }
+    return best
+}
+
+// Markdown-escape a description for table cells.
+fn _md_cell(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("|", "\\|")
+    let c = b.replace("\n", " ")
+    let d = c.replace("\r", "")
+    return d.trim()
+}
+
+// ─── render ──────────────────────────────────────────────────────────────
+
+fn render(tool_dir: string, ts: string) -> string {
+    let files = _list_hexa(tool_dir)
+    let n = len(files)
+    let mut s = ""
+    s = s + HDR_LINE_1 + "\n"
+    s = s + "<!-- generated: " + ts + " -->\n"
+    s = s + "<!-- source_dir: " + tool_dir + " -->\n"
+    s = s + "<!-- tool_count: " + to_string(n) + " -->\n"
+    s = s + "\n"
+    s = s + TITLE + "\n"
+    s = s + "\n"
+    s = s + "_AUTO-GENERATED, DO NOT EDIT — re-run `hexa run tool/auto_tool_index.hexa` to refresh._\n"
+    s = s + "\n"
+    s = s + "Generated (UTC): `" + ts + "`  Tools indexed: **" + to_string(n) + "**\n"
+    s = s + "\n"
+    s = s + "| tool | description |\n"
+    s = s + "| ---- | ----------- |\n"
+    let mut i = 0
+    while i < n {
+        let full = to_string(files[i])
+        let base = _basename(full)
+        let body = read_file(full)
+        let desc = extract_description(body)
+        let safe = _md_cell(desc)
+        s = s + "| `" + base + "` | " + safe + " |\n"
+        i = i + 1
+    }
+    return s
+}
+
+fn _atomic_write(path: string, body: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    let _ = _exec_code("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn do_generate(tool_dir: string, out_path: string) -> int {
+    if !_dir_exists(tool_dir) {
+        eprintln("auto_tool_index: SETUP_ERROR — tool dir missing: " + tool_dir)
+        return 2
+    }
+    let _ = _mkdir_p(_parent_of(out_path))
+    let ts = _utc_now()
+    let body = render(tool_dir, ts)
+    _atomic_write(out_path, body)
+    let n = len(_list_hexa(tool_dir))
+    println("auto_tool_index: wrote " + out_path)
+    println("  tool_dir = " + tool_dir)
+    println("  count    = " + to_string(n))
+    println("  ts       = " + ts)
+    return 0
+}
+
+// ─── argv / main ─────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av {
+        if to_string(x) == k { return true }
+    }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) {
+            return to_string(av[i + 1])
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────
+
+fn _mktempdir() -> string {
+    return _exec_out("mktemp -d -t auto_tool_index_selftest.XXXXXX 2>/dev/null").trim()
+}
+
+fn _hash_after_strip_ts(path: string) -> string {
+    // Strip the volatile generation timestamp line so re-runs hash equal.
+    let cmd = "grep -v -e '<!-- generated:' -e 'Generated (UTC):' " + _sh_quote(path) + " | shasum -a 256 | awk '{print $1}'"
+    return _exec_out(cmd).trim()
+}
+
+fn run_selftest() -> int {
+    println("auto_tool_index: SELFTEST starting")
+    let d = _mktempdir()
+    if d == "" {
+        println("S0 FAIL: mktemp failed")
+        return 1
+    }
+    write_file(d + "/alpha.hexa",
+        "// tool/alpha.hexa — alpha helper, prints greeting\n" +
+        "fn main() { println(\"hi\") }\n")
+    write_file(d + "/bravo.hexa",
+        "// ════════════════════════════════════════════\n" +
+        "// tool/bravo.hexa — bravo verifier, no I/O\n" +
+        "// ════════════════════════════════════════════\n" +
+        "fn main() {}\n")
+    write_file(d + "/charlie.hexa",
+        "// charlie helper without em-dash\n" +
+        "fn main() {}\n")
+    let out = d + "/idx.md"
+    let rc1 = do_generate(d, out)
+    if rc1 != 0 { println("S1 FAIL: rc1=" + to_string(rc1)); let _ = _rm_rf(d); return 1 }
+    let body = read_file(out)
+    let mut fails = 0
+    if body.index_of("AUTO-GENERATED") < 0 { fails = fails + 1; println("S1 FAIL: missing AUTO-GENERATED header") }
+    if body.index_of("`alpha.hexa`") < 0 { fails = fails + 1; println("S1 FAIL: missing alpha row") }
+    if body.index_of("alpha helper, prints greeting") < 0 { fails = fails + 1; println("S1 FAIL: missing alpha desc") }
+    if body.index_of("bravo verifier, no I/O") < 0 { fails = fails + 1; println("S1 FAIL: missing bravo desc") }
+    if body.index_of("charlie helper without em-dash") < 0 { fails = fails + 1; println("S1 FAIL: missing charlie desc") }
+    // Idempotency: re-run, hash (sans ts line) must match.
+    let h1 = _hash_after_strip_ts(out)
+    let _ = do_generate(d, out)
+    let h2 = _hash_after_strip_ts(out)
+    if h1 != "" && h1 == h2 {
+        println("S2 PASS: idempotent (sha256_no_ts=" + h1.substring(0, 12) + "...)")
+    } else {
+        fails = fails + 1
+        println("S2 FAIL: hash drift h1=" + h1 + " h2=" + h2)
+    }
+    let _ = _rm_rf(d)
+    if fails == 0 {
+        println("auto_tool_index: SELFTEST PASS")
+        return 0
+    }
+    println("auto_tool_index: SELFTEST FAIL (" + to_string(fails) + ")")
+    return 1
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/auto_tool_index.hexa [opts]")
+        println("  --tool-dir <dir>   default: " + DEFAULT_TOOL_DIR)
+        println("  --out <file>       default: " + DEFAULT_OUT_PATH)
+        println("  --selftest         run selftest")
+        return 0
+    }
+    if _flag(av, "--selftest") { return run_selftest() }
+    let td = _opt(av, "--tool-dir", DEFAULT_TOOL_DIR)
+    let op = _opt(av, "--out", DEFAULT_OUT_PATH)
+    return do_generate(td, op)
+}
+
+exit(main())

@@ -1,0 +1,335 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/sbom_generate.hexa — ROI #68 (security/compliance)
+//
+//  PURPOSE
+//    Produce CycloneDX 1.5 JSON SBOM for anima:
+//      - hexa-lang core component
+//      - all tool/*.hexa
+//      - all config/*.json
+//
+//  DESIGN
+//    raw#9   hexa-only
+//    raw#15  no-hardcode (config/sbom_generate_config.json)
+//    Each component: name + version (git short SHA fallback) + license + purl
+//    + sha256 hash.
+//
+//  USAGE
+//    hexa tool/sbom_generate.hexa
+//    hexa tool/sbom_generate.hexa --selftest
+//    hexa tool/sbom_generate.hexa --config <path>
+//
+//  EXIT CODES
+//    0  SBOM generated  3  setup error
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/sbom_generate_config.json"
+
+// ─── sys helpers ─────────────────────────────────────────────────────
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _is_file(path: string) -> bool {
+    let r = exec_with_status("test -f " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _mkdir_p(dir: string) -> bool {
+    return _exec_code("mkdir -p " + _sh_quote(dir)) == 0
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _ts_epoch() -> string {
+    return _exec_out("date -u +%s").trim()
+}
+
+fn _git_short_sha(repo_root: string) -> string {
+    let cmd = "git -C " + _sh_quote(repo_root) + " rev-parse --short=8 HEAD 2>/dev/null"
+    let r = exec_with_status(cmd)
+    if r[1] != 0 { return "" }
+    return to_string(r[0]).trim()
+}
+
+fn _sha256_of_file(path: string) -> string {
+    if !_is_file(path) { return "" }
+    let cmd = "shasum -a 256 " + _sh_quote(path) + " 2>/dev/null | awk '{print $1}'"
+    return _exec_out(cmd).trim()
+}
+
+// ─── argv ────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av {
+        if to_string(x) == k { return true }
+    }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) {
+            return to_string(av[i + 1])
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── config ──────────────────────────────────────────────────────────
+
+fn _load_config(path: string) {
+    if !_file_exists(path) {
+        eprintln("sbom_generate: SETUP_ERROR — config missing: " + path)
+        exit(3)
+    }
+    return json_parse(read_file(path))
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ─── basename ────────────────────────────────────────────────────────
+
+fn _basename(path: string) -> string {
+    let s = path
+    let lastSlash = -1
+    let mut i = 0
+    while i < len(s) {
+        if s.substring(i, i + 1) == "/" {
+            // track last
+        }
+        i = i + 1
+    }
+    // Fallback: use shell basename
+    let r = exec_with_status("basename " + _sh_quote(path))
+    return to_string(r[0]).trim()
+}
+
+// ─── enumerate group files ───────────────────────────────────────────
+
+fn _list_group_files(repo_root: string, root: string, ext: string) -> array {
+    let full = repo_root + "/" + root
+    if !_file_exists(full) { return [] }
+    let cmd = "find " + _sh_quote(full) + " -maxdepth 4 -type f -name '*" + ext + "' 2>/dev/null | sort"
+    let out = _exec_out(cmd)
+    let lines = split(out, "\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if len(t) > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+// ─── component build ─────────────────────────────────────────────────
+
+fn _build_component(name: string, version: string, ctype: string, purl: string, license: string, sha256: string, description: string) {
+    let mut c = #{}
+    c["name"] = name
+    c["version"] = version
+    c["type"] = ctype
+    c["purl"] = purl
+    c["license"] = license
+    c["sha256"] = sha256
+    c["description"] = description
+    return c
+}
+
+// ─── output emission ─────────────────────────────────────────────────
+
+fn _emit_sbom(out_path: string, summary_path: string, cfg, components: array, ts: string, version: string) {
+    let metadata = cfg["metadata"]
+    let serial_prefix = to_string(cfg["serial_number_prefix"])
+    let spec_version = to_string(cfg["spec_version"])
+    let serial = serial_prefix + ":" + _ts_epoch()
+
+    let mut p = []
+    p.push("{\n")
+    p.push("  \"bomFormat\": \"CycloneDX\",\n")
+    p.push("  \"specVersion\": \"" + spec_version + "\",\n")
+    p.push("  \"serialNumber\": \"" + serial + "\",\n")
+    p.push("  \"version\": 1,\n")
+    p.push("  \"metadata\": {\n")
+    p.push("    \"timestamp\": \"" + ts + "\",\n")
+    p.push("    \"tools\": [{\"vendor\": \"Anima Project\", \"name\": \"sbom_generate.hexa\", \"version\": \"v1\"}],\n")
+    p.push("    \"component\": {\n")
+    p.push("      \"type\": \"application\",\n")
+    p.push("      \"name\": \"" + _json_escape(to_string(metadata["component_name"])) + "\",\n")
+    p.push("      \"version\": \"" + _json_escape(version) + "\",\n")
+    p.push("      \"supplier\": {\"name\": \"" + _json_escape(to_string(metadata["supplier"])) + "\"}\n")
+    p.push("    }\n")
+    p.push("  },\n")
+    p.push("  \"components\": [\n")
+    let mut i = 0
+    while i < len(components) {
+        let c = components[i]
+        let comma = if i + 1 < len(components) { "," } else { "" }
+        p.push("    {\n")
+        p.push("      \"type\": \"" + to_string(c["type"]) + "\",\n")
+        p.push("      \"name\": \"" + _json_escape(to_string(c["name"])) + "\",\n")
+        p.push("      \"version\": \"" + _json_escape(to_string(c["version"])) + "\",\n")
+        p.push("      \"purl\": \"" + _json_escape(to_string(c["purl"])) + "\",\n")
+        p.push("      \"description\": \"" + _json_escape(to_string(c["description"])) + "\",\n")
+        p.push("      \"licenses\": [{\"license\": {\"id\": \"" + _json_escape(to_string(c["license"])) + "\"}}],\n")
+        p.push("      \"hashes\": [{\"alg\": \"SHA-256\", \"content\": \"" + to_string(c["sha256"]) + "\"}]\n")
+        p.push("    }" + comma + "\n")
+        i = i + 1
+    }
+    p.push("  ]\n}\n")
+    let _ = _mkdir_p("/Users/ghost/core/anima/state")
+    let _ = write_file(out_path, p.join(""))
+
+    // Summary (count + license tally)
+    let mut lic_counts = #{}
+    for c in components {
+        let lk = to_string(c["license"])
+        if lic_counts.contains_key(lk) {
+            lic_counts[lk] = to_int(to_string(lic_counts[lk])) + 1
+        } else {
+            lic_counts[lk] = 1
+        }
+    }
+    let mut sp = []
+    sp.push("{\n")
+    sp.push("  \"schema\": \"anima.sbom_summary.v1\",\n")
+    sp.push("  \"ts\": \"" + ts + "\",\n")
+    sp.push("  \"format\": \"CycloneDX\",\n")
+    sp.push("  \"specVersion\": \"" + spec_version + "\",\n")
+    sp.push("  \"component_count\": " + to_string(len(components)) + ",\n")
+    sp.push("  \"sbom_path\": \"" + out_path + "\",\n")
+    sp.push("  \"licenses_tally\": {")
+    let keys = lic_counts.keys()
+    let mut ki = 0
+    while ki < len(keys) {
+        let k = to_string(keys[ki])
+        let comma = if ki + 1 < len(keys) { ", " } else { "" }
+        sp.push("\"" + _json_escape(k) + "\": " + to_string(lic_counts[k]) + comma)
+        ki = ki + 1
+    }
+    sp.push("}\n}\n")
+    let _ = write_file(summary_path, sp.join(""))
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa tool/sbom_generate.hexa [opts]")
+        println("  --selftest       run with reduced fixture (smoke)")
+        println("  --config <path>  override config")
+        return 0
+    }
+
+    let cfg_path = _opt(av, "--config", DEFAULT_CONFIG)
+    let cfg = _load_config(cfg_path)
+    let repo_root = to_string(cfg["repo_root"])
+    let core_components = cfg["core_components"]
+    let scan_groups = cfg["scan_groups"]
+    let license_overrides = cfg["license_overrides"]
+    let version_strategy = cfg["version_strategy"]
+    let output = cfg["output"]
+    let out_path = repo_root + "/" + to_string(output["sbom_path"])
+    let summary_path = repo_root + "/" + to_string(output["summary_path"])
+
+    // Resolve project version
+    let mut version = _git_short_sha(repo_root)
+    if len(version) == 0 { version = to_string(version_strategy["fallback"]) }
+
+    // Build components
+    let mut components = []
+
+    // Core components (hexa-lang etc.)
+    for cc in core_components {
+        let src = to_string(cc["source"])
+        let sha = if _is_file(src) { _sha256_of_file(src) } else { "" }
+        let comp = _build_component(
+            to_string(cc["name"]),
+            to_string(cc["version"]),
+            to_string(cc["type"]),
+            to_string(cc["purl"]),
+            to_string(cc["license"]),
+            sha,
+            to_string(cc["description"])
+        )
+        components.push(comp)
+    }
+
+    // Scan groups
+    for g in scan_groups {
+        let root = to_string(g["root"])
+        let ext = to_string(g["extension"])
+        let lic_def = to_string(g["license_default"])
+        let desc = to_string(g["description"])
+        let gtype = to_string(g["type"])
+        let files = _list_group_files(repo_root, root, ext)
+        for f in files {
+            let path = to_string(f)
+            // relative path key for license override lookup
+            let rel = if path.index_of(repo_root + "/") == 0 {
+                path.substring(len(repo_root) + 1, len(path))
+            } else { path }
+            let lic = if license_overrides.contains_key(rel) {
+                to_string(license_overrides[rel])
+            } else { lic_def }
+            let bn = _basename(path)
+            let purl = "pkg:generic/anima/" + rel + "@" + version
+            let sha = _sha256_of_file(path)
+            let comp = _build_component(bn, version, gtype, purl, lic, sha, desc + " — " + rel)
+            components.push(comp)
+        }
+    }
+
+    let ts = _ts_iso()
+    _emit_sbom(out_path, summary_path, cfg, components, ts, version)
+
+    println("── sbom_generate ──")
+    println("  format:           CycloneDX " + to_string(cfg["spec_version"]))
+    println("  component_count:  " + to_string(len(components)))
+    println("  project_version:  " + version)
+    println("  sbom_path:        " + out_path)
+    println("  summary_path:     " + summary_path)
+    return 0
+}
+
+main()

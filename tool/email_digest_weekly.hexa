@@ -1,0 +1,156 @@
+// tool/email_digest_weekly.hexa — ROI #81 weekly email digest (text only)
+//
+// PURPOSE
+//   Generates a plaintext weekly digest of anima progress: roadmap progress
+//   summary + recent git log + cost estimate (manifest-based). Output is
+//   ALWAYS stdout — `--send` is intentionally NOT implemented.
+//
+// USAGE
+//   hexa run tool/email_digest_weekly.hexa             # plain text
+//   hexa run tool/email_digest_weekly.hexa --json      # machine-readable
+//   hexa run tool/email_digest_weekly.hexa --self-test # inline assertion
+//
+// CONSTRAINTS
+//   raw#9 hexa-only, raw#10 proof-carrying.
+//   No SMTP, no network, no .py.
+
+let ROADMAP_PROGRESS = "/Users/ghost/core/anima/state/roadmap_progress.json"
+let LAUNCH_MANIFEST  = "/Users/ghost/core/anima/state/h100_launch_manifest.json"
+let GIT_LOG_LIMIT    = 12
+let DIGEST_RECIPIENT = "loveiu99@proton.me"
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool { return exec_with_status("test -e " + _sh_quote(p))[1] == 0 }
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _json_escape(s: string) -> string { return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") }
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _has(av, k) -> bool {
+    let mut i = 0
+    while i < len(av) { if to_string(av[i]) == k { return true }; i = i + 1 }
+    return false
+}
+
+fn _now_iso() -> string {
+    let r = exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")
+    return to_string(r[0]).replace("\n", "")
+}
+
+fn _git_log_recent() -> string {
+    let cmd = "cd /Users/ghost/core/anima && git log --pretty=format:'%h %s' -n " + to_string(GIT_LOG_LIMIT)
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+// Returns [done_count, active_count, planned_count, mean_pct, total]
+fn _roadmap_summary() -> array {
+    if !_file_exists(ROADMAP_PROGRESS) { return [0, 0, 0, 0, 0] }
+    let p = json_parse(read_file(ROADMAP_PROGRESS))
+    let entries = p["entries"]
+    let agg = p["aggregate"]
+    let mean = if has_key(agg, "mean_pct") { to_int(agg["mean_pct"]) } else { 0 }
+    let total = len(entries)
+    let mut done = 0
+    let mut active = 0
+    let mut planned = 0
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let st = to_string(e["status"])
+        if st == "done"    { done = done + 1 }
+        if st == "active"  { active = active + 1 }
+        if st == "planned" { planned = planned + 1 }
+        i = i + 1
+    }
+    return [done, active, planned, mean, total]
+}
+
+// Returns approximate $ cost from launch manifest (sum of all stage gpu_count * $3/hr * duration_days * 24).
+fn _cost_estimate_usd() -> int {
+    if !_file_exists(LAUNCH_MANIFEST) { return 0 }
+    let m = json_parse(read_file(LAUNCH_MANIFEST))
+    let stages = m["stages"]
+    let mut total = 0
+    let mut i = 0
+    while i < len(stages) {
+        let s = stages[i]
+        let gpu_n = if has_key(s, "gpu_count") { to_int(s["gpu_count"]) } else { 1 }
+        let dur_d = if has_key(s, "duration_days") { to_int(s["duration_days"]) } else { 0 }
+        total = total + (gpu_n * dur_d * 24 * 3)
+        i = i + 1
+    }
+    return total
+}
+
+fn _build_text() -> string {
+    let now = _now_iso()
+    let s = _roadmap_summary()
+    let cost = _cost_estimate_usd()
+    let gitlog = _git_log_recent()
+
+    let mut t = ""
+    t = t + "anima weekly digest — " + now + "\n"
+    t = t + "to: " + DIGEST_RECIPIENT + "\n"
+    t = t + "===========================================\n\n"
+    t = t + "ROADMAP PROGRESS\n"
+    t = t + "  total entries: " + to_string(s[4]) + "\n"
+    t = t + "  done:    " + to_string(s[0]) + "\n"
+    t = t + "  active:  " + to_string(s[1]) + "\n"
+    t = t + "  planned: " + to_string(s[2]) + "\n"
+    t = t + "  mean pct: " + to_string(s[3]) + "%\n\n"
+    t = t + "COST ESTIMATE (theoretical, manifest-based)\n"
+    t = t + "  H100 launch budget: $" + to_string(cost) + "\n\n"
+    t = t + "RECENT COMMITS (last " + to_string(GIT_LOG_LIMIT) + ")\n"
+    t = t + gitlog + "\n\n"
+    t = t + "ISSUES / PENDING\n"
+    t = t + "  - check state/anima_roadmap_lint_last.json for current lint failures\n"
+    t = t + "  - check state/h100_launch_completion_verdict.json for next launch action\n\n"
+    t = t + "===========================================\n"
+    t = t + "delivery: stdout-only (per ROI #81 spec — --send NOT implemented)\n"
+    return t
+}
+
+fn _self_test() {
+    let txt = _build_text()
+    if len(txt) < 200 {
+        eprintln("[email_digest] SELFTEST FAIL: digest too short (" + to_string(len(txt)) + ")")
+        exit(1)
+    }
+    if txt.index_of("ROADMAP PROGRESS") < 0 {
+        eprintln("[email_digest] SELFTEST FAIL: missing ROADMAP section")
+        exit(1)
+    }
+    if txt.index_of("COST ESTIMATE") < 0 {
+        eprintln("[email_digest] SELFTEST FAIL: missing COST section")
+        exit(1)
+    }
+    println("[email_digest] SELFTEST PASS bytes=" + to_string(len(txt)))
+    exit(0)
+}
+
+fn main() {
+    let av = _argv()
+    if _has(av, "--self-test") { _self_test() }
+    let want_json = _has(av, "--json")
+    let txt = _build_text()
+    if want_json {
+        println("{\"schema\":\"anima/email_digest_weekly/1\",\"recipient\":\"" + DIGEST_RECIPIENT +
+                "\",\"sent\":false,\"body_b\":" + to_string(len(txt)) + "}")
+        exit(0)
+    }
+    println(txt)
+    if _has(av, "--send") {
+        eprintln("[email_digest] --send is NOT implemented (per ROI #81 spec). No SMTP path. Exit 0.")
+    }
+    exit(0)
+}
+
+main()

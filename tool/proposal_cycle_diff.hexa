@@ -1,0 +1,457 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/proposal_cycle_diff.hexa — AA3 (anima auto-evolution cycle delta)
+//
+//  PURPOSE
+//    Compute the delta between two proposal-stack cycles by reading the
+//    per-step counts recorded in state/proposals/meta/cycle_log.jsonl.
+//    Each auto_evolution_loop tick appends N ordered {cycle_id, step, counts}
+//    lines; this tool pulls the terminal `proposal_emit` counts for each
+//    selected cycle (fallback: latest counts seen for that cycle_id) and
+//    emits a scalar delta for pending / approved / rejected / archived /
+//    clusters / debate / refinement.
+//
+//  SUBCMDS (flag-driven, additive)
+//    proposal_cycle_diff                                 last two cycle ids
+//    proposal_cycle_diff --cycle-a <id> --cycle-b <id>   specific pair (a→b delta)
+//    proposal_cycle_diff --json                          also print JSON tail
+//    proposal_cycle_diff --selftest                      synthetic jsonl smoke
+//    proposal_cycle_diff --help
+//
+//  OUTPUTS
+//    stdout  : one-box human-readable delta table
+//    file    : state/proposal_cycle_diff_last.json
+//              { schema, ts, cycle_a, cycle_b, counts_a, counts_b,
+//                delta:{pending,approved,rejected,archived,clusters,
+//                       debate,refinement} }
+//
+//  SAFETY
+//    - READ-ONLY over cycle_log.jsonl + inventory.json
+//    - graceful no-data when cycle_log.jsonl is missing / <2 cycles
+//    - idempotent (re-running same inputs → same outputs)
+//    - NO .py emitted anywhere
+//
+//  RAW
+//    raw#9 hexa-only · raw#11 snake_case · raw#12 실측 only · raw#15 no-hardcode
+//
+//  EXIT CODES
+//    0 — wrote diff / selftest pass / NO_DATA graceful
+//    1 — selftest fail
+//    2 — usage error
+// ════════════════════════════════════════════════════════════════════════════
+
+let TOOL_NAME    = "proposal_cycle_diff"
+let TOOL_VERSION = "v1"
+let REPO_ROOT    = "/Users/ghost/core/anima"
+let LOG_PATH     = "/Users/ghost/core/anima/state/proposals/meta/cycle_log.jsonl"
+let OUT_PATH     = "/Users/ghost/core/anima/state/proposal_cycle_diff_last.json"
+
+// ─── shell / fs helpers ────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _is_file(path: string) -> bool {
+    return _exec_code("test -f " + _sh_quote(path)) == 0
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ─── argv helpers ──────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    // return user argv stripped of any hexa-cache noise
+    let raw = args()
+    let mut out = []
+    let mut i = 0
+    while i < len(raw) {
+        let s = to_string(raw[i])
+        if !s.contains("/.hexa-cache/") { out = out + [s] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _flag_present(av, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _flag_value(av, k: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) {
+            return to_string(av[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+// ─── cycle_log parsing ─────────────────────────────────────────────────────
+//
+// A cycle_log.jsonl row looks like:
+//   {"ts":"...","cycle_id":"20260422T131244Z","step":3,
+//    "name":"proposal_emit","status":"ok","exit":0,
+//    "counts":{"pending":55,"approved":0,...},"msg":"..."}
+//
+// We want the most informative row per cycle_id. Preference order:
+//   1. step with name == "proposal_emit"  (richest counts after emit)
+//   2. otherwise the row with the largest counts object (non-empty)
+//   3. fallback: last row for that cycle_id
+
+fn _read_log_lines(path: string) -> array {
+    if !_is_file(path) { return [] }
+    let raw = _exec_out("cat " + _sh_quote(path))
+    if len(raw) == 0 { return [] }
+    let parts = split(raw, "\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(parts) {
+        let s = to_string(parts[i]).trim()
+        if len(s) > 0 && s.starts_with("{") { out = out + [s] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _unique_cycle_ids(lines) -> array {
+    // preserve first-seen order
+    let mut ids = []
+    let mut i = 0
+    while i < len(lines) {
+        let doc = json_parse(to_string(lines[i]))
+        if doc.contains_key("cycle_id") {
+            let cid = to_string(doc["cycle_id"])
+            let mut seen = false
+            let mut j = 0
+            while j < len(ids) {
+                if to_string(ids[j]) == cid { seen = true }
+                j = j + 1
+            }
+            if !seen { ids = ids + [cid] }
+        }
+        i = i + 1
+    }
+    return ids
+}
+
+fn _counts_for(lines, cycle_id: string) {
+    // return {pending,approved,rejected,archived,debate,clusters,refinement}
+    // with best-available row's counts mapped in. Missing keys → 0.
+    let mut best = _zero_counts()
+    let mut emit_seen = false
+    let mut any_seen  = false
+    let mut i = 0
+    while i < len(lines) {
+        let doc = json_parse(to_string(lines[i]))
+        if !doc.contains_key("cycle_id") { i = i + 1; continue }
+        if to_string(doc["cycle_id"]) != cycle_id { i = i + 1; continue }
+        if !doc.contains_key("counts") { i = i + 1; continue }
+        let counts = doc["counts"]
+        if type_of(counts) != "map" { i = i + 1; continue }
+        let nm = if doc.contains_key("name") { to_string(doc["name"]) } else { "" }
+        if nm == "proposal_emit" {
+            best = counts
+            emit_seen = true
+        } else if !emit_seen {
+            // pick row with the most keys we care about
+            let cur_score = _count_score(counts)
+            let best_score = _count_score(best)
+            if cur_score > best_score { best = counts }
+        }
+        any_seen = true
+        i = i + 1
+    }
+    if !any_seen { return _zero_counts() }
+    return _normalize_counts(best)
+}
+
+fn _count_score(o) -> int {
+    // how many of the 7 tracked keys are present (with int value)
+    if type_of(o) != "map" { return 0 }
+    let keys = ["pending","approved","rejected","archived","debate","clusters","refinement"]
+    let mut s = 0
+    let mut i = 0
+    while i < len(keys) {
+        let k = to_string(keys[i])
+        if o.contains_key(k) { s = s + 1 }
+        i = i + 1
+    }
+    return s
+}
+
+fn _zero_counts() {
+    return {
+        "pending": 0, "approved": 0, "rejected": 0, "archived": 0,
+        "debate": 0, "clusters": 0, "refinement": 0
+    }
+}
+
+fn _normalize_counts(o) {
+    let mut out = _zero_counts()
+    if type_of(o) != "map" { return out }
+    let keys = ["pending","approved","rejected","archived","debate","clusters","refinement"]
+    let mut i = 0
+    while i < len(keys) {
+        let k = to_string(keys[i])
+        if o.contains_key(k) {
+            let v = o[k]
+            if type_of(v) == "int" { out[k] = v }
+            else if type_of(v) == "float" { out[k] = to_int(v) }
+            else if type_of(v) == "string" { out[k] = to_int(to_string(v)) }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _delta(a, b) {
+    let keys = ["pending","approved","rejected","archived","debate","clusters","refinement"]
+    let mut d = _zero_counts()
+    let mut i = 0
+    while i < len(keys) {
+        let k = to_string(keys[i])
+        let av = if a.contains_key(k) { to_int(a[k]) } else { 0 }
+        let bv = if b.contains_key(k) { to_int(b[k]) } else { 0 }
+        d[k] = bv - av
+        i = i + 1
+    }
+    return d
+}
+
+// ─── rendering ─────────────────────────────────────────────────────────────
+
+fn _signed(n: int) -> string {
+    if n > 0 { return "+" + to_string(n) }
+    return to_string(n)
+}
+
+fn _print_table(cycle_a: string, cycle_b: string, ca, cb, delta) {
+    println("── " + TOOL_NAME + " ──────────────────────────────────────")
+    println("  cycle_a : " + cycle_a)
+    println("  cycle_b : " + cycle_b)
+    println("  ─ key ──────── a ─── b ─── Δ ─")
+    let keys = ["pending","approved","rejected","archived","debate","clusters","refinement"]
+    let mut i = 0
+    while i < len(keys) {
+        let k = to_string(keys[i])
+        let av = if ca.contains_key(k) { to_int(ca[k]) } else { 0 }
+        let bv = if cb.contains_key(k) { to_int(cb[k]) } else { 0 }
+        let dv = if delta.contains_key(k) { to_int(delta[k]) } else { 0 }
+        let line = "  " + _pad_right(k, 12) + _pad_left(to_string(av), 6) + _pad_left(to_string(bv), 6) + _pad_left(_signed(dv), 6)
+        println(line)
+        i = i + 1
+    }
+    println("────────────────────────────────────────────────────────")
+}
+
+fn _pad_right(s: string, n: int) -> string {
+    let mut out = s
+    while len(out) < n { out = out + " " }
+    return out
+}
+
+fn _pad_left(s: string, n: int) -> string {
+    let mut out = s
+    while len(out) < n { out = " " + out }
+    return out
+}
+
+// ─── JSON emit ─────────────────────────────────────────────────────────────
+
+fn _counts_json(o) -> string {
+    let keys = ["pending","approved","rejected","archived","debate","clusters","refinement"]
+    let mut body = "{"
+    let mut i = 0
+    while i < len(keys) {
+        let k = to_string(keys[i])
+        let v = if o.contains_key(k) { to_int(o[k]) } else { 0 }
+        if i > 0 { body = body + "," }
+        body = body + "\"" + k + "\":" + to_string(v)
+        i = i + 1
+    }
+    body = body + "}"
+    return body
+}
+
+fn _emit_json(cycle_a: string, cycle_b: string, ca, cb, delta, out_path: string, no_data: bool, reason: string) {
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.proposal_cycle_diff.v1\",\n"
+    body = body + "  \"tool\": \"" + TOOL_NAME + "\",\n"
+    body = body + "  \"tool_version\": \"" + TOOL_VERSION + "\",\n"
+    body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    body = body + "  \"cycle_a\": \"" + _json_escape(cycle_a) + "\",\n"
+    body = body + "  \"cycle_b\": \"" + _json_escape(cycle_b) + "\",\n"
+    body = body + "  \"counts_a\": " + _counts_json(ca) + ",\n"
+    body = body + "  \"counts_b\": " + _counts_json(cb) + ",\n"
+    body = body + "  \"delta\": "    + _counts_json(delta) + ",\n"
+    body = body + "  \"no_data\": "  + (if no_data { "true" } else { "false" }) + ",\n"
+    body = body + "  \"reason\": \""  + _json_escape(reason) + "\"\n"
+    body = body + "}\n"
+    write_file(out_path, body)
+}
+
+// ─── core driver ───────────────────────────────────────────────────────────
+
+fn _pick_cycles(av) -> array {
+    // returns [cycle_a, cycle_b, source] where source ∈ "auto" | "explicit"
+    let a = _flag_value(av, "--cycle-a", "").trim()
+    let b = _flag_value(av, "--cycle-b", "").trim()
+    if len(a) > 0 && len(b) > 0 { return [a, b, "explicit"] }
+    return ["", "", "auto"]
+}
+
+fn _auto_pick(lines) -> array {
+    let ids = _unique_cycle_ids(lines)
+    let n = len(ids)
+    if n < 2 { return ["", "", false] }
+    let a = to_string(ids[n - 2])
+    let b = to_string(ids[n - 1])
+    return [a, b, true]
+}
+
+fn run_diff(log_path: string, out_path: string, av) -> int {
+    let want_json = _flag_present(av, "--json")
+    if !_is_file(log_path) {
+        println(TOOL_NAME + ": cycle_log missing — " + log_path)
+        println(TOOL_NAME + ": NO_DATA (graceful)")
+        _emit_json("", "", _zero_counts(), _zero_counts(), _zero_counts(), out_path, true, "cycle_log_missing")
+        return 0
+    }
+    let lines = _read_log_lines(log_path)
+    if len(lines) == 0 {
+        println(TOOL_NAME + ": cycle_log empty — NO_DATA (graceful)")
+        _emit_json("", "", _zero_counts(), _zero_counts(), _zero_counts(), out_path, true, "cycle_log_empty")
+        return 0
+    }
+
+    let picked = _pick_cycles(av)
+    let mut ca_id = to_string(picked[0])
+    let mut cb_id = to_string(picked[1])
+    let src = to_string(picked[2])
+
+    if src == "auto" {
+        let auto = _auto_pick(lines)
+        if !to_bool(auto[2]) {
+            println(TOOL_NAME + ": <2 cycles in log — NO_DATA (graceful)")
+            _emit_json("", "", _zero_counts(), _zero_counts(), _zero_counts(), out_path, true, "lt_two_cycles")
+            return 0
+        }
+        ca_id = to_string(auto[0])
+        cb_id = to_string(auto[1])
+    }
+
+    let counts_a = _counts_for(lines, ca_id)
+    let counts_b = _counts_for(lines, cb_id)
+    let delta    = _delta(counts_a, counts_b)
+
+    _print_table(ca_id, cb_id, counts_a, counts_b, delta)
+    _emit_json(ca_id, cb_id, counts_a, counts_b, delta, out_path, false, "ok")
+
+    if want_json {
+        println("── " + TOOL_NAME + " --json (" + out_path + ") ──")
+        println(_exec_out("cat " + _sh_quote(out_path)))
+    }
+    return 0
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn run_selftest() -> int {
+    let tmp_log = "/tmp/anima_proposal_cycle_diff_selftest.jsonl"
+    let tmp_out = "/tmp/anima_proposal_cycle_diff_selftest.json"
+    // synthetic 2-cycle log
+    let l1 = "{\"ts\":\"2026-01-01T00:00:00Z\",\"cycle_id\":\"AAA\",\"step\":3,\"name\":\"proposal_emit\",\"status\":\"ok\",\"exit\":0,\"counts\":{\"pending\":10,\"approved\":1,\"rejected\":0,\"archived\":0,\"debate\":0,\"clusters\":0,\"refinement\":5},\"msg\":\"-\"}"
+    let l2 = "{\"ts\":\"2026-01-02T00:00:00Z\",\"cycle_id\":\"BBB\",\"step\":3,\"name\":\"proposal_emit\",\"status\":\"ok\",\"exit\":0,\"counts\":{\"pending\":15,\"approved\":3,\"rejected\":1,\"archived\":2,\"debate\":0,\"clusters\":4,\"refinement\":8},\"msg\":\"-\"}"
+    write_file(tmp_log, l1 + "\n" + l2 + "\n")
+
+    let lines = _read_log_lines(tmp_log)
+    if len(lines) != 2 { println("FAIL " + TOOL_NAME + " selftest (expected 2 lines, got " + to_string(len(lines)) + ")"); return 1 }
+
+    let ids = _unique_cycle_ids(lines)
+    if len(ids) != 2 { println("FAIL " + TOOL_NAME + " selftest (expected 2 cycle_ids)"); return 1 }
+
+    let ca = _counts_for(lines, "AAA")
+    let cb = _counts_for(lines, "BBB")
+    let d  = _delta(ca, cb)
+
+    // expected deltas: pending +5, approved +2, rejected +1, archived +2, clusters +4, debate 0, refinement +3
+    let checks = [
+        ["pending",    5],
+        ["approved",   2],
+        ["rejected",   1],
+        ["archived",   2],
+        ["debate",     0],
+        ["clusters",   4],
+        ["refinement", 3]
+    ]
+    let mut i = 0
+    while i < len(checks) {
+        let k = to_string(checks[i][0])
+        let want = to_int(checks[i][1])
+        let got  = if d.contains_key(k) { to_int(d[k]) } else { -999 }
+        if got != want {
+            println("FAIL " + TOOL_NAME + " selftest (" + k + ": want " + to_string(want) + ", got " + to_string(got) + ")")
+            return 1
+        }
+        i = i + 1
+    }
+
+    // end-to-end: run_diff writing to tmp_out
+    let rc = run_diff(tmp_log, tmp_out, [])
+    if rc != 0 { println("FAIL " + TOOL_NAME + " selftest (run_diff exit " + to_string(rc) + ")"); return 1 }
+    if !_is_file(tmp_out) { println("FAIL " + TOOL_NAME + " selftest (out file missing)"); return 1 }
+
+    println("PASS " + TOOL_NAME + " selftest (2-cycle synthetic diff · 7-key delta OK)")
+    return 0
+}
+
+// ─── help ──────────────────────────────────────────────────────────────────
+
+fn print_help() {
+    println("proposal_cycle_diff — delta between two auto-evolution cycles")
+    println("")
+    println("  hexa run tool/proposal_cycle_diff.hexa")
+    println("  hexa run tool/proposal_cycle_diff.hexa --cycle-a <id> --cycle-b <id>")
+    println("  hexa run tool/proposal_cycle_diff.hexa --json")
+    println("  hexa run tool/proposal_cycle_diff.hexa --selftest")
+    println("")
+    println("  reads  : state/proposals/meta/cycle_log.jsonl")
+    println("  writes : state/proposal_cycle_diff_last.json (idempotent)")
+}
+
+// ─── entry ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = _argv()
+    if _flag_present(av, "--help") { print_help(); exit(0) }
+    if _flag_present(av, "--selftest") { exit(run_selftest()) }
+    let rc = run_diff(LOG_PATH, OUT_PATH, av)
+    exit(rc)
+}
+
+main()

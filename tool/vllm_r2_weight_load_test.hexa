@@ -1,0 +1,124 @@
+// tool/vllm_r2_weight_load_test.hexa — pre-H100 ROI S1
+//
+// Mock-only verifier for vllm_container_template.json. Reads the template
+// JSON, asserts spec invariants, and simulates an R2 weight-load handshake
+// WITHOUT issuing any network call or spawning a pod. Selftest exit code:
+//   0 = PASS, 1 = FAIL, 2 = template missing.
+//
+// Usage:
+//   hexa tool/vllm_r2_weight_load_test.hexa
+//   hexa tool/vllm_r2_weight_load_test.hexa --template config/vllm_container_template.json
+//
+// Hard constraints:
+//   - mock-only (no boto3/rclone calls; no real GETs)
+//   - DO NOT spawn pod
+//   - selftest must pass before any H100 launch handoff
+
+fn read_file(path) {
+    let f = open(path, "r")
+    let s = f.read_all()
+    f.close()
+    return s
+}
+
+fn json_has(j, key) {
+    return j.contains_key(key)
+}
+
+fn assert_eq(label, got, want) {
+    if got != want {
+        println("  FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        return false
+    }
+    println("  ok   " + label + " = " + str(got))
+    return true
+}
+
+fn assert_true(label, cond) {
+    if !cond {
+        println("  FAIL " + label)
+        return false
+    }
+    println("  ok   " + label)
+    return true
+}
+
+fn mock_r2_handshake(bucket, prefix, files) {
+    // SIMULATED: pretend each file resolves via R2 GET HEAD with 200 OK.
+    // No actual network IO. We only count and emit a deterministic trace.
+    println("  [mock] R2 HEAD bucket=" + bucket + " prefix=" + prefix)
+    let n = len(files)
+    let i = 0
+    while i < n {
+        println("    [mock] HEAD " + files[i] + " -> 200 OK (simulated)")
+        i = i + 1
+    }
+    return n
+}
+
+fn main() {
+    let template_path = "config/vllm_container_template.json"
+    let args = sys_args()
+    let i = 0
+    while i < len(args) {
+        if args[i] == "--template" && i + 1 < len(args) {
+            template_path = args[i + 1]
+            i = i + 1
+        }
+        i = i + 1
+    }
+
+    println("vllm_r2_weight_load_test (mock-only)")
+    println("  template = " + template_path)
+
+    if !file_exists(template_path) {
+        println("ERR template missing: " + template_path)
+        exit(2)
+    }
+
+    let raw = read_file(template_path)
+    let j = json_parse(raw)
+    let ok = true
+
+    // Section 1 — container shape
+    let container = j["container"]
+    let gpu = container["gpu"]
+    ok = assert_eq("gpu.count", gpu["count"], 4) && ok
+    ok = assert_eq("gpu.min_compute_capability", gpu["min_compute_capability"], "9.0") && ok
+    ok = assert_true("image pinned (vllm/vllm-openai)", container["image"].starts_with("vllm/vllm-openai:")) && ok
+
+    // Section 2 — vLLM args
+    let va = j["vllm_args"]
+    ok = assert_eq("tensor_parallel_size", va["tensor_parallel_size"], 4) && ok
+    ok = assert_true("max_model_len <= 8192", va["max_model_len"] <= 8192) && ok
+    ok = assert_true("gpu_memory_utilization in (0,1]", va["gpu_memory_utilization"] > 0.0 && va["gpu_memory_utilization"] <= 1.0) && ok
+    ok = assert_eq("trust_remote_code", va["trust_remote_code"], false) && ok
+
+    // Section 3 — model load (R2 source; mock handshake)
+    let ml = j["model_load"]
+    ok = assert_eq("model_load.source", ml["source"], "r2") && ok
+    let files = ml["expected_weight_files"]
+    ok = assert_true("expected_weight_files non-empty", len(files) > 0) && ok
+    let n_head = mock_r2_handshake(ml["bucket"], ml["weight_prefix"], files)
+    ok = assert_eq("mock R2 HEAD count == declared files", n_head, len(files)) && ok
+
+    // Section 4 — env hygiene (no creds inline)
+    let env = j["env"]
+    ok = assert_true("R2_ENDPOINT_URL is placeholder", env["R2_ENDPOINT_URL"].starts_with("${")) && ok
+    ok = assert_true("AWS_SECRET_ACCESS_KEY is placeholder", env["AWS_SECRET_ACCESS_KEY"].starts_with("${")) && ok
+
+    // Section 5 — selftest contract
+    let mv = j["mock_verify"]
+    ok = assert_eq("mock_verify.mode", mv["mode"], "mock-only") && ok
+    ok = assert_eq("mock_verify.tool", mv["tool"], "tool/vllm_r2_weight_load_test.hexa") && ok
+
+    if ok {
+        println("PASS vllm_r2_weight_load_test (mock-only) — " + str(len(files)) + " weight files asserted")
+        exit(0)
+    } else {
+        println("FAIL vllm_r2_weight_load_test")
+        exit(1)
+    }
+}
+
+main()

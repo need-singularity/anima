@@ -29,21 +29,26 @@ let DEFAULT_STATE  = "/Users/ghost/core/anima/state/h100_auto_kill_last_run.json
 
 // ─── shell/io helpers ─────────────────────────────────────────────────────
 
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _sh_quote(s: string) -> string {
     let mut o = "'"
     o = o + s.replace("'", "'\\''")
     o = o + "'"
     return o
 }
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _file_exists(p: string) -> bool {
     return exec_with_status("test -e " + _sh_quote(p))[1] == 0
 }
+// Native primitives honor SOURCE_DATE_EPOCH / HEXA_REPRODUCIBLE=1 (hexa-lang PR #23).
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _ts_iso() -> string {
-    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+    return to_string(utc_iso_now())
 }
 fn _ts_epoch() -> string {
-    return to_string(exec_with_status("date -u +%s")[0]).trim()
+    return to_string(now())
 }
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _json_escape(s: string) -> string {
     return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 }
@@ -171,6 +176,31 @@ fn _evaluate_pod(pod, cfg, apply) {
         let tmpl = _cfg_str(cfg, "stop_cmd_template", "runpodctl stop pod {pod_id}")
         let stop_cmd = tmpl.replace("{pod_id}", pid)
         v["stop_cmd"] = stop_cmd
+        // 2026-04-22 ROI Q3: SIGUSR2 graceful ckpt save before STOP.
+        // Cfg-gated (graceful_save_enabled, default true); fully backward-compat:
+        //   - if disabled, planning + apply skip the SIGUSR2 step entirely.
+        //   - graceful_save_cmd_template defaults to a no-op SSH-based kill -USR2;
+        //     in dry-run we only PLAN it (no exec). On apply, we exec only when
+        //     SSH host is present AND the cmd is non-empty.
+        let graceful_enabled = _cfg_bool(cfg, "graceful_save_enabled", true)
+        if graceful_enabled {
+            let g_tmpl = _cfg_str(cfg, "graceful_save_cmd_template",
+                "ssh -o ConnectTimeout=8 -o BatchMode=yes -p {ssh_port} {ssh_user}@{ssh_host} 'pkill -USR2 -f anima || true'")
+            let host = _pod_field_str(pod, "ssh_host", "")
+            let port = _pod_field_int(pod, "ssh_port", 22)
+            let user = _pod_field_str(pod, "ssh_user", "root")
+            let g_cmd = g_tmpl.replace("{pod_id}", pid).replace("{ssh_host}", host).replace("{ssh_port}", to_string(port)).replace("{ssh_user}", user)
+            v["graceful_save_cmd"] = g_cmd
+            let wait_sec = _cfg_int(cfg, "graceful_save_wait_sec", 30)
+            v["graceful_save_wait_sec"] = wait_sec
+            if apply && host != "" {
+                let gr = exec_with_status(g_cmd)
+                v["graceful_rc"] = gr[1]
+                v["graceful_stdout"] = to_string(gr[0]).trim()
+                // Brief sleep to let the trap finish ckpt write before STOP.
+                exec_with_status("sleep " + to_string(wait_sec))
+            }
+        }
         if apply {
             if _which("runpodctl") {
                 let r = exec_with_status(stop_cmd)
@@ -213,6 +243,14 @@ fn _render_verdict(v) -> string {
     o = o + "      \"probe_cmd\": \""       + _json_escape(to_string(v["probe_cmd"]))          + "\",\n"
     if v.contains_key("stop_cmd") {
         o = o + "      \"stop_cmd\": \""    + _json_escape(to_string(v["stop_cmd"]))          + "\",\n"
+    }
+    if v.contains_key("graceful_save_cmd") {
+        o = o + "      \"graceful_save_cmd\": \"" + _json_escape(to_string(v["graceful_save_cmd"])) + "\",\n"
+        o = o + "      \"graceful_save_wait_sec\": " + to_string(v["graceful_save_wait_sec"]) + ",\n"
+    }
+    if v.contains_key("graceful_rc") {
+        o = o + "      \"graceful_rc\": " + to_string(v["graceful_rc"]) + ",\n"
+        o = o + "      \"graceful_stdout\": \"" + _json_escape(to_string(v["graceful_stdout"])) + "\",\n"
     }
     if v.contains_key("apply_rc") {
         o = o + "      \"apply_rc\": "      + to_string(v["apply_rc"])                        + ",\n"
@@ -320,8 +358,9 @@ fn self_test(cfg) -> int {
     let threshold = _cfg_int(cfg, "threshold_minutes", 30)
 
     // Scenario pods, injected via idle_minutes_mock.
-    let s1 = json_parse("{\"pod_id\":\"S1-idle\",\"provider\":\"runpod\",\"ssh_host\":\"\",\"ssh_port\":22,\"ssh_user\":\"root\",\"last_activity_source\":\"nvidia_smi\",\"idle_minutes_mock\":31}")
-    let s2 = json_parse("{\"pod_id\":\"S2-active\",\"provider\":\"runpod\",\"ssh_host\":\"\",\"ssh_port\":22,\"ssh_user\":\"root\",\"last_activity_source\":\"tmux\",\"idle_minutes_mock\":5}")
+    // 2026-04-22 ROI A2: threshold tightened 30→5min; self-test mocks adjusted (idle=6 STOP, idle=2 KEEP) accordingly.
+    let s1 = json_parse("{\"pod_id\":\"S1-idle\",\"provider\":\"runpod\",\"ssh_host\":\"\",\"ssh_port\":22,\"ssh_user\":\"root\",\"last_activity_source\":\"nvidia_smi\",\"idle_minutes_mock\":6}")
+    let s2 = json_parse("{\"pod_id\":\"S2-active\",\"provider\":\"runpod\",\"ssh_host\":\"\",\"ssh_port\":22,\"ssh_user\":\"root\",\"last_activity_source\":\"tmux\",\"idle_minutes_mock\":2}")
     // S3 intentionally malformed — missing pod_id + last_activity_source
     let s3 = json_parse("{\"provider\":\"runpod\"}")
 
@@ -332,10 +371,10 @@ fn self_test(cfg) -> int {
     let mut passes = 0
     let mut fails  = 0
 
-    if to_string(v1["verdict"]) == "STOP" { println("  S1 PASS (idle=31 → STOP)"); passes = passes + 1 }
+    if to_string(v1["verdict"]) == "STOP" { println("  S1 PASS (idle=6 → STOP)"); passes = passes + 1 }
     else { println("  S1 FAIL expected STOP got " + to_string(v1["verdict"])); fails = fails + 1 }
 
-    if to_string(v2["verdict"]) == "KEEP" { println("  S2 PASS (idle=5  → KEEP)"); passes = passes + 1 }
+    if to_string(v2["verdict"]) == "KEEP" { println("  S2 PASS (idle=2  → KEEP)"); passes = passes + 1 }
     else { println("  S2 FAIL expected KEEP got " + to_string(v2["verdict"])); fails = fails + 1 }
 
     if to_string(v3["verdict"]) == "SKIP" && to_string(v3["error"]) != "" {
@@ -346,9 +385,19 @@ fn self_test(cfg) -> int {
         fails = fails + 1
     }
 
+    // 2026-04-22 ROI Q3: SIGUSR2 graceful save plan must be present on STOP verdict
+    // when graceful_save_enabled (default true). Re-uses S1 verdict above.
+    if v1.contains_key("graceful_save_cmd") && to_string(v1["graceful_save_cmd"]).contains("USR2") {
+        println("  S4 PASS (STOP → graceful_save_cmd contains SIGUSR2 plan)")
+        passes = passes + 1
+    } else {
+        println("  S4 FAIL expected graceful_save_cmd with USR2; got=" + to_string(v1.contains_key("graceful_save_cmd")))
+        fails = fails + 1
+    }
+
     // threshold sanity check (self-documentation)
     println("  threshold_minutes=" + to_string(threshold))
-    println("h100_auto_kill selftest: " + to_string(passes) + "/3 PASS, " + to_string(fails) + " FAIL")
+    println("h100_auto_kill selftest: " + to_string(passes) + "/4 PASS, " + to_string(fails) + " FAIL")
     if fails > 0 { return 1 }
     return 0
 }

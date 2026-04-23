@@ -1,0 +1,479 @@
+// tool/proposal_conflict_detect.hexa — pending proposal pairwise conflict detector
+//
+// PURPOSE
+//   Scan state/proposals/pending/*.json for incompatible proposal pairs and
+//   emit a debate routing file at state/proposals/debate/<pair_slug>.json
+//   awaiting user resolution (see proposal_conflict_resolve.hexa).
+//
+//   Spec source: docs/anima_proposal_stack_paradigm_20260422.md
+//     §6 보호 mechanisms — conflict: conflicts_with[] field + cycle detect
+//     §3 cycle step 6 — conflict: 2 incompatible → debate folder
+//
+// ALGORITHM
+//   For each unordered pair (A, B) of pending proposals:
+//     1. EXPLICIT: B.id ∈ A.conflicts_with[]  OR  A.id ∈ B.conflicts_with[]
+//     2. AUTO (file-direction):
+//          ∃ path P such that
+//              P ∈ A.touched_files  AND  P ∈ B.touched_files  AND
+//              A.direction[P] != B.direction[P]
+//          where direction is one of {"add","remove","modify"} — opposites
+//          add↔remove count as conflict, modify alone never conflicts.
+//     3. AUTO (paradigm-axis):
+//          A.kind == "paradigm"  AND  B.kind == "paradigm"  AND
+//          A.axis == B.axis      AND  A.hypothesis != B.hypothesis
+//
+// USAGE
+//   hexa tool/proposal_conflict_detect.hexa            — DRY (default), prints summary
+//   hexa tool/proposal_conflict_detect.hexa --apply    — write debate/*.json
+//   hexa tool/proposal_conflict_detect.hexa --selftest — synthetic 2-pair flow
+//   hexa tool/proposal_conflict_detect.hexa --pending <dir> --debate <dir>
+//
+// OUTPUT (per pair, when --apply)
+//   state/proposals/debate/<lo>__vs__<hi>.json
+//     { schema, pair_slug, ids: [lo, hi], reason, kind, status: "open",
+//       created_at, awaiting: "user_resolution" }
+//
+// HARD CONSTRAINTS
+//   - DO NOT modify .roadmap (uchg)
+//   - atomic write (tmp + mv)
+//   - idempotent (re-run preserves existing open debates)
+//   - read-only on pending/*.json
+
+let DEFAULT_PENDING = "/Users/ghost/core/anima/state/proposals/pending"
+let DEFAULT_DEBATE  = "/Users/ghost/core/anima/state/proposals/debate"
+
+// ─── helpers ────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec_out(cmd: string) -> string {
+    return to_string(exec(cmd))
+}
+
+fn _file_exists(p: string) -> bool {
+    return _exec_out("test -e " + _sh_quote(p) + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn _now_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _ls_json(dir: string) -> array {
+    let out = _exec_out("ls " + _sh_quote(dir) + "/*.json 2>/dev/null")
+    let lines = split(out, "\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if len(t) > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+fn _basename_noext(p: string) -> string {
+    let mut last_sl = -1
+    let mut i = 0
+    while i < len(p) {
+        if p.substring(i, i + 1) == "/" { last_sl = i }
+        i = i + 1
+    }
+    let base = if last_sl >= 0 { p.substring(last_sl + 1, len(p)) } else { p }
+    let dot = base.index_of(".json")
+    if dot >= 0 { return base.substring(0, dot) }
+    return base
+}
+
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+}
+
+fn _atomic_write(path: string, body: string) {
+    let mut last_sl = -1
+    let mut i = 0
+    while i < len(path) {
+        if path.substring(i, i + 1) == "/" { last_sl = i }
+        i = i + 1
+    }
+    if last_sl > 0 {
+        let dir = path.substring(0, last_sl)
+        exec("mkdir -p " + _sh_quote(dir))
+    }
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    exec("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn _arr_contains(arr: array, needle: string) -> bool {
+    for x in arr { if to_string(x) == needle { return true } }
+    return false
+}
+
+fn _has(o, k: string) -> bool { return has_key(o, k) }
+
+fn _get_str(o, k: string, dflt: string) -> string {
+    if !_has(o, k) { return dflt }
+    return to_string(o[k])
+}
+
+fn _get_arr(o, k: string) -> array {
+    if !_has(o, k) { return [] }
+    return o[k]
+}
+
+// ─── proposal load ──────────────────────────────────────────────────
+
+fn _load_proposal(p: string) {
+    return json_parse(read_file(p))
+}
+
+// Build [ids, props] indexed in same order from a pending dir.
+fn _load_pending(dir: string) -> array {
+    let paths = _ls_json(dir)
+    let mut ids = []
+    let mut props = []
+    for p in paths {
+        let pr = _load_proposal(p)
+        let id = _get_str(pr, "id", _basename_noext(p))
+        ids.push(id)
+        props.push(pr)
+    }
+    return [ids, props]
+}
+
+// ─── conflict checks ────────────────────────────────────────────────
+
+// Explicit: A.conflicts_with includes B.id, or vice versa.
+fn _explicit_conflict(a, b, a_id: string, b_id: string) -> bool {
+    let cw_a = _get_arr(a, "conflicts_with")
+    if _arr_contains(cw_a, b_id) { return true }
+    let cw_b = _get_arr(b, "conflicts_with")
+    if _arr_contains(cw_b, a_id) { return true }
+    return false
+}
+
+// Build map path → direction (add|remove|modify).
+//
+// Two accepted shapes:
+//   1. touched_files: [{"path": "...", "direction": "add|remove|modify"}, ...]
+//   2. touched_files: ["a.txt", ...]  (no direction → treat as "modify")
+fn _file_dirs(p) -> array {
+    let mut paths = []
+    let mut dirs = []
+    if !_has(p, "touched_files") { return [paths, dirs] }
+    let tf = p["touched_files"]
+    let mut i = 0
+    while i < len(tf) {
+        let item = tf[i]
+        if type_of(item) == "string" {
+            paths.push(to_string(item))
+            dirs.push("modify")
+        } else {
+            let pp = _get_str(item, "path", "")
+            let dd = _get_str(item, "direction", "modify")
+            if len(pp) > 0 {
+                paths.push(pp)
+                dirs.push(dd)
+            }
+        }
+        i = i + 1
+    }
+    return [paths, dirs]
+}
+
+fn _opposite(d1: string, d2: string) -> bool {
+    if d1 == "add" && d2 == "remove" { return true }
+    if d1 == "remove" && d2 == "add" { return true }
+    return false
+}
+
+// Returns "" if no conflict, else the offending path.
+fn _file_direction_conflict(a, b) -> string {
+    let fa = _file_dirs(a)
+    let fb = _file_dirs(b)
+    let pa = fa[0]
+    let da = fa[1]
+    let pb = fb[0]
+    let db = fb[1]
+    let mut i = 0
+    while i < len(pa) {
+        let mut j = 0
+        while j < len(pb) {
+            if to_string(pa[i]) == to_string(pb[j]) {
+                if _opposite(to_string(da[i]), to_string(db[j])) {
+                    return to_string(pa[i])
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// kind=paradigm + same axis + different hypothesis.
+fn _paradigm_axis_conflict(a, b) -> bool {
+    if _get_str(a, "kind", "") != "paradigm" { return false }
+    if _get_str(b, "kind", "") != "paradigm" { return false }
+    let ax_a = _get_str(a, "axis", "")
+    let ax_b = _get_str(b, "axis", "")
+    if len(ax_a) == 0 || ax_a != ax_b { return false }
+    let h_a = _get_str(a, "hypothesis", "")
+    let h_b = _get_str(b, "hypothesis", "")
+    if len(h_a) == 0 || len(h_b) == 0 { return false }
+    return h_a != h_b
+}
+
+// Returns [is_conflict, kind, reason]
+fn _detect_pair(a, b, a_id: string, b_id: string) -> array {
+    if _explicit_conflict(a, b, a_id, b_id) {
+        return [true, "explicit", "conflicts_with field declares incompatibility"]
+    }
+    let path = _file_direction_conflict(a, b)
+    if len(path) > 0 {
+        return [true, "file_direction", "opposite add/remove on path: " + path]
+    }
+    if _paradigm_axis_conflict(a, b) {
+        let ax = _get_str(a, "axis", "")
+        return [true, "paradigm_axis", "kind=paradigm, axis=" + ax + ", divergent hypothesis"]
+    }
+    return [false, "", ""]
+}
+
+// Slug: alphabetically sort the two ids → "<lo>__vs__<hi>"
+fn _pair_slug(a_id: string, b_id: string) -> string {
+    if a_id <= b_id { return a_id + "__vs__" + b_id }
+    return b_id + "__vs__" + a_id
+}
+
+fn _emit_debate(debate_dir: string, a_id: string, b_id: string, kind: string, reason: string) -> string {
+    let slug = _pair_slug(a_id, b_id)
+    let path = debate_dir + "/" + slug + ".json"
+    // idempotency: if exists and status == open or resolved, do not overwrite
+    if _file_exists(path) {
+        let existing = json_parse(read_file(path))
+        let st = _get_str(existing, "status", "open")
+        if st == "open" || st == "resolved" {
+            return ""  // skip — preserve existing
+        }
+    }
+    let lo = if a_id <= b_id { a_id } else { b_id }
+    let hi = if a_id <= b_id { b_id } else { a_id }
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"anima.proposal.debate.v1\",\n"
+    j = j + "  \"pair_slug\": \"" + _json_esc(slug) + "\",\n"
+    j = j + "  \"ids\": [\"" + _json_esc(lo) + "\", \"" + _json_esc(hi) + "\"],\n"
+    j = j + "  \"kind\": \"" + _json_esc(kind) + "\",\n"
+    j = j + "  \"reason\": \"" + _json_esc(reason) + "\",\n"
+    j = j + "  \"status\": \"open\",\n"
+    j = j + "  \"created_at\": \"" + _now_iso() + "\",\n"
+    j = j + "  \"awaiting\": \"user_resolution\",\n"
+    j = j + "  \"resolved_at\": null,\n"
+    j = j + "  \"winner\": null,\n"
+    j = j + "  \"resolution_reason\": null\n"
+    j = j + "}\n"
+    _atomic_write(path, j)
+    return path
+}
+
+// Returns array of [a_id, b_id, kind, reason]
+fn _scan_all(pending_dir: string) -> array {
+    let loaded = _load_pending(pending_dir)
+    let ids = loaded[0]
+    let props = loaded[1]
+    let n = len(ids)
+    let mut conflicts = []
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            let a = props[i]
+            let b = props[j]
+            let det = _detect_pair(a, b, to_string(ids[i]), to_string(ids[j]))
+            if det[0] {
+                conflicts.push([to_string(ids[i]), to_string(ids[j]), to_string(det[1]), to_string(det[2])])
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return conflicts
+}
+
+// ─── selftest ──────────────────────────────────────────────────────
+//
+// S1 explicit: A.conflicts_with=[B] → 1 conflict
+// S2 file-direction: A removes path X, B adds path X → 1 conflict
+// S3 paradigm-axis: A kind=paradigm axis=eta hyp=X, B kind=paradigm axis=eta hyp=Y → 1 conflict
+// S4 idempotent: re-run does not overwrite open debate
+// S5 emit: --apply produces debate file with correct schema
+
+fn _write_proposal(p: string, body: string) {
+    _atomic_write(p, body)
+}
+
+fn _selftest() -> int {
+    println("── proposal_conflict_detect selftest ──")
+    let sandbox = "/tmp/anima_pcdetect_selftest"
+    let pend = sandbox + "/pending"
+    let deb  = sandbox + "/debate"
+    exec("rm -rf " + _sh_quote(sandbox))
+    exec("mkdir -p " + _sh_quote(pend) + " " + _sh_quote(deb))
+
+    let mut fails = 0
+
+    // seed 4 proposals — yields 2 conflict pairs (explicit, paradigm_axis) + 1 file_direction
+    let p_a = "{\"id\":\"A1\",\"kind\":\"tool\",\"conflicts_with\":[\"A2\"],\"touched_files\":[]}\n"
+    let p_b = "{\"id\":\"A2\",\"kind\":\"tool\",\"conflicts_with\":[],\"touched_files\":[]}\n"
+    let p_c = "{\"id\":\"A3\",\"kind\":\"paradigm\",\"axis\":\"eta\",\"hypothesis\":\"X\",\"touched_files\":[{\"path\":\"shared/foo.hexa\",\"direction\":\"remove\"}]}\n"
+    let p_d = "{\"id\":\"A4\",\"kind\":\"paradigm\",\"axis\":\"eta\",\"hypothesis\":\"Y\",\"touched_files\":[{\"path\":\"shared/foo.hexa\",\"direction\":\"add\"}]}\n"
+    _write_proposal(pend + "/A1.json", p_a)
+    _write_proposal(pend + "/A2.json", p_b)
+    _write_proposal(pend + "/A3.json", p_c)
+    _write_proposal(pend + "/A4.json", p_d)
+
+    let conflicts = _scan_all(pend)
+    // Expected pairs:
+    //   (A1, A2) explicit
+    //   (A3, A4) — first detected match (explicit→file_direction); both file_direction & paradigm_axis hold but explicit takes priority. Here neither has conflicts_with, so file_direction wins.
+    let want = 2
+    if len(conflicts) != want {
+        eprintln("  FAIL S1 conflicts=" + to_string(len(conflicts)) + " want=" + to_string(want))
+        for c in conflicts {
+            eprintln("    pair=" + to_string(c[0]) + " vs " + to_string(c[1]) + " kind=" + to_string(c[2]) + " reason=" + to_string(c[3]))
+        }
+        fails = fails + 1
+    } else {
+        println("  S1 PASS: detected " + to_string(want) + " conflict pairs")
+        for c in conflicts {
+            println("    " + to_string(c[0]) + " vs " + to_string(c[1]) + " [" + to_string(c[2]) + "] " + to_string(c[3]))
+        }
+    }
+
+    // S2 — emit (apply) and verify debate files written
+    for c in conflicts {
+        let _e = _emit_debate(deb, to_string(c[0]), to_string(c[1]), to_string(c[2]), to_string(c[3]))
+    }
+    let emitted = _ls_json(deb)
+    if len(emitted) != want {
+        eprintln("  FAIL S2 emitted=" + to_string(len(emitted)) + " want=" + to_string(want))
+        fails = fails + 1
+    } else {
+        println("  S2 PASS: " + to_string(want) + " debate files written")
+    }
+
+    // S3 — idempotent re-emit (no overwrite of open)
+    let before_mtime = _exec_out("stat -f %m " + _sh_quote(emitted[0]) + " 2>/dev/null").trim()
+    exec("sleep 1")
+    for c in conflicts {
+        let _e = _emit_debate(deb, to_string(c[0]), to_string(c[1]), to_string(c[2]), to_string(c[3]))
+    }
+    let after_mtime = _exec_out("stat -f %m " + _sh_quote(emitted[0]) + " 2>/dev/null").trim()
+    if before_mtime != after_mtime {
+        eprintln("  FAIL S3 mtime changed (before=" + before_mtime + " after=" + after_mtime + ") — not idempotent")
+        fails = fails + 1
+    } else {
+        println("  S3 PASS: idempotent (open debate preserved)")
+    }
+
+    // S4 — verify schema fields present in emitted file
+    let sample = json_parse(read_file(emitted[0]))
+    let need_keys = ["schema", "pair_slug", "ids", "kind", "reason", "status", "created_at", "winner"]
+    let mut missing = []
+    for k in need_keys {
+        if !_has(sample, k) { missing.push(k) }
+    }
+    if len(missing) > 0 {
+        eprintln("  FAIL S4 missing keys: " + to_string(len(missing)))
+        for m in missing { eprintln("    - " + to_string(m)) }
+        fails = fails + 1
+    } else {
+        println("  S4 PASS: schema fields complete")
+    }
+
+    exec("rm -rf " + _sh_quote(sandbox))
+
+    let passed = 4 - fails
+    if fails == 0 {
+        println("proposal_conflict_detect selftest: 4/4 PASS")
+        return 0
+    }
+    println("proposal_conflict_detect selftest: " + to_string(passed) + "/4 (fails=" + to_string(fails) + ")")
+    return 1
+}
+
+// ─── CLI ────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") {
+        println("usage: hexa tool/proposal_conflict_detect.hexa [--apply] [--pending <dir>] [--debate <dir>]")
+        println("       hexa tool/proposal_conflict_detect.hexa --selftest")
+        return 0
+    }
+    if _flag(av, "--selftest") { return _selftest() }
+
+    let pending = _opt(av, "--pending", DEFAULT_PENDING)
+    let debate  = _opt(av, "--debate",  DEFAULT_DEBATE)
+    let apply_mode = _flag(av, "--apply")
+
+    if !_file_exists(pending) {
+        println("proposal_conflict_detect: pending dir not found: " + pending)
+        return 0
+    }
+
+    let conflicts = _scan_all(pending)
+    println("── proposal_conflict_detect ──")
+    println("pending dir : " + pending)
+    println("debate dir  : " + debate)
+    println("mode        : " + (if apply_mode { "apply" } else { "dry" }))
+    println("pairs found : " + to_string(len(conflicts)))
+
+    let mut written = 0
+    for c in conflicts {
+        let a = to_string(c[0])
+        let b = to_string(c[1])
+        let k = to_string(c[2])
+        let r = to_string(c[3])
+        println("  " + a + " vs " + b + " [" + k + "] " + r)
+        if apply_mode {
+            let p = _emit_debate(debate, a, b, k, r)
+            if len(p) > 0 {
+                written = written + 1
+                println("    → wrote " + p)
+            } else {
+                println("    → skip (existing debate preserved)")
+            }
+        }
+    }
+    if apply_mode {
+        println("written     : " + to_string(written))
+    } else {
+        println("(dry run — pass --apply to emit debate files)")
+    }
+    return 0
+}
+
+main()

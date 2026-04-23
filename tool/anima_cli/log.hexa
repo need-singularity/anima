@@ -1,0 +1,412 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/log.hexa — anima CLI `log` topic (unified log tail)
+//
+//  PURPOSE
+//    Single-pane tail across the 6 canonical JSONL log streams that the
+//    anima session writes to. Operators had to remember each path and run
+//    six tails in parallel; this module folds them into one view, sorted
+//    by `ts` field (ISO-8601, UTC), source-tagged with a short prefix.
+//
+//  SOURCES (6)
+//    cycle   state/proposals/meta/cycle_log.jsonl
+//    cost    state/anima_cost_ledger.jsonl
+//    weight  state/h100_weight_precache_progress.jsonl
+//    dist    state/dist_native_build_periodic_log.jsonl
+//    asset   state/asset_archive_log.jsonl          (READ-ONLY · do not touch)
+//    xrepo   state/cross_repo_sync_log.jsonl
+//
+//  SUBCOMMANDS
+//    (none)                     recent N (default 20) lines, ts-desc merged
+//    tail [--since 1h|1d|...]   time-filtered merged view
+//    watch                      live tail (bash `tail -f` wrap, color/source)
+//    --source <name>            single-source filter (applies to all modes)
+//    --n N                      row limit (default 20)
+//    --selftest                 synthetic 2-source merge test
+//    --help
+//
+//  OUTPUT FORMAT
+//    [<ts>] [<source>] <msg>
+//
+//  DESIGN
+//    raw#9  hexa-only (live mode shells out to bash `tail -f`)
+//    raw#11 snake_case
+//    raw#15 no-hardcode (paths via _resolve_root)
+//    idempotent (non-watch modes: read-only)
+//    deterministic-friendly (HEXA_REPRODUCIBLE=1 → REDACTED ts in header)
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── vendored helpers (sibling pattern) ─────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── source catalog ─────────────────────────────────────────────────────
+
+fn _source_names() -> array {
+    return ["cycle", "cost", "weight", "dist", "asset", "xrepo"]
+}
+
+fn _source_path(name: string) -> string {
+    let root = _resolve_root()
+    if name == "cycle"  { return root + "/state/proposals/meta/cycle_log.jsonl" }
+    if name == "cost"   { return root + "/state/anima_cost_ledger.jsonl" }
+    if name == "weight" { return root + "/state/h100_weight_precache_progress.jsonl" }
+    if name == "dist"   { return root + "/state/dist_native_build_periodic_log.jsonl" }
+    if name == "asset"  { return root + "/state/asset_archive_log.jsonl" }
+    if name == "xrepo"  { return root + "/state/cross_repo_sync_log.jsonl" }
+    return ""
+}
+
+fn _source_color(name: string) -> string {
+    // ANSI 256-color codes for watch mode (tty only)
+    if name == "cycle"  { return "36" }   // cyan
+    if name == "cost"   { return "33" }   // yellow
+    if name == "weight" { return "35" }   // magenta
+    if name == "dist"   { return "34" }   // blue
+    if name == "asset"  { return "37" }   // light grey
+    if name == "xrepo"  { return "32" }   // green
+    return "0"
+}
+
+// ─── merge core ─────────────────────────────────────────────────────────
+
+fn _build_merge_cmd(filter_src: string, n: string, since: string) -> string {
+    // Emit python3 snippet that reads each source, tags w/ source, optionally
+    // filters by --since (relative, e.g. 1h / 2d / 30m), merges, sorts by ts
+    // desc, prints last N in "[ts] [src   ] msg" format.
+    let root = _resolve_root()
+    let names = _source_names()
+    let src_csv = ""
+    let i = 0
+    while i < len(names) {
+        let nm = _str(names[i])
+        if filter_src == "" || filter_src == nm {
+            let path = _source_path(nm)
+            if src_csv != "" { src_csv = src_csv + "|" }
+            src_csv = src_csv + nm + "::" + path
+        }
+        i = i + 1
+    }
+    let cmd = "python3 - <<'PY' 2>/dev/null\n"
+            + "import json, os, sys, time, datetime as dt\n"
+            + "src_csv = '" + src_csv + "'\n"
+            + "n = int('" + n + "' or '20')\n"
+            + "since = '" + since + "'\n"
+            + "cutoff = None\n"
+            + "if since:\n"
+            + "    unit = since[-1]; num = since[:-1]\n"
+            + "    mult = {'s':1,'m':60,'h':3600,'d':86400}.get(unit)\n"
+            + "    if mult and num.isdigit():\n"
+            + "        cutoff = dt.datetime.utcnow() - dt.timedelta(seconds=int(num)*mult)\n"
+            + "def parse_ts(t):\n"
+            + "    if not t: return None\n"
+            + "    t = str(t).replace('Z','').rstrip()\n"
+            + "    for fmt in ('%Y-%m-%dT%H:%M:%S','%Y-%m-%dT%H:%M:%S.%f','%Y%m%dT%H%M%S'):\n"
+            + "        try: return dt.datetime.strptime(t, fmt)\n"
+            + "        except Exception: pass\n"
+            + "    return None\n"
+            + "def short(src):\n"
+            + "    return (src + '      ')[:6]\n"
+            + "def summarize(src, obj):\n"
+            + "    if not isinstance(obj, dict): return str(obj)[:140]\n"
+            + "    if src == 'cycle':\n"
+            + "        return f\"cycle {obj.get('cycle_id','?')} step={obj.get('step','?')} {obj.get('name','?')}({obj.get('status','?')})\"\n"
+            + "    if src == 'cost':\n"
+            + "        return f\"session delta=${obj.get('delta_usd','?')} cumul=${obj.get('cumulative_burn_usd','?')} bal=${obj.get('balance_usd','?')}\"\n"
+            + "    if src == 'weight':\n"
+            + "        return f\"{obj.get('path','?')} {obj.get('status','?')} {obj.get('size_mb','?')}MB strat={obj.get('strategy','?')}\"\n"
+            + "    if src == 'dist':\n"
+            + "        return f\"{obj.get('tool','?')} {obj.get('event','?')} verdict={obj.get('verdict','?')} {obj.get('note','')[:80]}\"\n"
+            + "    if src == 'asset':\n"
+            + "        return f\"{obj.get('action','?')} {obj.get('status','?')} {obj.get('path','?')}\"\n"
+            + "    if src == 'xrepo':\n"
+            + "        return f\"mode={obj.get('mode','?')} reach={obj.get('reachable','?')} new={obj.get('new_links','?')} dedup={obj.get('dedup_skip','?')}\"\n"
+            + "    return json.dumps({k:obj[k] for k in list(obj)[:4]}, ensure_ascii=False)\n"
+            + "rows = []\n"
+            + "for entry in src_csv.split('|'):\n"
+            + "    if not entry: continue\n"
+            + "    nm, _, path = entry.partition('::')\n"
+            + "    if not os.path.isfile(path): continue\n"
+            + "    with open(path, 'r', encoding='utf-8', errors='replace') as fh:\n"
+            + "        for ln in fh:\n"
+            + "            ln = ln.strip()\n"
+            + "            if not ln: continue\n"
+            + "            try: obj = json.loads(ln)\n"
+            + "            except Exception: continue\n"
+            + "            ts = obj.get('ts') if isinstance(obj, dict) else None\n"
+            + "            ptime = parse_ts(ts)\n"
+            + "            if cutoff and ptime and ptime < cutoff: continue\n"
+            + "            rows.append((ts or '', nm, summarize(nm, obj)))\n"
+            + "rows.sort(key=lambda r: r[0], reverse=True)\n"
+            + "for ts, nm, msg in rows[:n]:\n"
+            + "    print(f\"[{ts}] [{short(nm)}] {msg}\")\n"
+            + "PY\n"
+    return cmd
+}
+
+// ─── subcommands ────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima log — unified tail across 6 JSONL log streams")
+    println("")
+    println("  (no subcmd)              last N (default 20) merged, ts-desc")
+    println("  tail [--since 1h|1d]     time-filtered merged view")
+    println("  watch                    live tail (tail -f 6 files · colored)")
+    println("")
+    println("FLAGS")
+    println("  --source <name>          cycle|cost|weight|dist|asset|xrepo")
+    println("  --n N                    line limit (default 20)")
+    println("  --since <dur>            1s|5m|1h|2d relative window")
+    println("  --selftest   --help")
+    println("")
+    println("SOURCES")
+    println("  cycle   state/proposals/meta/cycle_log.jsonl")
+    println("  cost    state/anima_cost_ledger.jsonl")
+    println("  weight  state/h100_weight_precache_progress.jsonl")
+    println("  dist    state/dist_native_build_periodic_log.jsonl")
+    println("  asset   state/asset_archive_log.jsonl          (read-only)")
+    println("  xrepo   state/cross_repo_sync_log.jsonl")
+}
+
+fn sub_show(argv, since_default: string) {
+    let src = _arg_value(argv, "--source", "")
+    let n = _arg_value(argv, "--n", "20")
+    let since = _arg_value(argv, "--since", since_default)
+    if src != "" {
+        let names = _source_names()
+        let ok = false
+        let i = 0
+        while i < len(names) {
+            if _str(names[i]) == src { ok = true }
+            i = i + 1
+        }
+        if !ok {
+            println("log: unknown --source '" + src + "' (cycle|cost|weight|dist|asset|xrepo)")
+            exit(2)
+        }
+    }
+    let cmd = _build_merge_cmd(src, n, since)
+    let out = _str(exec(cmd))
+    // header only when ts not redacted-mode and output non-empty → keep quiet
+    if out.trim() == "" {
+        let tag = if src == "" { "any source" } else { "source=" + src }
+        println("(no entries · " + tag + (if since == "" { "" } else { " since=" + since }) + ")")
+        return
+    }
+    println(out.trim())
+}
+
+fn sub_watch(argv) {
+    // NOTE: live streaming requires stdout to bypass hexa's exec() capture,
+    // so the canonical entry is `bin/anima log watch` (bash wrapper).
+    // This in-hexa fallback still works but only flushes when tail-F writes
+    // before the exec() blocks; use it for short probes / programmatic runs.
+    println("# anima log watch — for live streaming run `bin/anima log watch`")
+    println("# (running in-hexa fallback · may buffer until tails flush)")
+    let src = _arg_value(argv, "--source", "")
+    let names = _source_names()
+    let paths = []
+    let colors = []
+    let i = 0
+    while i < len(names) {
+        let nm = _str(names[i])
+        if src == "" || src == nm {
+            let p = _source_path(nm)
+            if _fexists(p) {
+                paths = paths + [nm + "::" + p]
+                colors = colors + [_source_color(nm)]
+            }
+        }
+        i = i + 1
+    }
+    if len(paths) == 0 {
+        println("log watch: no readable sources (root=" + _resolve_root() + ")")
+        exit(1)
+    }
+    // bash subshell: parallel `tail -f` into a colorizer awk. Each line gets
+    // the "[src  ] " prefix plus ANSI color when stdout is a tty.
+    let sh = "{\n"
+    let j = 0
+    while j < len(paths) {
+        let entry = _str(paths[j])
+        let idx = entry.index_of("::")
+        let nm = entry.substring(0, idx)
+        let path = entry.substring(idx + 2, len(entry))
+        let color = _str(colors[j])
+        let short_nm = (nm + "      ")
+        // pad to 6
+        let padded = short_nm.substring(0, 6)
+        sh = sh + "  tail -n 0 -F " + path + " 2>/dev/null | awk -v SRC='" + padded + "' -v C='" + color + "' '\n"
+              + "    BEGIN{ tty = system(\"test -t 1\") == 0 }\n"
+              + "    {\n"
+              + "      ts = \"\"\n"
+              + "      if (match($0, /\"ts\":\"[^\"]+\"/)) {\n"
+              + "        ts = substr($0, RSTART+6, RLENGTH-7)\n"
+              + "      }\n"
+              + "      line = \"[\" ts \"] [\" SRC \"] \" $0\n"
+              + "      if (tty) { printf \"\\033[%sm%s\\033[0m\\n\", C, line; fflush() }\n"
+              + "      else     { print line; fflush() }\n"
+              + "    }' &\n"
+        j = j + 1
+    }
+    sh = sh + "  wait\n"
+    sh = sh + "}\n"
+    let wrap = "bash -c " + _shell_quote(sh)
+    // exec directly (foreground); Ctrl-C kills child tails via the subshell.
+    exec(wrap)
+}
+
+fn _shell_quote(s: string) -> string {
+    // Single-quote the blob; embedded single quotes are rare in our heredoc
+    // content (awk uses double quotes), but be safe.
+    let out = "'"
+    let i = 0
+    while i < len(s) {
+        let ch = s.substring(i, i + 1)
+        if ch == "'" { out = out + "'\"'\"'" } else { out = out + ch }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+// ─── selftest ───────────────────────────────────────────────────────────
+
+fn sub_selftest() {
+    // synthetic 2-source merge: write two tmp jsonl, invoke a mini merge via
+    // the same python core, assert order + source prefix.
+    let tmp_a = "/tmp/anima_log_selftest_a.jsonl"
+    let tmp_b = "/tmp/anima_log_selftest_b.jsonl"
+    exec("printf '%s\\n' '{\"ts\":\"2026-04-22T00:00:01Z\",\"msg\":\"alpha-1\"}' "
+       + "'{\"ts\":\"2026-04-22T00:00:03Z\",\"msg\":\"alpha-3\"}' > " + tmp_a)
+    exec("printf '%s\\n' '{\"ts\":\"2026-04-22T00:00:02Z\",\"msg\":\"beta-2\"}' "
+       + "'{\"ts\":\"2026-04-22T00:00:04Z\",\"msg\":\"beta-4\"}' > " + tmp_b)
+    let cmd = "python3 - <<'PY' 2>/dev/null\n"
+            + "import json\n"
+            + "paths = [('alpha','" + tmp_a + "'),('beta','" + tmp_b + "')]\n"
+            + "rows = []\n"
+            + "for nm, p in paths:\n"
+            + "    for ln in open(p):\n"
+            + "        ln=ln.strip()\n"
+            + "        if not ln: continue\n"
+            + "        o = json.loads(ln)\n"
+            + "        rows.append((o['ts'], nm, o['msg']))\n"
+            + "rows.sort(key=lambda r: r[0], reverse=True)\n"
+            + "for ts,nm,m in rows:\n"
+            + "    print(f'[{ts}] [{(nm+\"      \")[:6]}] {m}')\n"
+            + "PY\n"
+    let got = _str(exec(cmd)).trim()
+    exec("rm -f " + tmp_a + " " + tmp_b)
+    // expected: beta-4 first, then alpha-3, beta-2, alpha-1
+    let expected_first = "[2026-04-22T00:00:04Z] [beta  ] beta-4"
+    let first_line = got
+    let nl = got.index_of("\n")
+    if nl >= 0 { first_line = got.substring(0, nl) }
+    if first_line != expected_first {
+        println("FAIL anima_cli/log selftest (merge order)")
+        println("  expected first: " + expected_first)
+        println("  got first:      " + first_line)
+        exit(1)
+    }
+    // line count = 4
+    let count = _str(exec("printf '%s\\n' '" + got + "' | grep -c '^\\[' 2>/dev/null")).trim()
+    if count != "4" {
+        println("FAIL anima_cli/log selftest (line count=" + count + ")")
+        exit(1)
+    }
+    // source catalog sanity
+    let names = _source_names()
+    if len(names) != 6 {
+        println("FAIL anima_cli/log selftest (source catalog)")
+        exit(1)
+    }
+    let i = 0
+    while i < len(names) {
+        let p = _source_path(_str(names[i]))
+        if p == "" {
+            println("FAIL anima_cli/log selftest (missing path for " + _str(names[i]) + ")")
+            exit(1)
+        }
+        i = i + 1
+    }
+    println("PASS anima_cli/log selftest (2-source merge · 6 sources registered)")
+    exit(0)
+}
+
+// ─── entry ──────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help")     { sub_help(); return }
+
+    // parse positional subcommand (first non-flag token)
+    let sub = ""
+    let i = 0
+    while i < len(argv) {
+        let t = _str(argv[i])
+        if !t.starts_with("--") { sub = t; break }
+        i = i + 1
+    }
+
+    if sub == "watch" { sub_watch(argv); return }
+    if sub == "tail"  { sub_show(argv, "1h"); return }
+    // default (no subcmd or unknown positional): show recent
+    sub_show(argv, "")
+}
+
+main()

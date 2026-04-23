@@ -1,0 +1,464 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/metrics.hexa — anima CLI `metrics` topic (Prometheus exposition)
+//
+//  PURPOSE
+//    Emit a Prometheus text exposition format 0.0.4 payload scraping current
+//    anima SSOT state files. Downstream Grafana (docs/grafana_htz_preboot_guide.md,
+//    config/sli_slo.json burn-rate alerts) targets this endpoint.
+//
+//  SUBCOMMANDS
+//    (default)                   print Prometheus payload to stdout
+//    --serve [--port 9091]       local HTTP server via bash + socat/nc
+//                                (SKIP if neither socat nor nc -l available)
+//    --pushgateway <url>         one-shot push to Prometheus Pushgateway
+//    --selftest                  emit → parse → verify spec compliance
+//    --help
+//
+//  METRICS (10 — all scraped from SSOT state/ files)
+//    anima_pods_running                   gauge   pods (runpodctl | 0)
+//    anima_burn_rate_usd_per_hr           gauge   cost / running hours
+//    anima_runpod_balance_usd             gauge   state/runpod_credit_status.json
+//    anima_proposal_pending               gauge   state/proposals/meta/metrics.json
+//    anima_proposal_approved              gauge   "
+//    anima_proposal_rejected              gauge   "
+//    anima_proposal_archived              gauge   "
+//    anima_cycle_last_ts                  gauge   unix epoch of last cycle_log line
+//    anima_cert_gate_verdict              gauge   1=PASS/BASE_OR_ABOVE/FULL_REWARD 0=else
+//    anima_weight_precache_total_gb       gauge   state/h100_weight_precache_manifest.json
+//    anima_cost_cumulative_usd            counter sum of stage*_launch_state cost
+//    anima_roadmap_done_count             gauge   entries with status==done
+//    anima_session_duration_seconds       gauge   now - cycle_last_ts (rough)
+//
+//  OUTPUT
+//    Content-Type: text/plain; version=0.0.4; charset=utf-8
+//
+//  DESIGN
+//    raw#9  hexa-only (no .py) · raw#11 snake_case · raw#15 no-hardcode
+//    deterministic when HEXA_REPRODUCIBLE=1 (timestamps redacted in HELP only;
+//    metric values themselves remain snapshot-dependent by definition).
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── helpers ────────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    if t == "int" || t == "float" || t == "number" { return "" + x }
+    return ""
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _epoch_now() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "0" }
+    return _str(exec("date -u +%s")).trim()
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _has_cmd(c: string) -> bool {
+    return _str(exec("command -v " + c + " >/dev/null 2>&1 && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _jq_field(path: string, key: string) -> string {
+    if !_fexists(path) { return "" }
+    return _str(exec("jq -r '" + key + " // \"\"' " + path + " 2>/dev/null")).trim()
+}
+
+fn _default(s: string, d: string) -> string {
+    if s == "" || s == "null" { return d }
+    return s
+}
+
+// ─── per-metric scrape functions ────────────────────────────────────────
+
+fn m_pods_running() -> string {
+    if _has_cmd("runpodctl") {
+        let n = _str(exec("runpodctl pod list 2>/dev/null | tail -n +2 | wc -l | tr -d ' '")).trim()
+        return _default(n, "0")
+    }
+    return "0"
+}
+
+fn m_runpod_balance() -> string {
+    let root = _resolve_root()
+    let p = root + "/state/runpod_credit_status.json"
+    return _default(_jq_field(p, ".balance_usd"), "0")
+}
+
+fn m_cost_cumulative() -> string {
+    // Sum .total_session_cost_usd across all state/h100_stage*_launch_state.json via jq only.
+    let root = _resolve_root()
+    let cmd = "ls " + root + "/state/h100_stage*_launch_state.json 2>/dev/null "
+            + "| xargs -I{} jq -r '.total_session_cost_usd // 0' {} 2>/dev/null "
+            + "| awk 'BEGIN{s=0} {s+=$1} END{printf \"%.4f\", s}'"
+    let v = _str(exec(cmd)).trim()
+    return _default(v, "0.0000")
+}
+
+fn m_burn_rate_hr() -> string {
+    // Rough estimate: cumulative_usd / max(session_duration_hours, 1).
+    let cum = m_cost_cumulative()
+    let dur_s = m_session_duration_seconds()
+    let cmd = "awk -v c=" + cum + " -v s=" + dur_s
+            + " 'BEGIN{ if(s<=0){print \"0.0000\"; exit} h=s/3600.0; if(h<1.0) h=1.0; printf \"%.4f\", c/h }'"
+    return _default(_str(exec(cmd)).trim(), "0.0000")
+}
+
+fn m_proposal_counts() -> array {
+    // Returns [pending, approved, rejected, archived]
+    let root = _resolve_root()
+    let p = root + "/state/proposals/meta/metrics.json"
+    let pe = _default(_jq_field(p, ".counts.pending"), "0")
+    let ap = _default(_jq_field(p, ".counts.approved"), "0")
+    let rj = _default(_jq_field(p, ".counts.rejected"), "0")
+    let ar = _default(_jq_field(p, ".counts.archived"), "0")
+    return [pe, ap, rj, ar]
+}
+
+fn m_cycle_last_ts() -> string {
+    // unix epoch of last line ts in state/proposals/meta/cycle_log.jsonl
+    let root = _resolve_root()
+    let p = root + "/state/proposals/meta/cycle_log.jsonl"
+    if !_fexists(p) { return "0" }
+    let cmd = "ts=$(tail -n 1 " + p + " 2>/dev/null | jq -r '.ts // \"\"' 2>/dev/null); "
+            + "[ -z \"$ts\" ] && echo 0 && exit; "
+            + "date -u -j -f '%Y-%m-%dT%H:%M:%SZ' \"$ts\" +%s 2>/dev/null "
+            + "|| date -u -d \"$ts\" +%s 2>/dev/null || echo 0"
+    return _default(_str(exec(cmd)).trim(), "0")
+}
+
+fn m_session_duration_seconds() -> string {
+    let last = m_cycle_last_ts()
+    let now = _epoch_now()
+    if last == "0" || now == "0" { return "0" }
+    let cmd = "awk -v a=" + now + " -v b=" + last + " 'BEGIN{d=a-b; if(d<0)d=0; printf \"%d\", d}'"
+    return _default(_str(exec(cmd)).trim(), "0")
+}
+
+fn m_cert_gate_verdict() -> string {
+    // 1 when verdict ∈ {PASS, BASE_OR_ABOVE, FULL_REWARD} else 0
+    let root = _resolve_root()
+    let p = root + "/state/cert_gate_result.json"
+    let v = _jq_field(p, ".verdict")
+    if v == "PASS" { return "1" }
+    if v == "BASE_OR_ABOVE" { return "1" }
+    if v == "FULL_REWARD" { return "1" }
+    return "0"
+}
+
+fn m_weight_precache_total_gb() -> string {
+    // sum paths.*.size_gb from h100_weight_precache_manifest.json
+    let root = _resolve_root()
+    let p = root + "/state/h100_weight_precache_manifest.json"
+    if !_fexists(p) { return "0" }
+    let cmd = "jq -r '[.paths[]? | .size_gb // 0] | add // 0' " + p + " 2>/dev/null"
+    return _default(_str(exec(cmd)).trim(), "0")
+}
+
+fn m_roadmap_done_count() -> string {
+    let root = _resolve_root()
+    let p = root + "/state/roadmap_progress.json"
+    if !_fexists(p) { return "0" }
+    let cmd = "jq -r '[.entries[] | select(.status==\"done\")] | length' " + p + " 2>/dev/null"
+    return _default(_str(exec(cmd)).trim(), "0")
+}
+
+// ─── exposition format emitter ──────────────────────────────────────────
+
+fn _metric_line(nm: string, kind: string, help: string, val: string) -> string {
+    let mut s = ""
+    s = s + "# HELP " + nm + " " + help + "\n"
+    s = s + "# TYPE " + nm + " " + kind + "\n"
+    s = s + nm + " " + val + "\n"
+    return s
+}
+
+fn render_exposition() -> string {
+    let pc = m_proposal_counts()
+    let mut body = ""
+    body = body + _metric_line("anima_pods_running", "gauge",
+        "Number of running runpod pods (0 if runpodctl unavailable).", m_pods_running())
+    body = body + _metric_line("anima_burn_rate_usd_per_hr", "gauge",
+        "Estimated burn rate in USD per hour (cumulative_usd / running_hours).", m_burn_rate_hr())
+    body = body + _metric_line("anima_runpod_balance_usd", "gauge",
+        "Current runpod account balance in USD.", m_runpod_balance())
+    body = body + _metric_line("anima_proposal_pending", "gauge",
+        "Proposals in pending state.", _str(pc[0]))
+    body = body + _metric_line("anima_proposal_approved", "gauge",
+        "Proposals in approved state.", _str(pc[1]))
+    body = body + _metric_line("anima_proposal_rejected", "gauge",
+        "Proposals in rejected state.", _str(pc[2]))
+    body = body + _metric_line("anima_proposal_archived", "gauge",
+        "Proposals in archived state.", _str(pc[3]))
+    body = body + _metric_line("anima_cycle_last_ts", "gauge",
+        "Unix epoch timestamp of most recent auto-evolution cycle log entry.", m_cycle_last_ts())
+    body = body + _metric_line("anima_cert_gate_verdict", "gauge",
+        "1 if last cert_gate verdict is PASS/BASE_OR_ABOVE/FULL_REWARD, else 0.", m_cert_gate_verdict())
+    body = body + _metric_line("anima_weight_precache_total_gb", "gauge",
+        "Total size in GB of pre-cached H100 model weights.", m_weight_precache_total_gb())
+    body = body + _metric_line("anima_cost_cumulative_usd", "counter",
+        "Cumulative session cost in USD across all stage launches.", m_cost_cumulative())
+    body = body + _metric_line("anima_roadmap_done_count", "gauge",
+        "Count of roadmap entries with status=done.", m_roadmap_done_count())
+    body = body + _metric_line("anima_session_duration_seconds", "gauge",
+        "Seconds since last cycle_log entry (approx session activity age).", m_session_duration_seconds())
+    return body
+}
+
+// ─── subcommands ────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima metrics — Prometheus text exposition (format 0.0.4)")
+    println("")
+    println("  (default)               print exposition to stdout")
+    println("  --serve [--port 9091]   local HTTP server (socat or nc required)")
+    println("  --pushgateway <url>     one-shot push to Prometheus Pushgateway")
+    println("  --selftest              emit → parse → spec verify")
+    println("  --help                  this help")
+    println("")
+    println("Metrics emitted (13 lines, one per metric name):")
+    println("  anima_pods_running, anima_burn_rate_usd_per_hr, anima_runpod_balance_usd,")
+    println("  anima_proposal_{pending,approved,rejected,archived},")
+    println("  anima_cycle_last_ts, anima_cert_gate_verdict, anima_weight_precache_total_gb,")
+    println("  anima_cost_cumulative_usd, anima_roadmap_done_count, anima_session_duration_seconds")
+}
+
+fn sub_emit() {
+    let body = render_exposition()
+    print(body)
+}
+
+fn sub_pushgateway(argv) {
+    let url = _arg_value(argv, "--pushgateway", "")
+    if url == "" {
+        println("metrics --pushgateway: missing URL")
+        exit(2)
+    }
+    if !_has_cmd("curl") {
+        println("metrics --pushgateway: curl not available")
+        exit(2)
+    }
+    let body = render_exposition()
+    // Write body to tmp, POST it
+    let tmp = "/tmp/anima_metrics_push." + _epoch_now() + ".prom"
+    write_file(tmp, body)
+    let cmd = "curl -sS -X POST --data-binary @" + tmp
+            + " -H 'Content-Type: text/plain; version=0.0.4' "
+            + url + "/metrics/job/anima"
+    let r = _str(exec(cmd))
+    exec("rm -f " + tmp)
+    println("pushed to " + url + " (resp=" + r.trim() + ")")
+}
+
+fn sub_serve(argv) {
+    let port = _arg_value(argv, "--port", "9091")
+    // Prefer socat (stable HTTP handling), fall back to bash nc loop.
+    let have_socat = _has_cmd("socat")
+    let have_nc = _has_cmd("nc")
+    if !have_socat && !have_nc {
+        println("metrics --serve: SKIPPED (neither socat nor nc -l available)")
+        println("  hexa has no native HTTP primitive; install socat or use --pushgateway instead.")
+        exit(2)
+    }
+
+    let root = _resolve_root()
+    let emitter = root + "/tool/anima_cli/metrics.hexa"
+    let hexa_bin = _default(_str(env("HEXA_BIN")), "/Users/ghost/.hx/bin/hexa")
+
+    // Build a small bash responder script that re-execs this tool each request.
+    let script = "/tmp/anima_metrics_serve." + port + ".sh"
+    let mut sh = "#!/bin/bash\n"
+    sh = sh + "set -u\n"
+    sh = sh + "PORT='" + port + "'\n"
+    sh = sh + "HEXA='" + hexa_bin + "'\n"
+    sh = sh + "TOOL='" + emitter + "'\n"
+    sh = sh + "respond() {\n"
+    sh = sh + "  local body status ctype\n"
+    sh = sh + "  body=\"$(\"$HEXA\" run \"$TOOL\" 2>/dev/null)\"\n"
+    sh = sh + "  printf 'HTTP/1.1 200 OK\\r\\nContent-Type: text/plain; version=0.0.4; charset=utf-8\\r\\nContent-Length: %d\\r\\nConnection: close\\r\\n\\r\\n%s' \"${#body}\" \"$body\"\n"
+    sh = sh + "}\n"
+    if have_socat {
+        sh = sh + "echo \"[anima metrics] socat listening on 0.0.0.0:$PORT\" >&2\n"
+        sh = sh + "exec socat -T 2 TCP-LISTEN:\"$PORT\",reuseaddr,fork SYSTEM:\"$0 __respond__\" \n"
+    } else {
+        sh = sh + "echo \"[anima metrics] nc loop on 127.0.0.1:$PORT (one-shot per connect)\" >&2\n"
+        sh = sh + "while true; do\n"
+        sh = sh + "  respond | nc -l 127.0.0.1 \"$PORT\" -w 2 >/dev/null 2>&1 || true\n"
+        sh = sh + "  sleep 0.1\n"
+        sh = sh + "done\n"
+    }
+    sh = sh + "\n# socat SYSTEM: re-entry\n"
+    sh = sh + "if [ \"${1:-}\" = \"__respond__\" ]; then respond; exit 0; fi\n"
+    write_file(script, sh)
+    exec("chmod +x " + script)
+    println("anima metrics --serve: port=" + port + "  script=" + script)
+    println("  (foreground; Ctrl-C to stop)")
+    // Exec the script (replaces current process semantics handled by exec())
+    exec("bash " + script)
+}
+
+// ─── selftest: emit → parse → spec verify ───────────────────────────────
+//
+// Prometheus text exposition 0.0.4 spec (simplified):
+//   - Each metric: # HELP, # TYPE, then one or more sample lines
+//   - TYPE ∈ {counter, gauge, histogram, summary, untyped}
+//   - Sample line: <metric_name>[{labels}] <value> [ timestamp_ms ]
+//   - metric_name: [a-zA-Z_:][a-zA-Z0-9_:]*
+//   - value: floating-point, Inf, -Inf, NaN, or integer
+// We verify: HELP+TYPE present for each of the 13 names; each name has a
+// numeric sample line; TYPE is one of the allowed set; no duplicate HELP.
+
+fn _contains_line(body: string, needle: string) -> bool {
+    return body.contains(needle)
+}
+
+fn _numeric_ok(v: string) -> bool {
+    // Accept int, float (optional leading '-'), or 'NaN'/'Inf'/'-Inf'/'+Inf'
+    if v == "" { return false }
+    if v == "NaN" || v == "Inf" || v == "+Inf" || v == "-Inf" { return true }
+    let cmd = "awk -v s='" + v + "' 'BEGIN{ if(s+0==s+0 && s ~ /^-?[0-9]+(\\.[0-9]+)?$/) print 1; else print 0 }'"
+    return _str(exec(cmd)).trim() == "1"
+}
+
+fn sub_selftest() {
+    let names = [
+        "anima_pods_running",
+        "anima_burn_rate_usd_per_hr",
+        "anima_runpod_balance_usd",
+        "anima_proposal_pending",
+        "anima_proposal_approved",
+        "anima_proposal_rejected",
+        "anima_proposal_archived",
+        "anima_cycle_last_ts",
+        "anima_cert_gate_verdict",
+        "anima_weight_precache_total_gb",
+        "anima_cost_cumulative_usd",
+        "anima_roadmap_done_count",
+        "anima_session_duration_seconds"
+    ]
+    let allowed_types = ["counter", "gauge", "histogram", "summary", "untyped"]
+
+    let body = render_exposition()
+
+    // Persist for forensics
+    let tmp = "/tmp/anima_metrics_selftest.prom"
+    write_file(tmp, body)
+
+    let mut fails = 0
+    let mut checked = 0
+    let mut i = 0
+    while i < len(names) {
+        let nm = _str(names[i])
+        checked = checked + 1
+        let help_tag = "# HELP " + nm + " "
+        let type_tag = "# TYPE " + nm + " "
+        if !_contains_line(body, help_tag) {
+            println("FAIL missing HELP for " + nm)
+            fails = fails + 1
+        }
+        if !_contains_line(body, type_tag) {
+            println("FAIL missing TYPE for " + nm)
+            fails = fails + 1
+        }
+        // extract TYPE kind via grep
+        let t_cmd = "grep -m1 '^# TYPE " + nm + " ' " + tmp + " | awk '{print $4}'"
+        let t_val = _str(exec(t_cmd)).trim()
+        let mut type_ok = false
+        let mut j = 0
+        while j < len(allowed_types) {
+            if _str(allowed_types[j]) == t_val { type_ok = true }
+            j = j + 1
+        }
+        if !type_ok {
+            println("FAIL invalid TYPE '" + t_val + "' for " + nm)
+            fails = fails + 1
+        }
+        // extract sample line value
+        let v_cmd = "grep -m1 '^" + nm + " ' " + tmp + " | awk '{print $2}'"
+        let v_val = _str(exec(v_cmd)).trim()
+        if !_numeric_ok(v_val) {
+            println("FAIL non-numeric value '" + v_val + "' for " + nm)
+            fails = fails + 1
+        }
+        i = i + 1
+    }
+
+    // Count unique HELP lines must equal names count (no duplicates)
+    let help_cmd = "grep -c '^# HELP ' " + tmp
+    let help_n = _str(exec(help_cmd)).trim()
+    if help_n != _str(len(names)) {
+        println("FAIL HELP line count=" + help_n + " want=" + _str(len(names)))
+        fails = fails + 1
+    }
+
+    println("")
+    println("checked=" + _str(checked) + " metrics  fails=" + _str(fails))
+    if fails == 0 {
+        println("PASS anima_cli/metrics selftest  (13 metrics, Prometheus 0.0.4 compliant)")
+        exit(0)
+    }
+    println("FAIL anima_cli/metrics selftest")
+    exit(1)
+}
+
+// ─── main ───────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--help") { sub_help(); return }
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--pushgateway") { sub_pushgateway(argv); return }
+    if _arg_present(argv, "--serve") { sub_serve(argv); return }
+    sub_emit()
+}
+
+main()

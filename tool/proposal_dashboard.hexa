@@ -1,0 +1,894 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/proposal_dashboard.hexa — P5 (proposal stack docs/proposal_dashboard.md
+//  auto-generation)
+//
+//  PURPOSE
+//    Render docs/proposal_dashboard.md from proposal stack state:
+//        state/proposals/inventory.json
+//        state/proposals/meta/metrics.json
+//        state/proposals/{pending,approved,rejected,archived,debate}/*.json
+//        state/proposals/clusters/*.json
+//
+//    The output is fully READ-ONLY w.r.t. state/proposals/ — this tool never
+//    mutates proposal stack data, only renders the markdown dashboard.
+//
+//  SECTIONS (per spec §11)
+//    1. summary table (status counts)
+//    2. top 10 pending by score
+//    3. recent transitions (last 7d)
+//    4. cluster summary
+//    5. metrics (approval_rate_30d / median_age_pending / evolution_velocity)
+//    6. top 5 stale (oldest pending — decay candidate alert)
+//
+//  IDEMPOTENCY
+//    Top of file emits AUTO-GENERATED + UTC ts. The volatile timestamp line
+//    is regex-strippable so re-runs on identical input hash equal after strip
+//    (verified by --selftest).
+//
+//  USAGE
+//    hexa run tool/proposal_dashboard.hexa
+//    hexa run tool/proposal_dashboard.hexa --out <path>
+//    hexa run tool/proposal_dashboard.hexa --root <state/proposals dir>
+//    hexa run tool/proposal_dashboard.hexa --selftest
+//
+//  HARD CONSTRAINTS (P5 spec)
+//    - READ-ONLY for state/proposals/ (writes ONLY docs/proposal_dashboard.md)
+//    - DO NOT modify .roadmap or any other tool
+//    - NO .py files (raw#9 hexa-only)
+//    - atomic write (tmp + mv)
+//
+//  RAW
+//    raw#9 hexa-only · raw#10 deterministic ledger · raw#11 snake_case
+//    raw#12 실측 only · raw#15 no-hardcode (paths via flags)
+// ════════════════════════════════════════════════════════════════════════════
+
+let TOOL_NAME    = "proposal_dashboard"
+let TOOL_VERSION = "v1"
+let DEFAULT_ROOT = "/Users/ghost/core/anima/state/proposals"
+let DEFAULT_OUT  = "/Users/ghost/core/anima/docs/proposal_dashboard.md"
+let SMOKE_OUT    = "/Users/ghost/core/anima/state/proposal_dashboard_result.json"
+
+let HDR_AUTOGEN  = "<!-- AUTO-GENERATED, DO NOT EDIT — source: tool/proposal_dashboard.hexa -->"
+let HDR_TS_PFX   = "<!-- generated: "
+let TITLE        = "# anima proposal stack dashboard (auto)"
+
+let STALE_DAYS_DEFAULT = 90
+let RECENT_TRANSITION_DAYS = 7
+let TOP_PENDING_N = 10
+let TOP_STALE_N = 5
+
+// ─── shell helpers ────────────────────────────────────────────────────────
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(path: string) -> bool {
+    return _exec_code("test -e " + _sh_quote(path)) == 0
+}
+
+fn _is_file(path: string) -> bool {
+    return _exec_code("test -f " + _sh_quote(path)) == 0
+}
+
+fn _dir_exists(path: string) -> bool {
+    return _exec_code("test -d " + _sh_quote(path)) == 0
+}
+
+fn _mkdir_p(d: string) -> bool {
+    return _exec_code("mkdir -p " + _sh_quote(d)) == 0
+}
+
+fn _rm_rf(path: string) -> bool {
+    return _exec_code("rm -rf " + _sh_quote(path)) == 0
+}
+
+fn _utc_now() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _today_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%d").trim()
+}
+
+// epoch seconds (UTC) for a given ISO 8601 date string ("2026-04-22T...Z" or "2026-04-22").
+// Returns -1 on parse failure.
+fn _epoch_of(iso: string) -> int {
+    let s = iso.trim()
+    if s.len() == 0 { return -1 }
+    // strip subsecond fragments / "Z" — `date -j -f` cannot grok them on macOS.
+    let mut clean = s
+    let dot = clean.index_of(".")
+    if dot >= 0 {
+        clean = clean.substring(0, dot)
+    }
+    if clean.ends_with("Z") {
+        clean = clean.substring(0, clean.len() - 1)
+    }
+    // detect date-only vs full datetime
+    let has_t = clean.index_of("T") >= 0
+    let mut cmd = ""
+    if has_t {
+        cmd = "date -u -j -f '%Y-%m-%dT%H:%M:%S' " + _sh_quote(clean) + " +%s 2>/dev/null"
+    } else {
+        cmd = "date -u -j -f '%Y-%m-%d' " + _sh_quote(clean) + " +%s 2>/dev/null"
+    }
+    let out = _exec_out(cmd).trim()
+    if out.len() == 0 { return -1 }
+    return to_int(out)
+}
+
+fn _epoch_now() -> int {
+    return to_int(_exec_out("date -u +%s").trim())
+}
+
+fn _basename(path: string) -> string {
+    let parts = path.split("/")
+    if len(parts) == 0 { return path }
+    return to_string(parts[len(parts) - 1])
+}
+
+fn _parent_of(path: string) -> string {
+    let parts = path.split("/")
+    if len(parts) <= 1 { return "." }
+    let mut out = ""
+    let mut i = 0
+    let cap = len(parts) - 1
+    while i < cap {
+        if i > 0 { out = out + "/" }
+        out = out + to_string(parts[i])
+        i = i + 1
+    }
+    if out == "" { return "/" }
+    return out
+}
+
+// LC_ALL=C sorted file list (non-recursive).
+fn _list_json(dir: string) -> array {
+    if !_dir_exists(dir) { return [] }
+    let cmd = "find " + _sh_quote(dir) + " -maxdepth 1 -type f -name '*.json' 2>/dev/null | LC_ALL=C sort"
+    let out = _exec_out(cmd)
+    let lines = out.split("\n")
+    let mut acc = []
+    for l in lines {
+        let t = to_string(l).trim()
+        if t.len() > 0 { acc.push(t) }
+    }
+    return acc
+}
+
+// ─── proposal record loader ───────────────────────────────────────────────
+//
+// Each *.json file under state/proposals/<status>/ matches schema in
+// docs/anima_proposal_stack_paradigm_20260422.md §2. We tolerate missing
+// fields and coerce to safe defaults; no field is mandatory beyond `id`.
+
+fn _str_or(d, key: string, fallback: string) -> string {
+    if d.contains_key(key) {
+        let v = d[key]
+        let s = to_string(v).trim()
+        if s.len() > 0 && s != "null" { return s }
+    }
+    return fallback
+}
+
+fn _int_or(d, key: string, fallback: int) -> int {
+    if d.contains_key(key) {
+        let s = to_string(d[key]).trim()
+        if s.len() == 0 || s == "null" { return fallback }
+        return to_int(s)
+    }
+    return fallback
+}
+
+fn _arr_len_or(d, key: string) -> int {
+    if !d.contains_key(key) { return 0 }
+    let v = d[key]
+    return len(v)
+}
+
+fn _load_proposal(path: string) {
+    let mut empty = #{}
+    empty["__loaded"] = false
+    if !_is_file(path) { return empty }
+    let raw = read_file(path).trim()
+    if raw.len() == 0 { return empty }
+    let doc = json_parse(raw)
+    let mut p = #{}
+    p["__loaded"] = true
+    p["__path"] = path
+    p["id"] = _str_or(doc, "id", _basename(path).replace(".json", ""))
+    p["title"] = _str_or(doc, "title", "(untitled)")
+    p["kind"] = _str_or(doc, "kind", "?")
+    p["score_priority"] = _int_or(doc, "score_priority", 0)
+    p["user_status"] = _str_or(doc, "user_status", "pending")
+    p["first_seen_ts"] = _str_or(doc, "first_seen_ts", "")
+    p["last_refined_ts"] = _str_or(doc, "last_refined_ts", "")
+    p["user_decision_at"] = _str_or(doc, "user_decision_at", "")
+    p["lineage_parent"] = _str_or(doc, "lineage_parent", "")
+    p["refines_n"] = _arr_len_or(doc, "refinement_history")
+    p["version"] = _int_or(doc, "version", 1)
+    return p
+}
+
+// Load all proposals under <root>/<status>/ for a given status name.
+fn _load_status_dir(root: string, status: string) -> array {
+    let dir = root + "/" + status
+    let files = _list_json(dir)
+    let mut acc = []
+    for f in files {
+        let p = _load_proposal(to_string(f))
+        if p["__loaded"] {
+            acc.push(p)
+        }
+    }
+    return acc
+}
+
+// Aggregate counts from inventory.json (preferred) OR by directory scan.
+// Returns dict with keys: pending/approved/rejected/archived/debate/cluster + total.
+fn _summary_counts(root: string) {
+    let mut s = #{}
+    let inv_path = root + "/inventory.json"
+    if _is_file(inv_path) {
+        let raw = read_file(inv_path).trim()
+        if raw.len() > 0 {
+            let doc = json_parse(raw)
+            // expected shape: {"counts": {...}} OR top-level dict.
+            let mut src = doc
+            if doc.contains_key("counts") { src = doc["counts"] }
+            s["pending"]  = _int_or(src, "pending",  -1)
+            s["approved"] = _int_or(src, "approved", -1)
+            s["rejected"] = _int_or(src, "rejected", -1)
+            s["archived"] = _int_or(src, "archived", -1)
+            s["debate"]   = _int_or(src, "debate",   -1)
+            s["cluster"]  = _int_or(src, "cluster",  -1)
+        }
+    }
+    // Backfill from directory scan when inventory missing/incomplete.
+    if !s.contains_key("pending")  || s["pending"]  < 0 { s["pending"]  = len(_list_json(root + "/pending")) }
+    if !s.contains_key("approved") || s["approved"] < 0 { s["approved"] = len(_list_json(root + "/approved")) }
+    if !s.contains_key("rejected") || s["rejected"] < 0 { s["rejected"] = len(_list_json(root + "/rejected")) }
+    if !s.contains_key("archived") || s["archived"] < 0 { s["archived"] = len(_list_json(root + "/archived")) }
+    if !s.contains_key("debate")   || s["debate"]   < 0 { s["debate"]   = len(_list_json(root + "/debate")) }
+    if !s.contains_key("cluster")  || s["cluster"]  < 0 { s["cluster"]  = len(_list_json(root + "/clusters")) }
+    let total = s["pending"] + s["approved"] + s["rejected"] + s["archived"] + s["debate"]
+    s["total"] = total
+    return s
+}
+
+// ─── sorting helpers (stable selection sort — small N, deterministic) ────
+
+// Sort proposals descending by score_priority. Ties left in input order
+// (which is LC_ALL=C-sorted by filename, hence already deterministic).
+fn _sort_by_score_desc(items: array) -> array {
+    let mut a = []
+    for x in items { a.push(x) }
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        let mut best = i
+        let mut j = i + 1
+        while j < n {
+            let bi = a[best]
+            let bj = a[j]
+            let si = to_int(to_string(bi["score_priority"]))
+            let sj = to_int(to_string(bj["score_priority"]))
+            if sj > si { best = j }
+            j = j + 1
+        }
+        if best != i {
+            let tmp = a[i]
+            a[i] = a[best]
+            a[best] = tmp
+        }
+        i = i + 1
+    }
+    return a
+}
+
+// Sort proposals ascending by first_seen_ts epoch (oldest first).
+// Missing/unparseable ts → sorted to the end (epoch sentinel = +∞ ≈ 2^62).
+fn _sort_by_age_asc(items: array) -> array {
+    let mut a = []
+    let huge = 9223372036000000000
+    // Pre-compute epoch keys to avoid repeated date(1) calls and rely on
+    // integer comparison (compiled-hexa-safe).
+    for x in items {
+        let mut row = #{}
+        row["item"] = x
+        let ts = to_string(x["first_seen_ts"])
+        let mut e = huge
+        if ts.len() > 0 {
+            let pe = _epoch_of(ts)
+            if pe >= 0 { e = pe }
+        }
+        row["epoch"] = e
+        a.push(row)
+    }
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        let mut best = i
+        let mut j = i + 1
+        while j < n {
+            let bi = a[best]
+            let bj = a[j]
+            let ei = to_int(to_string(bi["epoch"]))
+            let ej = to_int(to_string(bj["epoch"]))
+            let mut take = false
+            if ej < ei {
+                take = true
+            } else if ej == ei {
+                let ii = to_string(bi["item"])
+                let jj = to_string(bj["item"])
+                let id_i = to_string(bi["item"]["id"])
+                let id_j = to_string(bj["item"]["id"])
+                if id_j.len() < id_i.len() { take = true }
+            }
+            if take { best = j }
+            j = j + 1
+        }
+        if best != i {
+            let tmp = a[i]
+            a[i] = a[best]
+            a[best] = tmp
+        }
+        i = i + 1
+    }
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        out.push(a[k]["item"])
+        k = k + 1
+    }
+    return out
+}
+
+// ─── rendering helpers ─────────────────────────────────────────────────────
+
+fn _md_cell(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("|", "\\|")
+    let c = b.replace("\n", " ")
+    let d = c.replace("\r", "")
+    return d.trim()
+}
+
+fn _truncate(s: string, n: int) -> string {
+    if s.len() <= n { return s }
+    return s.substring(0, n - 1) + "…"
+}
+
+fn _age_days(first_seen_ts: string, now_epoch: int) -> int {
+    if first_seen_ts.len() == 0 { return -1 }
+    let e = _epoch_of(first_seen_ts)
+    if e < 0 { return -1 }
+    let secs = now_epoch - e
+    if secs < 0 { return 0 }
+    return secs / 86400
+}
+
+fn _age_str(days: int) -> string {
+    if days < 0 { return "?" }
+    return to_string(days) + "d"
+}
+
+// ─── section renderers ────────────────────────────────────────────────────
+
+fn _render_section_1(counts) -> string {
+    let mut s = "## 1. summary\n\n"
+    s = s + "| status | count |\n"
+    s = s + "| ------ | ----: |\n"
+    s = s + "| pending  | " + to_string(counts["pending"])  + " |\n"
+    s = s + "| approved | " + to_string(counts["approved"]) + " |\n"
+    s = s + "| rejected | " + to_string(counts["rejected"]) + " |\n"
+    s = s + "| archived | " + to_string(counts["archived"]) + " |\n"
+    s = s + "| debate   | " + to_string(counts["debate"])   + " |\n"
+    s = s + "| cluster  | " + to_string(counts["cluster"])  + " |\n"
+    s = s + "| **total** (excl. cluster) | **" + to_string(counts["total"]) + "** |\n"
+    s = s + "\n"
+    return s
+}
+
+fn _render_section_2(pending: array, now_epoch: int) -> string {
+    let mut s = "## 2. top " + to_string(TOP_PENDING_N) + " pending by score\n\n"
+    let n = len(pending)
+    if n == 0 {
+        s = s + "_no proposals yet_\n\n"
+        return s
+    }
+    let sorted = _sort_by_score_desc(pending)
+    s = s + "| id | score | kind | title | age | refines |\n"
+    s = s + "| -- | ----: | ---- | ----- | --- | ------: |\n"
+    let mut i = 0
+    let cap = if n < TOP_PENDING_N { n } else { TOP_PENDING_N }
+    while i < cap {
+        let p = sorted[i]
+        let id = _md_cell(to_string(p["id"]))
+        let score = to_string(p["score_priority"])
+        let kind = _md_cell(to_string(p["kind"]))
+        let title = _md_cell(_truncate(to_string(p["title"]), 60))
+        let age = _age_str(_age_days(to_string(p["first_seen_ts"]), now_epoch))
+        let refines = to_string(p["refines_n"])
+        s = s + "| `" + id + "` | " + score + " | " + kind + " | " + title +
+            " | " + age + " | " + refines + " |\n"
+        i = i + 1
+    }
+    s = s + "\n"
+    return s
+}
+
+// Recent transitions = approved/rejected/archived items whose
+// user_decision_at falls within the last RECENT_TRANSITION_DAYS days.
+fn _render_section_3(root: string, now_epoch: int) -> string {
+    let mut s = "## 3. recent transitions (last " + to_string(RECENT_TRANSITION_DAYS) + "d)\n\n"
+    let cutoff = now_epoch - (RECENT_TRANSITION_DAYS * 86400)
+    let mut acc = []
+    let kinds = ["approved", "rejected", "archived"]
+    let mut k = 0
+    while k < len(kinds) {
+        let action = to_string(kinds[k])
+        let items = _load_status_dir(root, action)
+        let mut i = 0
+        while i < len(items) {
+            let p = items[i]
+            let dts = to_string(p["user_decision_at"])
+            if dts.len() > 0 {
+                let e = _epoch_of(dts)
+                if e >= cutoff {
+                    let mut row = #{}
+                    row["id"] = to_string(p["id"])
+                    row["action"] = action
+                    row["date"] = dts
+                    row["epoch"] = e
+                    acc.push(row)
+                }
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    let n = len(acc)
+    if n == 0 {
+        s = s + "_no transitions in window_\n\n"
+        return s
+    }
+    // sort by epoch desc (newest first); ties left in load order.
+    let mut a = []
+    for x in acc { a.push(x) }
+    let mut i = 0
+    while i < n {
+        let mut best = i
+        let mut j = i + 1
+        while j < n {
+            let bi = a[best]
+            let bj = a[j]
+            let ei = to_int(to_string(bi["epoch"]))
+            let ej = to_int(to_string(bj["epoch"]))
+            if ej > ei { best = j }
+            j = j + 1
+        }
+        if best != i {
+            let tmp = a[i]
+            a[i] = a[best]
+            a[best] = tmp
+        }
+        i = i + 1
+    }
+    s = s + "| id | action | date |\n"
+    s = s + "| -- | ------ | ---- |\n"
+    let mut q = 0
+    while q < n {
+        let row = a[q]
+        s = s + "| `" + _md_cell(to_string(row["id"])) + "` | " +
+            _md_cell(to_string(row["action"])) + " | " +
+            _md_cell(to_string(row["date"])) + " |\n"
+        q = q + 1
+    }
+    s = s + "\n"
+    return s
+}
+
+fn _render_section_4(root: string) -> string {
+    let mut s = "## 4. clusters\n\n"
+    let dir = root + "/clusters"
+    let files = _list_json(dir)
+    if len(files) == 0 {
+        s = s + "_no clusters_\n\n"
+        return s
+    }
+    s = s + "| cluster id | members |\n"
+    s = s + "| ---------- | ------- |\n"
+    let mut i = 0
+    while i < len(files) {
+        let path = to_string(files[i])
+        let raw = read_file(path).trim()
+        let mut cid = _basename(path).replace(".json", "")
+        let mut members_str = "(unknown)"
+        if raw.len() > 0 {
+            let doc = json_parse(raw)
+            cid = _str_or(doc, "id", cid)
+            if doc.contains_key("members") {
+                let m = doc["members"]
+                let mut joined = ""
+                let mut k = 0
+                while k < len(m) {
+                    if k > 0 { joined = joined + ", " }
+                    joined = joined + "`" + to_string(m[k]) + "`"
+                    k = k + 1
+                }
+                members_str = if joined.len() > 0 { joined } else { "(empty)" }
+            }
+        }
+        s = s + "| `" + _md_cell(cid) + "` | " + _md_cell(members_str) + " |\n"
+        i = i + 1
+    }
+    s = s + "\n"
+    return s
+}
+
+fn _render_section_5(root: string) -> string {
+    let mut s = "## 5. metrics\n\n"
+    let mp = root + "/meta/metrics.json"
+    if !_is_file(mp) {
+        s = s + "_metrics not yet generated_\n\n"
+        return s
+    }
+    let raw = read_file(mp).trim()
+    if raw.len() == 0 {
+        s = s + "_metrics file empty_\n\n"
+        return s
+    }
+    let doc = json_parse(raw)
+    s = s + "| metric | value |\n"
+    s = s + "| ------ | ----- |\n"
+    s = s + "| approval_rate_30d        | " + _str_or(doc, "approval_rate_30d", "?")        + " |\n"
+    s = s + "| median_age_pending_days  | " + _str_or(doc, "median_age_pending_days", "?")  + " |\n"
+    s = s + "| evolution_velocity       | " + _str_or(doc, "evolution_velocity", "?")       + " |\n"
+    s = s + "| implementation_lag_days  | " + _str_or(doc, "implementation_lag_days", "?")  + " |\n"
+    s = s + "| user_review_lag_days     | " + _str_or(doc, "user_review_lag_days", "?")     + " |\n"
+    s = s + "\n"
+    return s
+}
+
+fn _render_section_6(pending: array, now_epoch: int) -> string {
+    let mut s = "## 6. top " + to_string(TOP_STALE_N) + " stale (decay candidate)\n\n"
+    let n = len(pending)
+    if n == 0 {
+        s = s + "_no proposals yet_\n\n"
+        return s
+    }
+    let sorted = _sort_by_age_asc(pending)
+    s = s + "| id | age | score | title |\n"
+    s = s + "| -- | --- | ----: | ----- |\n"
+    let mut i = 0
+    let cap = if n < TOP_STALE_N { n } else { TOP_STALE_N }
+    while i < cap {
+        let p = sorted[i]
+        let age_d = _age_days(to_string(p["first_seen_ts"]), now_epoch)
+        let mut age_s = _age_str(age_d)
+        if age_d >= STALE_DAYS_DEFAULT { age_s = age_s + " ⚠" }
+        s = s + "| `" + _md_cell(to_string(p["id"])) + "` | " + age_s +
+            " | " + to_string(p["score_priority"]) +
+            " | " + _md_cell(_truncate(to_string(p["title"]), 60)) + " |\n"
+        i = i + 1
+    }
+    s = s + "\n"
+    return s
+}
+
+// ─── full document render ────────────────────────────────────────────────
+
+fn render(root: string, ts: string) -> string {
+    let counts = _summary_counts(root)
+    let pending = _load_status_dir(root, "pending")
+    let now_e = _epoch_now()
+    let mut s = ""
+    s = s + HDR_AUTOGEN + "\n"
+    s = s + HDR_TS_PFX + ts + " -->\n"
+    s = s + "<!-- source_root: " + root + " -->\n"
+    s = s + "<!-- proposal_total: " + to_string(counts["total"]) + " -->\n"
+    s = s + "\n"
+    s = s + TITLE + "\n\n"
+    s = s + "_AUTO-GENERATED, DO NOT EDIT — re-run `hexa run tool/proposal_dashboard.hexa` to refresh._\n\n"
+    s = s + "Generated (UTC): `" + ts + "`  Source: `" + root + "`\n\n"
+    if counts["total"] == 0 && counts["cluster"] == 0 {
+        s = s + "> **no proposals yet** — proposal stack is empty (state/proposals/ contains no records).\n\n"
+    }
+    s = s + _render_section_1(counts)
+    s = s + _render_section_2(pending, now_e)
+    s = s + _render_section_3(root, now_e)
+    s = s + _render_section_4(root)
+    s = s + _render_section_5(root)
+    s = s + _render_section_6(pending, now_e)
+    return s
+}
+
+// ─── atomic write ────────────────────────────────────────────────────────
+
+fn _atomic_write(path: string, body: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    let _ = _exec_code("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn do_generate(root: string, out_path: string) -> int {
+    if !_dir_exists(root) {
+        // Render an "empty/stub" dashboard rather than fail — useful pre-P1.
+        eprintln("proposal_dashboard: WARN — root missing, rendering empty stub: " + root)
+    }
+    let _ = _mkdir_p(_parent_of(out_path))
+    let ts = _utc_now()
+    let body = render(root, ts)
+    _atomic_write(out_path, body)
+    println("proposal_dashboard: wrote " + out_path)
+    println("  root = " + root)
+    println("  ts   = " + ts)
+    return 0
+}
+
+// ─── argv ────────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av {
+        if to_string(x) == k { return true }
+    }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) {
+            return to_string(av[i + 1])
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────
+
+fn _mktempdir() -> string {
+    return _exec_out("mktemp -d -t proposal_dashboard_selftest.XXXXXX 2>/dev/null").trim()
+}
+
+fn _hash_after_strip_ts(path: string) -> string {
+    // Strip the volatile timestamp lines so re-runs hash equal.
+    let cmd = "grep -v -e '<!-- generated:' -e 'Generated (UTC):' " +
+              _sh_quote(path) + " | shasum -a 256 | awk '{print $1}'"
+    return _exec_out(cmd).trim()
+}
+
+fn _write_proposal(path: string, id: string, title: string, kind: string,
+                   score: int, status: string, first_seen: string, decision_at: string) {
+    let mut body = "{\n"
+    body = body + "  \"id\": \"" + id + "\",\n"
+    body = body + "  \"version\": 1,\n"
+    body = body + "  \"title\": \"" + title + "\",\n"
+    body = body + "  \"kind\": \"" + kind + "\",\n"
+    body = body + "  \"score_priority\": " + to_string(score) + ",\n"
+    body = body + "  \"user_status\": \"" + status + "\",\n"
+    body = body + "  \"first_seen_ts\": \"" + first_seen + "\",\n"
+    body = body + "  \"last_refined_ts\": \"" + first_seen + "\",\n"
+    body = body + "  \"user_decision_at\": " +
+        (if decision_at.len() > 0 { "\"" + decision_at + "\"" } else { "null" }) + ",\n"
+    body = body + "  \"refinement_history\": []\n"
+    body = body + "}\n"
+    write_file(path, body)
+}
+
+fn run_selftest() -> int {
+    println("proposal_dashboard: SELFTEST starting")
+    let d = _mktempdir()
+    if d == "" {
+        println("S0 FAIL: mktemp failed")
+        return 1
+    }
+    // Build a synthetic proposal stack root.
+    let root = d + "/proposals"
+    let _ = _mkdir_p(root + "/pending")
+    let _ = _mkdir_p(root + "/approved")
+    let _ = _mkdir_p(root + "/rejected")
+    let _ = _mkdir_p(root + "/archived")
+    let _ = _mkdir_p(root + "/debate")
+    let _ = _mkdir_p(root + "/clusters")
+    let _ = _mkdir_p(root + "/meta")
+
+    // FIXED timestamps so the second pass hashes identical to the first.
+    // (Real-world ages computed against `_epoch_now()` will differ between
+    //  runs anyway — selftest only proves render is deterministic given
+    //  fixed input + same wall clock.)
+    let ts_recent = "2026-04-20T00:00:00Z"
+    let ts_old    = "2025-12-23T00:00:00Z"
+    let ts_mid    = "2026-03-23T00:00:00Z"
+
+    _write_proposal(root + "/pending/p_alpha.json",
+        "20260422-001", "alpha proposal: cell extract", "tool", 87, "pending", ts_recent, "")
+    _write_proposal(root + "/pending/p_beta.json",
+        "20260420-002", "beta proposal: persona swap", "paradigm", 65, "pending", ts_mid, "")
+    _write_proposal(root + "/pending/p_stale.json",
+        "20260101-003", "stale proposal: old idea", "fix", 12, "pending", ts_old, "")
+
+    _write_proposal(root + "/approved/p_appr.json",
+        "20260420-010", "approved item", "tool", 70, "approved", ts_mid, ts_recent)
+    _write_proposal(root + "/rejected/p_rej.json",
+        "20260418-011", "rejected item", "fix", 5, "rejected", ts_old, ts_recent)
+    _write_proposal(root + "/archived/p_arc.json",
+        "20260415-012", "archived item", "module", 90, "archived", ts_old, ts_recent)
+    _write_proposal(root + "/debate/p_deb.json",
+        "20260417-013", "debate item", "axis", 50, "debate", ts_mid, "")
+
+    // cluster
+    let mut cbody = "{\n"
+    cbody = cbody + "  \"id\": \"cluster-cp1\",\n"
+    cbody = cbody + "  \"members\": [\"20260422-001\", \"20260420-002\", \"20260420-010\"]\n"
+    cbody = cbody + "}\n"
+    write_file(root + "/clusters/cluster-cp1.json", cbody)
+
+    // metrics
+    let mut mbody = "{\n"
+    mbody = mbody + "  \"approval_rate_30d\": \"33%\",\n"
+    mbody = mbody + "  \"median_age_pending_days\": \"30\",\n"
+    mbody = mbody + "  \"evolution_velocity\": \"4/cycle\",\n"
+    mbody = mbody + "  \"implementation_lag_days\": \"5\",\n"
+    mbody = mbody + "  \"user_review_lag_days\": \"7\"\n"
+    mbody = mbody + "}\n"
+    write_file(root + "/meta/metrics.json", mbody)
+
+    // inventory
+    let mut ibody = "{\n"
+    ibody = ibody + "  \"counts\": {\n"
+    ibody = ibody + "    \"pending\": 3,\n"
+    ibody = ibody + "    \"approved\": 1,\n"
+    ibody = ibody + "    \"rejected\": 1,\n"
+    ibody = ibody + "    \"archived\": 1,\n"
+    ibody = ibody + "    \"debate\": 1,\n"
+    ibody = ibody + "    \"cluster\": 1\n"
+    ibody = ibody + "  }\n"
+    ibody = ibody + "}\n"
+    write_file(root + "/inventory.json", ibody)
+
+    let out = d + "/proposal_dashboard.md"
+    let rc1 = do_generate(root, out)
+    if rc1 != 0 {
+        println("S1 FAIL: rc1=" + to_string(rc1))
+        let _ = _rm_rf(d)
+        return 1
+    }
+
+    let body = read_file(out)
+    let mut fails = 0
+
+    if body.index_of("AUTO-GENERATED") < 0 {
+        fails = fails + 1; println("S1 FAIL: missing AUTO-GENERATED header")
+    }
+    if body.index_of("## 1. summary") < 0 {
+        fails = fails + 1; println("S1 FAIL: missing section 1")
+    }
+    if body.index_of("## 2. top") < 0 {
+        fails = fails + 1; println("S1 FAIL: missing section 2")
+    }
+    if body.index_of("## 3. recent transitions") < 0 {
+        fails = fails + 1; println("S1 FAIL: missing section 3")
+    }
+    if body.index_of("## 4. clusters") < 0 {
+        fails = fails + 1; println("S1 FAIL: missing section 4")
+    }
+    if body.index_of("## 5. metrics") < 0 {
+        fails = fails + 1; println("S1 FAIL: missing section 5")
+    }
+    if body.index_of("## 6. top") < 0 {
+        fails = fails + 1; println("S1 FAIL: missing section 6")
+    }
+    if body.index_of("`20260422-001`") < 0 {
+        fails = fails + 1; println("S1 FAIL: missing top pending row")
+    }
+    if body.index_of("cluster-cp1") < 0 {
+        fails = fails + 1; println("S1 FAIL: missing cluster row")
+    }
+    if body.index_of("approval_rate_30d") < 0 {
+        fails = fails + 1; println("S1 FAIL: missing metric row")
+    }
+    if body.index_of("⚠") < 0 {
+        // stale 120d > 90d → must mark warning
+        fails = fails + 1; println("S1 FAIL: missing stale warning glyph")
+    }
+
+    // Idempotency: re-run, hash (sans ts) must match.
+    let h1 = _hash_after_strip_ts(out)
+    let _ = do_generate(root, out)
+    let h2 = _hash_after_strip_ts(out)
+    if h1.len() > 0 && h1 == h2 {
+        println("S2 PASS: idempotent (sha256_no_ts=" + h1.substring(0, 12) + "...)")
+    } else {
+        fails = fails + 1
+        println("S2 FAIL: hash drift h1=" + h1 + " h2=" + h2)
+    }
+
+    // Empty-root case: must still emit all 6 sections + "no proposals yet".
+    let root2 = d + "/empty_root"
+    let _ = _mkdir_p(root2)
+    let out2 = d + "/empty_dashboard.md"
+    let rc3 = do_generate(root2, out2)
+    if rc3 != 0 {
+        fails = fails + 1; println("S3 FAIL: empty-root rc=" + to_string(rc3))
+    } else {
+        let body2 = read_file(out2)
+        if body2.index_of("no proposals yet") < 0 {
+            fails = fails + 1; println("S3 FAIL: empty-root missing 'no proposals yet'")
+        }
+        let secs = ["## 1.", "## 2.", "## 3.", "## 4.", "## 5.", "## 6."]
+        let mut k = 0
+        while k < len(secs) {
+            if body2.index_of(to_string(secs[k])) < 0 {
+                fails = fails + 1
+                println("S3 FAIL: empty-root missing section " + to_string(secs[k]))
+            }
+            k = k + 1
+        }
+    }
+
+    let _ = _rm_rf(d)
+
+    let mut rbody = "{\n"
+    rbody = rbody + "  \"schema\": \"anima.proposal_dashboard.v1\",\n"
+    rbody = rbody + "  \"tool\": \"tool/proposal_dashboard.hexa\",\n"
+    rbody = rbody + "  \"ts\": \"" + _utc_now() + "\",\n"
+    rbody = rbody + "  \"mode\": \"selftest\",\n"
+    rbody = rbody + "  \"verdict\": \"" + (if fails == 0 { "PASS" } else { "FAIL" }) + "\",\n"
+    rbody = rbody + "  \"fails\": " + to_string(fails) + "\n"
+    rbody = rbody + "}\n"
+    let _ = _mkdir_p(_parent_of(SMOKE_OUT))
+    write_file(SMOKE_OUT, rbody)
+
+    if fails == 0 {
+        println("proposal_dashboard: SELFTEST PASS")
+        return 0
+    }
+    println("proposal_dashboard: SELFTEST FAIL (" + to_string(fails) + ")")
+    return 1
+}
+
+// ─── main ────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/proposal_dashboard.hexa [opts]")
+        println("  --root <dir>     default: " + DEFAULT_ROOT)
+        println("  --out <file>     default: " + DEFAULT_OUT)
+        println("  --selftest       run synthetic-input selftest + idempotency check")
+        return 0
+    }
+    if _flag(av, "--selftest") { return run_selftest() }
+    let root = _opt(av, "--root", DEFAULT_ROOT)
+    let out  = _opt(av, "--out",  DEFAULT_OUT)
+    return do_generate(root, out)
+}
+
+exit(main())

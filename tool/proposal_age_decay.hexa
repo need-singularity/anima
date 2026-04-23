@@ -1,0 +1,428 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/proposal_age_decay.hexa — AA1 (pending proposal age-decay automation)
+//
+//  PURPOSE
+//    For each state/proposals/pending/*.json whose first_seen_ts is >= 90 days
+//    old, halve score_priority (floor 0) and mark decay_count=1 so subsequent
+//    runs are a no-op (idempotent cap). Append a JSONL audit line per decay to
+//    state/proposal_decay_log.jsonl and bump a "decay" field block inside
+//    state/proposals/meta/metrics.json.
+//
+//  CONSTRAINTS (raw#20 + idempotent)
+//    - NEVER touches user_status, user_decision_*, or any approval field.
+//      We only adjust score_priority + inject decay_count + decayed_ts.
+//    - DRY by default. --apply required for writes.
+//    - Already decayed (decay_count >= 1) proposals are SKIPPED (cap=1).
+//    - Halve rounds down via integer div; min 0 (no negatives).
+//
+//  CLI
+//    hexa run tool/proposal_age_decay.hexa             # dry-run report
+//    hexa run tool/proposal_age_decay.hexa --apply     # rewrite matched cards
+//    hexa run tool/proposal_age_decay.hexa --selftest  # synthetic 90d+ test
+//    hexa run tool/proposal_age_decay.hexa --help
+//
+//  OUTPUT SSOT
+//    state/proposal_decay_log.jsonl — one line per decay:
+//      {"ts":"<iso>","id":"...","before":N,"after":M,"age_days":D,"reason":"age>=90d"}
+//    state/proposals/meta/metrics.json — adds "decay":{...} block at top level
+//
+//  EXIT CODES
+//    0   success (or selftest PASS)
+//    1   runtime / selftest FAIL
+//    3   user error (missing jq, bad flag)
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT   = "/Users/ghost/core/anima"
+let PENDING_DIR  = "/Users/ghost/core/anima/state/proposals/pending"
+let META_PATH    = "/Users/ghost/core/anima/state/proposals/meta/metrics.json"
+let META_DIR     = "/Users/ghost/core/anima/state/proposals/meta"
+let DECAY_LOG    = "/Users/ghost/core/anima/state/proposal_decay_log.jsonl"
+
+let AGE_DAYS_THRESHOLD = 90
+let SECS_PER_DAY       = 86400
+
+// ─── shell / fs helpers ───────────────────────────────────────────────────
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec(cmd: string) -> array { return exec_with_status(cmd) }
+
+fn _exec_out(cmd: string) -> string {
+    return to_string(exec_with_status(cmd)[0])
+}
+
+fn _exec_status(cmd: string) -> int {
+    return exec_with_status(cmd)[1]
+}
+
+fn _file_exists(p: string) -> bool {
+    return _exec_status("test -e " + _shq(p)) == 0
+}
+
+fn _dir_exists(p: string) -> bool {
+    return _exec_status("test -d " + _shq(p)) == 0
+}
+
+fn _mkdir_p(p: string) { exec_with_status("mkdir -p " + _shq(p)) }
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _now_epoch() -> int {
+    return to_int(_exec_out("date -u +%s").trim())
+}
+
+fn _iso_to_epoch(iso: string) -> int {
+    // BSD date on macOS: -j -f parses arbitrary format; -u for UTC.
+    let s = iso.trim()
+    if len(s) == 0 { return 0 }
+    let r = _exec_out("date -j -u -f '%Y-%m-%dT%H:%M:%SZ' " + _shq(s) + " +%s 2>/dev/null").trim()
+    if len(r) == 0 { return 0 }
+    return to_int(r)
+}
+
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ─── argv / flags ─────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+
+fn _flag(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── jq availability (strict dep; fail clean if missing) ──────────────────
+
+fn _have_jq() -> bool {
+    return _exec_status("command -v jq >/dev/null 2>&1") == 0
+}
+
+// ─── per-card inspection (read-only via jq) ───────────────────────────────
+
+fn _jq_field(path: string, filter: string) -> string {
+    // Returns trimmed stdout from jq -r "<filter>" <path>. Empty on error.
+    let cmd = "jq -r " + _shq(filter) + " " + _shq(path) + " 2>/dev/null"
+    return _exec_out(cmd).trim()
+}
+
+// ─── apply: surgical per-card rewrite via jq (atomic tmp+mv) ──────────────
+
+fn _apply_decay(path: string, before: int, after: int, now_iso: string) -> bool {
+    // Use jq to set score_priority, decay_count=1, decayed_ts, and append a
+    // refinement_history entry. Write to tmp + atomic mv.
+    let tmp = path + ".decay.tmp"
+    let hist_entry = "{\"v\": ((.version // 0) + 1), \"ts\": \"" + now_iso +
+        "\", \"diff\": \"age_decay: score_priority " + to_string(before) +
+        " -> " + to_string(after) + " (>=90d, cap=1)\"}"
+    let filter = ".score_priority = " + to_string(after) + " | " +
+        ".decay_count = 1 | " +
+        ".decayed_ts = \"" + now_iso + "\" | " +
+        ".version = ((.version // 0) + 1) | " +
+        ".refinement_history = ((.refinement_history // []) + [" + hist_entry + "])"
+    let cmd = "jq " + _shq(filter) + " " + _shq(path) + " > " + _shq(tmp) + " 2>/dev/null"
+    let rc = _exec_status(cmd)
+    if rc != 0 {
+        _exec("rm -f " + _shq(tmp))
+        return false
+    }
+    let mv = _exec_status("mv -f " + _shq(tmp) + " " + _shq(path))
+    return mv == 0
+}
+
+fn _append_decay_log(id: string, before: int, after: int, age_days: int, now_iso: string) {
+    _mkdir_p("/Users/ghost/core/anima/state")
+    let line = "{" +
+        "\"ts\":\"" + now_iso + "\"," +
+        "\"id\":\"" + _json_esc(id) + "\"," +
+        "\"before\":" + to_string(before) + "," +
+        "\"after\":" + to_string(after) + "," +
+        "\"age_days\":" + to_string(age_days) + "," +
+        "\"reason\":\"age>=90d\"" +
+        "}"
+    exec_with_status("printf '%s\\n' " + _shq(line) + " >> " + _shq(DECAY_LOG))
+}
+
+// ─── metrics.json decay block bump (jq surgical) ──────────────────────────
+
+fn _update_metrics(decayed_this_run: int, now_iso: string) -> bool {
+    if !_file_exists(META_PATH) {
+        _mkdir_p(META_DIR)
+        // seed minimal skeleton
+        let seed = "{\n" +
+            "  \"schema\": \"anima/proposal_metrics/1\",\n" +
+            "  \"ts\": \"" + now_iso + "\",\n" +
+            "  \"counts\": {},\n" +
+            "  \"refreshed_by\": \"tool/proposal_age_decay.hexa\"\n" +
+            "}\n"
+        write_file(META_PATH, seed)
+    }
+    let tmp = META_PATH + ".decay.tmp"
+    let filter = ".decay = ((.decay // {\"total_decayed\":0,\"last_run_ts\":\"\",\"last_run_decayed\":0})) | " +
+        ".decay.total_decayed = ((.decay.total_decayed // 0) + " + to_string(decayed_this_run) + ") | " +
+        ".decay.last_run_ts = \"" + now_iso + "\" | " +
+        ".decay.last_run_decayed = " + to_string(decayed_this_run)
+    let cmd = "jq " + _shq(filter) + " " + _shq(META_PATH) + " > " + _shq(tmp) + " 2>/dev/null"
+    let rc = _exec_status(cmd)
+    if rc != 0 {
+        _exec("rm -f " + _shq(tmp))
+        return false
+    }
+    return _exec_status("mv -f " + _shq(tmp) + " " + _shq(META_PATH)) == 0
+}
+
+// ─── core scan ────────────────────────────────────────────────────────────
+//
+// Returns array of maps:
+//   { path, id, first_seen_ts, age_days, score_before, score_after,
+//     already_decayed, eligible }
+
+fn _scan_pending() -> array {
+    let mut out = []
+    if !_dir_exists(PENDING_DIR) { return out }
+    let listing = _exec_out("ls -1 " + _shq(PENDING_DIR) + "/*.json 2>/dev/null")
+    let now = _now_epoch()
+    let lines = listing.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let p = to_string(lines[i]).trim()
+        i = i + 1
+        if len(p) == 0 { continue }
+        let id    = _jq_field(p, ".id // \"\"")
+        let fseen = _jq_field(p, ".first_seen_ts // \"\"")
+        let score_s = _jq_field(p, ".score_priority // 0")
+        let dec_s   = _jq_field(p, ".decay_count // 0")
+        let score = to_int(score_s)
+        let dec_count = to_int(dec_s)
+        let ep = _iso_to_epoch(fseen)
+        let mut age = 0
+        if ep > 0 { age = (now - ep) / SECS_PER_DAY }
+        let eligible = (age >= AGE_DAYS_THRESHOLD) && (dec_count < 1) && (score > 0)
+        let after_score = score / 2    // integer floor; halve
+        let mut rec = json_parse("{}")
+        rec["path"] = p
+        rec["id"] = id
+        rec["first_seen_ts"] = fseen
+        rec["age_days"] = age
+        rec["score_before"] = score
+        rec["score_after"]  = after_score
+        rec["decay_count_prev"] = dec_count
+        rec["eligible"] = (if eligible { "true" } else { "false" })
+        out.push(rec)
+    }
+    return out
+}
+
+// ─── report ───────────────────────────────────────────────────────────────
+
+fn _render_report(recs: array, applied: int, apply: bool) -> string {
+    let mut s = "── proposal_age_decay ──\n"
+    s = s + "ts            : " + _ts_iso() + "\n"
+    s = s + "mode          : " + (if apply { "APPLY" } else { "dry-run" }) + "\n"
+    s = s + "pending dir   : " + PENDING_DIR + "\n"
+    s = s + "threshold     : age >= " + to_string(AGE_DAYS_THRESHOLD) + "d\n"
+    s = s + "pending seen  : " + to_string(len(recs)) + "\n"
+
+    let mut elig = 0
+    let mut already = 0
+    let mut i = 0
+    while i < len(recs) {
+        let r = recs[i]
+        if to_string(r["eligible"]) == "true" { elig = elig + 1 }
+        if to_int(to_string(r["decay_count_prev"])) >= 1 { already = already + 1 }
+        i = i + 1
+    }
+    s = s + "eligible      : " + to_string(elig) + "\n"
+    s = s + "already decayed (cap=1, skip) : " + to_string(already) + "\n"
+    if apply {
+        s = s + "applied       : " + to_string(applied) + "\n"
+    }
+    s = s + "\n── eligible rows ──\n"
+    if elig == 0 {
+        s = s + "  (none — no pending proposal is 90d+ uncapped)\n"
+    } else {
+        let mut j = 0
+        while j < len(recs) {
+            let r = recs[j]
+            if to_string(r["eligible"]) == "true" {
+                s = s + "  + id=" + to_string(r["id"]) +
+                    " age=" + to_string(r["age_days"]) + "d" +
+                    " score " + to_string(r["score_before"]) +
+                    " -> " + to_string(r["score_after"]) + "\n"
+            }
+            j = j + 1
+        }
+    }
+    if !apply {
+        s = s + "\n(dry-run — no writes. Pass --apply to mutate + log.)\n"
+    } else {
+        s = s + "\nlog : " + DECAY_LOG + "\n"
+    }
+    return s
+}
+
+// ─── run ──────────────────────────────────────────────────────────────────
+
+fn _run(apply: bool) -> int {
+    if !_have_jq() {
+        println("proposal_age_decay: ERROR — jq not found on PATH. Install jq (brew install jq) and retry.")
+        return 3
+    }
+    let recs = _scan_pending()
+    let now_iso = _ts_iso()
+    let mut applied = 0
+    if apply {
+        let mut i = 0
+        while i < len(recs) {
+            let r = recs[i]
+            if to_string(r["eligible"]) == "true" {
+                let path = to_string(r["path"])
+                let id   = to_string(r["id"])
+                let before = to_int(to_string(r["score_before"]))
+                let after  = to_int(to_string(r["score_after"]))
+                let age    = to_int(to_string(r["age_days"]))
+                if _apply_decay(path, before, after, now_iso) {
+                    _append_decay_log(id, before, after, age, now_iso)
+                    applied = applied + 1
+                }
+            }
+            i = i + 1
+        }
+        _update_metrics(applied, now_iso)
+    }
+    println(_render_report(recs, applied, apply))
+    return 0
+}
+
+fn _elig_path(path: string) -> bool {
+    let fseen = _jq_field(path, ".first_seen_ts // \"\"")
+    let score = to_int(_jq_field(path, ".score_priority // 0"))
+    let dec   = to_int(_jq_field(path, ".decay_count // 0"))
+    let ep = _iso_to_epoch(fseen)
+    if ep == 0 { return false }
+    let age = (_now_epoch() - ep) / SECS_PER_DAY
+    return (age >= AGE_DAYS_THRESHOLD) && (dec < 1) && (score > 0)
+}
+
+// ─── selftest ─────────────────────────────────────────────────────────────
+//
+// Creates 3 synthetic proposals under /tmp:
+//   s1: 95d old, score=80, decay_count=0  → MUST be halved to 40
+//   s2: 30d old, score=80, decay_count=0  → MUST stay 80
+//   s3: 95d old, score=80, decay_count=1  → MUST stay 80 (cap=1 idempotent)
+// Then runs scan logic directly against the tmp dir. Verifies eligibility
+// flags + post-apply scores by invoking _apply_decay on s1.
+
+fn _selftest() -> int {
+    println("── proposal_age_decay selftest ──")
+    if !_have_jq() {
+        println("selftest FAIL: jq missing")
+        return 1
+    }
+    let tdir = "/tmp/anima_proposal_age_decay_selftest"
+    _exec("rm -rf " + _shq(tdir))
+    _mkdir_p(tdir)
+
+    // build ISO timestamps for "now-95d" and "now-30d"
+    let now = _now_epoch()
+    let ep95 = now - 95 * SECS_PER_DAY
+    let ep30 = now - 30 * SECS_PER_DAY
+    let iso95 = _exec_out("date -u -r " + to_string(ep95) + " +%Y-%m-%dT%H:%M:%SZ").trim()
+    let iso30 = _exec_out("date -u -r " + to_string(ep30) + " +%Y-%m-%dT%H:%M:%SZ").trim()
+
+    let s1 = "{\"id\":\"S1\",\"version\":1,\"first_seen_ts\":\"" + iso95 +
+             "\",\"score_priority\":80,\"decay_count\":0,\"refinement_history\":[]}\n"
+    let s2 = "{\"id\":\"S2\",\"version\":1,\"first_seen_ts\":\"" + iso30 +
+             "\",\"score_priority\":80,\"decay_count\":0,\"refinement_history\":[]}\n"
+    let s3 = "{\"id\":\"S3\",\"version\":1,\"first_seen_ts\":\"" + iso95 +
+             "\",\"score_priority\":80,\"decay_count\":1,\"refinement_history\":[]}\n"
+    write_file(tdir + "/s1.json", s1)
+    write_file(tdir + "/s2.json", s2)
+    write_file(tdir + "/s3.json", s3)
+
+    let e1 = _elig_path(tdir + "/s1.json")
+    let e2 = _elig_path(tdir + "/s2.json")
+    let e3 = _elig_path(tdir + "/s3.json")
+
+    let t1 = (e1 == true)
+    let t2 = (e2 == false)
+    let t3 = (e3 == false)
+    println("T1 s1 (95d,score=80,dec=0) eligible    : " + (if t1 { "PASS" } else { "FAIL" }))
+    println("T2 s2 (30d,score=80,dec=0) NOT eligible: " + (if t2 { "PASS" } else { "FAIL" }))
+    println("T3 s3 (95d,score=80,dec=1) NOT eligible: " + (if t3 { "PASS" } else { "FAIL" }))
+
+    // Apply decay to s1 + verify post-state
+    let now_iso = _ts_iso()
+    let ok = _apply_decay(tdir + "/s1.json", 80, 40, now_iso)
+    let post_score = to_int(_jq_field(tdir + "/s1.json", ".score_priority"))
+    let post_dec   = to_int(_jq_field(tdir + "/s1.json", ".decay_count"))
+    let t4 = (ok && post_score == 40 && post_dec == 1)
+    println("T4 apply halve 80->40 + decay_count=1  : " + (if t4 { "PASS" } else {
+        "FAIL (ok=" + (if ok { "true" } else { "false" }) +
+        " score=" + to_string(post_score) + " dec=" + to_string(post_dec) + ")"
+    }))
+
+    // Re-run eligibility on s1 (should now be non-eligible — idempotent cap)
+    let e1b = _elig_path(tdir + "/s1.json")
+    let t5 = (e1b == false)
+    println("T5 idempotent: s1 post-decay NOT elig  : " + (if t5 { "PASS" } else { "FAIL" }))
+
+    _exec("rm -rf " + _shq(tdir))
+
+    if t1 && t2 && t3 && t4 && t5 {
+        println("── selftest 5/5 PASS ──")
+        return 0
+    }
+    println("── selftest FAIL ──")
+    return 1
+}
+
+// ─── help ─────────────────────────────────────────────────────────────────
+
+fn _print_help() {
+    println("usage: hexa run tool/proposal_age_decay.hexa [opts]")
+    println("  (no args)   dry-run — scan pending/, print eligible 90d+ rows")
+    println("  --apply     halve score_priority on 90d+ eligible, write log + metrics")
+    println("  --selftest  synthetic 5/5 validation (creates+cleans /tmp only)")
+    println("  --help      show this help")
+    println("")
+    println("rules:")
+    println("  - only first_seen_ts age >= 90d AND decay_count < 1 AND score > 0 are halved")
+    println("  - halve = integer floor (score / 2), minimum 0")
+    println("  - cap = 1 (each proposal halved at most once — idempotent)")
+    println("  - NEVER modifies user_status or any approval field (raw#20)")
+    println("")
+    println("outputs:")
+    println("  state/proposal_decay_log.jsonl          (JSONL append per decay)")
+    println("  state/proposals/meta/metrics.json       (decay.{total,last_run_ts,last_run_decayed})")
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        _print_help()
+        return 0
+    }
+    if _flag(av, "--selftest") { return _selftest() }
+    let apply = _flag(av, "--apply")
+    return _run(apply)
+}
+
+exit(main())

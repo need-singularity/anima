@@ -1,0 +1,320 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/persona_lora_init.hexa — pre-H100 ROI O2
+//
+//  PURPOSE
+//    Create the persona_lora directory skeleton + meta.json template that
+//    serve_alm_persona.hexa expects to find on the pod at
+//      /workspace/lora/persona_lora/<persona_id>/
+//    so that the moment H100 cascade #9 lands base_model + cascade #10 lands
+//    the trained adapter, the symlink-flip is instantaneous (CP1 swap-in 0s).
+//
+//  PARENT
+//    .roadmap#77 CP1 — dest1 persona LIVE
+//    config/serve_alm_persona.json :: swap_in_artifacts[persona_lora_path]
+//    config/h100_pod_workspace_template.json :: symlink_template[lora]
+//
+//  WHAT THIS BUILDS (under repo root, NOT on pod — pod side is mirrored at run-time)
+//    state/persona_lora/
+//      ├── dest1/
+//      │   ├── meta.json                  (anima.persona_lora.meta.v1)
+//      │   └── README                     (1-line pointer to meta.json)
+//      ├── default/
+//      │   └── meta.json
+//      ├── friend/    meta.json
+//      ├── scholar/   meta.json
+//      ├── engineer/  meta.json
+//      └── sorceress/ meta.json
+//
+//  META JSON SCHEMA (anima.persona_lora.meta.v1)
+//    { "schema":           "anima.persona_lora.meta.v1",
+//      "persona_id":       "<id>",
+//      "status":           "TEMPLATE_PRE_TRAIN" | "TRAINED" | "DEPLOYED",
+//      "base_model":       "qwen3_8b" (substrate_id from phi_4path_substrates),
+//      "persona_layer_idx": 20,
+//      "phi_layer_idx":    24,
+//      "alpha":            1.0,
+//      "lora_rank":        64 (8B base; capacity-normalized per substrate),
+//      "lora_alpha":       128,
+//      "target_modules":   ["q_proj", "k_proj", "v_proj", "o_proj"],
+//      "weights_path":     "/workspace/lora/persona_lora/<id>/adapter_model.safetensors",
+//      "weights_sha256":   null (filled post-train),
+//      "trained_at":       null,
+//      "trained_by_tool":  "tool/persona_lora_train.hexa (planned)",
+//      "contrast_pairs":   "<source jsonl path; persona-defining utterance pairs>",
+//      "smoke_score":      null }
+//
+//  RAW
+//    raw#9 hexa-only · raw#10 deterministic · raw#11 snake_case
+//    raw#12 실측 only (status=TEMPLATE_PRE_TRAIN until weights actually land)
+//    raw#15 no-hardcode (personas list pulled from config/serve_alm_persona.json)
+//
+//  USAGE
+//    hexa run tool/persona_lora_init.hexa            (idempotent init)
+//    hexa run tool/persona_lora_init.hexa --selftest (verify 6 dirs + 6 metas)
+//    hexa run tool/persona_lora_init.hexa --status   (print per-persona status)
+//
+//  EXIT CODES
+//    0 — init OK / selftest PASS / status printed
+//    1 — selftest FAIL
+//    2 — io / setup error
+// ════════════════════════════════════════════════════════════════════════════
+
+let TOOL_NAME      = "persona_lora_init"
+let TOOL_VERSION   = "v1"
+let REPO_ROOT      = "/Users/ghost/core/anima"
+let STATE_ROOT     = "/Users/ghost/core/anima/state"
+let LORA_ROOT      = "/Users/ghost/core/anima/state/persona_lora"
+let CFG_PATH       = "/Users/ghost/core/anima/config/serve_alm_persona.json"
+let SMOKE_OUT      = "/Users/ghost/core/anima/state/persona_lora_init_result.json"
+
+// ─── shell helpers ────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut out = "'"
+    out = out + s.replace("'", "'\\''")
+    out = out + "'"
+    return out
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _ts_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _bool_s(b: bool) -> string {
+    if b { return "true" } else { return "false" }
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -f " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _is_dir(path: string) -> bool {
+    let r = exec_with_status("test -d " + _sh_quote(path))
+    return r[1] == 0
+}
+
+fn _mkdir_p(d: string) -> bool {
+    let r = exec_with_status("mkdir -p " + _sh_quote(d))
+    return r[1] == 0
+}
+
+fn flag_present(name: string) -> bool {
+    let argv = args()
+    let mut i = 0
+    while i < len(argv) {
+        if to_string(argv[i]) == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── personas list (config-sourced; hard fallback to default 6) ──────────
+//
+// Reads config/serve_alm_persona.json :: personas (CSV-pluck from raw JSON).
+// If config is unreachable we fall back to the documented default 6 so the
+// scaffold is never empty (raw#12: surface MISSING via status, not by skip).
+
+fn _load_personas() -> array {
+    let fallback = ["dest1", "default", "friend", "scholar", "engineer", "sorceress"]
+    if !_file_exists(CFG_PATH) { return fallback }
+    let raw = read_file(CFG_PATH)
+    let key = "\"personas\""
+    let k = raw.index_of(key)
+    if k < 0 { return fallback }
+    let lbr = raw.substring(k, len(raw)).index_of("[")
+    if lbr < 0 { return fallback }
+    let abs_lbr = k + lbr
+    let rest = raw.substring(abs_lbr + 1, len(raw))
+    let rbr = rest.index_of("]")
+    if rbr < 0 { return fallback }
+    let inner = rest.substring(0, rbr)
+    let parts = inner.split(",")
+    let mut out = []
+    let mut i = 0
+    while i < len(parts) {
+        let p0 = to_string(parts[i]).trim()
+        // strip outer quotes
+        let p1 = p0.replace("\"", "").trim()
+        if len(p1) > 0 { out = push(out, p1) }
+        i = i + 1
+    }
+    if len(out) == 0 { return fallback }
+    return out
+}
+
+// ─── meta.json emitter ────────────────────────────────────────────────────
+
+fn _meta_path(persona_id: string) -> string {
+    return LORA_ROOT + "/" + persona_id + "/meta.json"
+}
+
+fn _readme_path(persona_id: string) -> string {
+    return LORA_ROOT + "/" + persona_id + "/README"
+}
+
+fn write_meta_template(persona_id: string, ts: string) {
+    let mut body = "{\n"
+    body = body + "  \"schema\":              \"anima.persona_lora.meta.v1\",\n"
+    body = body + "  \"persona_id\":          \"" + persona_id + "\",\n"
+    body = body + "  \"status\":              \"TEMPLATE_PRE_TRAIN\",\n"
+    body = body + "  \"base_model\":          \"qwen3_8b\",\n"
+    body = body + "  \"base_model_substrate\": \"p1\",\n"
+    body = body + "  \"persona_layer_idx\":   20,\n"
+    body = body + "  \"phi_layer_idx\":       24,\n"
+    body = body + "  \"alpha\":               1.0,\n"
+    body = body + "  \"lora_rank\":           64,\n"
+    body = body + "  \"lora_alpha\":          128,\n"
+    body = body + "  \"target_modules\":      [\"q_proj\", \"k_proj\", \"v_proj\", \"o_proj\"],\n"
+    body = body + "  \"pod_dir\":             \"/workspace/lora/persona_lora/" + persona_id + "/\",\n"
+    body = body + "  \"weights_path\":        \"/workspace/lora/persona_lora/" + persona_id + "/adapter_model.safetensors\",\n"
+    body = body + "  \"weights_sha256\":      null,\n"
+    body = body + "  \"trained_at\":          null,\n"
+    body = body + "  \"trained_by_tool\":     \"tool/persona_lora_train.hexa (planned, H100)\",\n"
+    body = body + "  \"contrast_pairs_src\":  \"consciousness/persona_pairs/" + persona_id + ".jsonl (planned)\",\n"
+    body = body + "  \"smoke_score\":         null,\n"
+    body = body + "  \"template_emitted_at\": \"" + ts + "\",\n"
+    body = body + "  \"emit_tool\":           \"tool/persona_lora_init.hexa\",\n"
+    body = body + "  \"raw_compliance\":      [\"raw#9\", \"raw#10\", \"raw#11\", \"raw#12\", \"raw#15\"]\n"
+    body = body + "}\n"
+    write_file(_meta_path(persona_id), body)
+}
+
+fn write_readme(persona_id: string) {
+    let body = "persona_lora/" + persona_id + "/  — see meta.json (anima.persona_lora.meta.v1). Pod swap-in target: /workspace/lora/persona_lora/" + persona_id + "/\n"
+    write_file(_readme_path(persona_id), body)
+}
+
+// ─── status print ─────────────────────────────────────────────────────────
+
+fn print_status(personas: array) {
+    println("[plora] state/persona_lora status:")
+    let mut i = 0
+    while i < len(personas) {
+        let pid = to_string(personas[i])
+        let dir_ok = _is_dir(LORA_ROOT + "/" + pid)
+        let meta_ok = _file_exists(_meta_path(pid))
+        let line = "[plora]   " + pid + "  dir=" + _bool_s(dir_ok) + "  meta.json=" + _bool_s(meta_ok)
+        println(line)
+        i = i + 1
+    }
+}
+
+// ─── selftest ─────────────────────────────────────────────────────────────
+
+fn run_selftest(personas: array) -> int {
+    println("[plora] selftest — " + to_string(len(personas)) + " persona dirs + meta.json each")
+    let mut ok = true
+    let mut i = 0
+    while i < len(personas) {
+        let pid = to_string(personas[i])
+        let dir_ok = _is_dir(LORA_ROOT + "/" + pid)
+        let meta_ok = _file_exists(_meta_path(pid))
+        if !dir_ok || !meta_ok { ok = false }
+        // schema check: read the meta and confirm schema field
+        if meta_ok {
+            let raw = read_file(_meta_path(pid))
+            if raw.index_of("\"anima.persona_lora.meta.v1\"") < 0 {
+                println("[plora]   FAIL — schema string missing in " + _meta_path(pid))
+                ok = false
+            }
+        }
+        let line = "[plora]   " + pid + "  dir_ok=" + _bool_s(dir_ok) + "  meta_ok=" + _bool_s(meta_ok)
+        println(line)
+        i = i + 1
+    }
+    if ok {
+        println("[plora] selftest PASS")
+        return 0
+    }
+    println("[plora] selftest FAIL")
+    return 1
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    let _ = _mkdir_p(STATE_ROOT)
+    let _ = _mkdir_p(LORA_ROOT)
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  tool/persona_lora_init.hexa — pre-H100 ROI O2 (CP1 swap-in)")
+    println("  raw#9 hexa-only · raw#12 실측 · ts=" + _ts_iso())
+    println("════════════════════════════════════════════════════════════════")
+
+    let personas = _load_personas()
+    println("[plora] personas (" + to_string(len(personas)) + "): " + to_string(personas))
+
+    if flag_present("--selftest") {
+        let rc = run_selftest(personas)
+        let mut body = "{\n"
+        body = body + "  \"schema\": \"anima.persona_lora_init.v1\",\n"
+        body = body + "  \"tool\": \"tool/persona_lora_init.hexa\",\n"
+        body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+        body = body + "  \"mode\": \"selftest\",\n"
+        body = body + "  \"personas_count\": " + to_string(len(personas)) + ",\n"
+        body = body + "  \"verdict\": \"" + (if rc == 0 { "PASS" } else { "FAIL" }) + "\"\n"
+        body = body + "}\n"
+        write_file(SMOKE_OUT, body)
+        exit(rc)
+    }
+
+    if flag_present("--status") {
+        print_status(personas)
+        exit(0)
+    }
+
+    // ─── default: idempotent init ────────────────────────────────────────
+    let ts = _ts_iso()
+    let mut dirs_created = 0
+    let mut metas_written = 0
+    let mut readmes_written = 0
+    let mut i = 0
+    while i < len(personas) {
+        let pid = to_string(personas[i])
+        let pdir = LORA_ROOT + "/" + pid
+        if !_is_dir(pdir) {
+            let _ = _mkdir_p(pdir)
+            dirs_created = dirs_created + 1
+            println("[plora] created " + pdir)
+        } else {
+            println("[plora] kept (exists) " + pdir)
+        }
+        if !_file_exists(_meta_path(pid)) {
+            write_meta_template(pid, ts)
+            metas_written = metas_written + 1
+            println("[plora] wrote " + _meta_path(pid))
+        } else {
+            println("[plora] kept (exists) " + _meta_path(pid))
+        }
+        if !_file_exists(_readme_path(pid)) {
+            write_readme(pid)
+            readmes_written = readmes_written + 1
+        }
+        i = i + 1
+    }
+
+    println("[plora] dirs_created=" + to_string(dirs_created) + " metas_written=" + to_string(metas_written) + " readmes_written=" + to_string(readmes_written))
+    print_status(personas)
+
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.persona_lora_init.v1\",\n"
+    body = body + "  \"tool\": \"tool/persona_lora_init.hexa\",\n"
+    body = body + "  \"ts\": \"" + ts + "\",\n"
+    body = body + "  \"mode\": \"init\",\n"
+    body = body + "  \"personas_count\": " + to_string(len(personas)) + ",\n"
+    body = body + "  \"dirs_created\": " + to_string(dirs_created) + ",\n"
+    body = body + "  \"metas_written\": " + to_string(metas_written) + ",\n"
+    body = body + "  \"readmes_written\": " + to_string(readmes_written) + ",\n"
+    body = body + "  \"verdict\": \"" + (if (dirs_created + metas_written) > 0 { "INITIALIZED" } else { "ALREADY_INITIALIZED" }) + "\"\n"
+    body = body + "}\n"
+    write_file(SMOKE_OUT, body)
+    exit(0)
+}
+
+main()

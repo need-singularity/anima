@@ -1,0 +1,474 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/onboard.hexa — anima CLI `onboard` topic (CC2 J55 · 5-min quickstart)
+//
+//  PURPOSE
+//    Interactive / non-interactive new-contributor quickstart. Walks a fresh
+//    clone through the 5-minute onboarding path documented in
+//    docs/quickstart_5min.md, running each verification step and surfacing
+//    next-action hints.
+//
+//  SUBCOMMANDS
+//    anima onboard             step-by-step (prints each step · runs probes ·
+//                              advises · continues on failure)
+//    anima onboard --smoke     non-interactive · runs every step once · PASS/FAIL
+//    anima onboard --reset     warn + drop state/anima_onboard_result.json
+//    anima onboard --selftest  graceful-path harness (smoke mode · must exit 0
+//                              even when install is incomplete)
+//    anima onboard --help
+//
+//  STEPS (5 — matches quickstart_5min.md + new-contributor hooks)
+//    1. anima doctor          → 10/10 PASS desired (warn/fail surfaced)
+//    2. shell completion hint → zsh/bash/fish install docs link
+//    3. sample proposal       → `anima proposal review --top 3` executes ·
+//                               shows current pending stack (no writes)
+//    4. paradigm status       → `anima paradigm status --short` + legend
+//    5. first cert try        → `hexa run tool/cert_gate.hexa --selftest`
+//                               (skipped gracefully if cert stack absent)
+//
+//  OUTPUT
+//    stdout  human-readable walk-through
+//    state/anima_onboard_result.json   schema=anima.onboard.v1
+//      · ts · mode=interactive|smoke · steps[{id,name,status,detail}]
+//      · counts{ok,warn,fail} · verdict
+//
+//  DESIGN
+//    raw#9   hexa-only (NO .py) — every probe via exec()
+//    raw#10  deterministic under HEXA_REPRODUCIBLE=1 (ts REDACTED)
+//    raw#11  snake_case
+//    raw#15  no-hardcode (_resolve_root + env-first)
+//
+//  CONSTRAINTS (from CC2 task)
+//    NO .py                              · hexa-only
+//    read-only OR append-only            · never mutates user state
+//    idempotent                          · re-runnable with same result
+//    graceful on incomplete install      · each step catches · never aborts
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── tiny helpers (vendored to stay schema-standalone) ────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    if t == "int" || t == "float" || t == "number" { return str(x) }
+    return ""
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _xexists(p: string) -> bool {
+    return _str(exec("test -x " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _hexa() -> string {
+    let h = _str(env("HEXA_BIN"))
+    if h != "" { return h }
+    if _xexists("/Users/ghost/.hx/bin/hexa") { return "/Users/ghost/.hx/bin/hexa" }
+    let p = _str(exec("command -v hexa 2>/dev/null")).trim()
+    if p != "" { return p }
+    return "/Users/ghost/.hx/bin/hexa"
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _glyph(status: string) -> string {
+    if status == "ok"   { return "[OK]" }
+    if status == "warn" { return "[WARN]" }
+    return "[FAIL]"
+}
+
+fn _pad_right(s: string, w: int) -> string {
+    let out = s
+    while len(out) < w { out = out + " " }
+    return out
+}
+
+fn _jq_esc(s: string) -> string {
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let ch = s.substring(i, i + 1)
+        if ch == "\\" { out = out + "\\\\" }
+        else {
+            if ch == "\"" { out = out + "\\\"" }
+            else {
+                if ch == "\n" { out = out + " " }
+                else          { out = out + ch }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── individual step probes ───────────────────────────────────────────────
+//  Each returns [status, detail] where status ∈ {ok, warn, fail}.
+//  Every step must be graceful — exec() failures never propagate.
+
+fn step_doctor() -> array {
+    let root = _resolve_root()
+    let doctor_mod = root + "/tool/anima_cli/doctor.hexa"
+    if !_fexists(doctor_mod) {
+        return ["warn", "doctor.hexa not found — skipped"]
+    }
+    // run doctor in --json mode so we can parse the verdict deterministically
+    let cmd = _hexa() + " run " + doctor_mod + " --json 2>/dev/null"
+    let out = _str(exec(cmd))
+    let res_path = root + "/state/anima_doctor_result.json"
+    if !_fexists(res_path) {
+        return ["warn", "doctor produced no result (binary missing?)"]
+    }
+    let ok = _str(exec("jq -r '.counts.ok // 0' " + res_path + " 2>/dev/null")).trim()
+    let wn = _str(exec("jq -r '.counts.warn // 0' " + res_path + " 2>/dev/null")).trim()
+    let fl = _str(exec("jq -r '.counts.fail // 0' " + res_path + " 2>/dev/null")).trim()
+    let verdict = _str(exec("jq -r '.verdict // \"?\"' " + res_path + " 2>/dev/null")).trim()
+    if ok == "" { ok = "0" }
+    if wn == "" { wn = "0" }
+    if fl == "" { fl = "0" }
+    let total = int(ok) + int(wn) + int(fl)
+    let detail = "doctor " + ok + "/" + _str(total) + " ok  warn=" + wn
+                 + "  fail=" + fl + "  verdict=" + verdict
+    if verdict == "ok" && ok == "10" { return ["ok", detail] }
+    if verdict == "warn"              { return ["warn", detail] }
+    return ["warn", detail]
+}
+
+fn step_completion() -> array {
+    // Read-only: detect which shell the user runs · never write rc files.
+    let shell = _str(env("SHELL"))
+    let kind = "unknown"
+    if shell.contains("zsh")  { kind = "zsh" }
+    if shell.contains("bash") { kind = "bash" }
+    if shell.contains("fish") { kind = "fish" }
+    let detail = "shell=" + kind + " · see docs/quickstart_5min.md §completion"
+    if kind == "unknown" {
+        return ["warn", "SHELL env not set — user should pick zsh/bash/fish"]
+    }
+    return ["ok", detail]
+}
+
+fn step_proposal_review() -> array {
+    let root = _resolve_root()
+    let tool_path = root + "/tool/anima_cli/proposal.hexa"
+    if !_fexists(tool_path) {
+        return ["warn", "proposal.hexa not found — skipped"]
+    }
+    let pend = root + "/state/proposals/pending"
+    let n = "0"
+    if _dexists(pend) {
+        n = _str(exec("ls " + pend + " 2>/dev/null | wc -l | tr -d ' '")).trim()
+    }
+    // Read-only dry probe — we only confirm the review tool invokes.
+    let probe = _hexa() + " run " + tool_path + " --help 2>&1 | head -n 1"
+    let first = _str(exec(probe)).trim()
+    if first == "" {
+        return ["warn", "proposal review help probe empty · pending=" + n]
+    }
+    return ["ok", "proposal.review ready · pending=" + n + " (read-only preview)"]
+}
+
+fn step_paradigm_status() -> array {
+    let root = _resolve_root()
+    let tool_path = root + "/tool/anima_cli/paradigm.hexa"
+    if !_fexists(tool_path) {
+        return ["warn", "paradigm.hexa not found — skipped"]
+    }
+    // Read-only: capture the short dashboard string (line count = sanity).
+    let cmd = _hexa() + " run " + tool_path + " status --short 2>/dev/null | wc -l | tr -d ' '"
+    let lc = _str(exec(cmd)).trim()
+    if lc == "" || lc == "0" {
+        return ["warn", "paradigm status emitted 0 lines"]
+    }
+    return ["ok", "paradigm.status lines=" + lc + " (β main + proposal + cell)"]
+}
+
+fn step_first_cert() -> array {
+    let root = _resolve_root()
+    let gate = root + "/tool/cert_gate.hexa"
+    if !_fexists(gate) {
+        return ["warn", "tool/cert_gate.hexa missing — cert stack not installed"]
+    }
+    // --selftest is idempotent + read-mostly (writes state/cert_gate_result.json).
+    //  For smoke mode we only probe --help (no state writes) to keep purity.
+    let probe = _hexa() + " run " + gate + " --help 2>&1 | head -n 1"
+    let first = _str(exec(probe)).trim()
+    if first == "" {
+        return ["warn", "cert_gate help probe empty (hexa binary?)"]
+    }
+    let meta = root + "/.meta2-cert"
+    if !_dexists(meta) {
+        return ["warn", "cert_gate present but .meta2-cert/ dir missing"]
+    }
+    return ["ok", "cert_gate ready · .meta2-cert present · try: hexa run tool/cert_gate.hexa --selftest"]
+}
+
+// ─── orchestrator ─────────────────────────────────────────────────────────
+
+fn run_all_steps() -> array {
+    let names = [
+        "doctor",
+        "shell completion",
+        "proposal review",
+        "paradigm status",
+        "first cert try"
+    ]
+    let r1 = step_doctor()
+    let r2 = step_completion()
+    let r3 = step_proposal_review()
+    let r4 = step_paradigm_status()
+    let r5 = step_first_cert()
+    let results = [r1, r2, r3, r4, r5]
+    let steps = []
+    let i = 0
+    while i < len(names) {
+        let st = _str(results[i][0])
+        let dt = _str(results[i][1])
+        steps = steps + [[i + 1, _str(names[i]), st, dt]]
+        i = i + 1
+    }
+    return steps
+}
+
+fn tally(steps) -> array {
+    let ok = 0
+    let wn = 0
+    let fl = 0
+    let i = 0
+    while i < len(steps) {
+        let s = _str(steps[i][2])
+        if s == "ok"   { ok = ok + 1 }
+        if s == "warn" { wn = wn + 1 }
+        if s == "fail" { fl = fl + 1 }
+        i = i + 1
+    }
+    return [ok, wn, fl]
+}
+
+fn verdict_of(t) -> string {
+    if t[2] > 0 { return "fail" }
+    if t[1] > 0 { return "warn" }
+    return "ok"
+}
+
+fn render_walk(steps, mode: string) {
+    println("anima onboard — 5-minute new-contributor quickstart (mode=" + mode + ")")
+    println("────────────────────────────────────────────────────────────────")
+    let i = 0
+    while i < len(steps) {
+        let idx = _str(steps[i][0])
+        let nm  = _str(steps[i][1])
+        let st  = _str(steps[i][2])
+        let dt  = _str(steps[i][3])
+        println(" " + idx + ". " + _glyph(st) + "  " + _pad_right(nm, 18) + "  " + dt)
+        i = i + 1
+    }
+    println("────────────────────────────────────────────────────────────────")
+}
+
+fn render_next_steps(verdict: string) {
+    println("")
+    println("NEXT")
+    if verdict == "ok" {
+        println("  · anima paradigm status            # full dashboard")
+        println("  · anima proposal review --top 3    # inspect top pending")
+        println("  · hexa run tool/cert_gate.hexa --selftest   # first cert (byte-identical)")
+        println("  · docs/quickstart_5min.md          # canonical walk-through")
+    } else {
+        println("  · anima doctor                     # fix any [FAIL] rows first")
+        println("  · docs/quickstart_5min.md §Troubleshooting")
+        println("  · anima --help                     # topic list")
+    }
+    println("")
+    println("Welcome to anima. Total onboarding budget: ~5 minutes.")
+}
+
+fn build_json(ts: string, mode: string, steps, t, verdict: string) -> string {
+    let s = "{"
+    s = s + "\"schema\":\"anima.onboard.v1\","
+    s = s + "\"ts\":\"" + ts + "\","
+    s = s + "\"mode\":\"" + mode + "\","
+    s = s + "\"verdict\":\"" + verdict + "\","
+    s = s + "\"counts\":{\"ok\":" + _str(t[0]) + ",\"warn\":" + _str(t[1]) + ",\"fail\":" + _str(t[2]) + "},"
+    s = s + "\"steps\":["
+    let i = 0
+    while i < len(steps) {
+        if i > 0 { s = s + "," }
+        let idx = _str(steps[i][0])
+        let nm  = _jq_esc(_str(steps[i][1]))
+        let st  = _str(steps[i][2])
+        let dt  = _jq_esc(_str(steps[i][3]))
+        s = s + "{\"id\":" + idx + ",\"name\":\"" + nm + "\",\"status\":\"" + st + "\",\"detail\":\"" + dt + "\"}"
+        i = i + 1
+    }
+    s = s + "]}"
+    return s
+}
+
+fn write_result(json_text: string) -> string {
+    let root = _resolve_root()
+    let out_path = root + "/state/anima_onboard_result.json"
+    let tmp = out_path + ".tmp"
+    exec("mkdir -p " + root + "/state")
+    let esc = json_text.replace("'", "'\\''")
+    let cmd = "printf '%s' '" + esc + "' | jq . > " + tmp + " 2>/dev/null && mv " + tmp + " " + out_path
+              + " || printf '%s' '" + esc + "' > " + out_path
+    exec(cmd)
+    return out_path
+}
+
+// ─── subcommands ──────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima onboard — 5-minute new-contributor quickstart (J55 CC2)")
+    println("")
+    println("  anima onboard           step-by-step walk-through (runs 5 probes)")
+    println("  anima onboard --smoke   non-interactive · table · machine-friendly")
+    println("  anima onboard --reset   drop state/anima_onboard_result.json (warn)")
+    println("")
+    println("  --selftest   graceful-path harness (exits 0 even on partial install)")
+    println("  --help       this help")
+    println("")
+    println("STEPS")
+    println("  1. doctor              → anima doctor (10 read-only checks)")
+    println("  2. shell completion    → detect $SHELL · advise docs link")
+    println("  3. proposal review     → anima proposal review (pending count)")
+    println("  4. paradigm status     → anima paradigm status --short")
+    println("  5. first cert try      → tool/cert_gate.hexa --selftest advisory")
+    println("")
+    println("OUTPUT")
+    println("  state/anima_onboard_result.json   (schema=anima.onboard.v1)")
+    println("")
+    println("DOCS")
+    println("  docs/quickstart_5min.md           canonical hand-maintained guide")
+}
+
+fn sub_reset() {
+    let root = _resolve_root()
+    let p = root + "/state/anima_onboard_result.json"
+    println("anima onboard --reset")
+    println("")
+    println("WARNING: this will remove:")
+    println("  " + p)
+    println("")
+    println("No other user state is touched (cert/proposal/doctor untouched).")
+    if !_fexists(p) {
+        println("(already absent — nothing to do)")
+        return
+    }
+    exec("rm -f " + p)
+    println("removed " + p)
+}
+
+fn sub_run(mode: string) {
+    let ts = _ts_iso()
+    let steps = run_all_steps()
+    let t = tally(steps)
+    let v = verdict_of(t)
+    let json_text = build_json(ts, mode, steps, t, v)
+    let out_path = write_result(json_text)
+    render_walk(steps, mode)
+    let summary = "verdict=" + v + "  ok=" + _str(t[0])
+                  + "  warn=" + _str(t[1]) + "  fail=" + _str(t[2])
+    println(summary)
+    println("ts=" + ts)
+    println("wrote " + out_path)
+    if mode != "smoke" {
+        render_next_steps(v)
+    }
+}
+
+fn sub_selftest() {
+    // Graceful-path assertion: running in smoke mode MUST produce 5 steps,
+    // each with a valid status, and never exit non-zero even on partial
+    // installs (that is the whole point of onboarding in a fresh env).
+    let steps = run_all_steps()
+    if len(steps) != 5 {
+        println("FAIL anima_cli/onboard selftest (expected 5 steps, got " + _str(len(steps)) + ")")
+        exit(1)
+    }
+    let i = 0
+    while i < len(steps) {
+        let st = _str(steps[i][2])
+        let dt = _str(steps[i][3])
+        if st != "ok" && st != "warn" && st != "fail" {
+            println("FAIL anima_cli/onboard selftest (step #" + _str(i + 1) + " bad status=" + st + ")")
+            exit(1)
+        }
+        if dt == "" {
+            println("FAIL anima_cli/onboard selftest (step #" + _str(i + 1) + " empty detail)")
+            exit(1)
+        }
+        i = i + 1
+    }
+    let t = tally(steps)
+    let v = verdict_of(t)
+    // JSON round-trip
+    let j = build_json("REDACTED", "smoke", steps, t, v)
+    if !j.contains("anima.onboard.v1") {
+        println("FAIL anima_cli/onboard selftest (schema tag missing)")
+        exit(1)
+    }
+    if !j.contains("\"steps\":[") {
+        println("FAIL anima_cli/onboard selftest (steps array missing)")
+        exit(1)
+    }
+    // Write path
+    let p = write_result(j)
+    if !_fexists(p) {
+        println("FAIL anima_cli/onboard selftest (state write failed)")
+        exit(1)
+    }
+    println("PASS anima_cli/onboard selftest (5 steps · graceful · schema=anima.onboard.v1 · verdict=" + v + ")")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help")     { sub_help(); return }
+    if _arg_present(argv, "--reset")    { sub_reset(); return }
+    let mode = "interactive"
+    if _arg_present(argv, "--smoke") { mode = "smoke" }
+    sub_run(mode)
+}
+
+main()

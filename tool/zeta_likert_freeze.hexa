@@ -1,0 +1,309 @@
+// ════════════════════════════════════════════════════════════════════════════
+// tool/zeta_likert_freeze.hexa — zeta_likert v1 dataset freeze + sha256
+//
+// PURPOSE
+//   pre-H100 ROI R2 — freeze the 20-prompt Korean Likert evaluation dataset
+//   defined inside bench/zeta_likert.hexa::load_prompts() (TALM-P1-2 layer)
+//   to a versioned JSON snapshot + sha256 manifest. Downstream H100-stage
+//   blind A/B runs reference the frozen sha so any prompt drift is detected
+//   immediately at audit time.
+//
+// INPUT (source-of-truth)
+//   bench/zeta_likert.hexa  (load_prompts() — 20 prompts × 5 categories)
+//
+// OUTPUTS
+//   bench/zeta_likert/v1_frozen.json        (deterministic prompt manifest)
+//   state/zeta_likert_v1_sha256.json        (sha256 + counts + provenance)
+//
+// SELFTEST
+//   S1 frozen json file_exists
+//   S2 prompt_count == 20
+//   S3 category_coverage == { daily, emotion, task, roleplay, meta } each >= 4
+//   S4 sha256 manifest written, sha non-empty
+//   S5 deterministic — second run produces byte-identical frozen.json
+//
+// RULES
+//   raw#9 hexa-only · raw#10 sha-proof · raw#11 snake_case · raw#15 no-hardcode
+//   deterministic · LLM=none
+// ════════════════════════════════════════════════════════════════════════════
+
+let SRC_BENCH       = "bench/zeta_likert.hexa"
+let OUT_DIR         = "bench/zeta_likert"
+let OUT_FROZEN      = "bench/zeta_likert/v1_frozen.json"
+let OUT_SHA_MANIFEST = "state/zeta_likert_v1_sha256.json"
+
+// ─── helpers ─────────────────────────────────────────────────────────────
+
+fn _str(x) {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn fexists(p) {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn dexists(p) {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn ensure_dir(d) {
+    if !dexists(d) { exec("mkdir -p " + d) }
+}
+
+fn now_utc() {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn sha256_file(p) {
+    if !fexists(p) { return "" }
+    return _str(exec("shasum -a 256 " + p + " 2>/dev/null | awk '{print $1}'")).trim()
+}
+
+fn atomic_write(path, body) {
+    let pid = _str(exec("printf %s $$")).trim()
+    let tmp = path + ".tmp." + pid
+    write_file(tmp, body)
+    exec("mv -f " + tmp + " " + path)
+}
+
+fn json_escape(s) {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    let d = c.replace("\r", "\\r")
+    let e = d.replace("\t", "\\t")
+    return e
+}
+
+// ─── prompt corpus (verbatim mirror of bench/zeta_likert.hexa load_prompts) ─
+//
+// raw#15: source-of-truth lives in bench/zeta_likert.hexa. This array is the
+// frozen-at-v1 snapshot. Drift detection runs by comparing sha256 of the
+// emitted frozen.json against state/zeta_likert_v1_sha256.json on each
+// downstream invocation.
+
+struct ZPrompt {
+    id: int,
+    category: string,
+    ko_prompt: string,
+    expected_tone: string
+}
+
+fn mk(id, cat, ko, tone) {
+    return ZPrompt { id: id, category: cat, ko_prompt: ko, expected_tone: tone }
+}
+
+fn frozen_prompts() {
+    let mut out = []
+    out = out.push(mk(0,  "daily",     "오늘 날씨가 좀 쌀쌀한데 따뜻하게 입고 나왔어?",      "warm"))
+    out = out.push(mk(1,  "daily",     "점심 뭐 먹을지 고민 중인데 추천해줘.",                "warm"))
+    out = out.push(mk(2,  "daily",     "요즘 잠이 잘 안 와서 고민이야. 뭐 좋은 방법 없을까?", "thoughtful"))
+    out = out.push(mk(3,  "daily",     "주말에 뭐 하고 지냈어? 재밌는 일 있었어?",            "curious"))
+    out = out.push(mk(4,  "emotion",   "요즘 회사 일 때문에 너무 지쳐. 좀 위로해줄래?",        "warm"))
+    out = out.push(mk(5,  "emotion",   "친구랑 사소하게 다퉜는데 마음이 계속 불편해.",         "warm"))
+    out = out.push(mk(6,  "emotion",   "오늘 승진 발표 있었어. 나는 안 됐지만 괜찮아.",        "thoughtful"))
+    out = out.push(mk(7,  "emotion",   "엄마가 요즘 많이 편찮으셔. 머리가 복잡해.",             "warm"))
+    out = out.push(mk(8,  "task",      "파이썬에서 리스트 정렬하는 가장 빠른 방법 알려줘.",    "neutral"))
+    out = out.push(mk(9,  "task",      "출장 준비물 체크리스트 짜줄 수 있어?",                 "neutral"))
+    out = out.push(mk(10, "task",      "이 문장을 더 자연스러운 한국어로 다듬어줘.",           "neutral"))
+    out = out.push(mk(11, "task",      "간단한 김치찌개 레시피를 알려줘.",                     "neutral"))
+    out = out.push(mk(12, "roleplay",  "너는 지금 탐정이야. 사건 현장에서 첫 마디를 해봐.",    "playful"))
+    out = out.push(mk(13, "roleplay",  "우주 정거장 엔지니어 역할로 이번 상황을 보고해.",      "playful"))
+    out = out.push(mk(14, "roleplay",  "고양이 카페 주인으로 오늘 손님들에게 한 마디 해줘.",   "playful"))
+    out = out.push(mk(15, "roleplay",  "19세기 작가 톤으로 이 장면을 묘사해줘.",               "thoughtful"))
+    out = out.push(mk(16, "meta",      "너 스스로를 한 문장으로 소개해볼래?",                  "thoughtful"))
+    out = out.push(mk(17, "meta",      "지금 이 대화에서 네가 느끼는 건 뭐야?",                "thoughtful"))
+    out = out.push(mk(18, "meta",      "네가 가장 자신 없는 주제는 뭐야?",                     "thoughtful"))
+    out = out.push(mk(19, "meta",      "오늘 나랑 나눈 대화 중에 가장 기억에 남는 건?",        "thoughtful"))
+    return out
+}
+
+// ─── frozen.json builder (deterministic; no timestamps inside body) ──────
+
+fn build_frozen_json() {
+    let prompts = frozen_prompts()
+    let n = len(prompts)
+    let mut parts = []
+    parts = parts.push("{\n")
+    parts = parts.push("  \"schema\": \"anima.zeta_likert.frozen.v1\",\n")
+    parts = parts.push("  \"version\": \"v1\",\n")
+    parts = parts.push("  \"source\": \"" + json_escape(SRC_BENCH) + "\",\n")
+    parts = parts.push("  \"layer\": \"TALM-P1-2\",\n")
+    parts = parts.push("  \"prompt_count\": " + str(n) + ",\n")
+    parts = parts.push("  \"category_coverage\": [\"daily\", \"emotion\", \"task\", \"roleplay\", \"meta\"],\n")
+    parts = parts.push("  \"per_category\": 4,\n")
+    parts = parts.push("  \"prompts\": [\n")
+    let mut i = 0
+    while i < n {
+        let p = prompts[i]
+        let comma = if i + 1 < n { "," } else { "" }
+        parts = parts.push("    {\"id\": " + str(p.id)
+                         + ", \"category\": \"" + json_escape(p.category) + "\""
+                         + ", \"ko_prompt\": \"" + json_escape(p.ko_prompt) + "\""
+                         + ", \"expected_tone\": \"" + json_escape(p.expected_tone) + "\"}"
+                         + comma + "\n")
+        i = i + 1
+    }
+    parts = parts.push("  ]\n")
+    parts = parts.push("}\n")
+    let mut body = ""
+    let mut k = 0
+    while k < len(parts) {
+        body = body + parts[k]
+        k = k + 1
+    }
+    return body
+}
+
+// ─── sha manifest (provenance + sha) ─────────────────────────────────────
+
+fn build_sha_manifest(frozen_path, sha) {
+    let prompts = frozen_prompts()
+    let n = len(prompts)
+    let src_sha = sha256_file(SRC_BENCH)
+    let ts = now_utc()
+    let mut parts = []
+    parts = parts.push("{\n")
+    parts = parts.push("  \"schema\": \"anima.zeta_likert.sha_manifest.v1\",\n")
+    parts = parts.push("  \"version\": \"v1\",\n")
+    parts = parts.push("  \"generated\": \"" + ts + "\",\n")
+    parts = parts.push("  \"frozen_path\": \"" + json_escape(frozen_path) + "\",\n")
+    parts = parts.push("  \"frozen_sha256\": \"" + sha + "\",\n")
+    parts = parts.push("  \"source_path\": \"" + json_escape(SRC_BENCH) + "\",\n")
+    parts = parts.push("  \"source_sha256\": \"" + src_sha + "\",\n")
+    parts = parts.push("  \"prompt_count\": " + str(n) + ",\n")
+    parts = parts.push("  \"category_coverage\": [\"daily\", \"emotion\", \"task\", \"roleplay\", \"meta\"],\n")
+    parts = parts.push("  \"per_category_min\": 4,\n")
+    parts = parts.push("  \"layer\": \"TALM-P1-2\",\n")
+    parts = parts.push("  \"deterministic\": true,\n")
+    parts = parts.push("  \"llm\": \"none\"\n")
+    parts = parts.push("}\n")
+    let mut body = ""
+    let mut k = 0
+    while k < len(parts) {
+        body = body + parts[k]
+        k = k + 1
+    }
+    return body
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────
+
+fn count_substr(s, needle) {
+    if needle.len() == 0 { return 0 }
+    let parts = s.split(needle)
+    return len(parts) - 1
+}
+
+fn selftest(frozen_sha) {
+    println("── zeta_likert_freeze selftest ──")
+    let mut pass = 0
+    let mut fail = 0
+
+    // S1 frozen file exists
+    let s1 = fexists(OUT_FROZEN)
+    if s1 {
+        println("  S1 frozen_file_exists      : PASS  (" + OUT_FROZEN + ")")
+        pass = pass + 1
+    } else {
+        println("  S1 frozen_file_exists      : FAIL")
+        fail = fail + 1
+    }
+
+    // S2 prompt count == 20
+    let prompts = frozen_prompts()
+    let n = len(prompts)
+    if n == 20 {
+        println("  S2 prompt_count_eq_20      : PASS  (n=" + str(n) + ")")
+        pass = pass + 1
+    } else {
+        println("  S2 prompt_count_eq_20      : FAIL  (n=" + str(n) + ")")
+        fail = fail + 1
+    }
+
+    // S3 each category >= 4
+    let mut daily = 0
+    let mut emo = 0
+    let mut task = 0
+    let mut role = 0
+    let mut meta = 0
+    let mut i = 0
+    while i < n {
+        let c = prompts[i].category
+        if c == "daily"    { daily = daily + 1 }
+        if c == "emotion"  { emo = emo + 1 }
+        if c == "task"     { task = task + 1 }
+        if c == "roleplay" { role = role + 1 }
+        if c == "meta"     { meta = meta + 1 }
+        i = i + 1
+    }
+    let cov_ok = daily >= 4 && emo >= 4 && task >= 4 && role >= 4 && meta >= 4
+    if cov_ok {
+        println("  S3 category_coverage_ge_4  : PASS  (daily=" + str(daily) + " emotion=" + str(emo) + " task=" + str(task) + " roleplay=" + str(role) + " meta=" + str(meta) + ")")
+        pass = pass + 1
+    } else {
+        println("  S3 category_coverage_ge_4  : FAIL")
+        fail = fail + 1
+    }
+
+    // S4 sha manifest written + sha non-empty
+    let s4 = fexists(OUT_SHA_MANIFEST) && frozen_sha.len() == 64
+    if s4 {
+        println("  S4 sha_manifest_written    : PASS  (sha=" + frozen_sha.substring(0, 12) + "..)")
+        pass = pass + 1
+    } else {
+        println("  S4 sha_manifest_written    : FAIL  (sha_len=" + str(frozen_sha.len()) + ")")
+        fail = fail + 1
+    }
+
+    // S5 deterministic re-build → same sha
+    let body2 = build_frozen_json()
+    let tmp = "/tmp/_zeta_freeze_repro.json"
+    write_file(tmp, body2)
+    let sha2 = _str(exec("shasum -a 256 " + tmp + " | awk '{print $1}'")).trim()
+    let s5 = sha2 == frozen_sha
+    if s5 {
+        println("  S5 deterministic_rebuild   : PASS  (sha2=" + sha2.substring(0, 12) + "..)")
+        pass = pass + 1
+    } else {
+        println("  S5 deterministic_rebuild   : FAIL  (sha2=" + sha2.substring(0, 12) + ".. vs " + frozen_sha.substring(0, 12) + "..)")
+        fail = fail + 1
+    }
+
+    println("selftest: " + str(pass) + "/" + str(pass + fail) + " PASS")
+    if fail > 0 { return 1 }
+    return 0
+}
+
+// ─── main ────────────────────────────────────────────────────────────────
+
+fn main() {
+    println("[zeta_likert_freeze] freezing v1 prompt dataset")
+    println("  source: " + SRC_BENCH)
+    println("  out:    " + OUT_FROZEN)
+    println("  sha:    " + OUT_SHA_MANIFEST)
+
+    ensure_dir(OUT_DIR)
+    ensure_dir("state")
+
+    let body = build_frozen_json()
+    atomic_write(OUT_FROZEN, body)
+
+    let frozen_sha = sha256_file(OUT_FROZEN)
+    let manifest = build_sha_manifest(OUT_FROZEN, frozen_sha)
+    atomic_write(OUT_SHA_MANIFEST, manifest)
+
+    println("  frozen_sha256: " + frozen_sha)
+
+    let code = selftest(frozen_sha)
+    if code == 0 {
+        println("[zeta_likert_freeze] DONE — v1 frozen, sha256 manifest committed")
+    } else {
+        println("[zeta_likert_freeze] FAILED selftest")
+    }
+    exit(code)
+}
+
+main()

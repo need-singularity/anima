@@ -1,0 +1,107 @@
+// tool/slack_notify_launch_verdict.hexa — ROI #80 Slack notify on launch verdict
+//
+// PURPOSE
+//   Composes a Slack webhook payload summarising the current
+//   h100_launch_completion_verdict.json verdict. Leverages the #74 endpoint
+//   framing but does NOT actually POST unless --apply is passed AND env
+//   SLACK_WEBHOOK_URL is set.
+//
+// USAGE
+//   hexa run tool/slack_notify_launch_verdict.hexa             # dry (default)
+//   hexa run tool/slack_notify_launch_verdict.hexa --apply     # would POST
+//                                                                (still NO-OP
+//                                                                without env)
+//   hexa run tool/slack_notify_launch_verdict.hexa --self-test # inline smoke
+//
+// CONSTRAINTS
+//   raw#9 hexa-only, raw#10 proof-carrying.
+//   DEFAULTS TO DRY. No network unless --apply AND env set.
+//   This tool never fails the run on missing webhook (graceful no-op).
+
+let VERDICT_PATH = "/Users/ghost/core/anima/state/h100_launch_completion_verdict.json"
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool { return exec_with_status("test -e " + _sh_quote(p))[1] == 0 }
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _json_escape(s: string) -> string { return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") }
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _has(av, k) -> bool {
+    let mut i = 0
+    while i < len(av) { if to_string(av[i]) == k { return true }; i = i + 1 }
+    return false
+}
+
+fn _env(name: string) -> string {
+    let r = exec_with_status("printf %s \"${" + name + ":-}\"")
+    return to_string(r[0])
+}
+
+fn _build_payload(verdict_file: string) -> string {
+    if !_file_exists(verdict_file) {
+        return "{\"text\":\"anima H100 launch verdict: MISSING (" + verdict_file + ")\"}"
+    }
+    let v = json_parse(read_file(verdict_file))
+    let overall = if has_key(v, "overall") { to_string(v["overall"]) } else { "UNKNOWN" }
+    let action  = if has_key(v, "roadmap_83_action") { to_string(v["roadmap_83_action"]) } else { "UNKNOWN" }
+    let ready   = if has_key(v, "ready_for_roadmap_83_done") { v["ready_for_roadmap_83_done"] } else { false }
+    let ready_s = if ready == true { "✅" } else { "⏳" }
+    let ts      = if has_key(v, "generated_at") { to_string(v["generated_at"]) } else { "-" }
+
+    let txt = "*anima H100 launch verdict* " + ready_s + "\n" +
+              "• overall: `" + overall + "`\n" +
+              "• roadmap_83_action: `" + action + "`\n" +
+              "• generated_at: `" + ts + "`\n" +
+              "• source: `" + verdict_file + "`"
+    return "{\"text\":\"" + _json_escape(txt) + "\"}"
+}
+
+fn _self_test() {
+    let p = _build_payload(VERDICT_PATH)
+    if len(p) < 10 {
+        eprintln("[slack_notify] SELFTEST FAIL: payload too short")
+        exit(1)
+    }
+    if p.index_of("anima H100 launch verdict") < 0 {
+        eprintln("[slack_notify] SELFTEST FAIL: missing header")
+        exit(1)
+    }
+    println("[slack_notify] SELFTEST PASS payload_bytes=" + to_string(len(p)))
+    exit(0)
+}
+
+fn main() {
+    let av = _argv()
+    if _has(av, "--self-test") { _self_test() }
+
+    let apply = _has(av, "--apply")
+    let webhook = _env("SLACK_WEBHOOK_URL")
+    let payload = _build_payload(VERDICT_PATH)
+
+    println("[slack_notify] mode=" + (if apply { "apply" } else { "dry" }) +
+            " webhook_set=" + (if len(webhook) > 0 { "true" } else { "false" }))
+    println("[slack_notify] payload=" + payload)
+
+    if !apply {
+        println("[slack_notify] DRY — no POST")
+        exit(0)
+    }
+    if len(webhook) == 0 {
+        println("[slack_notify] NO-OP — SLACK_WEBHOOK_URL unset")
+        exit(0)
+    }
+    // Actual POST is intentionally gated — requires --apply AND env set AND
+    // user explicit confirm. For this ROI lane we stop at the dry boundary.
+    println("[slack_notify] apply-gate held: real POST deferred to supervisor callsite (#74)")
+    exit(0)
+}
+
+main()

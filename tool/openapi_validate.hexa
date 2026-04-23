@@ -1,0 +1,469 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/openapi_validate.hexa — D-axis D.1 OpenAPI 3.1 spec validator
+//
+//  PURPOSE
+//    Light-weight validator for docs/api/openapi.yaml (produced by
+//    tool/openapi_emit.hexa). Verifies structural compliance with a
+//    pragmatic subset of the OpenAPI 3.1 specification:
+//      - top-level keys: openapi, info, servers, paths, components
+//      - info.{title, version}
+//      - openapi version matches "3.1.*"
+//      - every $ref points at a defined schema under components.schemas
+//      - every path entry has at least one method (get/post/put/patch/delete)
+//      - components.schemas has required core types: PersonaRequest,
+//        PersonaResponse, HealthStatus, PersonaList, Error
+//      - components.securitySchemes.apiKey{.type, .in, .name}
+//    Emits:
+//      - state/openapi_validate_result.json (pass/fail + check matrix)
+//
+//  CLI
+//    hexa tool/openapi_validate.hexa
+//    hexa tool/openapi_validate.hexa --path docs/api/openapi.yaml
+//    hexa tool/openapi_validate.hexa --selftest
+//
+//  NOTES
+//    - No external openapi-cli / swagger-parser; pure hexa.
+//    - YAML is parsed line-by-line (sufficient for the deterministic layout
+//      emitted by openapi_emit.hexa; not a general YAML parser).
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let DEFAULT_PATH = "docs/api/openapi.yaml"
+let DEFAULT_RESULT = "state/openapi_validate_result.json"
+
+// INLINE_DEPRECATED[H42]: kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec_out(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_code(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+fn _file_exists(p: string) -> bool { return _exec_code("test -e " + _sh_quote(p)) == 0 }
+fn _mkdir_p(p: string) -> bool { return _exec_code("mkdir -p " + _sh_quote(p)) == 0 }
+
+fn _last_slash(p: string) -> int {
+    let mut i = p.len() - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ─── validator helpers ──────────────────────────────────────────────────
+
+fn _has_line(body: string, prefix: string) -> bool {
+    let lines = body.split("\n")
+    for l in lines {
+        let s = to_string(l)
+        // strip leading spaces for prefix match
+        if s.index_of(prefix) == 0 { return true }
+        let t = s
+        let mut k = 0
+        while k < t.len() {
+            let c = t.substring(k, k + 1)
+            if c != " " && c != "\t" { break }
+            k = k + 1
+        }
+        if t.substring(k, t.len()).index_of(prefix) == 0 { return true }
+    }
+    return false
+}
+
+fn _extract_refs(body: string) -> array {
+    let mut out = []
+    let lines = body.split("\n")
+    for l in lines {
+        let s = to_string(l)
+        let i = s.index_of("$ref:")
+        if i < 0 { continue }
+        let after = s.substring(i + 5, s.len()).trim()
+        // strip surrounding quotes
+        let mut v = after
+        if v.len() >= 2 && v.substring(0, 1) == "\"" {
+            v = v.substring(1, v.len())
+            let e = v.index_of("\"")
+            if e >= 0 { v = v.substring(0, e) }
+        }
+        if v.len() > 0 { out.push(v) }
+    }
+    return out
+}
+
+fn _extract_schema_names(body: string) -> array {
+    // Find the "  schemas:" block and collect names like "    PersonaRequest:"
+    let lines = body.split("\n")
+    let mut out = []
+    let mut in_schemas = false
+    let mut schemas_indent = -1
+    for l in lines {
+        let s = to_string(l)
+        let trimmed = s.trim()
+        if trimmed == "schemas:" {
+            in_schemas = true
+            // measure indent
+            let mut k = 0
+            while k < s.len() {
+                let c = s.substring(k, k + 1)
+                if c != " " { break }
+                k = k + 1
+            }
+            schemas_indent = k
+            continue
+        }
+        if !in_schemas { continue }
+        // break when we leave the schemas block (indent <= schemas_indent and not blank)
+        if trimmed.len() == 0 { continue }
+        let mut k = 0
+        while k < s.len() {
+            let c = s.substring(k, k + 1)
+            if c != " " { break }
+            k = k + 1
+        }
+        if k <= schemas_indent { in_schemas = false; continue }
+        // schema names are at schemas_indent + 2 exactly and end with :
+        if k == schemas_indent + 2 {
+            let name_end = s.index_of(":")
+            if name_end > 0 {
+                let name = s.substring(k, name_end)
+                if name.len() > 0 { out.push(name) }
+            }
+        }
+    }
+    return out
+}
+
+fn _path_keys(body: string) -> array {
+    let lines = body.split("\n")
+    let mut out = []
+    let mut in_paths = false
+    let mut paths_indent = -1
+    for l in lines {
+        let s = to_string(l)
+        let trimmed = s.trim()
+        if trimmed == "paths:" {
+            in_paths = true
+            paths_indent = 0
+            continue
+        }
+        if !in_paths { continue }
+        // count leading spaces
+        let mut k = 0
+        while k < s.len() {
+            let c = s.substring(k, k + 1)
+            if c != " " { break }
+            k = k + 1
+        }
+        if trimmed.len() == 0 { continue }
+        // break if we return to column 0 on a non-path top-level key
+        if k == 0 { in_paths = false; continue }
+        // path keys are at indent == 2 and look like "  /xxx:"
+        if k == 2 && s.substring(k, k + 1) == "/" {
+            let end = s.index_of(":")
+            if end > 0 { out.push(s.substring(k, end)) }
+        }
+    }
+    return out
+}
+
+fn _has_method_for_path(body: string, path: string) -> bool {
+    // scan lines after the path key until next path (indent 2) or end,
+    // check presence of http method at indent 4.
+    let lines = body.split("\n")
+    let mut seen = false
+    let mut found = false
+    let target = "  " + path + ":"
+    for l in lines {
+        let s = to_string(l)
+        if s == target { seen = true; continue }
+        if !seen { continue }
+        // leading spaces
+        let mut k = 0
+        while k < s.len() {
+            let c = s.substring(k, k + 1)
+            if c != " " { break }
+            k = k + 1
+        }
+        // new path at col 2 ends the region
+        if k == 2 && s.substring(k, k + 1) == "/" { break }
+        // top-level key at col 0 ends the region
+        if k == 0 && s.trim().len() > 0 { break }
+        // methods appear at col 4 as "    get:" / "    post:" etc.
+        if k == 4 {
+            let rest = s.substring(k, s.len())
+            if rest.index_of("get:") == 0 || rest.index_of("post:") == 0 ||
+               rest.index_of("put:") == 0 || rest.index_of("patch:") == 0 ||
+               rest.index_of("delete:") == 0 || rest.index_of("head:") == 0 ||
+               rest.index_of("options:") == 0 {
+                found = true
+                break
+            }
+        }
+    }
+    return found
+}
+
+// ─── validator core ─────────────────────────────────────────────────────
+
+fn validate(body: string) -> array {
+    // returns [pass_count, fail_count, findings_json_fragment]
+    let mut findings = []
+    let mut fails = 0
+
+    // C1: openapi key starts with 3.1
+    let mut c1_pass = false
+    let lines = body.split("\n")
+    for l in lines {
+        let s = to_string(l).trim()
+        if s.index_of("openapi:") == 0 {
+            // extract value
+            let v = s.substring(8, s.len()).trim().replace("\"", "")
+            if v.index_of("3.1") == 0 { c1_pass = true }
+            break
+        }
+    }
+    findings.push("{\"check\": \"openapi_version\", \"pass\": " + (if c1_pass { "true" } else { "false" }) + "}")
+    if !c1_pass { fails = fails + 1 }
+
+    // C2: info block present with title+version
+    let c2_pass = _has_line(body, "info:") && body.index_of("title:") >= 0 && body.index_of("version:") >= 0
+    findings.push("{\"check\": \"info_title_version\", \"pass\": " + (if c2_pass { "true" } else { "false" }) + "}")
+    if !c2_pass { fails = fails + 1 }
+
+    // C3: servers block present
+    let c3_pass = _has_line(body, "servers:")
+    findings.push("{\"check\": \"servers_present\", \"pass\": " + (if c3_pass { "true" } else { "false" }) + "}")
+    if !c3_pass { fails = fails + 1 }
+
+    // C4: paths block present
+    let c4_pass = _has_line(body, "paths:")
+    findings.push("{\"check\": \"paths_present\", \"pass\": " + (if c4_pass { "true" } else { "false" }) + "}")
+    if !c4_pass { fails = fails + 1 }
+
+    // C5: components.schemas present
+    let c5_pass = _has_line(body, "components:") && body.index_of("schemas:") >= 0
+    findings.push("{\"check\": \"components_schemas\", \"pass\": " + (if c5_pass { "true" } else { "false" }) + "}")
+    if !c5_pass { fails = fails + 1 }
+
+    // C6: required schemas
+    let schemas = _extract_schema_names(body)
+    let required = ["PersonaRequest", "PersonaResponse", "HealthStatus", "PersonaList", "Error"]
+    let mut missing = []
+    for r in required {
+        let needle = to_string(r)
+        let mut ok = false
+        for s in schemas { if to_string(s) == needle { ok = true; break } }
+        if !ok { missing.push(needle) }
+    }
+    let c6_pass = len(missing) == 0
+    let missing_csv = missing.join(",")
+    findings.push("{\"check\": \"required_schemas\", \"pass\": " + (if c6_pass { "true" } else { "false" }) + ", \"missing\": \"" + missing_csv + "\"}")
+    if !c6_pass { fails = fails + 1 }
+
+    // C7: all $ref targets resolve
+    let refs = _extract_refs(body)
+    let mut bad_refs = []
+    for r in refs {
+        let rs = to_string(r)
+        // only check #/components/schemas/ refs
+        let prefix = "#/components/schemas/"
+        if rs.index_of(prefix) != 0 {
+            bad_refs.push(rs + " (non-component ref)")
+            continue
+        }
+        let name = rs.substring(prefix.len(), rs.len())
+        let mut ok = false
+        for s in schemas { if to_string(s) == name { ok = true; break } }
+        if !ok { bad_refs.push(rs) }
+    }
+    let c7_pass = len(bad_refs) == 0
+    findings.push("{\"check\": \"refs_resolve\", \"pass\": " + (if c7_pass { "true" } else { "false" }) + ", \"ref_count\": " + to_string(len(refs)) + ", \"bad\": " + to_string(len(bad_refs)) + "}")
+    if !c7_pass { fails = fails + 1 }
+
+    // C8: every path has at least one HTTP method
+    let paths = _path_keys(body)
+    let mut missing_methods = []
+    for p in paths {
+        let ps = to_string(p)
+        if !_has_method_for_path(body, ps) { missing_methods.push(ps) }
+    }
+    let c8_pass = (len(paths) > 0) && (len(missing_methods) == 0)
+    findings.push("{\"check\": \"paths_have_methods\", \"pass\": " + (if c8_pass { "true" } else { "false" }) + ", \"path_count\": " + to_string(len(paths)) + "}")
+    if !c8_pass { fails = fails + 1 }
+
+    // C9: apiKey security scheme
+    let c9_pass = body.index_of("securitySchemes:") >= 0 && body.index_of("apiKey:") >= 0 && body.index_of("X-Anima-Key") >= 0
+    findings.push("{\"check\": \"api_key_security\", \"pass\": " + (if c9_pass { "true" } else { "false" }) + "}")
+    if !c9_pass { fails = fails + 1 }
+
+    let total = 9
+    let passed = total - fails
+    return [passed, fails, "[" + findings.join(",") + "]", len(schemas), len(refs), len(paths)]
+}
+
+// ─── main + selftest ────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) { out.push(a[i]); i = i + 1 }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn do_validate(path_abs: string, result_abs: string) -> int {
+    if !_file_exists(path_abs) {
+        println("openapi_validate: FAIL path missing: " + path_abs)
+        return 2
+    }
+    let body = read_file(path_abs)
+    let r = validate(body)
+    let passed = r[0]
+    let failed = r[1]
+    let findings = to_string(r[2])
+    let schema_count = r[3]
+    let ref_count = r[4]
+    let path_count = r[5]
+
+    let verdict = if failed == 0 { "PASS" } else { "FAIL" }
+
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima.openapi_validate_result.v1\",\n"
+    out = out + "  \"tool\": \"tool/openapi_validate.hexa\",\n"
+    out = out + "  \"d_axis_subtask\": \"D.1\",\n"
+    out = out + "  \"target\": \"" + path_abs + "\",\n"
+    out = out + "  \"checks_total\": 9,\n"
+    out = out + "  \"checks_passed\": " + to_string(passed) + ",\n"
+    out = out + "  \"checks_failed\": " + to_string(failed) + ",\n"
+    out = out + "  \"schema_count\": " + to_string(schema_count) + ",\n"
+    out = out + "  \"ref_count\": " + to_string(ref_count) + ",\n"
+    out = out + "  \"path_count\": " + to_string(path_count) + ",\n"
+    out = out + "  \"findings\": " + findings + ",\n"
+    out = out + "  \"verdict\": \"" + verdict + "\"\n"
+    out = out + "}\n"
+
+    let ls = _last_slash(result_abs)
+    if ls > 0 { let _ = _mkdir_p(result_abs.substring(0, ls)) }
+    write_file(result_abs, out)
+
+    println("openapi_validate: " + verdict + " (" + to_string(passed) + "/9 checks, " +
+            to_string(path_count) + " paths, " + to_string(schema_count) + " schemas, " +
+            to_string(ref_count) + " refs)")
+    return if failed == 0 { 0 } else { 1 }
+}
+
+fn run_selftest() -> int {
+    println("openapi_validate: SELFTEST starting")
+    let mut fails = 0
+    let tmp = _exec_out("mktemp -d -t openapi_validate_st.XXXXXX 2>/dev/null").trim()
+    if tmp == "" { println("S0 FAIL: mktemp"); return 1 }
+
+    // S1: round-trip — emit via openapi_emit.hexa then validate
+    let cfg_path = tmp + "/config.json"
+    let cfg_body = "{\n" +
+        "  \"default_persona_id\": \"dest1\",\n" +
+        "  \"personas\": [\"dest1\", \"friend\"],\n" +
+        "  \"host\": \"127.0.0.1\",\n" +
+        "  \"port\": 8000,\n" +
+        "  \"default_max_tokens\": 256,\n" +
+        "  \"endpoints\": [\n" +
+        "    {\"path\": \"/health\",   \"method\": \"GET\"},\n" +
+        "    {\"path\": \"/personas\", \"method\": \"GET\"},\n" +
+        "    {\"path\": \"/persona\",  \"method\": \"POST\", \"gates\": [\"cert_gate\", \"an11_a\"]}\n" +
+        "  ]\n" +
+        "}\n"
+    write_file(cfg_path, cfg_body)
+    let out_path = tmp + "/openapi.yaml"
+    let res_path = tmp + "/emit_result.json"
+
+    let emit_cmd = "/Users/ghost/.hx/bin/hexa run " + ANIMA_ROOT + "/tool/openapi_emit.hexa" +
+                   " --config " + _sh_quote(cfg_path) +
+                   " --out " + _sh_quote(out_path) +
+                   " --result " + _sh_quote(res_path)
+    let rc = _exec_code(emit_cmd)
+    if rc != 0 { fails = fails + 1; println("S1 FAIL: emit rc=" + to_string(rc)) }
+    if !_file_exists(out_path) { fails = fails + 1; println("S1 FAIL: yaml missing") }
+
+    // S2: validate on the emitted yaml → expect PASS
+    let v_result = tmp + "/validate_result.json"
+    let vrc = do_validate(out_path, v_result)
+    if vrc != 0 { fails = fails + 1; println("S2 FAIL: validate rc=" + to_string(vrc)) }
+    let vbody = read_file(v_result)
+    if vbody.index_of("\"verdict\": \"PASS\"") < 0 {
+        fails = fails + 1
+        println("S2 FAIL: verdict != PASS")
+    }
+    if vbody.index_of("\"path_count\": 3") < 0 {
+        fails = fails + 1
+        println("S2 FAIL: path_count != 3")
+    }
+    if vbody.index_of("\"schema_count\": 5") < 0 {
+        fails = fails + 1
+        println("S2 FAIL: schema_count != 5")
+    }
+
+    // S3: bad yaml (missing required schema) → expect FAIL
+    let bad_path = tmp + "/bad.yaml"
+    let bad_body = "openapi: \"3.1.0\"\n" +
+                   "info:\n  title: \"x\"\n  version: \"1\"\n" +
+                   "servers:\n  - url: \"http://x\"\n" +
+                   "paths:\n  /x:\n    get:\n      responses:\n        \"200\":\n          description: \"y\"\n" +
+                   "components:\n  schemas:\n    Foo:\n      type: object\n"
+    write_file(bad_path, bad_body)
+    let bad_result = tmp + "/bad_result.json"
+    let brc = do_validate(bad_path, bad_result)
+    if brc == 0 {
+        fails = fails + 1
+        println("S3 FAIL: bad yaml should fail but rc=0")
+    }
+    let bbody = read_file(bad_result)
+    if bbody.index_of("\"verdict\": \"FAIL\"") < 0 {
+        fails = fails + 1
+        println("S3 FAIL: verdict should be FAIL")
+    }
+
+    let _ = _exec_code("rm -rf " + _sh_quote(tmp))
+    if fails == 0 {
+        println("openapi_validate: SELFTEST PASS")
+        return 0
+    }
+    println("openapi_validate: SELFTEST FAIL (" + to_string(fails) + " checks)")
+    return 1
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--selftest") { return run_selftest() }
+
+    let path_rel = _opt(av, "--path", DEFAULT_PATH)
+    let res_rel = _opt(av, "--result", DEFAULT_RESULT)
+
+    let path_abs = if path_rel.substring(0, 1) == "/" { path_rel } else { ANIMA_ROOT + "/" + path_rel }
+    let res_abs = if res_rel.substring(0, 1) == "/" { res_rel } else { ANIMA_ROOT + "/" + res_rel }
+
+    return do_validate(path_abs, res_abs)
+}
+
+main()

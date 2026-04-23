@@ -1,0 +1,458 @@
+// tool/proposal_reject.hexa — anima proposal stack: pending → rejected
+//
+// PURPOSE
+//   Move a pending proposal to rejected/, increment veto_count, set
+//   resurrection_eligible_after = "never" when veto_count == 3.
+//   P4 (docs/anima_proposal_stack_paradigm_20260422.md §5 + §6 veto).
+//
+// USAGE
+//   hexa tool/proposal_reject.hexa --id <N> --reason "..."
+//   hexa tool/proposal_reject.hexa --selftest
+//
+// EXIT
+//   0 success | 1 validation fail | 3 user error
+//
+// RULES
+//   raw#9/10/11/15/20.  --reason is REQUIRED.
+//   Idempotent: re-running on already-rejected id (same reason or empty)
+//     → exit 0 noop. veto_count is incremented exactly once per rejection
+//     event (we treat presence in rejected/ as the dedup signal).
+
+let DEFAULT_ROOT     = "/Users/ghost/core/anima"
+let PROPOSALS_DIR    = DEFAULT_ROOT + "/state/proposals"
+let PENDING_DIR      = PROPOSALS_DIR + "/pending"
+let REJECTED_DIR     = PROPOSALS_DIR + "/rejected"
+let INVENTORY_PATH   = PROPOSALS_DIR + "/inventory.json"
+
+let VETO_THRESHOLD   = 3
+
+// ─── shared helpers ──────────────────────────────────────────────────
+
+fn _str(x) -> string { return to_string(x) }
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _fexists(p: string) -> bool {
+    let r = to_string(exec("ls -d " + _sh_quote(p) + " 2>/dev/null")).trim()
+    return r == p
+}
+
+fn _now_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _ensure_dir(p: string) { exec("mkdir -p " + _sh_quote(p)) }
+
+fn _atomic_write(path: string, body: string) {
+    let mut last_sl = -1
+    let mut k = 0
+    while k < len(path) {
+        if path.substring(k, k + 1) == "/" { last_sl = k }
+        k = k + 1
+    }
+    if last_sl > 0 { _ensure_dir(path.substring(0, last_sl)) }
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    exec("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _is_numeric_str(s: string) -> bool {
+    if s == "" { return false }
+    let mut start = 0
+    if s.substring(0, 1) == "-" {
+        if len(s) == 1 { return false }
+        start = 1
+    }
+    let mut saw_dot = false
+    let mut i = start
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "." {
+            if saw_dot { return false }
+            saw_dot = true
+        } else if c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            // ok
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn _is_string_key(k: string) -> bool {
+    if k == "id" { return true }
+    if k == "title" { return true }
+    if k == "kind" { return true }
+    if k == "rationale" { return true }
+    if k == "user_status" { return true }
+    if k == "first_seen_ts" { return true }
+    if k == "last_refined_ts" { return true }
+    if k == "user_decision_at" { return true }
+    if k == "user_decision_reason" { return true }
+    if k == "implementation_module_path" { return true }
+    if k == "resurrection_eligible_after" { return true }
+    if k == "estimated_effort" { return true }
+    if k == "estimated_impact" { return true }
+    if k == "lineage_parent" { return true }
+    if k == "source_signal" { return true }
+    if k == "path" { return true }
+    if k == "schema" { return true }
+    if k == "created_at" { return true }
+    if k == "updated_at" { return true }
+    return false
+}
+
+fn _json_esc(s: string) -> string {
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { out = out + "\\\\" }
+        else if c == "\"" { out = out + "\\\"" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn _list_dir(dir: string) -> array {
+    if !_fexists(dir) { return [] }
+    let raw = to_string(exec("ls -1 " + _sh_quote(dir) + " 2>/dev/null"))
+    let mut out = []
+    let mut buf = ""
+    let mut i = 0
+    while i < len(raw) {
+        let c = raw.substring(i, i + 1)
+        if c == "\n" {
+            if len(buf) > 0 { out = out.push(buf) }
+            buf = ""
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    if len(buf) > 0 { out = out.push(buf) }
+    return out
+}
+
+fn _resolve_proposal_file(dir: string, id: string) -> string {
+    if !_fexists(dir) { return "" }
+    let exact = dir + "/" + id + ".json"
+    if _fexists(exact) { return exact }
+    let files = _list_dir(dir)
+    let mut i = 0
+    let suffix = "-" + id + ".json"
+    let prefix = id + "_"
+    let prefix_dot = id + ".json"
+    while i < len(files) {
+        let f = files[i]
+        if f == prefix_dot { return dir + "/" + f }
+        if len(f) >= len(suffix) {
+            let tail = f.substring(len(f) - len(suffix), len(f))
+            if tail == suffix { return dir + "/" + f }
+        }
+        if len(f) >= len(prefix) {
+            let head = f.substring(0, len(prefix))
+            if head == prefix { return dir + "/" + f }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _load_inventory() {
+    if !_fexists(INVENTORY_PATH) {
+        return json_parse("{\"schema\":\"anima.proposals.inventory.v1\",\"updated_at\":\"\",\"proposals\":[]}")
+    }
+    return json_parse(read_file(INVENTORY_PATH))
+}
+
+fn _inv_find_idx(inv, id: string) -> int {
+    if !inv.contains_key("proposals") { return -1 }
+    let ps = inv["proposals"]
+    let mut i = 0
+    while i < len(ps) {
+        let p = ps[i]
+        if p.contains_key("id") && _str(p["id"]) == id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _serialize_value(k: string, v, indent: string) -> string {
+    let ts = _str(v)
+    if ts == "void" { return "null" }
+    if ts == "true" || ts == "false" { return ts }
+
+    if len(ts) >= 1 && ts.substring(0, 1) == "[" {
+        let n = len(v)
+        if n == 0 { return "[]" }
+        let mut out = "[\n"
+        let mut i = 0
+        while i < n {
+            out = out + indent + "  " + _serialize_value("", v[i], indent + "  ")
+            if i + 1 < n { out = out + "," }
+            out = out + "\n"
+            i = i + 1
+        }
+        out = out + indent + "]"
+        return out
+    }
+
+    if len(ts) >= 1 && ts.substring(0, 1) == "{" {
+        let mks = keys(v)
+        let n = len(mks)
+        if n == 0 { return "{}" }
+        let mut out = "{\n"
+        let mut i = 0
+        while i < n {
+            let mk = mks[i]
+            out = out + indent + "  \"" + _json_esc(mk) + "\": " + _serialize_value(mk, v[mk], indent + "  ")
+            if i + 1 < n { out = out + "," }
+            out = out + "\n"
+            i = i + 1
+        }
+        out = out + indent + "}"
+        return out
+    }
+
+    if k != "" && _is_string_key(k) { return "\"" + _json_esc(ts) + "\"" }
+    if _is_numeric_str(ts) { return ts }
+    return "\"" + _json_esc(ts) + "\""
+}
+
+fn _proposal_to_json(p) -> string {
+    let ks = keys(p)
+    let mut out = "{\n"
+    let mut i = 0
+    while i < len(ks) {
+        let k = ks[i]
+        out = out + "    \"" + _json_esc(k) + "\": " + _serialize_value(k, p[k], "    ")
+        if i + 1 < len(ks) { out = out + "," }
+        out = out + "\n"
+        i = i + 1
+    }
+    out = out + "  }"
+    return out
+}
+
+fn _save_inventory(inv) {
+    let ks = keys(inv)
+    let mut body = "{\n"
+    let mut emitted_updated = false
+    let mut i = 0
+    while i < len(ks) {
+        let k = ks[i]
+        if k == "proposals" { i = i + 1; continue }
+        let mut v = inv[k]
+        if k == "updated_at" {
+            emitted_updated = true
+            v = _now_iso()
+        }
+        body = body + "  \"" + _json_esc(k) + "\": " + _serialize_value(k, v, "  ") + ",\n"
+        i = i + 1
+    }
+    if !emitted_updated {
+        body = body + "  \"updated_at\": \"" + _now_iso() + "\",\n"
+    }
+    let ps = if inv.contains_key("proposals") { inv["proposals"] } else { [] }
+    body = body + "  \"proposals\": [\n"
+    let mut j = 0
+    while j < len(ps) {
+        body = body + "  " + _proposal_to_json(ps[j])
+        if j + 1 < len(ps) { body = body + "," }
+        body = body + "\n"
+        j = j + 1
+    }
+    body = body + "  ]\n"
+    body = body + "}\n"
+    _atomic_write(INVENTORY_PATH, body)
+}
+
+fn _per_proposal_load(path: string) {
+    return json_parse(read_file(path))
+}
+
+fn _per_proposal_save(path: string, p) {
+    let raw = _proposal_to_json(p)
+    _atomic_write(path, raw + "\n")
+}
+
+fn _set_field(p, k: string, v) { p[k] = v }
+
+// ─── core action ─────────────────────────────────────────────────────
+
+fn _do_reject(id: string, reason: string) -> array {
+    if id == "" { return [3, "proposal_reject: --id required"] }
+    if reason == "" { return [3, "proposal_reject: --reason required (rejection must justify)"] }
+
+    let pending_path  = _resolve_proposal_file(PENDING_DIR, id)
+    let rejected_path = _resolve_proposal_file(REJECTED_DIR, id)
+
+    if rejected_path != "" && pending_path == "" {
+        return [0, "proposal_reject: id=" + id + " already rejected at " + rejected_path + " (noop)"]
+    }
+
+    if pending_path == "" {
+        return [1, "proposal_reject: id=" + id + " not found in pending/"]
+    }
+
+    let p = _per_proposal_load(pending_path)
+
+    // veto_count++
+    let mut vc = 0
+    if p.contains_key("veto_count") {
+        let raw = _str(p["veto_count"])
+        if raw != "" && raw != "null" {
+            vc = parse_int(raw)
+        }
+    }
+    vc = vc + 1
+    _set_field(p, "veto_count", vc)
+    _set_field(p, "user_status", "rejected")
+    _set_field(p, "user_decision_at", _now_iso())
+    _set_field(p, "user_decision_reason", reason)
+    if vc >= VETO_THRESHOLD {
+        _set_field(p, "resurrection_eligible_after", "never")
+    }
+
+    let mut last_sl = -1
+    let mut k = 0
+    while k < len(pending_path) {
+        if pending_path.substring(k, k + 1) == "/" { last_sl = k }
+        k = k + 1
+    }
+    let basename = pending_path.substring(last_sl + 1, len(pending_path))
+    let dst = REJECTED_DIR + "/" + basename
+
+    _per_proposal_save(dst, p)
+    exec("rm -f " + _sh_quote(pending_path))
+
+    let inv = _load_inventory()
+    let idx = _inv_find_idx(inv, id)
+    if idx >= 0 {
+        let ps = inv["proposals"]
+        let entry = ps[idx]
+        _set_field(entry, "user_status", "rejected")
+        _set_field(entry, "user_decision_at", _now_iso())
+        _set_field(entry, "user_decision_reason", reason)
+        _set_field(entry, "veto_count", vc)
+        if vc >= VETO_THRESHOLD {
+            _set_field(entry, "resurrection_eligible_after", "never")
+        }
+        ps[idx] = entry
+        inv["proposals"] = ps
+    }
+    _save_inventory(inv)
+
+    let mut msg = "proposal_reject: id=" + id + " moved pending → rejected at " + dst + " (veto_count=" + _str(vc) + ")"
+    if vc >= VETO_THRESHOLD {
+        msg = msg + " — VETO THRESHOLD reached, resurrection_eligible_after=never"
+    }
+    return [0, msg]
+}
+
+// ─── selftest ────────────────────────────────────────────────────────
+
+fn _selftest() -> array {
+    let id = "99999999-T02"
+    let pending_path  = PENDING_DIR + "/" + id + ".json"
+    let rejected_path = REJECTED_DIR + "/" + id + ".json"
+    _ensure_dir(PENDING_DIR)
+    _ensure_dir(REJECTED_DIR)
+    exec("rm -f " + _sh_quote(pending_path) + " " + _sh_quote(rejected_path))
+
+    // S1: missing reason → exit 3
+    _atomic_write(pending_path, "{\n  \"id\": \"" + id + "\",\n  \"title\": \"selftest\",\n  \"user_status\": \"pending\",\n  \"veto_count\": 0\n}\n")
+    let r0 = _do_reject(id, "")
+    if r0[0] != 3 {
+        exec("rm -f " + _sh_quote(pending_path) + " " + _sh_quote(rejected_path))
+        return [false, "S1: missing reason should exit 3, got " + _str(r0[0])]
+    }
+
+    // S2: valid reject → exit 0, veto_count=1
+    let r1 = _do_reject(id, "selftest reason")
+    if r1[0] != 0 {
+        exec("rm -f " + _sh_quote(pending_path) + " " + _sh_quote(rejected_path))
+        return [false, "S2: reject returned " + _str(r1[0]) + " — " + _str(r1[1])]
+    }
+    if !_fexists(rejected_path) {
+        return [false, "S2: target rejected file missing"]
+    }
+    let p1 = _per_proposal_load(rejected_path)
+    if !p1.contains_key("veto_count") || _str(p1["veto_count"]) != "1" {
+        exec("rm -f " + _sh_quote(rejected_path))
+        return [false, "S2: veto_count should be 1, got " + _str(p1["veto_count"])]
+    }
+
+    // S3: idempotent re-reject (file already in rejected/) → noop exit 0
+    let r2 = _do_reject(id, "selftest reason")
+    if r2[0] != 0 {
+        exec("rm -f " + _sh_quote(rejected_path))
+        return [false, "S3: idempotent re-reject returned " + _str(r2[0])]
+    }
+
+    // S4: simulate veto threshold — manually bump veto_count to 2 in pending,
+    // reject again → vc becomes 3 → resurrection_eligible_after = "never"
+    exec("rm -f " + _sh_quote(rejected_path))
+    _atomic_write(pending_path, "{\n  \"id\": \"" + id + "\",\n  \"title\": \"selftest\",\n  \"user_status\": \"pending\",\n  \"veto_count\": 2\n}\n")
+    let r3 = _do_reject(id, "third strike")
+    if r3[0] != 0 {
+        exec("rm -f " + _sh_quote(pending_path) + " " + _sh_quote(rejected_path))
+        return [false, "S4: third reject returned " + _str(r3[0])]
+    }
+    let p3 = _per_proposal_load(rejected_path)
+    let vc_str = _str(p3["veto_count"])
+    let res_str = if p3.contains_key("resurrection_eligible_after") { _str(p3["resurrection_eligible_after"]) } else { "" }
+    exec("rm -f " + _sh_quote(rejected_path) + " " + _sh_quote(pending_path))
+    if vc_str != "3" || res_str != "never" {
+        return [false, "S4: expected veto_count=3 + resurrection=never, got vc=" + vc_str + " res=" + res_str]
+    }
+
+    return [true, "S1 missing-reason + S2 reject + S3 idempotent + S4 veto-threshold → 4/4 PASS"]
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────────
+
+let argv = args()
+
+if _arg_present(argv, "--selftest") {
+    println("── proposal_reject selftest ──")
+    let r = _selftest()
+    println(_str(r[1]))
+    println("── selftest result: " + (if r[0] { "4/4 PASS" } else { "FAIL" }) + " ──")
+    if r[0] { exit(0) }
+    exit(1)
+}
+
+let id     = _arg_value(argv, "--id", "")
+let reason = _arg_value(argv, "--reason", "")
+
+let r = _do_reject(id, reason)
+println(_str(r[1]))
+exit(r[0])

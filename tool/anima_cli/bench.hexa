@@ -1,0 +1,404 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/bench.hexa — anima CLI `bench` topic
+//
+//  PURPOSE
+//    Integrated selftest timer. Runs --selftest against every
+//    tool/anima_cli/*.hexa module (_common + 9 topic modules), measures
+//    wall-time for each, and renders a table (or machine-readable JSON).
+//    Detects regression vs. last recorded run.
+//
+//  SUBCOMMANDS
+//    all                  run every module's --selftest · timed · table
+//    <module>             run a single module timed (e.g. `compute`)
+//    --json               machine-readable output (schema anima.bench.v1)
+//    --selftest           synthetic 1-module timing check
+//    --help
+//
+//  OUTPUT (table)
+//    module        status  duration  detail
+//    _common       PASS    120ms
+//    compute       PASS    80ms
+//    ...
+//    TOTAL         10/10   ~900ms
+//
+//  STATE
+//    state/anima_bench_result.json   (schema anima.bench.v1)
+//      · ts · per-module duration_ms + status · total_ms · pass_count
+//      · regression_delta_ms vs prior run
+//
+//  DESIGN
+//    raw#9  hexa-only (NO .py) · raw#11 snake_case · raw#15 no-hardcode
+//    Idempotent. LLM=none. Deterministic when HEXA_REPRODUCIBLE=1.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── shared helpers (vendored from _common.hexa) ──────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _json_field(path: string, key: string) -> string {
+    if !_fexists(path) { return "" }
+    return _str(exec("jq -r '" + key + " // \"\"' " + path + " 2>/dev/null")).trim()
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _table_row(cells) -> string {
+    let s = ""
+    let i = 0
+    while i < len(cells) {
+        if i > 0 { s = s + "  " }
+        s = s + _str(cells[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn _hexa() -> string {
+    let h = _str(env("HEXA_BIN"))
+    if h != "" { return h }
+    return "/Users/ghost/.hx/bin/hexa"
+}
+
+// ─── timing (perl-based ms; macOS `date +%s%N` unsupported) ───────────────
+
+fn _now_ms() -> string {
+    return _str(exec("perl -e 'use Time::HiRes qw(time); printf \"%.0f\", time()*1000'")).trim()
+}
+
+fn _to_int(s: string) -> int {
+    if s == "" { return 0 }
+    let n = int(s)
+    return n
+}
+
+fn _pad_right(s: string, w: int) -> string {
+    let out = s
+    while len(out) < w {
+        out = out + " "
+    }
+    return out
+}
+
+// ─── module registry ──────────────────────────────────────────────────────
+//  Explicit list — matches bin/anima TOPICS + _common helper host.
+
+fn _modules() -> array {
+    return [
+        "_common",
+        "compute",
+        "weight",
+        "proposal",
+        "cert",
+        "roadmap",
+        "serve",
+        "paradigm",
+        "inbox",
+        "cost"
+    ]
+}
+
+// ─── single-module timed run ──────────────────────────────────────────────
+
+fn _run_one(mn: string) -> array {
+    // returns [status, duration_ms_str, detail]
+    let root = _resolve_root()
+    let path = root + "/tool/anima_cli/" + mn + ".hexa"
+    if !_fexists(path) {
+        return ["MISS", "0", "tool missing"]
+    }
+    let cmd = _hexa() + " run " + path + " --selftest 2>&1 | head -n 1"
+    let t0 = _to_int(_now_ms())
+    let first = _str(exec(cmd)).trim()
+    let t1 = _to_int(_now_ms())
+    let dur = t1 - t0
+    let status = "FAIL"
+    if first.contains("PASS") { status = "PASS" }
+    let detail = ""
+    if status == "FAIL" { detail = first }
+    return [status, str(dur), detail]
+}
+
+// ─── state write (schema anima.bench.v1) ──────────────────────────────────
+
+fn _prior_total_ms() -> int {
+    let root = _resolve_root()
+    let p = root + "/state/anima_bench_result.json"
+    if !_fexists(p) { return 0 }
+    let v = _json_field(p, ".total_ms")
+    return _to_int(v)
+}
+
+fn _write_result(rows, total_ms: int, pass_count: int, mod_count: int) {
+    let root = _resolve_root()
+    let state_dir = root + "/state"
+    if !_dexists(state_dir) { exec("mkdir -p " + state_dir) }
+    let prior = _prior_total_ms()
+    let delta = total_ms - prior
+    let out_path = state_dir + "/anima_bench_result.json"
+    let ts = _ts_iso()
+
+    // build JSON body (compact, deterministic)
+    let body = "{\"schema\":\"anima.bench.v1\",\"ts\":\"" + ts + "\","
+    body = body + "\"total_ms\":" + str(total_ms) + ","
+    body = body + "\"pass_count\":" + str(pass_count) + ","
+    body = body + "\"module_count\":" + str(mod_count) + ","
+    body = body + "\"prior_total_ms\":" + str(prior) + ","
+    body = body + "\"regression_delta_ms\":" + str(delta) + ","
+    body = body + "\"modules\":["
+    let i = 0
+    while i < len(rows) {
+        let r = rows[i]
+        if i > 0 { body = body + "," }
+        body = body + "{\"name\":\"" + _str(r[0]) + "\","
+        body = body + "\"status\":\"" + _str(r[1]) + "\","
+        body = body + "\"duration_ms\":" + _str(r[2])
+        let d = _str(r[3])
+        if d != "" {
+            // escape quotes minimally
+            let de = d.replace("\"", "\\\"")
+            body = body + ",\"detail\":\"" + de + "\""
+        }
+        body = body + "}"
+        i = i + 1
+    }
+    body = body + "]}"
+
+    // jq pretty-print (tolerate jq absent)
+    let tmp = "/tmp/anima_bench_result.stage.json"
+    exec("printf '%s' " + _shell_quote(body) + " > " + tmp)
+    let jq_ok = _str(exec("command -v jq >/dev/null 2>&1 && echo 1 || echo 0")).trim()
+    if jq_ok == "1" {
+        exec("jq . " + tmp + " > " + out_path + " 2>/dev/null || cp " + tmp + " " + out_path)
+    } else {
+        exec("cp " + tmp + " " + out_path)
+    }
+    exec("rm -f " + tmp)
+}
+
+fn _shell_quote(s: string) -> string {
+    // single-quote + escape embedded single quotes
+    let esc = s.replace("'", "'\\''")
+    return "'" + esc + "'"
+}
+
+// ─── table rendering ──────────────────────────────────────────────────────
+
+fn _render_table(rows, total_ms: int, pass_count: int, mod_count: int) {
+    println(_table_row([_pad_right("module", 12), _pad_right("status", 6),
+                       _pad_right("duration", 10), "detail"]))
+    let i = 0
+    while i < len(rows) {
+        let r = rows[i]
+        let name = _str(r[0])
+        let st = _str(r[1])
+        let dur = _str(r[2]) + "ms"
+        let det = _str(r[3])
+        println(_table_row([_pad_right(name, 12), _pad_right(st, 6),
+                           _pad_right(dur, 10), det]))
+        i = i + 1
+    }
+    let tot_label = str(pass_count) + "/" + str(mod_count)
+    let tot_dur = "~" + str(total_ms) + "ms"
+    println(_table_row([_pad_right("TOTAL", 12), _pad_right(tot_label, 6),
+                       _pad_right(tot_dur, 10), ""]))
+}
+
+// ─── json output ──────────────────────────────────────────────────────────
+
+fn _render_json(rows, total_ms: int, pass_count: int, mod_count: int) {
+    // re-emit the state file (already written) to stdout for machine use
+    let root = _resolve_root()
+    let p = root + "/state/anima_bench_result.json"
+    if _fexists(p) {
+        println(_str(exec("cat " + p)))
+        return
+    }
+    // fallback inline build
+    println("{\"schema\":\"anima.bench.v1\",\"total_ms\":" + str(total_ms)
+            + ",\"pass_count\":" + str(pass_count)
+            + ",\"module_count\":" + str(mod_count) + "}")
+}
+
+// ─── subcommands ──────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima bench — integrated selftest timer")
+    println("")
+    println("  all                run every module's --selftest · timed · table")
+    println("  <module>           run a single module timed")
+    println("                     (_common, compute, weight, proposal, cert,")
+    println("                      roadmap, serve, paradigm, inbox, cost)")
+    println("")
+    println("  --json             machine-readable output (anima.bench.v1)")
+    println("  --selftest         synthetic 1-module timing self-check")
+    println("  --help             this help")
+    println("")
+    println("State: state/anima_bench_result.json (schema anima.bench.v1)")
+}
+
+fn sub_all(emit_json: bool) {
+    let mods = _modules()
+    let rows = []
+    let total_ms = 0
+    let pass_count = 0
+    let mod_count = len(mods)
+    let i = 0
+    while i < mod_count {
+        let m = _str(mods[i])
+        let r = _run_one(m)
+        let st = _str(r[0])
+        let dms = _to_int(_str(r[1]))
+        let detail = _str(r[2])
+        total_ms = total_ms + dms
+        if st == "PASS" { pass_count = pass_count + 1 }
+        rows = rows + [[m, st, str(dms), detail]]
+        i = i + 1
+    }
+    _write_result(rows, total_ms, pass_count, mod_count)
+    if emit_json {
+        _render_json(rows, total_ms, pass_count, mod_count)
+        return
+    }
+    _render_table(rows, total_ms, pass_count, mod_count)
+    let prior = _prior_total_ms()
+    // prior was just overwritten; fetch from file doesn't help. Use pre-write cached:
+    // (we print delta by reading state right after — but we just wrote it, so the
+    //  delta vs the OLD run was embedded. Pull it from the file now.)
+    let delta_s = _json_field(_resolve_root() + "/state/anima_bench_result.json",
+                              ".regression_delta_ms")
+    if delta_s != "" && delta_s != "0" {
+        let sign = ""
+        let d = _to_int(delta_s)
+        if d > 0 { sign = "+" }
+        println("regression_delta: " + sign + delta_s + "ms (vs prior run)")
+    }
+}
+
+fn sub_single(mn: string, emit_json: bool) {
+    let mods = _modules()
+    let ok = false
+    let i = 0
+    while i < len(mods) {
+        if _str(mods[i]) == mn { ok = true }
+        i = i + 1
+    }
+    if !ok {
+        println("bench: unknown module '" + mn + "'")
+        println("       known: _common compute weight proposal cert roadmap "
+                + "serve paradigm inbox cost")
+        exit(2)
+    }
+    let r = _run_one(mn)
+    let st = _str(r[0])
+    let dms = _to_int(_str(r[1]))
+    let detail = _str(r[2])
+    let rows = [[mn, st, str(dms), detail]]
+    let pc = 0
+    if st == "PASS" { pc = 1 }
+    _write_result(rows, dms, pc, 1)
+    if emit_json {
+        _render_json(rows, dms, pc, 1)
+        return
+    }
+    _render_table(rows, dms, pc, 1)
+}
+
+fn sub_selftest() {
+    // synthetic check: time a single module (_common is always present)
+    let r = _run_one("_common")
+    let st = _str(r[0])
+    let dms = _to_int(_str(r[1]))
+    if st != "PASS" {
+        println("FAIL anima_cli/bench selftest (_common did not PASS)")
+        exit(1)
+    }
+    if dms <= 0 {
+        println("FAIL anima_cli/bench selftest (duration not measured)")
+        exit(1)
+    }
+    // verify state write path works
+    _write_result([["_common", st, str(dms), ""]], dms, 1, 1)
+    let p = _resolve_root() + "/state/anima_bench_result.json"
+    if !_fexists(p) {
+        println("FAIL anima_cli/bench selftest (state not written)")
+        exit(1)
+    }
+    let sch = _json_field(p, ".schema")
+    if sch != "anima.bench.v1" {
+        println("FAIL anima_cli/bench selftest (schema mismatch: " + sch + ")")
+        exit(1)
+    }
+    println("PASS anima_cli/bench selftest (" + str(dms) + "ms, schema="
+            + sch + ")")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") || len(argv) == 0 { sub_help(); return }
+    let emit_json = _arg_present(argv, "--json")
+    // first non-flag token is the subcommand
+    let i = 0
+    let sub = ""
+    while i < len(argv) {
+        let s = _str(argv[i])
+        if !s.starts_with("--") { sub = s; break }
+        i = i + 1
+    }
+    if sub == "" {
+        if emit_json { sub_all(true); return }
+        sub_help()
+        return
+    }
+    if sub == "all" { sub_all(emit_json); return }
+    sub_single(sub, emit_json)
+}
+
+main()

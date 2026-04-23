@@ -1,0 +1,339 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/proposal_auto_threshold.hexa  —  N1 of pre-H100 ROI batch
+//
+//  PURPOSE
+//    Scan state/proposals/pending/ + state/proposals/approved/ and identify
+//    proposals satisfying the AUTO-IMPLEMENT THRESHOLD:
+//
+//        score_priority >= 80   AND
+//        risk_level <= 0.0      (== 0)   AND
+//        loss_free == true
+//
+//    For each matching proposal, emit (idempotently) a PROPOSE-ONLY markdown
+//    spec at docs/proposed_implementation_<id>.md by deferring to
+//    tool/proposal_implement.hexa --id <id>.  raw#20 invariant is enforced —
+//    we NEVER create the actual module file, only the propose-md.
+//
+//  HARD CONSTRAINTS  (raw#20 + .roadmap-uchg)
+//    - DRY-RUN by default. Caller MUST pass --apply to side-effect.
+//    - NEVER create / modify  tool/, .roadmap, or any module file.
+//    - NEVER auto-approve. Pending proposals stay pending; we just emit the
+//      propose-md as a "ready to approve + implement" hint.
+//    - For pending matches we ONLY produce a candidate report. The user must
+//      still run `proposal_approve.hexa --id <N>` first; once approved we run
+//      `proposal_implement.hexa --id <N>` (which itself only emits a md spec).
+//    - Idempotent: re-running on the same set is a no-op (proposal_implement
+//      is itself idempotent — md exists + inventory mod_path set → exit 0 noop).
+//    - Selftest is fully synthetic — touches only /tmp + a guarded pid.
+//
+//  USAGE
+//    hexa run tool/proposal_auto_threshold.hexa             # dry-run report
+//    hexa run tool/proposal_auto_threshold.hexa --apply     # emit propose-md
+//                                                            # for APPROVED matches
+//    hexa run tool/proposal_auto_threshold.hexa --selftest  # 5/5 synthetic
+//
+//  FLAGS
+//    --apply             write side: shell out to proposal_implement.hexa --id N
+//                        for APPROVED proposals matching the threshold.
+//    --include-pending   also list (NOT auto-approve) pending matches in the
+//                        report. Pending matches NEVER trigger implement.
+//    --score N           override score gate (default 80; min 80).
+//    --selftest          synthetic 5-case validation, exit 0/1.
+//
+//  EXIT CODES
+//    0   success
+//    1   selftest fail / runtime fail
+//    3   user error (bad flag value)
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT     = "/Users/ghost/core/anima"
+let PROP_ROOT      = "/Users/ghost/core/anima/state/proposals"
+let PENDING_DIR    = "/Users/ghost/core/anima/state/proposals/pending"
+let APPROVED_DIR   = "/Users/ghost/core/anima/state/proposals/approved"
+let DOCS_DIR       = "/Users/ghost/core/anima/docs"
+let IMPLEMENT_TOOL = "/Users/ghost/core/anima/tool/proposal_implement.hexa"
+
+// ─── basics ────────────────────────────────────────────────────────────────
+
+fn _str(x) -> string { return to_string(x) }
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exists(p: string) -> bool {
+    let r = exec_with_status("test -e " + _shq(p))
+    return to_int(_str(r[1])) == 0
+}
+
+fn _mkdir_p(p: string) { exec_with_status("mkdir -p " + _shq(p)) }
+
+fn _now_iso() -> string {
+    return _str(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+
+fn _atomic_write(path: string, body: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    exec_with_status("mv -f " + _shq(tmp) + " " + _shq(path))
+}
+
+fn _arg_present(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(av: array, k: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == k && i + 1 < len(av) { return _str(av[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+
+fn _list_json(dir: string) -> array {
+    if !_exists(dir) { return [] }
+    let raw = _str(exec_with_status("ls -1 " + _shq(dir) + " 2>/dev/null | grep -E '\\.json$' || true")[0])
+    let mut out = []
+    let mut buf = ""
+    let mut i = 0
+    while i < len(raw) {
+        let c = raw.substring(i, i + 1)
+        if c == "\n" {
+            if len(buf) > 0 { out.push(buf) }
+            buf = ""
+        } else { buf = buf + c }
+        i = i + 1
+    }
+    if len(buf) > 0 { out.push(buf) }
+    return out
+}
+
+// ─── threshold check ──────────────────────────────────────────────────────
+
+fn _matches_threshold(p, min_score: int) -> bool {
+    if !p.contains_key("score_priority") { return false }
+    let score = to_int(_str(p["score_priority"]))
+    if score < min_score { return false }
+
+    // risk_level can be either numeric (0.0-1.0) or string ("low"/"med"/"high"/"0").
+    // Spec for N1: risk == 0 strict.
+    if !p.contains_key("risk_level") { return false }
+    let rs = _str(p["risk_level"]).trim()
+    let risk_zero = (rs == "0" || rs == "0.0" || rs == "0.00")
+    if !risk_zero { return false }
+
+    if !p.contains_key("loss_free") { return false }
+    let lf = _str(p["loss_free"]).trim()
+    if lf != "true" { return false }
+
+    return true
+}
+
+// ─── scan one directory ───────────────────────────────────────────────────
+
+fn _scan_dir(dir: string, min_score: int) -> array {
+    let mut hits = []
+    let files = _list_json(dir)
+    let mut i = 0
+    while i < len(files) {
+        let fp = dir + "/" + _str(files[i])
+        let raw = _str(read_file(fp))
+        if len(raw.trim()) > 0 {
+            let p = json_parse(raw)
+            if _matches_threshold(p, min_score) {
+                let mut rec = json_parse("{}")
+                rec["id"]    = if p.contains_key("id")    { _str(p["id"])    } else { "" }
+                rec["title"] = if p.contains_key("title") { _str(p["title"]) } else { "" }
+                rec["score"] = to_int(_str(p["score_priority"]))
+                rec["path"]  = fp
+                hits.push(rec)
+            }
+        }
+        i = i + 1
+    }
+    return hits
+}
+
+// ─── per-id implement (delegates) ─────────────────────────────────────────
+
+fn _implement_one(id: string) -> map {
+    // Shell out to proposal_implement.hexa which itself enforces raw#20
+    // (only emits propose-md, never creates the module).
+    let cmd = "/Users/ghost/.hx/bin/hexa run " + _shq(IMPLEMENT_TOOL) +
+              " --id " + _shq(id) + " 2>&1"
+    let r = exec_with_status(cmd)
+    let mut o = json_parse("{}")
+    o["id"]      = id
+    o["rc"]      = to_int(_str(r[1]))
+    o["stdout"]  = _str(r[0]).trim()
+    o["md_path"] = DOCS_DIR + "/proposed_implementation_" + id + ".md"
+    return o
+}
+
+// ─── report rendering ─────────────────────────────────────────────────────
+
+fn _render_report(approved_hits: array, pending_hits: array, applied: array,
+                  apply_mode: bool, include_pending: bool, min_score: int) -> string {
+    let mut s = "── proposal_auto_threshold ──\n"
+    s = s + "ts          : " + _now_iso() + "\n"
+    s = s + "mode        : " + (if apply_mode { "APPLY" } else { "dry-run" }) + "\n"
+    s = s + "thresholds  : score >= " + _str(min_score) + " AND risk_level == 0 AND loss_free == true\n"
+    s = s + "approved hits : " + _str(len(approved_hits)) + "\n"
+    s = s + "pending  hits : " + _str(len(pending_hits)) +
+            (if include_pending { "  (listed below for awareness only)" } else { "  (use --include-pending to list)" }) + "\n"
+    s = s + "raw#20      : module files NEVER created — only docs/proposed_implementation_<id>.md\n"
+    s = s + "\n── approved candidates (auto-implementable now) ──\n"
+    if len(approved_hits) == 0 {
+        s = s + "  (none)\n"
+    } else {
+        let mut i = 0
+        while i < len(approved_hits) {
+            let h = approved_hits[i]
+            s = s + "  + [score=" + _str(h["score"]) + "] " + _str(h["id"]) +
+                "  ::  " + _str(h["title"]) + "\n"
+            i = i + 1
+        }
+    }
+    if include_pending {
+        s = s + "\n── pending candidates (need user approve first) ──\n"
+        if len(pending_hits) == 0 {
+            s = s + "  (none)\n"
+        } else {
+            let mut j = 0
+            while j < len(pending_hits) {
+                let h = pending_hits[j]
+                s = s + "  - [score=" + _str(h["score"]) + "] " + _str(h["id"]) +
+                    "  ::  " + _str(h["title"]) + "\n"
+                j = j + 1
+            }
+        }
+    }
+    if apply_mode {
+        s = s + "\n── applied propose-md emits ──\n"
+        if len(applied) == 0 {
+            s = s + "  (none — nothing to apply)\n"
+        } else {
+            let mut k = 0
+            while k < len(applied) {
+                let a = applied[k]
+                s = s + "  -> id=" + _str(a["id"]) + " rc=" + _str(a["rc"]) +
+                    " md=" + _str(a["md_path"]) + "\n"
+                k = k + 1
+            }
+        }
+    } else {
+        s = s + "\n(dry-run — no propose-md emitted. Pass --apply to invoke proposal_implement.hexa per approved hit.)\n"
+    }
+    return s
+}
+
+// ─── selftest ─────────────────────────────────────────────────────────────
+
+fn _selftest() -> int {
+    println("── proposal_auto_threshold selftest ──")
+    let tdir = "/tmp/anima_proposal_threshold_selftest"
+    exec_with_status("rm -rf " + _shq(tdir))
+    _mkdir_p(tdir)
+
+    // 5 synthetic proposals covering all gate combinations.
+    //   c1: score=85, risk=0,    loss_free=true    → MATCH
+    //   c2: score=95, risk=0,    loss_free=true    → MATCH
+    //   c3: score=75, risk=0,    loss_free=true    → score gate fail
+    //   c4: score=90, risk=0.05, loss_free=true    → risk gate fail
+    //   c5: score=90, risk=0,    loss_free=false   → loss_free gate fail
+    let c1 = "{\"id\":\"T1\",\"title\":\"t1\",\"score_priority\":85,\"risk_level\":0,\"loss_free\":true}\n"
+    let c2 = "{\"id\":\"T2\",\"title\":\"t2\",\"score_priority\":95,\"risk_level\":0,\"loss_free\":true}\n"
+    let c3 = "{\"id\":\"T3\",\"title\":\"t3\",\"score_priority\":75,\"risk_level\":0,\"loss_free\":true}\n"
+    let c4 = "{\"id\":\"T4\",\"title\":\"t4\",\"score_priority\":90,\"risk_level\":0.05,\"loss_free\":true}\n"
+    let c5 = "{\"id\":\"T5\",\"title\":\"t5\",\"score_priority\":90,\"risk_level\":0,\"loss_free\":false}\n"
+    _atomic_write(tdir + "/c1.json", c1)
+    _atomic_write(tdir + "/c2.json", c2)
+    _atomic_write(tdir + "/c3.json", c3)
+    _atomic_write(tdir + "/c4.json", c4)
+    _atomic_write(tdir + "/c5.json", c5)
+
+    let hits = _scan_dir(tdir, 80)
+
+    let s1 = (len(hits) == 2)
+    println("S1 hits == 2                           : " + (if s1 { "PASS" } else { "FAIL (got " + _str(len(hits)) + ")" }))
+
+    // Verify c3/c4/c5 each individually rejected.
+    let p3 = json_parse(_str(read_file(tdir + "/c3.json")))
+    let p4 = json_parse(_str(read_file(tdir + "/c4.json")))
+    let p5 = json_parse(_str(read_file(tdir + "/c5.json")))
+    let s2 = (!_matches_threshold(p3, 80))
+    let s3 = (!_matches_threshold(p4, 80))
+    let s4 = (!_matches_threshold(p5, 80))
+    println("S2 score < 80 rejected (c3)            : " + (if s2 { "PASS" } else { "FAIL" }))
+    println("S3 risk > 0 rejected   (c4)            : " + (if s3 { "PASS" } else { "FAIL" }))
+    println("S4 loss_free=false rejected (c5)       : " + (if s4 { "PASS" } else { "FAIL" }))
+
+    // raw#20 invariant: scan does NOT create any module files anywhere.
+    // Verify our synth ids T1/T2 did NOT produce tool/proposal_T1.hexa etc.
+    let rogue1 = ANIMA_ROOT + "/tool/proposal_T1.hexa"
+    let rogue2 = ANIMA_ROOT + "/tool/proposal_T2.hexa"
+    let s5 = (!_exists(rogue1) && !_exists(rogue2))
+    println("S5 raw#20: no module files materialized: " + (if s5 { "PASS" } else { "FAIL" }))
+
+    exec_with_status("rm -rf " + _shq(tdir))
+    if s1 && s2 && s3 && s4 && s5 {
+        println("── selftest 5/5 PASS ──")
+        return 0
+    }
+    println("── selftest FAIL ──")
+    return 1
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _arg_present(av, "--selftest") { return _selftest() }
+
+    let apply = _arg_present(av, "--apply")
+    let include_pending = _arg_present(av, "--include-pending")
+
+    let score_str = _arg_value(av, "--score", "80")
+    let mut min_score = 80
+    if len(score_str) > 0 {
+        let parsed = to_int(score_str)
+        if parsed < 80 {
+            println("proposal_auto_threshold: --score must be >= 80 (got " + score_str + ")")
+            return 3
+        }
+        min_score = parsed
+    }
+
+    let approved_hits = _scan_dir(APPROVED_DIR, min_score)
+    let pending_hits  = _scan_dir(PENDING_DIR,  min_score)
+
+    let mut applied = []
+    if apply {
+        let mut i = 0
+        while i < len(approved_hits) {
+            let h = approved_hits[i]
+            let r = _implement_one(_str(h["id"]))
+            applied.push(r)
+            i = i + 1
+        }
+    }
+
+    println(_render_report(approved_hits, pending_hits, applied, apply, include_pending, min_score))
+    return 0
+}
+
+exit(main())

@@ -1,0 +1,358 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/lint_rule_pack.hexa — ROI H45: code-quality lint pack
+//
+//  CHECKS
+//    L1  no .py files in tool/                             (R37 / AN13)
+//    L2  no console.log / debug print spam                 (use println sparingly)
+//    L3  no hardcoded /Users/ghost or /tmp paths in        (use $ANIMA_ROOT or
+//        tool/*.hexa                                         relative paths)
+//
+//  L1 detail
+//    Any tool/*.py is an automatic violation — anima is hexa-only per AN13.
+//    Sub-directories under tool/ are scanned non-recursively (top-level only)
+//    because the only legal .py files in the repo live OUTSIDE tool/.
+//
+//  L2 detail
+//    Forbidden tokens (case-sensitive):
+//      console.log(           — JS-ism, never legal in hexa
+//      console.error(         — same
+//      console.warn(          — same
+//      // DEBUG                — drive-by debug comment
+//      // TODO DEBUG           — same
+//    Real `println(` calls are fine — they are the canonical hexa stdout API.
+//
+//  L3 detail
+//    Hardcoded paths in tool/*.hexa are fragile. Specifically banned:
+//      /Users/ghost       (any caller's home dir)
+//      /tmp/              (machine-local; caller may be sandboxed)
+//    Allow-listed exceptions (declared CONST at the top of a tool, used
+//    intentionally as the canonical anima root):
+//      let ANIMA_ROOT = "/Users/ghost/core/anima"
+//      let ANIMA_ROOT = "/Users/ghost/core/anima/..."
+//      DEFAULT_ROADMAP, DEFAULT_OUT, etc. that anchor under ANIMA_ROOT.
+//    The check below allows lines that are pure `let NAME = "/Users/ghost/core/anima..."`
+//    constant declarations, and flags everything else.
+//
+//  OUTPUT
+//    state/lint_violations.json
+//      {
+//        "schema":     "anima.lint_violations.v1",
+//        "ts":         "<iso>",
+//        "checks":     ["L1_no_py", "L2_no_console", "L3_no_hardcoded_path"],
+//        "violations": [
+//          {"check": "L1_no_py", "file": "...", "line": 0, "msg": "..."},
+//          ...
+//        ],
+//        "pass":       bool
+//      }
+//
+//  EXIT
+//    0 — clean
+//    1 — violations present (gate trips)
+//
+//  USAGE
+//    hexa tool/lint_rule_pack.hexa
+//    hexa tool/lint_rule_pack.hexa --selftest
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let TOOL_DIR   = "/Users/ghost/core/anima/tool"
+let OUT_PATH   = "/Users/ghost/core/anima/state/lint_violations.json"
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _shq(p))[1] == 0
+}
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _short_path(p: string) -> string {
+    let root = ANIMA_ROOT + "/"
+    if len(p) > len(root) && p.substring(0, len(root)) == root {
+        return p.substring(len(root), len(p))
+    }
+    return p
+}
+
+fn _list_tool_hexa() -> array {
+    let r = exec_with_status("ls -1 " + _shq(TOOL_DIR) + "/*.hexa 2>/dev/null")
+    let mut out = []
+    if r[1] != 0 { return out }
+    let lines = split(to_string(r[0]), "\n")
+    for ln in lines {
+        let t = ln.trim()
+        if len(t) > 0 { out.push(t) }
+    }
+    return out
+}
+
+fn _list_tool_py() -> array {
+    let r = exec_with_status("ls -1 " + _shq(TOOL_DIR) + "/*.py 2>/dev/null")
+    let mut out = []
+    if r[1] != 0 { return out }
+    let lines = split(to_string(r[0]), "\n")
+    for ln in lines {
+        let t = ln.trim()
+        if len(t) > 0 { out.push(t) }
+    }
+    return out
+}
+
+// ─── L1: no .py in tool/ ───────────────────────────────────────────────────
+
+fn _check_l1() -> array {
+    let mut viols = []
+    let py_files = _list_tool_py()
+    for fp in py_files {
+        let entry = []
+        entry.push("L1_no_py")
+        entry.push(_short_path(fp))
+        entry.push(0)
+        entry.push(".py file in tool/ violates AN13 (hexa-only) — port to .hexa or move out of tool/")
+        viols.push(entry)
+    }
+    return viols
+}
+
+// ─── L2: no console.log style debug ────────────────────────────────────────
+
+fn _check_l2_file(fp: string) -> array {
+    let mut viols = []
+    let src = to_string(read_file(fp))
+    let lines = split(src, "\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i]
+        // Forbidden tokens
+        if ln.contains("console.log(") {
+            let entry = []
+            entry.push("L2_no_console")
+            entry.push(_short_path(fp))
+            entry.push(i + 1)
+            entry.push("console.log( — JS-ism, use println() instead")
+            viols.push(entry)
+        }
+        if ln.contains("console.error(") {
+            let entry = []
+            entry.push("L2_no_console")
+            entry.push(_short_path(fp))
+            entry.push(i + 1)
+            entry.push("console.error( — JS-ism, use eprintln() instead")
+            viols.push(entry)
+        }
+        if ln.contains("console.warn(") {
+            let entry = []
+            entry.push("L2_no_console")
+            entry.push(_short_path(fp))
+            entry.push(i + 1)
+            entry.push("console.warn( — JS-ism, use eprintln() instead")
+            viols.push(entry)
+        }
+        // // DEBUG comments are noise unless cleaned up before merge
+        let trimmed = ln.trim_start()
+        if len(trimmed) >= 8 && trimmed.substring(0, 8) == "// DEBUG" {
+            let entry = []
+            entry.push("L2_no_console")
+            entry.push(_short_path(fp))
+            entry.push(i + 1)
+            entry.push("// DEBUG comment — clean up before merge")
+            viols.push(entry)
+        }
+        i = i + 1
+    }
+    return viols
+}
+
+// ─── L3: no hardcoded /Users/ghost or /tmp paths ──────────────────────────
+//
+// Allowed: pure constant declaration of ANIMA_ROOT (or paths that begin with
+// the canonical anima root + slash). We check by walking lines and only
+// flagging when a /Users/ghost or /tmp/ literal appears OUTSIDE such an
+// allow-listed context.
+
+fn _l3_line_allowed(ln: string) -> bool {
+    let s = ln.trim_start()
+    // Ignore comment lines
+    if len(s) >= 2 && s.substring(0, 2) == "//" { return true }
+    // Allow: any string literal that is a valid anchor under /Users/ghost/core/anima
+    // Heuristic: if every `/Users/ghost` occurrence is followed by `/core/anima`,
+    // treat the line as allowed.
+    let needle = "/Users/ghost"
+    let canon  = "/Users/ghost/core/anima"
+    let mut i = 0
+    let mut all_ok = true
+    while true {
+        let idx = s.index_of(needle)
+        if idx < 0 { break }
+        // does this occurrence start an anima-canonical path?
+        let after = s.substring(idx, len(s))
+        if len(after) >= len(canon) && after.substring(0, len(canon)) == canon {
+            // strip and continue
+            s = s.substring(idx + len(canon), len(s))
+        } else {
+            all_ok = false
+            break
+        }
+        i = i + 1
+        if i > 16 { break }
+    }
+    return all_ok
+}
+
+fn _check_l3_file(fp: string) -> array {
+    let mut viols = []
+    let src = to_string(read_file(fp))
+    let lines = split(src, "\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i]
+        // hard ban: /tmp/ literals (unless inside a comment)
+        let trimmed_full = ln.trim_start()
+        let is_comment = (len(trimmed_full) >= 2 && trimmed_full.substring(0, 2) == "//")
+        if !is_comment {
+            if ln.contains("\"/tmp/") {
+                let entry = []
+                entry.push("L3_no_hardcoded_path")
+                entry.push(_short_path(fp))
+                entry.push(i + 1)
+                entry.push("hardcoded /tmp/ path — use a per-tool sandbox dir under state/ instead")
+                viols.push(entry)
+            }
+            // /Users/ghost outside the canonical anima root
+            if ln.contains("/Users/ghost") {
+                if !_l3_line_allowed(ln) {
+                    let entry = []
+                    entry.push("L3_no_hardcoded_path")
+                    entry.push(_short_path(fp))
+                    entry.push(i + 1)
+                    entry.push("hardcoded /Users/ghost path outside ANIMA_ROOT — use $ANIMA_ROOT or relative path")
+                    viols.push(entry)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return viols
+}
+
+// ─── audit driver ──────────────────────────────────────────────────────────
+
+fn _run_audit() -> array {
+    let mut all_viols = []
+    let l1 = _check_l1()
+    for v in l1 { all_viols.push(v) }
+
+    let files = _list_tool_hexa()
+    for fp in files {
+        if !_file_exists(fp) { continue }
+        let l2 = _check_l2_file(fp)
+        for v in l2 { all_viols.push(v) }
+        let l3 = _check_l3_file(fp)
+        for v in l3 { all_viols.push(v) }
+    }
+    return [files, all_viols]
+}
+
+fn _write_out(scanned: int, viols: array, pass: bool) {
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"anima.lint_violations.v1\",\n"
+    j = j + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    j = j + "  \"scanned_files\": " + to_string(scanned) + ",\n"
+    j = j + "  \"checks\": [\"L1_no_py\", \"L2_no_console\", \"L3_no_hardcoded_path\"],\n"
+    j = j + "  \"violation_count\": " + to_string(len(viols)) + ",\n"
+    j = j + "  \"violations\": ["
+    let mut i = 0
+    while i < len(viols) {
+        if i > 0 { j = j + "," }
+        let v = viols[i]
+        j = j + "\n    {\"check\": \"" + _json_esc(v[0]) + "\", \"file\": \"" + _json_esc(v[1]) + "\", \"line\": " + to_string(v[2]) + ", \"msg\": \"" + _json_esc(v[3]) + "\"}"
+        i = i + 1
+    }
+    if len(viols) > 0 { j = j + "\n  " }
+    j = j + "],\n"
+    j = j + "  \"pass\": " + (if pass { "true" } else { "false" }) + "\n"
+    j = j + "}\n"
+    let tmp = OUT_PATH + ".tmp"
+    write_file(tmp, j)
+    exec_with_status("mv -f " + _shq(tmp) + " " + _shq(OUT_PATH))
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn _arg_present(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let _argv = args()
+if _arg_present(_argv, "--selftest") {
+    println("── lint_rule_pack selftest ──")
+    // S1 — L2 detector flags console.log
+    let tmp_l2 = "/tmp/_lint_pack_l2.hexa"
+    write_file(tmp_l2, "let x = 1\nconsole.log(\"oops\")\n")
+    let v_l2 = _check_l2_file(tmp_l2)
+    let s1 = (len(v_l2) >= 1)
+    println("S1 L2 console.log detected: " + to_string(len(v_l2)) + " hits → " + (if s1 { "PASS" } else { "FAIL" }))
+    // S2 — L3 detector flags /tmp/ literal
+    let tmp_l3 = "/tmp/_lint_pack_l3.hexa"
+    write_file(tmp_l3, "let p = \"/tmp/foo.json\"\nlet q = \"/Users/ghost/somewhere/else\"\n")
+    let v_l3 = _check_l3_file(tmp_l3)
+    let s2 = (len(v_l3) >= 2)
+    println("S2 L3 /tmp + non-anima /Users/ghost detected: " + to_string(len(v_l3)) + " hits → " + (if s2 { "PASS" } else { "FAIL" }))
+    // S3 — L3 detector ALLOWS canonical ANIMA_ROOT decl
+    let tmp_l3_ok = "/tmp/_lint_pack_l3_ok.hexa"
+    write_file(tmp_l3_ok, "let ANIMA_ROOT = \"/Users/ghost/core/anima\"\nlet OUT = \"/Users/ghost/core/anima/state/x.json\"\n")
+    let v_l3_ok = _check_l3_file(tmp_l3_ok)
+    let s3 = (len(v_l3_ok) == 0)
+    println("S3 L3 allows canonical ANIMA_ROOT: " + to_string(len(v_l3_ok)) + " hits → " + (if s3 { "PASS" } else { "FAIL" }))
+    exec_with_status("rm -f " + _shq(tmp_l2) + " " + _shq(tmp_l3) + " " + _shq(tmp_l3_ok))
+    if s1 && s2 && s3 {
+        println("── selftest 3/3 PASS ──")
+        exit(0)
+    }
+    println("── selftest FAIL ──")
+    exit(1)
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+println("── lint_rule_pack (ROI H45) ──")
+let res = _run_audit()
+let scanned = len(res[0])
+let viols   = res[1]
+let pass = (len(viols) == 0)
+_write_out(scanned, viols, pass)
+println("scanned    : " + to_string(scanned))
+println("violations : " + to_string(len(viols)))
+println("output     : " + OUT_PATH)
+if pass {
+    println("PASS")
+    exit(0)
+}
+println("FAIL — " + to_string(len(viols)) + " lint violation(s)")
+let mut shown = 0
+for v in viols {
+    if shown < 20 {
+        eprintln("  " + v[0] + " " + v[1] + ":" + to_string(v[2]) + " — " + v[3])
+        shown = shown + 1
+    }
+}
+if len(viols) > 20 {
+    eprintln("  ... " + to_string(len(viols) - 20) + " more (see " + OUT_PATH + ")")
+}
+exit(1)

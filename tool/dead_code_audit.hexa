@@ -1,0 +1,243 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/dead_code_audit.hexa — ROI H41: post-AOT dead-code candidate report
+//
+//  PURPOSE
+//    Scan every tool/*.hexa, list defined `fn` names, and grep their usage
+//    across the whole repo. Functions with zero non-definition references
+//    are flagged as dead-code candidates.
+//
+//  IMPORTANT
+//    This tool ONLY reports — it never deletes or rewrites code. The output
+//    is consumed by humans (or downstream review tooling) to make the final
+//    keep/remove call.
+//
+//  OUTPUT
+//    state/dead_code_candidates.json
+//      {
+//        "schema": "anima.dead_code_candidates.v1",
+//        "ts":     "<iso>",
+//        "scanned_files": <int>,
+//        "total_fns":     <int>,
+//        "dead_count":    <int>,
+//        "candidates":    [ { "file": "...", "fn": "...", "line": <int> }, ... ]
+//      }
+//
+//  RULES IGNORED BY DESIGN
+//    - top-level entrypoints (no `fn` wrapper) — not parsed
+//    - fns referenced via dynamic dispatch / strings — heuristic miss possible;
+//      that's why this is a CANDIDATE list, not an auto-delete list.
+//    - private leading-underscore helpers count exactly the same as public.
+//
+//  EXIT
+//    0 always (this is a report, not a gate). A separate CI rule may decide
+//    whether the candidate count is allowed to grow.
+//
+//  USAGE
+//    hexa tool/dead_code_audit.hexa
+//    hexa tool/dead_code_audit.hexa --selftest
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let TOOL_DIR   = "/Users/ghost/core/anima/tool"
+let OUT_PATH   = "/Users/ghost/core/anima/state/dead_code_candidates.json"
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _shq(p))[1] == 0
+}
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// Return list of absolute paths to tool/*.hexa
+fn _list_tool_hexa() -> array {
+    let r = exec_with_status("ls -1 " + _shq(TOOL_DIR) + "/*.hexa 2>/dev/null")
+    let mut out = []
+    if r[1] != 0 { return out }
+    let lines = split(to_string(r[0]), "\n")
+    for ln in lines {
+        let t = ln.trim()
+        if len(t) > 0 { out.push(t) }
+    }
+    return out
+}
+
+// Extract `fn NAME` definitions from a hexa source. Returns array of [name, line].
+fn _extract_fn_defs(src: string) -> array {
+    let lines = split(src, "\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let raw = lines[i]
+        let s = raw.trim_start()
+        if len(s) >= 3 && s.substring(0, 3) == "fn " {
+            // parse: fn NAME(...
+            let rest = s.substring(3, len(s))
+            let mut end = 0
+            while end < len(rest) {
+                let c = rest.substring(end, end + 1)
+                if c == "(" || c == " " || c == "\t" { break }
+                end = end + 1
+            }
+            if end > 0 {
+                let nm = rest.substring(0, end)
+                if len(nm) > 0 { out.push([nm, i + 1]) }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Build a frequency map from tool/*.hexa: for every `IDENT(` occurrence
+// across the whole tree that is NOT preceded by `fn `, count the IDENT.
+//
+// Single-pass awk delivers C-speed scanning of a ~5 MB tree. We shell out
+// once, stream the result back, and parse the "<count> <ident>" lines into
+// a hexa map.
+//
+// Returned: object map keyed by ident → int count.
+fn _build_ref_freq() -> object {
+    let mut freq = json_parse("{}")
+    let awk_prog = "{ line=$0; while (match(line, /[A-Za-z_][A-Za-z0-9_]*\\(/)) { idp=substr(line,RSTART,RLENGTH); id=substr(idp,1,RLENGTH-1); pf=(RSTART>=4 && substr(line,RSTART-3,3)==\"fn \"); if(!pf) freq[id]++; line=substr(line,RSTART+RLENGTH) } } END { for(k in freq) print freq[k], k }"
+    let cmd = "cat " + _shq(TOOL_DIR) + "/*.hexa 2>/dev/null | awk " + _shq(awk_prog) + " 2>/dev/null"
+    let r = exec_with_status(cmd)
+    if r[1] != 0 && len(to_string(r[0]).trim()) == 0 { return freq }
+    let lines = split(to_string(r[0]), "\n")
+    for ln in lines {
+        let t = ln.trim()
+        if len(t) == 0 { continue }
+        let sp = t.index_of(" ")
+        if sp < 1 { continue }
+        let cnt_str = t.substring(0, sp)
+        let nm = t.substring(sp + 1, len(t))
+        freq[nm] = to_int(cnt_str)
+    }
+    return freq
+}
+
+fn _freq_lookup(freq: object, name: string) -> int {
+    if !freq.contains_key(name) { return 0 }
+    return to_int(to_string(freq[name]))
+}
+
+fn _short_path(p: string) -> string {
+    let root = ANIMA_ROOT + "/"
+    if len(p) > len(root) && p.substring(0, len(root)) == root {
+        return p.substring(len(root), len(p))
+    }
+    return p
+}
+
+// ─── audit driver ──────────────────────────────────────────────────────────
+//
+// Single-pass design:
+//   1) read every tool/*.hexa once into memory
+//   2) build the concatenated blob ALL_SRC
+//   3) extract per-file fn defs
+//   4) for each fn, count refs in ALL_SRC (in-memory string scan)
+//
+// This converts the audit from O(F * F) shell-greps to O(F) reads + O(N) scans,
+// which on the live tree (~170 tools, ~3000 fns) drops from minutes to seconds.
+
+fn _run_audit() -> array {
+    let files = _list_tool_hexa()
+    // ONE awk pass builds the call-frequency map for the whole tree.
+    let freq = _build_ref_freq()
+    let mut total_fns = 0
+    let mut candidates = []
+    for fpath in files {
+        if !_file_exists(fpath) { continue }
+        let src = to_string(read_file(fpath))
+        let defs = _extract_fn_defs(src)
+        for d in defs {
+            total_fns = total_fns + 1
+            let nm = d[0]
+            if len(nm) < 2 { continue }
+            let n_refs = _freq_lookup(freq, nm)
+            if n_refs == 0 {
+                candidates.push([_short_path(fpath), nm, d[1]])
+            }
+        }
+    }
+    return [files, total_fns, candidates]
+}
+
+fn _write_out(scanned: int, total: int, cands: array) {
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"anima.dead_code_candidates.v1\",\n"
+    j = j + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    j = j + "  \"scanned_files\": " + to_string(scanned) + ",\n"
+    j = j + "  \"total_fns\": " + to_string(total) + ",\n"
+    j = j + "  \"dead_count\": " + to_string(len(cands)) + ",\n"
+    j = j + "  \"candidates\": ["
+    let mut i = 0
+    while i < len(cands) {
+        if i > 0 { j = j + "," }
+        j = j + "\n    {\"file\": \"" + _json_esc(cands[i][0]) + "\", \"fn\": \"" + _json_esc(cands[i][1]) + "\", \"line\": " + to_string(cands[i][2]) + "}"
+        i = i + 1
+    }
+    if len(cands) > 0 { j = j + "\n  " }
+    j = j + "]\n}\n"
+    let tmp = OUT_PATH + ".tmp"
+    write_file(tmp, j)
+    exec_with_status("mv -f " + _shq(tmp) + " " + _shq(OUT_PATH))
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn _arg_present(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let _argv = args()
+if _arg_present(_argv, "--selftest") {
+    println("── dead_code_audit selftest ──")
+    let synth = "fn _used_helper(x: int) -> int { return x + 1 }\nfn _orphan_fn() -> int { return 0 }\nlet z = _used_helper(3)\n"
+    let defs = _extract_fn_defs(synth)
+    let mut s1_pass = false
+    let mut s2_pass = false
+    if len(defs) == 2 { s1_pass = true }
+    println("S1 fn extraction (expect 2 defs): " + to_string(len(defs)) + " → " + (if s1_pass { "PASS" } else { "FAIL" }))
+    // S2 — sanity: the audit driver runs without panic on the live tree
+    let res = _run_audit()
+    let scanned = len(res[0])
+    if scanned > 0 { s2_pass = true }
+    println("S2 audit driver scans real tool/ tree: " + to_string(scanned) + " files → " + (if s2_pass { "PASS" } else { "FAIL" }))
+    if s1_pass && s2_pass {
+        println("── selftest 2/2 PASS ──")
+        exit(0)
+    }
+    println("── selftest FAIL ──")
+    exit(1)
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+println("── dead_code_audit (ROI H41) ──")
+let res = _run_audit()
+let scanned = len(res[0])
+let total   = res[1]
+let cands   = res[2]
+_write_out(scanned, total, cands)
+println("scanned_files : " + to_string(scanned))
+println("total_fns     : " + to_string(total))
+println("dead_count    : " + to_string(len(cands)))
+println("output        : " + OUT_PATH)
+println("PASS (report-only — never auto-deletes)")
+exit(0)

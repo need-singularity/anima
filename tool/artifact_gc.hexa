@@ -1,0 +1,283 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/artifact_gc.hexa — ROI G39: orphan artifact GC
+//
+//  Scans state/ + .meta2-cert/ for files that are NOT referenced by either:
+//    (a) the read-only .roadmap (uchg-locked text source-of-truth), or
+//    (b) the .meta2-cert/index.json registry (for cert files).
+//
+//  Default: list candidates only. NEVER deletes. With --apply the script
+//  WOULD move (not delete) candidates to state/_gc_quarantine_<ts>/ — but
+//  per ROI hard-constraint we keep apply-mode strictly NON-DESTRUCTIVE
+//  (quarantine move only, plus an "intent log" sidecar). No `rm` ever.
+//
+//  Output: state/artifact_gc_report.json
+//
+//  USAGE
+//    hexa tool/artifact_gc.hexa                     # dry list (default)
+//    hexa tool/artifact_gc.hexa --apply             # quarantine move
+//    hexa tool/artifact_gc.hexa --min-age-days 14   # only flag files older
+// ════════════════════════════════════════════════════════════════════════════
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _exec(cmd: string) -> string {
+    let r = exec_with_status(cmd)
+    return to_string(r[0])
+}
+
+fn _exec_rc(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool { return _exec_rc("test -e " + _sh_quote(p)) == 0 }
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return _exec("echo $HOME").trim()
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) {
+        o.push(to_string(a[i]))
+        i = i + 1
+    }
+    return o
+}
+
+fn _flag(av, k) -> bool {
+    for x in av {
+        if to_string(x) == k { return true }
+    }
+    return false
+}
+
+fn _opt(av, k, d) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn _file_size(p: string) -> int {
+    let s = _exec("stat -f '%z' " + _sh_quote(p) + " 2>/dev/null").trim()
+    if len(s) == 0 { return 0 }
+    return to_int(s)
+}
+
+fn _file_age_days(p: string) -> int {
+    // mtime in epoch sec via stat -f '%m'; current time via date +%s.
+    let mt = _exec("stat -f '%m' " + _sh_quote(p) + " 2>/dev/null").trim()
+    let now = _exec("date +%s").trim()
+    if len(mt) == 0 || len(now) == 0 { return 0 }
+    let dm = to_int(mt)
+    let dn = to_int(now)
+    let secs = dn - dm
+    return secs / 86400
+}
+
+fn _list_files(dir: string) -> array {
+    if !_file_exists(dir) { return [] }
+    let cmd = "find " + _sh_quote(dir) + " -type f 2>/dev/null | sort"
+    let raw = _exec(cmd)
+    let mut o = []
+    for line in raw.split("\n") {
+        let t = to_string(line).trim()
+        if len(t) > 0 { o.push(t) }
+    }
+    return o
+}
+
+fn _basename(p: string) -> string {
+    let parts = p.split("/")
+    if len(parts) == 0 { return p }
+    return to_string(parts[len(parts) - 1])
+}
+
+// Build a single haystack string from .roadmap (uchg, read-only) + cert index.
+fn _build_reference_haystack(roadmap_path: string, cert_index_path: string) -> string {
+    let mut hay = ""
+    if _file_exists(roadmap_path) {
+        hay = hay + read_file(roadmap_path)
+    }
+    if _file_exists(cert_index_path) {
+        hay = hay + "\n" + read_file(cert_index_path)
+    }
+    return hay
+}
+
+// A file is "referenced" iff its basename or relative path appears
+// in the haystack (substring match, case-sensitive).
+fn _referenced(path: string, hay: string) -> bool {
+    let bn = _basename(path)
+    if len(bn) == 0 { return false }
+    if hay.index_of(bn) >= 0 { return true }
+    // also check basename-without-extension to catch edu / cross-references
+    let parts = bn.split(".")
+    if len(parts) > 1 {
+        let stem = to_string(parts[0])
+        if len(stem) >= 6 && hay.index_of(stem) >= 0 { return true }
+    }
+    return false
+}
+
+fn main() {
+    let argv = _argv()
+    let apply_mode = _flag(argv, "--apply")
+    let min_age = to_int(_opt(argv, "--min-age-days", "0"))
+    let home = _home()
+    let anima_root = home + "/core/anima"
+    let roadmap = anima_root + "/.roadmap"
+    let cert_index = anima_root + "/.meta2-cert/index.json"
+    let state_dir = anima_root + "/state"
+    let cert_dir = anima_root + "/.meta2-cert"
+    let report_path = state_dir + "/artifact_gc_report.json"
+    let ts = _exec("date -u +%Y%m%dT%H%M%SZ").trim()
+    let quarantine = state_dir + "/_gc_quarantine_" + ts
+
+    let mode_tag = if apply_mode { "apply-quarantine" } else { "dry" }
+    println("[artifact_gc] mode=" + mode_tag + " min_age_days=" + to_string(min_age))
+    println("[artifact_gc] roadmap=" + roadmap + " cert_index=" + cert_index)
+
+    let hay = _build_reference_haystack(roadmap, cert_index)
+    if len(hay) == 0 {
+        eprintln("[artifact_gc] WARN: empty reference haystack — refusing to flag anything")
+        let body0 = "{\n  \"schema_version\":\"1\",\n  \"roi_item\":\"G39\",\n  \"verdict\":\"NOOP\",\n  \"reason\":\"empty_haystack\"\n}\n"
+        write_file(report_path, body0)
+        exit(0)
+    }
+
+    let state_files = _list_files(state_dir)
+    let cert_files = _list_files(cert_dir)
+
+    let mut candidates = []
+    let mut bytes_total = 0
+    let mut kept = 0
+
+    let mut i = 0
+    while i < len(state_files) {
+        let p = to_string(state_files[i])
+        let skip_a = p.index_of("/_gc_quarantine_") >= 0
+        let skip_b = p.index_of("artifact_gc_report.json") >= 0
+        let skip_c = p.index_of("storage_roi_audit.json") >= 0
+        let skip_d = p.index_of("ckpt_dedup_ledger.json") >= 0
+        if skip_a || skip_b || skip_c || skip_d {
+            kept = kept + 1
+            i = i + 1
+            continue
+        }
+        let age = _file_age_days(p)
+        if age < min_age {
+            kept = kept + 1
+            i = i + 1
+            continue
+        }
+        if !_referenced(p, hay) {
+            let sz = _file_size(p)
+            bytes_total = bytes_total + sz
+            let entry_s = "    {\"path\":\"" + p + "\",\"size\":" + to_string(sz) + ",\"age_days\":" + to_string(age) + ",\"category\":\"state\"}"
+            candidates.push(entry_s)
+        } else {
+            kept = kept + 1
+        }
+        i = i + 1
+    }
+
+    let mut j = 0
+    while j < len(cert_files) {
+        let p = to_string(cert_files[j])
+        let age = _file_age_days(p)
+        if age < min_age {
+            kept = kept + 1
+            j = j + 1
+            continue
+        }
+        if _basename(p) == "index.json" {
+            kept = kept + 1
+            j = j + 1
+            continue
+        }
+        if !_referenced(p, hay) {
+            let sz = _file_size(p)
+            bytes_total = bytes_total + sz
+            let entry_c = "    {\"path\":\"" + p + "\",\"size\":" + to_string(sz) + ",\"age_days\":" + to_string(age) + ",\"category\":\"cert\"}"
+            candidates.push(entry_c)
+        } else {
+            kept = kept + 1
+        }
+        j = j + 1
+    }
+
+    let n_cand = len(candidates)
+    println("[artifact_gc] scanned: state=" + to_string(len(state_files)) + " cert=" + to_string(len(cert_files)) + " kept=" + to_string(kept) + " orphan_candidates=" + to_string(n_cand) + " orphan_bytes=" + to_string(bytes_total))
+
+    let mut moved = 0
+    if apply_mode && n_cand > 0 {
+        // Quarantine move only — NEVER delete.
+        _exec("mkdir -p " + _sh_quote(quarantine))
+        let mut k = 0
+        while k < n_cand {
+            // Re-derive the path from candidate JSON line via fragile parse:
+            // candidates[k] is "    {\"path\":\"<p>\",..." — extract <p>.
+            let entry = to_string(candidates[k])
+            let pstart = entry.index_of("\"path\":\"") + 8
+            let after = entry.substring(pstart, len(entry))
+            let pend = after.index_of("\"")
+            let p = after.substring(0, pend)
+            let bn = _basename(p)
+            let dst = quarantine + "/" + bn
+            // Avoid collisions
+            let mut suffix = 0
+            let mut final_dst = dst
+            while _file_exists(final_dst) {
+                suffix = suffix + 1
+                final_dst = dst + ".dup" + to_string(suffix)
+            }
+            let rc = _exec_rc("mv " + _sh_quote(p) + " " + _sh_quote(final_dst))
+            if rc == 0 { moved = moved + 1 }
+            k = k + 1
+        }
+        println("[artifact_gc] quarantined " + to_string(moved) + "/" + to_string(n_cand) + " -> " + quarantine)
+    }
+
+    let mut body = "{\n"
+    body = body + "  \"schema_version\":\"1\",\n"
+    body = body + "  \"roi_item\":\"G39\",\n"
+    body = body + "  \"mode\":\"" + mode_tag + "\",\n"
+    body = body + "  \"min_age_days\":" + to_string(min_age) + ",\n"
+    body = body + "  \"reference_sources\":[\"" + roadmap + "\",\"" + cert_index + "\"],\n"
+    body = body + "  \"scanned_state\":" + to_string(len(state_files)) + ",\n"
+    body = body + "  \"scanned_cert\":" + to_string(len(cert_files)) + ",\n"
+    body = body + "  \"kept\":" + to_string(kept) + ",\n"
+    body = body + "  \"orphan_count\":" + to_string(n_cand) + ",\n"
+    body = body + "  \"orphan_bytes\":" + to_string(bytes_total) + ",\n"
+    body = body + "  \"quarantined\":" + to_string(moved) + ",\n"
+    body = body + "  \"quarantine_dir\":\"" + (if moved > 0 { quarantine } else { "" }) + "\",\n"
+    body = body + "  \"candidates\":[\n"
+    let mut ci = 0
+    while ci < n_cand {
+        body = body + to_string(candidates[ci])
+        if ci < n_cand - 1 { body = body + "," }
+        body = body + "\n"
+        ci = ci + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"verdict\":\"" + (if n_cand == 0 { "CLEAN" } else { "ORPHANS_FOUND" }) + "\"\n"
+    body = body + "}\n"
+    write_file(report_path, body)
+    println("[artifact_gc] report=" + report_path)
+    exit(0)
+}

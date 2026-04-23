@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# ════════════════════════════════════════════════════════════════════════════
+#  tool/launchd_install_local.bash — ROI item D20 + D24 + E26 activation script
+#
+#  PURPOSE
+#    Per-user (LaunchAgents) installer for the anima-managed launchd plists in
+#    config/launchd/.  Symlinks each plist into ~/Library/LaunchAgents/ then
+#    (with --activate only) loads them via `launchctl load`.
+#
+#    THIS SCRIPT IS NEVER RUN BY THE AGENT.  The user must invoke it manually
+#    when they decide to enable the periodic agents on their workstation.
+#
+#  COVERED PLISTS (config/launchd/)
+#    - com.anima.h100_auto_kill.plist                 (D20: pre-existing)
+#    - com.anima.cert_watch.plist                     (pre-existing)
+#    - com.anima.airgenome_keyword_dispatch.plist     (pre-existing)
+#    - com.anima.worktree_merge_bot.plist             (pre-existing)
+#    - com.anima.adversarial_bench_periodic.plist     (D24: new, every 6h)
+#    - com.anima.cert_dag_periodic.plist              (E26: new, every 12h)
+#    - com.anima.auto_evolution.plist                 (P9: every 12h)
+#
+#  USAGE
+#    bash tool/launchd_install_local.bash                # default: --dry-run
+#    bash tool/launchd_install_local.bash --link         # symlink only, no load
+#    bash tool/launchd_install_local.bash --activate     # symlink + launchctl load
+#    bash tool/launchd_install_local.bash --unload       # launchctl unload + unlink
+#    bash tool/launchd_install_local.bash --status       # report current state
+#
+#  HARD CONSTRAINTS
+#    - Idempotent: --link / --activate / --unload may be re-run safely.
+#    - Dry-run by default — caller MUST opt in to side-effects via --activate.
+#    - Never edits the plist files (read-only inputs).
+#    - Never modifies .roadmap or any anima SSOT.
+#    - logs/ directory is created on demand (mkdir -p) since the plists' StandardOutPath / StandardErrorPath assume it exists.
+# ════════════════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+ANIMA_ROOT="/Users/ghost/core/anima"
+SRC_DIR="${ANIMA_ROOT}/config/launchd"
+DST_DIR="${HOME}/Library/LaunchAgents"
+LOGS_DIR="${ANIMA_ROOT}/logs"
+
+PLISTS=(
+    "com.anima.h100_auto_kill.plist"
+    "com.anima.cert_watch.plist"
+    "com.anima.airgenome_keyword_dispatch.plist"
+    "com.anima.worktree_merge_bot.plist"
+    "com.anima.adversarial_bench_periodic.plist"
+    "com.anima.cert_dag_periodic.plist"
+    "com.anima.auto_evolution.plist"
+    "com.anima.weight_precache_monitor.plist"
+    "com.anima.runpod_credit_check.plist"
+    "com.anima.log_rotation_weekly.plist"
+    "com.anima.dist_native_build_periodic.plist"
+)
+
+# Plists that are SYMLINKED + READY but MUST NOT be launchctl-loaded by
+# --activate (e.g. h100_auto_kill is only meaningful AFTER an H100 pod is
+# launched; loading it early would fire the kill hourly against a non-
+# existent pod). --unload still unloads them if they are loaded.
+SKIP_ACTIVATION=(
+    "com.anima.h100_auto_kill.plist"
+)
+
+_is_skip_activation() {
+    local candidate="$1"
+    local s
+    for s in "${SKIP_ACTIVATION[@]}"; do
+        if [[ "${s}" == "${candidate}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+MODE="${1:-}"
+if [[ -z "${MODE}" ]]; then
+    MODE="--dry-run"
+fi
+
+ensure_logs_dir() {
+    mkdir -p "${LOGS_DIR}"
+}
+
+dry_run() {
+    echo "── launchd_install_local.bash  mode=DRY-RUN ──"
+    echo "  src_dir = ${SRC_DIR}"
+    echo "  dst_dir = ${DST_DIR}"
+    echo
+    for p in "${PLISTS[@]}"; do
+        local src="${SRC_DIR}/${p}"
+        local dst="${DST_DIR}/${p}"
+        if [[ ! -f "${src}" ]]; then
+            echo "  [MISSING-SRC]  ${p}"
+            continue
+        fi
+        if [[ -L "${dst}" || -e "${dst}" ]]; then
+            echo "  [LINKED     ]  ${p}"
+        else
+            echo "  [NOT-LINKED ]  ${p}"
+        fi
+    done
+    echo
+    echo "  → run with --link     to create symlinks (no launchctl load)"
+    echo "  → run with --activate to symlink AND launchctl load each plist"
+    echo "  → run with --status   to show launchctl list state"
+    echo "  → run with --unload   to launchctl unload AND remove symlinks"
+}
+
+link_only() {
+    echo "── launchd_install_local.bash  mode=LINK ──"
+    ensure_logs_dir
+    mkdir -p "${DST_DIR}"
+    for p in "${PLISTS[@]}"; do
+        local src="${SRC_DIR}/${p}"
+        local dst="${DST_DIR}/${p}"
+        if [[ ! -f "${src}" ]]; then
+            echo "  [SKIP src missing]  ${p}"
+            continue
+        fi
+        if [[ -L "${dst}" ]]; then
+            local cur
+            cur="$(readlink "${dst}")"
+            if [[ "${cur}" == "${src}" ]]; then
+                echo "  [OK already-linked]  ${p}"
+                continue
+            fi
+            echo "  [REPLACE-LINK    ]  ${p}  (was ${cur})"
+            rm "${dst}"
+            ln -s "${src}" "${dst}"
+        elif [[ -e "${dst}" ]]; then
+            # If the dst is a plain file identical to src, replace with symlink;
+            # otherwise require manual review.
+            if cmp -s "${src}" "${dst}"; then
+                rm "${dst}"
+                ln -s "${src}" "${dst}"
+                echo "  [REPLACED-FILE-WITH-LINK]  ${p}"
+            else
+                echo "  [SKIP non-symlink dst exists]  ${p} — manual review required"
+                continue
+            fi
+        else
+            ln -s "${src}" "${dst}"
+            echo "  [LINK CREATED    ]  ${p}"
+        fi
+    done
+}
+
+activate() {
+    link_only
+    echo
+    echo "── launchctl load (per-plist) ──"
+    for p in "${PLISTS[@]}"; do
+        local dst="${DST_DIR}/${p}"
+        if [[ ! -e "${dst}" ]]; then
+            echo "  [SKIP not-linked]  ${p}"
+            continue
+        fi
+        if _is_skip_activation "${p}"; then
+            echo "  [SKIP-ACTIVATION]  ${p}  (per SKIP_ACTIVATION policy)"
+            continue
+        fi
+        # Idempotent: check whether label is already loaded before calling load.
+        local label="${p%.plist}"
+        if launchctl list "${label}" >/dev/null 2>&1; then
+            echo "  [ALREADY-LOADED ]  ${p}"
+            continue
+        fi
+        if launchctl load -w "${dst}" 2>/dev/null; then
+            echo "  [LOADED         ]  ${p}"
+        else
+            echo "  [LOAD-FAILED    ]  ${p}"
+        fi
+    done
+    echo
+    echo "  → check status: launchctl list | grep com.anima"
+}
+
+unload() {
+    echo "── launchd_install_local.bash  mode=UNLOAD ──"
+    for p in "${PLISTS[@]}"; do
+        local dst="${DST_DIR}/${p}"
+        if [[ -e "${dst}" ]]; then
+            if launchctl unload "${dst}" 2>/dev/null; then
+                echo "  [UNLOADED       ]  ${p}"
+            else
+                echo "  [UNLOAD-FAILED  ]  ${p}  (may not have been loaded)"
+            fi
+            if [[ -L "${dst}" ]]; then
+                rm "${dst}"
+                echo "  [UNLINKED       ]  ${p}"
+            fi
+        else
+            echo "  [SKIP not-linked]  ${p}"
+        fi
+    done
+}
+
+status() {
+    echo "── launchd_install_local.bash  mode=STATUS ──"
+    echo "  loaded launchd entries (com.anima.*):"
+    launchctl list | awk 'NR==1 || /com\.anima\./'
+    echo
+    echo "  symlinks in ${DST_DIR}:"
+    ls -la "${DST_DIR}/com.anima."* 2>/dev/null || echo "  (none)"
+}
+
+selftest() {
+    # MINIMAL SELFTEST (T1-T4 ROI): parse-clean + 1 invariant.
+    # NEVER calls launchctl. NEVER touches ${DST_DIR}.
+    echo "── launchd_install_local.bash  mode=SELFTEST ──"
+    bash -n "$0" || { echo "  parse FAIL"; return 1; }
+    # Invariant: every plist declared in PLISTS exists under SRC_DIR.
+    local missing=0
+    for p in "${PLISTS[@]}"; do
+        if [[ ! -f "${SRC_DIR}/${p}" ]]; then
+            echo "  [MISSING-SRC] ${p}"
+            missing=$((missing + 1))
+        fi
+    done
+    if [[ "${missing}" -gt 0 ]]; then
+        echo "  SELFTEST FAIL — ${missing} plist(s) missing"
+        return 1
+    fi
+    echo "  parse: PASS"
+    echo "  invariant: ${#PLISTS[@]} plist(s) all present in ${SRC_DIR}"
+    echo "  SELFTEST PASS"
+    return 0
+}
+
+case "${MODE}" in
+    --selftest)
+        selftest
+        exit $?
+        ;;
+    --dry-run|"")
+        dry_run
+        ;;
+    --link)
+        link_only
+        ;;
+    --activate)
+        activate
+        ;;
+    --unload)
+        unload
+        ;;
+    --status)
+        status
+        ;;
+    *)
+        echo "usage: $0 [--dry-run|--link|--activate|--unload|--status|--selftest]" >&2
+        exit 2
+        ;;
+esac

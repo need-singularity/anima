@@ -1,0 +1,244 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/mk_xii_precheck.hexa — B-axis B.1 (post-H100 research)
+//
+//  PURPOSE
+//    Pre-flight candidate selection for Mk.XII (70B) base substrate.
+//    Plan-only, no downloads, no HF API hits. Captures candidate list,
+//    HF availability (known-landscape snapshot @ 2026-04-22), license, and
+//    gated-access status. Emits state/mk_xii_precheck.json with a verdict.
+//
+//  BACKGROUND
+//    Current substrate pool (4 models) from h100 precache → Gemma-4-31B is
+//    the largest coherent family; 70B scale requires a different base.
+//
+//  KNOWN-LANDSCAPE SNAPSHOT (2026-04-22)
+//    - Gemma-4-31B     : available on HF, gated (Google license click-through)
+//    - Gemma-4-70B     : NOT PUBLISHED as of snapshot date → reject
+//    - Llama-3.1-70B   : available on HF, gated (Meta license click-through)
+//    - Qwen2.5-72B     : available on HF, Apache-2.0 (non-gated)
+//    - Mistral-Large-2 : available on HF, MRL (gated + commercial-use restricted)
+//    - Yi-1.5-34B      : available on HF, Yi license (non-gated, <70B — fallback tier)
+//
+//  VERDICT RULES
+//    - Primary: Qwen2.5-72B (non-gated Apache-2.0 → no click-through friction)
+//    - Secondary: Llama-3.1-70B (if Meta access already granted)
+//    - Tertiary: Gemma-4-31B   (substrate continuity fallback, smaller scale)
+//
+//  RAW STRICT
+//    raw#9 hexa-only · raw#11 snake_case · raw#15 no-hardcode (data table local)
+//    LLM=none · deterministic · idempotent · selftest (--self-test)
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+fn now_utc() -> string { return exec("date -u +%FT%TZ").trim() }
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _has(av, k) -> bool {
+    let mut i = 0
+    while i < len(av) { if to_string(av[i]) == k { return true }; i = i + 1 }
+    return false
+}
+
+// ─── Candidate record ─────────────────────────────────────────────────────
+// Each entry: [name, hf_repo, params_b, hf_available, license, gated, tier]
+// tier: "primary" | "secondary" | "tertiary" | "reject"
+fn build_candidates() -> array {
+    let mut c = []
+    c.push(["Qwen2.5-72B",     "Qwen/Qwen2.5-72B",           72.0, true,  "Apache-2.0",        false, "primary"])
+    c.push(["Llama-3.1-70B",   "meta-llama/Llama-3.1-70B",   70.0, true,  "Meta-Llama-3",      true,  "secondary"])
+    c.push(["Mistral-Large-2", "mistralai/Mistral-Large-Instruct-2407", 123.0, true, "MRL-restricted", true, "tertiary"])
+    c.push(["Yi-1.5-34B",      "01-ai/Yi-1.5-34B",           34.0, true,  "Yi-1.0",            false, "fallback_smaller"])
+    c.push(["Gemma-4-31B",     "google/gemma-4-31b",         31.0, true,  "Gemma-terms",       true,  "substrate_continuity"])
+    c.push(["Gemma-4-70B",     "google/gemma-4-70b",         70.0, false, "unpublished",       false, "reject"])
+    return c
+}
+
+fn main() {
+    let home = _home()
+    let out_path = home + "/core/anima/state/mk_xii_precheck.json"
+    let av = _argv()
+    let self_test = _has(av, "--self-test")
+
+    let candidates = build_candidates()
+    let n = len(candidates)
+
+    // ── Counters ────────────────────────────────────────────────────────
+    let mut n_available = 0
+    let mut n_unpublished = 0
+    let mut n_gated = 0
+    let mut n_non_gated = 0
+    let mut n_ge_70b = 0
+    let mut n_primary = 0
+
+    let mut i = 0
+    while i < n {
+        let row = candidates[i]
+        let available = to_bool(row[3])
+        let gated = to_bool(row[5])
+        let params = to_float(row[2])
+        let tier = to_string(row[6])
+
+        if available { n_available = n_available + 1 } else { n_unpublished = n_unpublished + 1 }
+        if gated { n_gated = n_gated + 1 } else { n_non_gated = n_non_gated + 1 }
+        if params >= 70.0 { n_ge_70b = n_ge_70b + 1 }
+        if tier == "primary" { n_primary = n_primary + 1 }
+
+        i = i + 1
+    }
+
+    // ── Verdict ────────────────────────────────────────────────────────
+    // Need: at least one primary candidate that is available + >= 70B.
+    let mut primary_ok = false
+    let mut primary_name = "none"
+    let mut primary_repo = "none"
+    let mut primary_license = "none"
+    i = 0
+    while i < n {
+        let row = candidates[i]
+        if to_string(row[6]) == "primary" && to_bool(row[3]) && to_float(row[2]) >= 70.0 {
+            primary_ok = true
+            primary_name = to_string(row[0])
+            primary_repo = to_string(row[1])
+            primary_license = to_string(row[4])
+            i = n  // break
+        } else {
+            i = i + 1
+        }
+    }
+
+    let mut secondary_name = "none"
+    i = 0
+    while i < n {
+        let row = candidates[i]
+        if to_string(row[6]) == "secondary" && to_bool(row[3]) {
+            secondary_name = to_string(row[0])
+            i = n
+        } else {
+            i = i + 1
+        }
+    }
+
+    // ── Self-test: invariants ────────────────────────────────────────────
+    let mut selftest_pass = true
+    let mut selftest_notes = []
+    if n_available < 1 { selftest_pass = false; selftest_notes.push("no_available_candidates") }
+    if n_ge_70b < 1    { selftest_pass = false; selftest_notes.push("no_ge_70b_candidates") }
+    if n_primary != 1  { selftest_pass = false; selftest_notes.push("primary_count_not_exactly_one") }
+    if !primary_ok     { selftest_pass = false; selftest_notes.push("primary_not_resolvable") }
+
+    let verdict_overall = if selftest_pass && primary_ok { "READY" } else { "BLOCKED" }
+
+    // ── Emit JSON ────────────────────────────────────────────────────────
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.mk_xii_precheck.v1\",\n"
+    body = body + "  \"tool\": \"tool/mk_xii_precheck.hexa\",\n"
+    body = body + "  \"generated_at\": \"" + now_utc() + "\",\n"
+    body = body + "  \"snapshot_date\": \"2026-04-22\",\n"
+    body = body + "  \"side_effects\": \"precheck_file_only\",\n"
+    body = body + "  \"h100_activated\": false,\n"
+    body = body + "  \"hf_api_hit\": false,\n"
+    body = body + "  \"seed_fixed\": 2026,\n"
+    body = body + "  \"candidates\": [\n"
+
+    i = 0
+    while i < n {
+        let row = candidates[i]
+        let comma = if i + 1 < n { "," } else { "" }
+        body = body + "    {"
+        body = body + "\"name\": \"" + to_string(row[0]) + "\""
+        body = body + ", \"hf_repo\": \"" + to_string(row[1]) + "\""
+        body = body + ", \"params_billion\": " + to_string(to_float(row[2]))
+        body = body + ", \"hf_available\": " + bool_s(to_bool(row[3]))
+        body = body + ", \"license\": \"" + to_string(row[4]) + "\""
+        body = body + ", \"gated\": " + bool_s(to_bool(row[5]))
+        body = body + ", \"tier\": \"" + to_string(row[6]) + "\""
+        body = body + "}" + comma + "\n"
+        i = i + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"counters\": {\n"
+    body = body + "    \"total\":        " + to_string(n)             + ",\n"
+    body = body + "    \"available\":    " + to_string(n_available)   + ",\n"
+    body = body + "    \"unpublished\":  " + to_string(n_unpublished) + ",\n"
+    body = body + "    \"gated\":        " + to_string(n_gated)       + ",\n"
+    body = body + "    \"non_gated\":    " + to_string(n_non_gated)   + ",\n"
+    body = body + "    \"ge_70b\":       " + to_string(n_ge_70b)      + ",\n"
+    body = body + "    \"primary_count\":" + to_string(n_primary)     + "\n"
+    body = body + "  },\n"
+    body = body + "  \"verdict\": {\n"
+    body = body + "    \"primary_ok\":       " + bool_s(primary_ok) + ",\n"
+    body = body + "    \"primary_name\":     \"" + primary_name + "\",\n"
+    body = body + "    \"primary_repo\":     \"" + primary_repo + "\",\n"
+    body = body + "    \"primary_license\":  \"" + primary_license + "\",\n"
+    body = body + "    \"secondary_name\":   \"" + secondary_name + "\",\n"
+    body = body + "    \"overall\":          \"" + verdict_overall + "\",\n"
+    body = body + "    \"rationale\":        \"Qwen2.5-72B is 72B Apache-2.0 non-gated → zero friction primary; Llama-3.1-70B secondary if Meta access pre-granted; Gemma-4-70B unpublished → reject.\"\n"
+    body = body + "  },\n"
+    body = body + "  \"selftest\": {\n"
+    body = body + "    \"invariants_checked\": [\n"
+    body = body + "      \"n_available >= 1\",\n"
+    body = body + "      \"n_ge_70b >= 1\",\n"
+    body = body + "      \"n_primary == 1\",\n"
+    body = body + "      \"primary_ok\"\n"
+    body = body + "    ],\n"
+    body = body + "    \"pass\": " + bool_s(selftest_pass) + ",\n"
+    body = body + "    \"notes\": ["
+    i = 0
+    while i < len(selftest_notes) {
+        if i > 0 { body = body + ", " }
+        body = body + "\"" + to_string(selftest_notes[i]) + "\""
+        i = i + 1
+    }
+    body = body + "]\n"
+    body = body + "  },\n"
+    body = body + "  \"handoff\": {\n"
+    body = body + "    \"outside_anima_next_steps\": [\n"
+    body = body + "      \"hf auth: huggingface-cli login (anima user) — only if Llama-3.1 secondary path chosen\",\n"
+    body = body + "      \"hf snapshot download Qwen/Qwen2.5-72B (primary) to H100 pod shared volume\",\n"
+    body = body + "      \"deepspeed config generation from state/mk_xii_scale_plan.json · sharding_strategy\"\n"
+    body = body + "    ]\n"
+    body = body + "  },\n"
+    body = body + "  \"audit\": {\n"
+    body = body + "    \"fake_pass_guard\": \"No HF API call, no download, no auth. Static snapshot table only. Re-run after snapshot refresh.\",\n"
+    body = body + "    \"no_py\": true,\n"
+    body = body + "    \"deterministic\": true,\n"
+    body = body + "    \"idempotent\": true,\n"
+    body = body + "    \"raw_strict\": \"raw#9 raw#11 raw#15 · LLM=none\"\n"
+    body = body + "  }\n"
+    body = body + "}\n"
+
+    exec("mkdir -p '" + home + "/core/anima/state'")
+    write_file(out_path, body)
+
+    println("[mk_xii_precheck] candidates=" + to_string(n)
+            + " available=" + to_string(n_available)
+            + " ge_70b=" + to_string(n_ge_70b)
+            + " primary=" + primary_name)
+    println("[mk_xii_precheck] verdict=" + verdict_overall)
+    println("[mk_xii_precheck] output=" + out_path)
+
+    if self_test {
+        if !selftest_pass {
+            println("[mk_xii_precheck] SELFTEST FAIL")
+            exit(1)
+        }
+        println("[mk_xii_precheck] SELFTEST PASS")
+    }
+    if !selftest_pass {
+        exit(1)
+    }
+    exit(0)
+}
+
+main()

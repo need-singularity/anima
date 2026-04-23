@@ -1,0 +1,342 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/learning_cluster_cpu_sim.hexa — roadmap #31 improvements (2)(3)(4)(6)(9)
+//
+//  Pre-H100 CPU 시뮬레이션 — 학습 파이프라인 통합 없이도 5 개선의 로직 타당성을
+//  검증. H100 런칭 후 실제 training 에 통합될 때 behavioral contract 가 이미
+//  고정되어 있도록.
+//
+//  (2) AN11 sample filter — cert 결과 기반으로 low-quality 샘플 필터
+//  (3) Verified replay buffer — cert 통과 샘플만 replay buffer + FIFO+dedup
+//  (4) Cert saturation early-stop — Δsat_window < threshold detector
+//  (6) L_IX physics-informed loss — L_IX = T − V_struct − V_sync − V_RG + λ·I_irr
+//                                   synthetic tensors + loss combination 검증
+//  (9) τ(6)=4 auxiliary task — 4-way aux classification loss 다중 task 합성
+//
+//  이 스모크는 "CPU sim, fake-pass 아님" 명시 — 실제 통합은 H100 training
+//  후 trained pipeline 에서 재실측. verdict=SPEC_VERIFIED_PRE_H100_SIM.
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+fn now_utc() -> string { return exec("date -u +%FT%TZ").trim() }
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+fn abs_f(x: float) -> float { if x < 0.0 { return -x } else { return x } }
+
+// ─── (2) AN11 sample filter simulation ──────────────────────────────────
+// 합성 corpus: 각 샘플에 cert_score ∈ [0,1] 부여. threshold=0.5 이상만 pass.
+fn sim_an11_sample_filter() -> array {
+    let scores = [0.12, 0.78, 0.51, 0.33, 0.88, 0.45, 0.62, 0.70, 0.28, 0.95,
+                  0.50, 0.49, 0.71, 0.83, 0.20, 0.67]
+    let n = len(scores)
+    let threshold = 0.5
+    let mut pass = 0
+    let mut i = 0
+    while i < n {
+        if to_float(scores[i]) >= threshold { pass = pass + 1 }
+        i = i + 1
+    }
+    let pass_rate = to_float(pass) / to_float(n)
+    return [n, pass, pass_rate, threshold]
+}
+
+// ─── (3) Verified replay buffer simulation ──────────────────────────────
+// FIFO + dedup. cert_sha 로 dedup. capacity=8.
+fn sim_replay_buffer() -> array {
+    let shas = ["a1", "b2", "a1", "c3", "d4", "b2", "e5", "f6",
+                "g7", "h8", "a1", "i9", "j0", "k1", "l2", "m3"]
+    let n = len(shas)
+    let capacity = 8
+    let mut buffer = []
+    let mut dup_hits = 0
+    let mut i = 0
+    while i < n {
+        let s = shas[i]
+        // dedup 검사
+        let mut found = false
+        let mut j = 0
+        while j < len(buffer) {
+            if buffer[j] == s { found = true }
+            j = j + 1
+        }
+        if found {
+            dup_hits = dup_hits + 1
+        } else {
+            buffer.push(s)
+            // capacity 초과 시 FIFO pop (head 제거 시뮬레이션)
+            if len(buffer) > capacity {
+                let mut new_buf = []
+                let mut k = 1
+                while k < len(buffer) {
+                    new_buf.push(buffer[k])
+                    k = k + 1
+                }
+                buffer = new_buf
+            }
+        }
+        i = i + 1
+    }
+    let reuse_rate = to_float(dup_hits) / to_float(n)
+    return [n, len(buffer), dup_hits, reuse_rate, capacity]
+}
+
+// ─── (4) Cert saturation early-stop simulation ──────────────────────────
+// 합성 trajectory 50 step. sat 이 점진적 plateau. window=5, Δ threshold=0.005.
+fn sim_cert_early_stop() -> array {
+    // sat(t) = 1 - 1/(t+1) — classic monotone saturation to 1.0.
+    // Small window + low threshold detects plateau after bulk progression.
+    let mut traj = []
+    let mut t = 0
+    while t < 50 {
+        let x = to_float(t)
+        let sat = 1.0 - 1.0 / (x + 1.0)
+        traj.push(sat)
+        t = t + 1
+    }
+
+    let window = 5
+    let thresh = 0.003
+    let mut stop_step = -1
+    let mut i = window
+    while i < len(traj) {
+        let cur = to_float(traj[i])
+        let prev = to_float(traj[i - window])
+        let delta = abs_f(cur - prev)
+        if delta < thresh && stop_step == -1 {
+            stop_step = i
+        }
+        i = i + 1
+    }
+    let final_sat = to_float(traj[len(traj) - 1])
+    return [len(traj), window, thresh, stop_step, final_sat]
+}
+
+// ─── (6) L_IX physics-informed loss simulation ──────────────────────────
+// L_IX = T − V_struct − V_sync − V_RG + λ·I_irr
+// 합성 5 step trajectory — 각 step 에서 5 term 계산, 전체 loss 조합 확인.
+// 검증: trajectory 동안 L_IX 가 well-defined 유지 (NaN 없음), loss 가 main CE
+// 에 regularizer 로 더해질 때 bounded (폭발 없음).
+fn sim_l_ix_loss() -> array {
+    let lam = 0.1
+    // synthetic 5 step: (T, V_struct, V_sync, V_RG, I_irr)
+    let trajectory = [
+        [1.20, 0.40, 0.30, 0.20, 0.05],
+        [1.15, 0.38, 0.28, 0.19, 0.04],
+        [1.10, 0.36, 0.26, 0.17, 0.03],
+        [1.05, 0.34, 0.25, 0.16, 0.02],
+        [1.02, 0.33, 0.24, 0.15, 0.015]
+    ]
+    let main_ce = [2.10, 1.85, 1.60, 1.42, 1.28]
+    let n = len(trajectory)
+
+    let mut l_ix_history = []
+    let mut combined_history = []
+    let mut any_nan = false
+    let mut i = 0
+    while i < n {
+        let t = to_float(trajectory[i][0])
+        let vs = to_float(trajectory[i][1])
+        let vy = to_float(trajectory[i][2])
+        let vr = to_float(trajectory[i][3])
+        let irr = to_float(trajectory[i][4])
+        let l_ix = t - vs - vy - vr + lam * irr
+        l_ix_history.push(l_ix)
+        let combined = to_float(main_ce[i]) + 0.05 * l_ix
+        combined_history.push(combined)
+        // NaN check via self-compare (NaN != NaN in IEEE 754)
+        if l_ix != l_ix { any_nan = true }
+        if combined != combined { any_nan = true }
+        i = i + 1
+    }
+    let l_first = to_float(l_ix_history[0])
+    let l_last = to_float(l_ix_history[n - 1])
+    let bounded = abs_f(l_first) < 10.0 && abs_f(l_last) < 10.0
+    let descending_ce = to_float(main_ce[n - 1]) < to_float(main_ce[0])
+    let no_nan = !any_nan
+    return [n, l_first, l_last, lam, bounded, descending_ce, no_nan]
+}
+
+// ─── (9) τ(6)=4 auxiliary task simulation ───────────────────────────────
+// 4-way classification aux task. synthetic logits (batch=8, classes=4) +
+// targets. aux CE 계산 + main CE 와 λ-weighted 합성.
+// 검증: aux CE bounded · 4 classes 전부 cover · multi-task loss finite.
+fn sim_tau6_aux_task() -> array {
+    let tau6 = 4
+    let batch = 8
+    // Each sample: synthetic logits for 4 classes + true class index
+    let logits = [
+        [2.1, 0.3, 0.1, 0.2],   // class 0
+        [0.2, 1.8, 0.4, 0.1],   // class 1
+        [0.1, 0.2, 2.3, 0.3],   // class 2
+        [0.3, 0.4, 0.2, 2.0],   // class 3
+        [1.5, 0.6, 0.3, 0.2],   // class 0
+        [0.4, 1.6, 0.2, 0.3],   // class 1
+        [0.2, 0.3, 1.7, 0.4],   // class 2
+        [0.3, 0.2, 0.4, 1.9]    // class 3
+    ]
+    let targets = [0, 1, 2, 3, 0, 1, 2, 3]
+    let main_ce = 1.42
+
+    // softmax + CE per sample. Approx via max+sum (Taylor-free stable).
+    // CE = -log(exp(logit_true) / sum(exp(logit_i)))
+    //    = log(sum(exp(logit_i))) - logit_true
+    // exp 근사: exp(x) ≈ 1 + x + x²/2 + x³/6 + x⁴/24 for |x| small.
+    // logits 0~2.3 범위 → x shift by max 필요한데 단순화 위해 x/(1+|x|) 근사.
+    // 실무에서는 stdlib exp 사용. smoke 목적으로 monotone 근사 OK.
+    fn exp_approx(x: float) -> float {
+        // Taylor 4차 — |x| ≤ 3 에서 합리적
+        let x2 = x * x
+        let x3 = x2 * x
+        let x4 = x3 * x
+        return 1.0 + x + x2 / 2.0 + x3 / 6.0 + x4 / 24.0
+    }
+    fn log_approx(y: float) -> float {
+        // y > 0 가정. log(y) = 2·(z + z³/3 + z⁵/5 + ...) where z = (y-1)/(y+1)
+        if y <= 0.0 { return -100.0 }
+        let z = (y - 1.0) / (y + 1.0)
+        let z2 = z * z
+        return 2.0 * (z + z * z2 / 3.0 + z * z2 * z2 / 5.0)
+    }
+
+    let mut ce_sum = 0.0
+    let mut any_nan = false
+    let mut class_counts = [0, 0, 0, 0]
+    let mut i = 0
+    while i < batch {
+        let t = to_int(targets[i])
+        let mut sum_exp = 0.0
+        let mut j = 0
+        while j < tau6 {
+            sum_exp = sum_exp + exp_approx(to_float(logits[i][j]))
+            j = j + 1
+        }
+        let logit_true = to_float(logits[i][t])
+        let ce_i = log_approx(sum_exp) - logit_true
+        if ce_i != ce_i { any_nan = true }
+        ce_sum = ce_sum + ce_i
+        class_counts[t] = to_int(class_counts[t]) + 1
+        i = i + 1
+    }
+    let mean_ce = ce_sum / to_float(batch)
+    let lam_aux = 0.1
+    let combined = main_ce + lam_aux * mean_ce
+    let bounded = abs_f(mean_ce) < 10.0
+    let covers_4_classes = to_int(class_counts[0]) > 0 && to_int(class_counts[1]) > 0 && to_int(class_counts[2]) > 0 && to_int(class_counts[3]) > 0
+    let no_nan = !any_nan
+    return [tau6, batch, mean_ce, combined, bounded, covers_4_classes, no_nan]
+}
+
+fn main() {
+    let home = _home()
+    let out_path = home + "/core/anima/state/learning_cluster_cpu_sim_result.json"
+
+    // run 5 simulations
+    let r2 = sim_an11_sample_filter()
+    let r3 = sim_replay_buffer()
+    let r4 = sim_cert_early_stop()
+    let r6 = sim_l_ix_loss()
+    let r9 = sim_tau6_aux_task()
+
+    // validation criteria
+    let c2_pass_rate_reasonable = to_float(r2[2]) >= 0.3 && to_float(r2[2]) <= 0.9
+    let c3_dedup_works = to_int(r3[2]) > 0 && to_int(r3[1]) <= to_int(r3[4])
+    let c4_early_stop_detected = to_int(r4[3]) > 0 && to_int(r4[3]) < to_int(r4[0])
+    let c6_bounded = to_int(r6[4]) == 1
+    let c6_no_nan = to_int(r6[6]) == 1
+    let c6_pass = c6_bounded && c6_no_nan
+    let c9_bounded = to_int(r9[4]) == 1
+    let c9_covers = to_int(r9[5]) == 1
+    let c9_no_nan = to_int(r9[6]) == 1
+    let c9_pass = c9_bounded && c9_covers && c9_no_nan
+
+    let all_sim_pass = c2_pass_rate_reasonable && c3_dedup_works && c4_early_stop_detected && c6_pass && c9_pass
+
+    let mut body = "{\n"
+    body = body + "  \"schema_version\": \"1\",\n"
+    body = body + "  \"slug\": \"learning-cluster-cpu-sim\",\n"
+    body = body + "  \"tool\": \"tool/learning_cluster_cpu_sim.hexa\",\n"
+    body = body + "  \"roadmap_entry\": \"31\",\n"
+    body = body + "  \"created\": \"" + now_utc() + "\",\n"
+    body = body + "  \"scope\": \"Pre-H100 CPU 시뮬레이션. 실제 training pipeline 통합은 #9 ALM r13 launch 후 재실측.\",\n"
+    body = body + "  \"disclaimer\": \"NOT a fake training pass. Synthetic data + deterministic logic only. Real integration PENDING H100.\",\n"
+
+    // improvement (2)
+    body = body + "  \"improvement_2_an11_sample_filter\": {\n"
+    body = body + "    \"corpus_size\": " + to_string(r2[0]) + ",\n"
+    body = body + "    \"pass_count\": " + to_string(r2[1]) + ",\n"
+    body = body + "    \"pass_rate\": " + to_string(r2[2]) + ",\n"
+    body = body + "    \"threshold\": " + to_string(r2[3]) + ",\n"
+    body = body + "    \"reasonable_range\": " + bool_s(c2_pass_rate_reasonable) + "\n"
+    body = body + "  },\n"
+
+    // improvement (3)
+    body = body + "  \"improvement_3_verified_replay_buffer\": {\n"
+    body = body + "    \"samples_in\": " + to_string(r3[0]) + ",\n"
+    body = body + "    \"buffer_final_size\": " + to_string(r3[1]) + ",\n"
+    body = body + "    \"dup_hits\": " + to_string(r3[2]) + ",\n"
+    body = body + "    \"reuse_rate\": " + to_string(r3[3]) + ",\n"
+    body = body + "    \"capacity\": " + to_string(r3[4]) + ",\n"
+    body = body + "    \"dedup_works\": " + bool_s(c3_dedup_works) + "\n"
+    body = body + "  },\n"
+
+    // improvement (4)
+    body = body + "  \"improvement_4_cert_saturation_early_stop\": {\n"
+    body = body + "    \"trajectory_steps\": " + to_string(r4[0]) + ",\n"
+    body = body + "    \"window\": " + to_string(r4[1]) + ",\n"
+    body = body + "    \"delta_threshold\": " + to_string(r4[2]) + ",\n"
+    body = body + "    \"stop_step_detected\": " + to_string(r4[3]) + ",\n"
+    body = body + "    \"final_sat\": " + to_string(r4[4]) + ",\n"
+    body = body + "    \"early_stop_detected\": " + bool_s(c4_early_stop_detected) + "\n"
+    body = body + "  },\n"
+
+    body = body + "  \"improvement_6_l_ix_physics_loss\": {\n"
+    body = body + "    \"formula\": \"L_IX = T − V_struct − V_sync − V_RG + λ·I_irr\",\n"
+    body = body + "    \"trajectory_steps\": " + to_string(r6[0]) + ",\n"
+    body = body + "    \"l_ix_first\": " + to_string(r6[1]) + ",\n"
+    body = body + "    \"l_ix_last\": " + to_string(r6[2]) + ",\n"
+    body = body + "    \"lambda\": " + to_string(r6[3]) + ",\n"
+    body = body + "    \"bounded\": " + bool_s(c6_bounded) + ",\n"
+    body = body + "    \"no_nan\": " + bool_s(c6_no_nan) + ",\n"
+    body = body + "    \"main_ce_descending\": " + bool_s(to_int(r6[5]) == 1) + "\n"
+    body = body + "  },\n"
+
+    body = body + "  \"improvement_9_tau6_aux_task\": {\n"
+    body = body + "    \"tau6\": " + to_string(r9[0]) + ",\n"
+    body = body + "    \"batch_size\": " + to_string(r9[1]) + ",\n"
+    body = body + "    \"aux_mean_ce\": " + to_string(r9[2]) + ",\n"
+    body = body + "    \"combined_multi_task_loss\": " + to_string(r9[3]) + ",\n"
+    body = body + "    \"bounded\": " + bool_s(c9_bounded) + ",\n"
+    body = body + "    \"covers_4_classes\": " + bool_s(c9_covers) + ",\n"
+    body = body + "    \"no_nan\": " + bool_s(c9_no_nan) + "\n"
+    body = body + "  },\n"
+
+    body = body + "  \"cross_refs\": {\n"
+    body = body + "    \"roadmap_31_note_update\": \"10/10 CPU sim contracts frozen (5 real landing + 5 CPU sim). 전부 PENDING real trained pipeline integration for final done flip.\",\n"
+    body = body + "    \"landed_pre_h100_all_10\": [\"(1) cert_gate #22\", \"(2) AN11 filter [sim]\", \"(3) replay buffer [sim]\", \"(4) early-stop [sim]\", \"(5) tier curriculum #68\", \"(6) L_IX physics loss [sim]\", \"(7) Hexad batch #26\", \"(8) K=4 LoRA #26\", \"(9) τ(6)=4 aux task [sim]\", \"(10) gradient mask #26\"],\n"
+    body = body + "    \"integration_pending_h100\": \"real CE + real weight trajectory + real multi-task loss measurement\"\n"
+    body = body + "  },\n"
+
+    body = body + "  \"all_sim_pass\": " + bool_s(all_sim_pass) + ",\n"
+    body = body + "  \"verdict\": \"" + (if all_sim_pass { "SPEC_VERIFIED_PRE_H100_SIM" } else { "FAIL" }) + "\"\n"
+    body = body + "}\n"
+
+    exec("mkdir -p '" + home + "/core/anima/state'")
+    write_file(out_path, body)
+
+    println("[learn_cpu_sim] (2) AN11 filter: " + to_string(r2[1]) + "/" + to_string(r2[0]) + " pass, rate=" + to_string(r2[2]) + " reasonable=" + bool_s(c2_pass_rate_reasonable))
+    println("[learn_cpu_sim] (3) Replay buffer: in=" + to_string(r3[0]) + " dup=" + to_string(r3[2]) + " final_size=" + to_string(r3[1]) + "/" + to_string(r3[4]) + " dedup_works=" + bool_s(c3_dedup_works))
+    println("[learn_cpu_sim] (4) Early-stop: " + to_string(r4[0]) + " steps, stop@" + to_string(r4[3]) + ", final_sat=" + to_string(r4[4]) + " detected=" + bool_s(c4_early_stop_detected))
+    println("[learn_cpu_sim] (6) L_IX loss: " + to_string(r6[0]) + " steps, first=" + to_string(r6[1]) + " last=" + to_string(r6[2]) + " bounded=" + bool_s(c6_bounded) + " no_nan=" + bool_s(c6_no_nan))
+    println("[learn_cpu_sim] (9) τ(6)=4 aux: batch=" + to_string(r9[1]) + " mean_ce=" + to_string(r9[2]) + " combined=" + to_string(r9[3]) + " covers_4=" + bool_s(c9_covers) + " no_nan=" + bool_s(c9_no_nan))
+    println("[learn_cpu_sim] output=" + out_path)
+    if all_sim_pass {
+        println("[learn_cpu_sim] selftest PASS — 5/5 CPU sims verified, verdict=SPEC_VERIFIED_PRE_H100_SIM")
+        exit(0)
+    } else {
+        eprintln("[learn_cpu_sim] selftest FAIL")
+        exit(1)
+    }
+}

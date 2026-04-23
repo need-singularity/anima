@@ -1,0 +1,464 @@
+// tool/proposal_approve.hexa — anima proposal stack: pending → approved
+//
+// PURPOSE
+//   Move a pending proposal to approved/, update inventory.json + per-proposal
+//   user_status. P4 of the proposal stack paradigm
+//   (docs/anima_proposal_stack_paradigm_20260422.md §5 CLI, §8 transition gate).
+//
+// USAGE
+//   hexa tool/proposal_approve.hexa --id <N> [--reason "..."]
+//   hexa tool/proposal_approve.hexa --selftest
+//
+// EXIT
+//   0 success | 1 validation fail | 3 user error
+//
+// RULES
+//   raw#9  hexa-only       raw#10 proof-carrying (atomic tmp+mv)
+//   raw#11 snake_case      raw#15 no-hardcode (paths constants top of file)
+//   raw#20 propose-not-implement (does NOT generate code, only state mutation)
+//   IDEMPOTENT: re-running on already-approved id → exit 0 noop with message.
+//   .roadmap NEVER touched (uchg).
+
+let DEFAULT_ROOT     = "/Users/ghost/core/anima"
+let PROPOSALS_DIR    = DEFAULT_ROOT + "/state/proposals"
+let PENDING_DIR      = PROPOSALS_DIR + "/pending"
+let APPROVED_DIR     = PROPOSALS_DIR + "/approved"
+let INVENTORY_PATH   = PROPOSALS_DIR + "/inventory.json"
+
+// ─── shared helpers ──────────────────────────────────────────────────
+
+fn _str(x) -> string { return to_string(x) }
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _fexists(p: string) -> bool {
+    // ls -d emits the path on success, error on missing. Capture & compare.
+    // Avoid &&/||/[]/?/$ — the runtime warns on shell metacharacters.
+    let r = to_string(exec("ls -d " + _sh_quote(p) + " 2>/dev/null")).trim()
+    return r == p
+}
+
+fn _now_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _ensure_dir(p: string) {
+    exec("mkdir -p " + _sh_quote(p))
+}
+
+fn _atomic_write(path: string, body: string) {
+    let mut last_sl = -1
+    let mut k = 0
+    while k < len(path) {
+        if path.substring(k, k + 1) == "/" { last_sl = k }
+        k = k + 1
+    }
+    if last_sl > 0 { _ensure_dir(path.substring(0, last_sl)) }
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    exec("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn _atomic_move(src: string, dst: string) {
+    let mut last_sl = -1
+    let mut k = 0
+    while k < len(dst) {
+        if dst.substring(k, k + 1) == "/" { last_sl = k }
+        k = k + 1
+    }
+    if last_sl > 0 { _ensure_dir(dst.substring(0, last_sl)) }
+    exec("mv -f " + _sh_quote(src) + " " + _sh_quote(dst))
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _is_numeric_str(s: string) -> bool {
+    if s == "" { return false }
+    let mut i = 0
+    let mut start = 0
+    if s.substring(0, 1) == "-" {
+        if len(s) == 1 { return false }
+        start = 1
+    }
+    let mut saw_dot = false
+    i = start
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "." {
+            if saw_dot { return false }
+            saw_dot = true
+        } else if c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            // ok
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn _json_esc(s: string) -> string {
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { out = out + "\\\\" }
+        else if c == "\"" { out = out + "\\\"" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── proposal id resolution ──────────────────────────────────────────
+//
+// id may be either a bare numeric ("042") or a full filename stem like
+// "20260422-042_some_slug". We resolve by listing pending/ and matching
+// the first file whose basename ends with "-<id>.json" or starts with
+// "<id>" or full match.
+
+fn _list_dir(dir: string) -> array {
+    if !_fexists(dir) { return [] }
+    let raw = to_string(exec("ls -1 " + _sh_quote(dir) + " 2>/dev/null"))
+    let mut out = []
+    let mut buf = ""
+    let mut i = 0
+    while i < len(raw) {
+        let c = raw.substring(i, i + 1)
+        if c == "\n" {
+            if len(buf) > 0 { out = out.push(buf) }
+            buf = ""
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    if len(buf) > 0 { out = out.push(buf) }
+    return out
+}
+
+fn _resolve_proposal_file(dir: string, id: string) -> string {
+    if !_fexists(dir) { return "" }
+    // 1. exact filename
+    let exact = dir + "/" + id + ".json"
+    if _fexists(exact) { return exact }
+    // 2. scan dir for files ending with -<id>.json or named <id>_*.json
+    let files = _list_dir(dir)
+    let mut i = 0
+    let suffix = "-" + id + ".json"
+    let prefix = id + "_"
+    let prefix_dot = id + ".json"
+    while i < len(files) {
+        let f = files[i]
+        if f == prefix_dot { return dir + "/" + f }
+        if len(f) >= len(suffix) {
+            let tail = f.substring(len(f) - len(suffix), len(f))
+            if tail == suffix { return dir + "/" + f }
+        }
+        if len(f) >= len(prefix) {
+            let head = f.substring(0, len(prefix))
+            if head == prefix { return dir + "/" + f }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── inventory load / save ───────────────────────────────────────────
+
+fn _load_inventory() {
+    if !_fexists(INVENTORY_PATH) {
+        // bootstrap empty inventory
+        return json_parse("{\"schema\":\"anima.proposals.inventory.v1\",\"updated_at\":\"\",\"proposals\":[]}")
+    }
+    return json_parse(read_file(INVENTORY_PATH))
+}
+
+fn _inv_find_idx(inv, id: string) -> int {
+    if !inv.contains_key("proposals") { return -1 }
+    let ps = inv["proposals"]
+    let mut i = 0
+    while i < len(ps) {
+        let p = ps[i]
+        if p.contains_key("id") && _str(p["id"]) == id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// String-typed keys: always emit as quoted string even if value parses
+// numerically (e.g. id "20260422-001" before the dash is parsed-friendly).
+fn _is_string_key(k: string) -> bool {
+    if k == "id" { return true }
+    if k == "title" { return true }
+    if k == "kind" { return true }
+    if k == "rationale" { return true }
+    if k == "user_status" { return true }
+    if k == "first_seen_ts" { return true }
+    if k == "last_refined_ts" { return true }
+    if k == "user_decision_at" { return true }
+    if k == "user_decision_reason" { return true }
+    if k == "implementation_module_path" { return true }
+    if k == "resurrection_eligible_after" { return true }
+    if k == "estimated_effort" { return true }
+    if k == "estimated_impact" { return true }
+    if k == "lineage_parent" { return true }
+    if k == "source_signal" { return true }
+    if k == "path" { return true }
+    if k == "schema" { return true }
+    if k == "created_at" { return true }
+    if k == "updated_at" { return true }
+    return false
+}
+
+fn _serialize_value(k: string, v, indent: string) -> string {
+    let ts = _str(v)
+    if ts == "void" { return "null" }
+    if ts == "true" || ts == "false" { return ts }
+
+    // array detection: to_string starts with "["
+    if len(ts) >= 1 && ts.substring(0, 1) == "[" {
+        let n = len(v)
+        if n == 0 { return "[]" }
+        let mut out = "[\n"
+        let mut i = 0
+        while i < n {
+            out = out + indent + "  " + _serialize_value("", v[i], indent + "  ")
+            if i + 1 < n { out = out + "," }
+            out = out + "\n"
+            i = i + 1
+        }
+        out = out + indent + "]"
+        return out
+    }
+
+    // map detection: to_string starts with "{"
+    if len(ts) >= 1 && ts.substring(0, 1) == "{" {
+        let mks = keys(v)
+        let n = len(mks)
+        if n == 0 { return "{}" }
+        let mut out = "{\n"
+        let mut i = 0
+        while i < n {
+            let mk = mks[i]
+            out = out + indent + "  \"" + _json_esc(mk) + "\": " + _serialize_value(mk, v[mk], indent + "  ")
+            if i + 1 < n { out = out + "," }
+            out = out + "\n"
+            i = i + 1
+        }
+        out = out + indent + "}"
+        return out
+    }
+
+    // scalar: known string-typed keys → always quote; otherwise numeric-only
+    // strings remain unquoted (preserving original JSON int/float types).
+    if k != "" && _is_string_key(k) { return "\"" + _json_esc(ts) + "\"" }
+    if _is_numeric_str(ts) { return ts }
+    return "\"" + _json_esc(ts) + "\""
+}
+
+fn _proposal_to_json(p) -> string {
+    let ks = keys(p)
+    let mut out = "{\n"
+    let mut i = 0
+    while i < len(ks) {
+        let k = ks[i]
+        out = out + "    \"" + _json_esc(k) + "\": " + _serialize_value(k, p[k], "    ")
+        if i + 1 < len(ks) { out = out + "," }
+        out = out + "\n"
+        i = i + 1
+    }
+    out = out + "  }"
+    return out
+}
+
+fn _save_inventory(inv) {
+    // Preserve all top-level keys; refresh updated_at; emit proposals via
+    // generic serializer. proposals[] is emitted at the end so all other
+    // top-level metadata (schema, created_at, summary, seq_today, ...) is
+    // round-tripped intact.
+    let ks = keys(inv)
+    let mut body = "{\n"
+    let mut emitted_updated = false
+    let mut i = 0
+    while i < len(ks) {
+        let k = ks[i]
+        if k == "proposals" {
+            // emit proposals[] last
+            i = i + 1
+            continue
+        }
+        let mut v = inv[k]
+        if k == "updated_at" {
+            emitted_updated = true
+            v = _now_iso()
+        }
+        body = body + "  \"" + _json_esc(k) + "\": " + _serialize_value(k, v, "  ") + ",\n"
+        i = i + 1
+    }
+    if !emitted_updated {
+        body = body + "  \"updated_at\": \"" + _now_iso() + "\",\n"
+    }
+    let ps = if inv.contains_key("proposals") { inv["proposals"] } else { [] }
+    body = body + "  \"proposals\": [\n"
+    let mut j = 0
+    while j < len(ps) {
+        body = body + "  " + _proposal_to_json(ps[j])
+        if j + 1 < len(ps) { body = body + "," }
+        body = body + "\n"
+        j = j + 1
+    }
+    body = body + "  ]\n"
+    body = body + "}\n"
+    _atomic_write(INVENTORY_PATH, body)
+}
+
+// ─── per-proposal json mutation ──────────────────────────────────────
+//
+// Re-parse, mutate user_status / user_decision_at / user_decision_reason,
+// re-emit with stable key order. We use json_parse then re-serialize via
+// _proposal_to_json.
+
+fn _per_proposal_load(path: string) {
+    return json_parse(read_file(path))
+}
+
+fn _per_proposal_save(path: string, p) {
+    // unwrap our _proposal_to_json (which produces "{ ... }" without leading 2-space indent)
+    let raw = _proposal_to_json(p)
+    // _proposal_to_json returns "{\n    ... \n  }" — that's fine as standalone file
+    _atomic_write(path, raw + "\n")
+}
+
+fn _set_field(p, k: string, v) {
+    p[k] = v
+}
+
+// ─── core action ─────────────────────────────────────────────────────
+//
+// Returns [exit_code, message].
+
+fn _do_approve(id: string, reason: string) -> array {
+    if id == "" { return [3, "proposal_approve: --id required"] }
+
+    let pending_path  = _resolve_proposal_file(PENDING_DIR, id)
+    let approved_path = _resolve_proposal_file(APPROVED_DIR, id)
+
+    // Idempotency: already approved → noop.
+    if approved_path != "" && pending_path == "" {
+        return [0, "proposal_approve: id=" + id + " already approved at " + approved_path + " (noop)"]
+    }
+
+    if pending_path == "" {
+        return [1, "proposal_approve: id=" + id + " not found in pending/ (and not in approved/)"]
+    }
+
+    // Load proposal, mutate, atomic write to approved path, remove pending.
+    let p = _per_proposal_load(pending_path)
+    _set_field(p, "user_status", "approved")
+    _set_field(p, "user_decision_at", _now_iso())
+    if reason != "" { _set_field(p, "user_decision_reason", reason) }
+
+    // Compute target filename: same basename in approved/.
+    let mut last_sl = -1
+    let mut k = 0
+    while k < len(pending_path) {
+        if pending_path.substring(k, k + 1) == "/" { last_sl = k }
+        k = k + 1
+    }
+    let basename = pending_path.substring(last_sl + 1, len(pending_path))
+    let dst = APPROVED_DIR + "/" + basename
+
+    // Write new file at dst (atomic) then unlink pending source.
+    _per_proposal_save(dst, p)
+    exec("rm -f " + _sh_quote(pending_path))
+
+    // Update inventory.
+    let inv = _load_inventory()
+    let idx = _inv_find_idx(inv, id)
+    if idx >= 0 {
+        let ps = inv["proposals"]
+        let entry = ps[idx]
+        _set_field(entry, "user_status", "approved")
+        _set_field(entry, "user_decision_at", _now_iso())
+        if reason != "" { _set_field(entry, "user_decision_reason", reason) }
+        ps[idx] = entry
+        inv["proposals"] = ps
+    }
+    _save_inventory(inv)
+
+    return [0, "proposal_approve: id=" + id + " moved pending → approved at " + dst]
+}
+
+// ─── selftest ────────────────────────────────────────────────────────
+
+fn _selftest() -> array {
+    // Synthetic: build temp proposal in pending/, approve, verify moved.
+    let id = "99999999-T01"
+    let pending_path = PENDING_DIR + "/" + id + ".json"
+    let approved_path = APPROVED_DIR + "/" + id + ".json"
+    _ensure_dir(PENDING_DIR)
+    _ensure_dir(APPROVED_DIR)
+
+    // Clean pre-existing artifacts (idempotent test).
+    exec("rm -f " + _sh_quote(pending_path) + " " + _sh_quote(approved_path))
+
+    let synth = "{\n  \"id\": \"" + id + "\",\n  \"title\": \"selftest synthetic\",\n  \"kind\": \"tool\",\n  \"user_status\": \"pending\",\n  \"user_decision_at\": null,\n  \"veto_count\": 0\n}\n"
+    _atomic_write(pending_path, synth)
+
+    let r = _do_approve(id, "selftest reason")
+    if r[0] != 0 { return [false, "S1: approve returned " + _str(r[0]) + " — " + _str(r[1])] }
+    if !_fexists(approved_path) { return [false, "S1: target approved file missing"] }
+    if _fexists(pending_path) { return [false, "S1: pending file should be removed"] }
+
+    // Idempotency check.
+    let r2 = _do_approve(id, "")
+    if r2[0] != 0 { return [false, "S2: idempotent re-approve returned " + _str(r2[0]) + " — " + _str(r2[1])] }
+
+    // Cleanup synthetic.
+    exec("rm -f " + _sh_quote(approved_path))
+
+    return [true, "S1: synthetic pending→approved + idempotent re-approve → PASS"]
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────────
+
+let argv = args()
+
+if _arg_present(argv, "--selftest") {
+    println("── proposal_approve selftest ──")
+    let r = _selftest()
+    println(_str(r[1]))
+    println("── selftest result: " + (if r[0] { "1/1 PASS" } else { "0/1 FAIL" }) + " ──")
+    if r[0] { exit(0) }
+    exit(1)
+}
+
+let id     = _arg_value(argv, "--id", "")
+let reason = _arg_value(argv, "--reason", "")
+
+let r = _do_approve(id, reason)
+println(_str(r[1]))
+exit(r[0])

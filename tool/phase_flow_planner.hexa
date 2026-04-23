@@ -25,6 +25,7 @@
 // ════════════════════════════════════════════════════════════════════════════
 
 let CONFIG_PATH_DEFAULT = "config/phase_progression_config.json"
+let WITH_UNLOCK_TOOL    = "/Users/ghost/core/hexa-lang/tool/roadmap_with_unlock.hexa"
 
 // ─── helpers (same idiom as controller) ───────────────────────────────
 
@@ -36,6 +37,7 @@ fn _str(x) -> string {
 
 fn _bool_s(b: bool) -> string { return if b { "true" } else { "false" } }
 
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _sh_quote(s: string) -> string {
     let mut out = "'"
     out = out + s.replace("'", "'\\''")
@@ -53,6 +55,7 @@ fn _exec_code(cmd: string) -> int {
     return r[1]
 }
 
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _file_exists(path: string) -> bool {
     return _exec_code("test -f " + _sh_quote(path)) == 0
 }
@@ -61,6 +64,7 @@ fn _mkdir_p(dir: string) -> bool {
     return _exec_code("mkdir -p " + _sh_quote(dir)) == 0
 }
 
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _ts_iso() -> string { return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim() }
 fn _today_iso() -> string { return _exec_out("date -u +%Y-%m-%d").trim() }
 
@@ -72,6 +76,7 @@ fn _eta_plus(days: int) -> string {
     return _exec_out(gnu).trim()
 }
 
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _json_escape(s: string) -> string {
     return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 }
@@ -177,19 +182,15 @@ fn _build_entry_text(id: int, component: string, track: string, phase: string) -
     return p.join("")
 }
 
-// Append multiple entries atomically (single write). Observes chflags uchg.
+// Append multiple entries atomically (single write). Migration 20260422:
+// unlock/write/relock atomicized via tool/roadmap_with_unlock.hexa (PR #25)
+// — the helper installs `trap '<relock>' EXIT INT TERM` so the file is
+// relocked even if the write is interrupted.
 fn _append_entries(roadmap_path: string, texts) -> bool {
     if len(texts) == 0 { return true }
     if !_file_exists(roadmap_path) {
         eprintln("phase_flow_planner: .roadmap missing at " + roadmap_path)
         return false
-    }
-    let had_uchg = _is_uchg(roadmap_path)
-    if had_uchg {
-        if !_chflags(roadmap_path, "nouchg") {
-            eprintln("phase_flow_planner: nouchg failed — skipping write")
-            return false
-        }
     }
     let cur = to_string(read_file(roadmap_path))
     let mut acc = cur
@@ -199,9 +200,41 @@ fn _append_entries(roadmap_path: string, texts) -> bool {
         acc = acc + _str(texts[i])
         i = i + 1
     }
-    let ok = write_file(roadmap_path, acc)
+    // Stage to tempfile, then atomic mv via the helper.
+    let mut tparts = []
+    tparts.push(roadmap_path)
+    tparts.push(".tmp.with_unlock.")
+    tparts.push(_ts_iso().replace(":", "").replace("-", ""))
+    let tmp = tparts.join("")
+    let staged_ok = write_file(tmp, acc)
+    if !staged_ok { return false }
+    if _file_exists(WITH_UNLOCK_TOOL) {
+        let mut cmd = []
+        cmd.push("hexa ")
+        cmd.push(WITH_UNLOCK_TOOL)
+        cmd.push(" --file ")
+        cmd.push(_sh_quote(roadmap_path))
+        cmd.push(" -- mv ")
+        cmd.push(_sh_quote(tmp))
+        cmd.push(" ")
+        cmd.push(_sh_quote(roadmap_path))
+        let r = exec_with_status(cmd.join(""))
+        if r[1] != 0 { let _rm = _exec_code("rm -f " + _sh_quote(tmp)); return false }
+        return true
+    }
+    // uchg_safe_edit:fallback-allow — legacy chflags dance retained ONLY when
+    // the helper is absent. Linter skips this block via the sentinel.
+    let had_uchg = _is_uchg(roadmap_path)
+    if had_uchg {
+        if !_chflags(roadmap_path, "nouchg") {
+            eprintln("phase_flow_planner: nouchg failed — skipping write")
+            let _rm = _exec_code("rm -f " + _sh_quote(tmp))
+            return false
+        }
+    }
+    let mvr = exec_with_status("mv " + _sh_quote(tmp) + " " + _sh_quote(roadmap_path))
     if had_uchg { let _u = _chflags(roadmap_path, "uchg") }
-    return ok
+    return mvr[1] == 0
 }
 
 // ─── flow_ready SSOT emit ──────────────────────────────────────────────

@@ -1,0 +1,134 @@
+// tool/r2_tokenizer_sha256_verify.hexa — pre-H100 ROI S3
+//
+// Compute sha256 of local tokenizer.json (and sibling tokenizer assets),
+// register them in config/r2_tokenizer_sha256_manifest.json, and re-verify
+// matches on subsequent runs. Mock-only for the R2 metadata write step
+// (PUT not performed; spec line is emitted instead).
+//
+// Selftest exit codes:
+//   0 = PASS (manifest written / matches)
+//   1 = FAIL (sha256 mismatch vs prior manifest)
+//   2 = no tokenizer.json found anywhere (still PASS spec, but exits 0 with WARN)
+//
+// Usage:
+//   hexa tool/r2_tokenizer_sha256_verify.hexa
+//   hexa tool/r2_tokenizer_sha256_verify.hexa --selftest
+
+fn try_sha256(path) {
+    if !file_exists(path) { return "" }
+    let f = open(path, "rb")
+    let bytes = f.read_all()
+    f.close()
+    return sha256_hex(bytes)
+}
+
+fn search_paths() {
+    // Canonical candidate locations for tokenizer assets.
+    return [
+        "models/alm14b/h100_release/tokenizer/tokenizer.json",
+        "models/alm14b/h100_release/tokenizer/tokenizer_config.json",
+        "models/alm14b/h100_release/tokenizer/special_tokens_map.json",
+        "models/alm14b/tokenizer/tokenizer.json",
+        "models/alm14b/tokenizer/tokenizer_config.json",
+        "models/alm14b/tokenizer/special_tokens_map.json",
+        "models/clm1b/tokenizer/tokenizer.json",
+        "models/clm3b/tokenizer/tokenizer.json",
+        "models/base_models/tokenizer/tokenizer.json",
+        "checkpoints/tokenizer/tokenizer.json",
+        "data/tokenizer/tokenizer.json"
+    ]
+}
+
+fn r2_metadata_spec_line(rel_path, sha) {
+    // SIMULATED R2 metadata PUT spec — printed only, never executed.
+    // The intended live invocation is documented for ops handoff:
+    //   rclone backend setmeta r2:anima-models/<rel_path> sha256=<sha>
+    return "  [spec] rclone backend setmeta r2:anima-models/" + rel_path + " sha256=" + sha
+}
+
+fn main() {
+    let manifest_path = "config/r2_tokenizer_sha256_manifest.json"
+    println("r2_tokenizer_sha256_verify (mock-only R2 metadata)")
+    println("  manifest = " + manifest_path)
+
+    let prior = {}
+    if file_exists(manifest_path) {
+        let f = open(manifest_path, "r")
+        let raw = f.read_all()
+        f.close()
+        prior = json_parse(raw)
+    }
+
+    let entries = {}
+    let cnt_found = 0
+    let cnt_match = 0
+    let cnt_new = 0
+    let cnt_mismatch = 0
+
+    let paths = search_paths()
+    let i = 0
+    while i < len(paths) {
+        let p = paths[i]
+        let sha = try_sha256(p)
+        if sha != "" {
+            cnt_found = cnt_found + 1
+            entries[p] = sha
+            println("  found " + p)
+            println("    sha256 = " + sha)
+            println(r2_metadata_spec_line(p, sha))
+            if prior.contains_key("entries") && prior["entries"].contains_key(p) {
+                if prior["entries"][p] == sha {
+                    cnt_match = cnt_match + 1
+                    println("    [match] manifest sha unchanged")
+                } else {
+                    cnt_mismatch = cnt_mismatch + 1
+                    println("    [MISMATCH] prior=" + prior["entries"][p])
+                }
+            } else {
+                cnt_new = cnt_new + 1
+                println("    [new] adding to manifest")
+            }
+        }
+        i = i + 1
+    }
+
+    let new_manifest = {
+        "schema_version": "1",
+        "roi_item": "S3",
+        "track": "pre-H100 ROI",
+        "generated_utc": utc_now_iso(),
+        "r2_bucket": "anima-models",
+        "metadata_key": "sha256",
+        "mock_only_put": true,
+        "counts": {
+            "found": cnt_found,
+            "match": cnt_match,
+            "new": cnt_new,
+            "mismatch": cnt_mismatch
+        },
+        "entries": entries
+    }
+
+    let out = open(manifest_path, "w")
+    out.write(json_stringify_pretty(new_manifest))
+    out.close()
+
+    println("summary:")
+    println("  found    = " + str(cnt_found))
+    println("  match    = " + str(cnt_match))
+    println("  new      = " + str(cnt_new))
+    println("  mismatch = " + str(cnt_mismatch))
+
+    if cnt_mismatch > 0 {
+        println("FAIL r2_tokenizer_sha256_verify — sha256 drift detected")
+        exit(1)
+    }
+
+    if cnt_found == 0 {
+        println("WARN no tokenizer assets found in canonical paths (acceptable pre-H100 — pulls from R2 at pod boot)")
+    }
+    println("PASS r2_tokenizer_sha256_verify — " + str(cnt_found) + " entries verified")
+    exit(0)
+}
+
+main()

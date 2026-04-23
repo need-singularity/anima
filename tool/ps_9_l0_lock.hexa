@@ -5,10 +5,15 @@
 // darwin hosts this is a noop (always returns success).
 
 let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/problem_solving_protocol_config.json"
+let WITH_UNLOCK_TOOL = "/Users/ghost/core/hexa-lang/tool/roadmap_with_unlock.hexa"
 
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _file_exists(p: string) -> bool { return exec_with_status("test -e " + _sh_quote(p))[1] == 0 }
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _ts_iso() -> string { return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim() }
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
 fn _json_escape(s: string) -> string { return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") }
 fn _is_darwin() -> bool {
     let r = exec_with_status("uname -s")
@@ -62,27 +67,57 @@ fn _replace_array_inline(body, key, inline) -> string {
     return body.substring(0, j) + inline + rest.substring(e, len(rest))
 }
 
+// Migration 20260422: write-then-lock via roadmap_with_unlock.hexa (PR #25).
+// Issue SSOTs are typically NOT pre-locked at step 9 (lock applied here as
+// part of the step transition), so the helper runs through its
+// "was_locked=false → bare exec" path; the lock is then applied separately
+// via _chflag_apply. If a previous run did leave the file uchg, the helper
+// transparently unlocks → mv → relocks under a trap, preserving safety.
+fn _stage_via_helper(target: string, body: string) -> bool {
+    let mut tmp_parts = []
+    tmp_parts.push(target)
+    tmp_parts.push(".tmp.with_unlock.")
+    tmp_parts.push(_ts_iso().replace(":", "").replace("-", ""))
+    let tmp = tmp_parts.join("")
+    write_file(tmp, body)
+    if !_file_exists(WITH_UNLOCK_TOOL) {
+        // Fallback: caller already removed uchg. Direct mv.
+        let mvr = exec_with_status("mv " + _sh_quote(tmp) + " " + _sh_quote(target))
+        return mvr[1] == 0
+    }
+    let mut cmd = []
+    cmd.push("hexa ")
+    cmd.push(WITH_UNLOCK_TOOL)
+    cmd.push(" --file ")
+    cmd.push(_sh_quote(target))
+    cmd.push(" -- mv ")
+    cmd.push(_sh_quote(tmp))
+    cmd.push(" ")
+    cmd.push(_sh_quote(target))
+    let r = exec_with_status(cmd.join(""))
+    if r[1] != 0 { exec_with_status("rm -f " + _sh_quote(tmp)) }
+    return r[1] == 0
+}
+
 fn l0_lock(cfg, id: string) -> int {
     let path = _issue_path(cfg, id)
     if !_file_exists(path) { eprintln("ps_9: missing " + id); return 2 }
     let required = _cfg_bool(cfg, "l0_lock_required", true)
     // write step first (before locking), then lock
     let body = read_file(path)
-    // temporarily remove uchg if present (idempotent)
-    let _rm = _chflag_remove(path, "uchg")
     let mut locked_list = []
     if required {
         let mut b2 = _replace_field_str(body, "updated", _ts_iso())
         b2 = _replace_field_int(b2, "current_step", 10)
         let inline = "\"" + _json_escape(path) + "\""
         b2 = _replace_array_inline(b2, "locked_files", inline)
-        write_file(path, b2)
+        let _ws = _stage_via_helper(path, b2)
         let ok = _chflag_apply(path, "uchg")
         if ok { locked_list.push(path) }
     } else {
         let mut b2 = _replace_field_str(body, "updated", _ts_iso())
         b2 = _replace_field_int(b2, "current_step", 10)
-        write_file(path, b2)
+        let _ws = _stage_via_helper(path, b2)
     }
     println("ps_9_l0_lock: issue=" + id + " darwin=" + to_string(_is_darwin()) +
             " required=" + to_string(required) + " locked=" + to_string(len(locked_list)) + " → step 10")

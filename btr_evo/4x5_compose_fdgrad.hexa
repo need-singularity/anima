@@ -1,0 +1,689 @@
+// ════════════════════════════════════════════════════════════════
+//  btr_evo/4x5_compose_fdgrad.hexa
+//  BTR Evolution 4×5 — FD gradient ascent on P-rows
+//
+//  PURPOSE
+//    Follow-up to btr_evo/4x5_compose.hexa (commit 1aebe82e, verdict
+//    BELOW, final_phi_delta +18%). Root cause: stochastic P-reseed kick
+//    fails to anchor on the high-Φ attractor — evo-4's analytic
+//    fixpoint (0.80) dominates stochastic search.
+//
+//    This variant replaces the seed-kick with **deterministic finite-
+//    difference gradient ascent** on the encoder projection P:
+//
+//        g_ij  = ( Φ(P + ε·e_ij) − Φ(P) ) / ε
+//        P_ij += η · g_ij
+//
+//    Same data (X, Y, w, seed=20260421), same KSG MI, same Φ synthesis
+//    (PHI_BASE + B·I_ZY/I_ZY_REF + C·compression/C_REF).  The only
+//    change is the P-update rule.
+//
+//    Prediction: climb toward +30%~+38% Φ range (evo-4 level), holding
+//    compression 3.2×.
+//
+//  CONSTRAINTS
+//    - Additive only. btr_evo/4x5_compose.hexa is NOT touched.
+//    - Deterministic (seed=20260421 fixed, LCG-only PRNG).
+//    - No LLM.  V8 SAFE_COMMIT.
+//    - FD gradient uses reduced n (FDG_N_GRAD) for speed, full n for
+//      Φ readout — documented numerically equivalent (MI estimator
+//      same, just fewer samples for derivative probe).
+//
+//  OUTPUT
+//    experiments/holo_post/results/btr_4x5_fdgrad_20260421.json
+// ════════════════════════════════════════════════════════════════
+
+// ── constants (match 4x5_compose.hexa where applicable) ────────
+
+let FDG_SMOKE_N        = 200
+let FDG_N_GRAD         = 60           // reduced-n subsample for FD probe
+let FDG_DIM_X          = 16
+let FDG_DIM_Z          = 5
+let FDG_KSG_K          = 5
+let FDG_IB_BETA        = 1.0
+let FDG_SMOKE_SEED     = 20260421
+let FDG_NOISE_SCALE    = 0.10
+let FDG_ITERS          = 30
+
+// FD gradient parameters
+let FDG_EPSILON        = 0.001        // ε = 1e-3 (per spec)
+let FDG_ETA            = 0.1          // η = 0.1  (per spec)
+
+// Φ synthesis (identical to 4x5_compose)
+let FDG_PHI_BASE       = 0.50
+let FDG_PHI_B_COEF     = 0.25
+let FDG_PHI_C_COEF     = 0.05
+let FDG_I_ZY_REF       = 0.20
+let FDG_C_REF          = 3.2
+
+// Verdict gates (identical to 4x5_compose)
+let FDG_VERDICT_UPPER  = 0.38         // +38%
+let FDG_VERDICT_LOWER  = 0.30         // +30%
+
+let FDG_EVO4_TRAJ      = "experiments/holo_post/results/eeg_closed_loop_20260421_trajectory.jsonl"
+let FDG_OUT_JSON       = "experiments/holo_post/results/btr_4x5_fdgrad_20260421.json"
+
+// ── deterministic LCG + quasi-Gaussian (identical to 4x5_compose) ──
+
+fn lcg_next(state: int) -> int {
+    let m: int = 2147483647
+    let a: int = 1103515245
+    let c: int = 12345
+    let s = (a * state + c) % m
+    if s < 0 { return 0 - s }
+    return s
+}
+
+fn normal_pair(seed: int) -> array {
+    let s1 = lcg_next(seed)
+    let s2 = lcg_next(s1)
+    let u1 = to_float(s1) / 2147483647.0
+    let u2 = to_float(s2) / 2147483647.0
+    let s3 = lcg_next(s2)
+    let s4 = lcg_next(s3)
+    let u3 = to_float(s3) / 2147483647.0
+    let u4 = to_float(s4) / 2147483647.0
+    let z = (u1 + u2 + u3 + u4) - 2.0
+    let mut out = []
+    out = out.push(z)
+    out = out.push(to_float(s4))
+    return out
+}
+
+// ── scalar helpers (ln, digamma) ───────────────────────────────
+
+fn ln_k(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1.0e30 }
+    let mut y = 0.0
+    let mut z = x
+    while z > 1.5 {
+        z = z * 0.5
+        y = y + 0.6931471805599453
+    }
+    while z < 0.5 {
+        z = z * 2.0
+        y = y - 0.6931471805599453
+    }
+    let u = z - 1.0
+    let mut sum = 0.0
+    let mut term = u
+    let mut k = 1
+    let mut sign = 1.0
+    while k < 40 {
+        sum = sum + sign * term / to_float(k)
+        term = term * u
+        sign = 0.0 - sign
+        k = k + 1
+    }
+    return y + sum
+}
+
+fn digamma_k(x: float) -> float {
+    if x <= 0.0 { return 0.0 - 1.0e30 }
+    let mut r = 0.0
+    let mut z = x
+    while z < 6.0 {
+        r = r - 1.0 / z
+        z = z + 1.0
+    }
+    let z2 = z * z
+    let z4 = z2 * z2
+    let z6 = z4 * z2
+    r = r + ln_k(z) - 0.5 / z - 1.0 / (12.0 * z2) + 1.0 / (120.0 * z4) - 1.0 / (252.0 * z6)
+    return r
+}
+
+// ── data synthesis ─────────────────────────────────────────────
+
+fn build_X(n: int, d: int, seed: int) -> array {
+    let mut X = []
+    let mut s = seed
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            let pair = normal_pair(s)
+            row = row.push(pair[0])
+            s = to_int(pair[1])
+            j = j + 1
+        }
+        X = X.push(row)
+        i = i + 1
+    }
+    return X
+}
+
+fn build_w(d: int, seed: int) -> array {
+    let mut w = []
+    let mut s = seed + 7919
+    let mut j = 0
+    while j < d {
+        let pair = normal_pair(s)
+        w = w.push(pair[0])
+        s = to_int(pair[1])
+        j = j + 1
+    }
+    return w
+}
+
+fn build_Y(X: array, w: array, seed: int, noise_scale: float) -> array {
+    let n = X.len()
+    let d = w.len()
+    let mut Y = []
+    let mut s = seed + 104729
+    let mut i = 0
+    while i < n {
+        let mut dot = 0.0
+        let mut j = 0
+        while j < d {
+            dot = dot + w[j] * X[i][j]
+            j = j + 1
+        }
+        let pair = normal_pair(s)
+        let eps = pair[0]
+        s = to_int(pair[1])
+        let mut row = []
+        row = row.push(dot + noise_scale * eps)
+        Y = Y.push(row)
+        i = i + 1
+    }
+    return Y
+}
+
+fn build_P(k: int, d: int, seed: int) -> array {
+    let mut P = []
+    let mut s = seed + 31337
+    let mut i = 0
+    while i < k {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            let pair = normal_pair(s)
+            row = row.push(pair[0] / 4.0)
+            s = to_int(pair[1])
+            j = j + 1
+        }
+        P = P.push(row)
+        i = i + 1
+    }
+    return P
+}
+
+fn project_Z(X: array, P: array) -> array {
+    let n = X.len()
+    let k = P.len()
+    let d = P[0].len()
+    let mut Z = []
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut a = 0
+        while a < k {
+            let mut s = 0.0
+            let mut b = 0
+            while b < d {
+                s = s + P[a][b] * X[i][b]
+                b = b + 1
+            }
+            row = row.push(s)
+            a = a + 1
+        }
+        Z = Z.push(row)
+        i = i + 1
+    }
+    return Z
+}
+
+// Take first m rows of an (n × d) matrix.
+fn take_rows(M: array, m: int) -> array {
+    let mut out = []
+    let n = M.len()
+    let lim = if m < n { m } else { n }
+    let mut i = 0
+    while i < lim {
+        out = out.push(M[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ── KSG MI estimator ───────────────────────────────────────────
+
+fn cheb_dist_joint(Ai: array, Aj: array, Bi: array, Bj: array) -> float {
+    let dA = Ai.len()
+    let dB = Bi.len()
+    let mut dmax = 0.0
+    let mut k = 0
+    while k < dA {
+        let diff = Ai[k] - Aj[k]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        k = k + 1
+    }
+    let mut m = 0
+    while m < dB {
+        let diff = Bi[m] - Bj[m]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        m = m + 1
+    }
+    return dmax
+}
+
+fn cheb_dist_single(Ai: array, Aj: array) -> float {
+    let d = Ai.len()
+    let mut dmax = 0.0
+    let mut k = 0
+    while k < d {
+        let diff = Ai[k] - Aj[k]
+        let ad = if diff < 0.0 { 0.0 - diff } else { diff }
+        if ad > dmax { dmax = ad }
+        k = k + 1
+    }
+    return dmax
+}
+
+fn ksg_mi(A: array, B: array, k: int) -> float {
+    let n = A.len()
+    if n < (k + 2) { return 0.0 }
+    let psi_k = digamma_k(to_float(k))
+    let psi_N = digamma_k(to_float(n))
+    let mut sum_psi = 0.0
+    let mut i = 0
+    while i < n {
+        let mut dists = []
+        let mut j = 0
+        while j < n {
+            if j != i {
+                let dj = cheb_dist_joint(A[i], A[j], B[i], B[j])
+                dists = dists.push(dj)
+            }
+            j = j + 1
+        }
+        let sd = dists.sort()
+        let eps = sd[k - 1]
+        let mut nA = 0
+        let mut nB = 0
+        let mut q = 0
+        while q < n {
+            if q != i {
+                let dA = cheb_dist_single(A[i], A[q])
+                let dB = cheb_dist_single(B[i], B[q])
+                if dA < eps { nA = nA + 1 }
+                if dB < eps { nB = nB + 1 }
+            }
+            q = q + 1
+        }
+        let pa = digamma_k(to_float(nA + 1))
+        let pb = digamma_k(to_float(nB + 1))
+        sum_psi = sum_psi + pa + pb
+        i = i + 1
+    }
+    let mean_psi = sum_psi / to_float(n)
+    let mi = psi_k - mean_psi + psi_N
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ── evo-4 trajectory loader ───────────────────────────────────
+
+fn get_float_b(blob: string, key: string, dflt: float) -> float {
+    let marker = "\"" + key + "\":"
+    let parts = blob.split(marker)
+    if parts.len() < 2 { return dflt }
+    let after = parts[1].trim()
+    let by_comma = after.split(",")
+    let tok1 = by_comma[0]
+    let by_brace = tok1.split("}")
+    let tok = by_brace[0].trim()
+    if tok.len() == 0 { return dflt }
+    return to_float(tok)
+}
+
+fn load_evo4_phi(path: string) -> array {
+    let mut out = []
+    if !file_exists(path) {
+        println("[fdg] WARN: evo4 trajectory not found: " + path)
+        return out
+    }
+    let raw = read_file(path)
+    if raw.len() == 0 { return out }
+    let lines = raw.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let line = lines[i].trim()
+        if line.len() > 0 && line.contains("\"phi\"") {
+            let phi = get_float_b(line, "phi", 0.0)
+            out = out.push(phi)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Φ synthesis from IB signals (identical to 4x5_compose) ────
+
+fn clamp01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn phi_from_ib(i_zy: float, compression: float) -> float {
+    let b = clamp01(i_zy / FDG_I_ZY_REF)
+    let c = clamp01(compression / FDG_C_REF)
+    return FDG_PHI_BASE + FDG_PHI_B_COEF * b + FDG_PHI_C_COEF * c
+}
+
+// ── Φ evaluation from P at arbitrary n ─────────────────────────
+// Returns [phi, i_xz, i_zy, compression]
+fn eval_phi(X: array, Y: array, P: array) -> array {
+    let Z = project_Z(X, P)
+    let i_xz = ksg_mi(X, Z, FDG_KSG_K)
+    let i_zy = ksg_mi(Z, Y, FDG_KSG_K)
+    let d = P[0].len()
+    let k = P.len()
+    let compression = to_float(d) / to_float(k)
+    let phi = phi_from_ib(i_zy, compression)
+    let mut out = []
+    out = out.push(phi)
+    out = out.push(i_xz)
+    out = out.push(i_zy)
+    out = out.push(compression)
+    return out
+}
+
+// ── FD gradient on P (element-wise) ────────────────────────────
+// g_ij = ( Φ(P + ε·e_ij) − Φ(P_base) ) / ε    (forward-difference)
+// Uses reduced-n subsample for speed; full-n used only for readout.
+fn fd_gradient(Xg: array, Yg: array, P: array, phi_base: float, eps: float) -> array {
+    let k = P.len()
+    let d = P[0].len()
+    let mut G = []
+    let mut a = 0
+    while a < k {
+        let mut grow = []
+        let mut b = 0
+        while b < d {
+            // perturb P[a][b] by +ε
+            let mut Pp = []
+            let mut r = 0
+            while r < k {
+                let mut row = []
+                let mut c = 0
+                while c < d {
+                    let v = if r == a && c == b { P[r][c] + eps } else { P[r][c] }
+                    row = row.push(v)
+                    c = c + 1
+                }
+                Pp = Pp.push(row)
+                r = r + 1
+            }
+            let fp = eval_phi(Xg, Yg, Pp)
+            let g = (fp[0] - phi_base) / eps
+            grow = grow.push(g)
+            b = b + 1
+        }
+        G = G.push(grow)
+        a = a + 1
+    }
+    return G
+}
+
+// Apply P += η · G
+fn apply_grad(P: array, G: array, eta: float) -> array {
+    let k = P.len()
+    let d = P[0].len()
+    let mut Pn = []
+    let mut i = 0
+    while i < k {
+        let mut row = []
+        let mut j = 0
+        while j < d {
+            row = row.push(P[i][j] + eta * G[i][j])
+            j = j + 1
+        }
+        Pn = Pn.push(row)
+        i = i + 1
+    }
+    return Pn
+}
+
+// grad L2-norm (for trajectory diagnostic)
+fn grad_norm(G: array) -> float {
+    let k = G.len()
+    let d = G[0].len()
+    let mut s = 0.0
+    let mut i = 0
+    while i < k {
+        let mut j = 0
+        while j < d {
+            s = s + G[i][j] * G[i][j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let mut r = s
+    // crude sqrt: Newton 8 iter
+    let mut x = if r > 1.0 { r } else { 1.0 }
+    let mut t = 0
+    while t < 8 {
+        if x <= 0.0 { x = 1.0e-12 }
+        x = 0.5 * (x + r / x)
+        t = t + 1
+    }
+    return x
+}
+
+// ── verdict ────────────────────────────────────────────────────
+// 0=BELOW, 1=REACHED_LOWER, 2=BETWEEN, 3=REACHED_UPPER
+fn verdict_code(delta: float) -> int {
+    let up = FDG_VERDICT_UPPER
+    let lo = FDG_VERDICT_LOWER
+    if delta >= up { return 3 }
+    if delta > lo { return 2 }
+    if delta >= lo { return 1 }
+    return 0
+}
+
+fn verdict_name(code: int) -> string {
+    if code == 3 { return "REACHED_UPPER" }
+    if code == 2 { return "BETWEEN" }
+    if code == 1 { return "REACHED_LOWER" }
+    return "BELOW"
+}
+
+// ── JSON emit ──────────────────────────────────────────────────
+
+fn emit_trajectory(traj: array) -> string {
+    let n = traj.len()
+    let mut s = "["
+    let mut i = 0
+    while i < n {
+        let row = traj[i]
+        if i > 0 { s = s + "," }
+        s = s + "{\"iter\":" + to_string(i)
+        s = s + ",\"phi_target\":" + to_string(row[0])
+        s = s + ",\"phi_current\":" + to_string(row[1])
+        s = s + ",\"i_xz\":" + to_string(row[2])
+        s = s + ",\"i_zy\":" + to_string(row[3])
+        s = s + ",\"compression\":" + to_string(row[4])
+        s = s + ",\"grad_norm\":" + to_string(row[5])
+        s = s + ",\"phi_gain\":" + to_string(row[6])
+        s = s + "}"
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+fn emit_summary(final_phi: float, phi_delta: float, compression: float,
+                i_xz: float, i_zy: float, verdict: string,
+                baseline_delta: float, improvement: float,
+                traj: array) -> string {
+    let mut s = "{"
+    s = s + "\"verifier\":\"btr_evo_4x5_fdgrad\""
+    s = s + ",\"seed\":" + to_string(FDG_SMOKE_SEED)
+    s = s + ",\"n\":" + to_string(FDG_SMOKE_N)
+    s = s + ",\"n_grad\":" + to_string(FDG_N_GRAD)
+    s = s + ",\"iters\":" + to_string(FDG_ITERS)
+    s = s + ",\"dim_x\":" + to_string(FDG_DIM_X)
+    s = s + ",\"dim_z\":" + to_string(FDG_DIM_Z)
+    s = s + ",\"ksg_k\":" + to_string(FDG_KSG_K)
+    s = s + ",\"beta\":" + to_string(FDG_IB_BETA)
+    s = s + ",\"epsilon\":" + to_string(FDG_EPSILON)
+    s = s + ",\"eta\":" + to_string(FDG_ETA)
+    s = s + ",\"phi_target_upper\":" + to_string(FDG_VERDICT_UPPER)
+    s = s + ",\"phi_target_lower\":" + to_string(FDG_VERDICT_LOWER)
+    s = s + ",\"final_phi\":" + to_string(final_phi)
+    s = s + ",\"final_phi_delta\":" + to_string(phi_delta)
+    s = s + ",\"final_compression\":" + to_string(compression)
+    s = s + ",\"final_i_xz\":" + to_string(i_xz)
+    s = s + ",\"final_i_zy\":" + to_string(i_zy)
+    s = s + ",\"baseline_phi_delta\":" + to_string(baseline_delta)
+    s = s + ",\"improvement_vs_baseline\":" + to_string(improvement)
+    s = s + ",\"verdict\":\"" + verdict + "\""
+    s = s + ",\"trajectory\":" + emit_trajectory(traj)
+    s = s + "}"
+    return s
+}
+
+// ── driver ─────────────────────────────────────────────────────
+
+fn run_fdgrad() -> array {
+    println("[fdg] btr evo 4×5 FD-gradient — P-row deterministic climb")
+    println("[fdg]   n=" + to_string(FDG_SMOKE_N) + " n_grad=" + to_string(FDG_N_GRAD) + " iters=" + to_string(FDG_ITERS) + " d=" + to_string(FDG_DIM_X) + " k=" + to_string(FDG_DIM_Z) + " seed=" + to_string(FDG_SMOKE_SEED))
+    println("[fdg]   eps=" + to_string(FDG_EPSILON) + " eta=" + to_string(FDG_ETA))
+
+    let phi_series = load_evo4_phi(FDG_EVO4_TRAJ)
+    let phi_len = phi_series.len()
+    println("[fdg] evo4 phi trajectory loaded: " + to_string(phi_len) + " samples")
+    if phi_len == 0 {
+        println("[fdg] FATAL: no evo4 trajectory; aborting")
+        let mut er = []
+        return er
+    }
+
+    let X = build_X(FDG_SMOKE_N, FDG_DIM_X, FDG_SMOKE_SEED)
+    let w = build_w(FDG_DIM_X, FDG_SMOKE_SEED)
+    let Y = build_Y(X, w, FDG_SMOKE_SEED, FDG_NOISE_SCALE)
+    let Xg = take_rows(X, FDG_N_GRAD)
+    let Yg = take_rows(Y, FDG_N_GRAD)
+    println("[fdg] bulk X built; teacher Y built; grad subsample ready")
+
+    // Initialise P from same seed as baseline
+    let mut P = build_P(FDG_DIM_Z, FDG_DIM_X, FDG_SMOKE_SEED)
+
+    let mut traj = []
+    let mut t = 0
+    let iters = FDG_ITERS
+    let mut prev_phi = 0.0
+    while t < iters {
+        let idx = (t * phi_len) / iters
+        let phi_target = phi_series[idx]
+
+        // full-n Φ readout
+        let full = eval_phi(X, Y, P)
+        let phi_cur = full[0]
+        let i_xz   = full[1]
+        let i_zy   = full[2]
+        let compression = full[3]
+
+        // reduced-n baseline for gradient
+        let base_g = eval_phi(Xg, Yg, P)
+        let phi_base_g = base_g[0]
+
+        // FD gradient of Φ w.r.t. P (element-wise, forward diff)
+        let G = fd_gradient(Xg, Yg, P, phi_base_g, FDG_EPSILON)
+        let gn = grad_norm(G)
+
+        let phi_gain = phi_cur - prev_phi
+
+        let mut row = []
+        row = row.push(phi_target)
+        row = row.push(phi_cur)
+        row = row.push(i_xz)
+        row = row.push(i_zy)
+        row = row.push(compression)
+        row = row.push(gn)
+        row = row.push(phi_gain)
+        traj = traj.push(row)
+
+        let msg = "[fdg] iter " + to_string(t) + " phi_tgt=" + to_string(phi_target) + " phi_cur=" + to_string(phi_cur) + " I_XZ=" + to_string(i_xz) + " I_ZY=" + to_string(i_zy) + " |g|=" + to_string(gn)
+        println(msg)
+
+        // Ascend: P += η · G   (climb toward higher Φ)
+        P = apply_grad(P, G, FDG_ETA)
+        prev_phi = phi_cur
+        t = t + 1
+    }
+    return traj
+}
+
+fn finalize(traj: array) -> array {
+    let n = traj.len()
+    if n == 0 {
+        let mut e = []
+        return e
+    }
+    let look = if n < 5 { n } else { 5 }
+    let mut sum_phi = 0.0
+    let mut sum_c = 0.0
+    let mut sum_ixz = 0.0
+    let mut sum_izy = 0.0
+    let mut i = n - look
+    while i < n {
+        let r = traj[i]
+        sum_phi = sum_phi + r[1]
+        sum_c   = sum_c   + r[4]
+        sum_ixz = sum_ixz + r[2]
+        sum_izy = sum_izy + r[3]
+        i = i + 1
+    }
+    let lk = to_float(look)
+    let mut out = []
+    out = out.push(sum_phi / lk)
+    out = out.push(sum_c   / lk)
+    out = out.push(sum_ixz / lk)
+    out = out.push(sum_izy / lk)
+    return out
+}
+
+// ── main ───────────────────────────────────────────────────────
+
+println("btr-evo 4×5 FD-gradient — seed kick replaced with ∂Φ/∂P_ij")
+let traj = run_fdgrad()
+
+if traj.len() > 0 {
+    let fin = finalize(traj)
+    let final_phi   = fin[0]
+    let final_comp  = fin[1]
+    let final_i_xz  = fin[2]
+    let final_i_zy  = fin[3]
+    let phi_delta   = final_phi - FDG_PHI_BASE
+    let baseline_delta = 0.1799398519401546   // from btr_4x5_compose_20260421.json
+    let improvement = phi_delta - baseline_delta
+    let vc = verdict_code(phi_delta)
+    let v = verdict_name(vc)
+
+    let summary = emit_summary(final_phi, phi_delta, final_comp, final_i_xz, final_i_zy, v, baseline_delta, improvement, traj)
+
+    try { write_file(FDG_OUT_JSON, summary) } catch e {
+        println("[fdg] WARN: write_file failed: " + FDG_OUT_JSON)
+    }
+
+    println("=== btr evo 4×5 FD-gradient ===")
+    println("  final_phi          = " + to_string(final_phi))
+    println("  final_phi_delta    = " + to_string(phi_delta))
+    println("  final_compression  = " + to_string(final_comp))
+    println("  final_I_XZ         = " + to_string(final_i_xz))
+    println("  final_I_ZY         = " + to_string(final_i_zy))
+    println("  baseline_delta     = " + to_string(baseline_delta))
+    println("  improvement        = " + to_string(improvement))
+    println("  verdict            = " + v)
+    println("  out -> " + FDG_OUT_JSON)
+} else {
+    println("[fdg] FD-gradient aborted")
+}

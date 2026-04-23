@@ -1,0 +1,227 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/ci_serve_alm_persona_smoke.hexa — ROI-C15 CPU CI smoke wrapper
+//
+//  PURPOSE
+//    Manually-invokable + git-hook-friendly wrapper around
+//    `bash tool/serve_alm_persona.bash --selftest --dry`. Designed to be
+//    pluggable into a git pre-push (or pre-commit) hook so persona serve
+//    regressions are caught BEFORE leaving the dev workstation. Hook
+//    install instructions live in docs/ci_hooks_setup.md — this tool
+//    does NOT install any git hooks (user controls .git/hooks/).
+//
+//  CHECKS
+//    1. bash tool/serve_alm_persona.bash --selftest --dry exits 0
+//    2. state/serve_alm_persona_selftest.json verdict == "PASS"
+//    3. state/serve_alm_persona_selftest_verdict.txt == "PASS"
+//
+//  CLI
+//    hexa run tool/ci_serve_alm_persona_smoke.hexa             # run
+//    hexa run tool/ci_serve_alm_persona_smoke.hexa --print     # run + stdout
+//    hexa run tool/ci_serve_alm_persona_smoke.hexa --self-test # logic test
+//
+//  EXIT
+//    0 — selftest PASS (all 3 checks ok)
+//    1 — selftest FAIL (any check failed) — git hook should abort
+//    2 — runner I/O failure
+//
+//  HARD CONSTRAINTS
+//    - hexa-only orchestration (calls existing .bash as raw#9 permits bridge)
+//    - idempotent (re-run safe; overwrites smoke verdict file)
+//    - no remote API; pure local exec
+//    - emits state/ci_serve_alm_persona_smoke.json (verdict+evidence)
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT       = "/Users/ghost/core/anima"
+let SAP_BASH         = "/Users/ghost/core/anima/tool/serve_alm_persona.bash"
+let SAP_SELFTEST     = "/Users/ghost/core/anima/state/serve_alm_persona_selftest.json"
+let SAP_VERDICT_TXT  = "/Users/ghost/core/anima/state/serve_alm_persona_selftest_verdict.txt"
+let SMOKE_OUT        = "/Users/ghost/core/anima/state/ci_serve_alm_persona_smoke.json"
+
+// ─── helpers ──────────────────────────────────────────────────────────────
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _ts_epoch() -> string {
+    return to_string(exec_with_status("date -u +%s")[0]).trim()
+}
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+fn _bool_str(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _flag(av, k) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+fn _last_slash(p: string) -> int {
+    let mut i = len(p) - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn _read_stripped(path: string) -> string {
+    if !_file_exists(path) { return "" }
+    return to_string(read_file(path)).trim()
+}
+
+fn _json_field_str_safe(path: string, key: string) -> string {
+    if !_file_exists(path) { return "" }
+    let raw = read_file(path)
+    if to_string(raw) == "" { return "" }
+    let obj = json_parse(to_string(raw))
+    if !obj.contains_key(key) { return "" }
+    return to_string(obj[key])
+}
+
+// ─── 3-check evaluator ────────────────────────────────────────────────────
+
+fn _evaluate(exit_code: int, json_verdict: string, txt_verdict: string) -> bool {
+    if exit_code != 0 { return false }
+    if json_verdict != "PASS" { return false }
+    if txt_verdict != "PASS" { return false }
+    return true
+}
+
+// ─── runner ───────────────────────────────────────────────────────────────
+
+fn run(also_print: bool) -> int {
+    let ts = _ts_iso()
+    println("── ci_serve_alm_persona_smoke " + ts + " ──")
+
+    if !_file_exists(SAP_BASH) {
+        println("  FAIL: " + SAP_BASH + " missing")
+        let body = "{\n"
+            + "  \"schema\": \"anima/ci_serve_alm_persona_smoke/1\",\n"
+            + "  \"generated_at\": \"" + _json_escape(ts) + "\",\n"
+            + "  \"verdict\": \"FAIL\",\n"
+            + "  \"reason\": \"sap_bash_missing\",\n"
+            + "  \"sap_bash\": \"" + _json_escape(SAP_BASH) + "\"\n"
+            + "}\n"
+        write_file(SMOKE_OUT, body)
+        return 1
+    }
+
+    let cmd = "cd " + _sh_quote(ANIMA_ROOT) + " && bash " + _sh_quote(SAP_BASH) + " --selftest --dry 2>&1"
+    let r = exec_with_status(cmd)
+    let stdout = to_string(r[0])
+    let exit_code = r[1]
+    println("  exit_code=" + to_string(exit_code))
+
+    let json_verdict = _json_field_str_safe(SAP_SELFTEST, "verdict")
+    let txt_verdict  = _read_stripped(SAP_VERDICT_TXT)
+    println("  json_verdict=" + json_verdict)
+    println("  txt_verdict="  + txt_verdict)
+
+    let ok = _evaluate(exit_code, json_verdict, txt_verdict)
+    let verdict = if ok { "PASS" } else { "FAIL" }
+    println("  smoke_verdict=" + verdict)
+
+    let body = "{\n"
+        + "  \"schema\": \"anima/ci_serve_alm_persona_smoke/1\",\n"
+        + "  \"generated_at\": \"" + _json_escape(ts) + "\",\n"
+        + "  \"generated_at_epoch\": " + _ts_epoch() + ",\n"
+        + "  \"generator\": \"tool/ci_serve_alm_persona_smoke.hexa\",\n"
+        + "  \"sap_bash\": \"" + _json_escape(SAP_BASH) + "\",\n"
+        + "  \"invocation\": \"bash tool/serve_alm_persona.bash --selftest --dry\",\n"
+        + "  \"checks\": {\n"
+        + "    \"exit_code_zero\": " + _bool_str(exit_code == 0) + ",\n"
+        + "    \"json_verdict_pass\": " + _bool_str(json_verdict == "PASS") + ",\n"
+        + "    \"txt_verdict_pass\": " + _bool_str(txt_verdict == "PASS") + "\n"
+        + "  },\n"
+        + "  \"observed\": {\n"
+        + "    \"exit_code\": " + to_string(exit_code) + ",\n"
+        + "    \"json_verdict\": \"" + _json_escape(json_verdict) + "\",\n"
+        + "    \"txt_verdict\": \"" + _json_escape(txt_verdict) + "\"\n"
+        + "  },\n"
+        + "  \"verdict\": \"" + verdict + "\",\n"
+        + "  \"policy\": {\n"
+        + "    \"side_effects\": \"smoke_verdict_file_only\",\n"
+        + "    \"safe_to_repeat\": true,\n"
+        + "    \"git_hook_exit_semantic\": \"non-zero aborts pre-push / pre-commit\"\n"
+        + "  }\n"
+        + "}\n"
+
+    let pdir = SMOKE_OUT.substring(0, _last_slash(SMOKE_OUT))
+    if pdir != "" { exec_with_status("mkdir -p " + _sh_quote(pdir)) }
+    write_file(SMOKE_OUT, body)
+    println("  smoke_out=" + SMOKE_OUT)
+
+    if also_print {
+        println(body)
+        println("─── sap selftest stdout ───")
+        println(stdout)
+    }
+
+    if ok { return 0 }
+    return 1
+}
+
+// ─── self-test (logic-only, does NOT shell out) ───────────────────────────
+
+fn self_test() -> int {
+    println("── ci_serve_alm_persona_smoke self-test ──")
+    let mut pass = 0
+    let mut fail = 0
+
+    if _evaluate(0, "PASS", "PASS") { println("  S1 PASS (all green)"); pass = pass + 1 }
+    else { println("  S1 FAIL"); fail = fail + 1 }
+
+    if !_evaluate(1, "PASS", "PASS") { println("  S2 PASS (exit!=0 → FAIL)"); pass = pass + 1 }
+    else { println("  S2 FAIL"); fail = fail + 1 }
+
+    if !_evaluate(0, "FAIL", "PASS") { println("  S3 PASS (json FAIL → FAIL)"); pass = pass + 1 }
+    else { println("  S3 FAIL"); fail = fail + 1 }
+
+    if !_evaluate(0, "PASS", "FAIL") { println("  S4 PASS (txt FAIL → FAIL)"); pass = pass + 1 }
+    else { println("  S4 FAIL"); fail = fail + 1 }
+
+    if !_evaluate(0, "", "") { println("  S5 PASS (empty verdicts → FAIL)"); pass = pass + 1 }
+    else { println("  S5 FAIL"); fail = fail + 1 }
+
+    println("ci_serve_alm_persona_smoke selftest: " + to_string(pass) + "/5 PASS, " + to_string(fail) + " FAIL")
+    if fail > 0 { return 1 }
+    return 0
+}
+
+// ─── entry ────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/ci_serve_alm_persona_smoke.hexa [--self-test] [--print]")
+        return 0
+    }
+    if _flag(av, "--self-test") || _flag(av, "self-test") {
+        return self_test()
+    }
+    let also_print = _flag(av, "--print")
+    return run(also_print)
+}

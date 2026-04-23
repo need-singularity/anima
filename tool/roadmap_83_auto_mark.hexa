@@ -1,0 +1,271 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/roadmap_83_auto_mark.hexa — ROI-C18 propose-only roadmap #83 mark
+//
+//  PURPOSE
+//    Reads state/h100_launch_completion_verdict.json (emitted by
+//    tool/h100_post_launch_ingest.hexa). When the verdict carries
+//    roadmap_83_action == "AUTO_MARK_DONE" this tool *proposes* the
+//    .roadmap edit (planned → done) for entry #83 by emitting a proposal
+//    JSON the user must approve via the uchg unlock dance.
+//
+//    THIS TOOL NEVER MUTATES .roadmap. .roadmap is uchg-locked at the
+//    OS level; even if the lock were released the tool would still only
+//    write a proposal artifact. Manual chflags nouchg + edit + chflags
+//    uchg by the user is the ONLY mark path.
+//
+//  EMITS
+//    state/roadmap_83_auto_mark_proposal.json
+//      { schema, generated_at, source_verdict, verdict_overall,
+//        verdict_ready_for_roadmap_83_done, action,
+//        proposed_roadmap_edit:{entry, current_status, proposed_status,
+//          line_pattern, replacement, dance:[step1..stepN]},
+//        approval_required: true, executed: false }
+//
+//  CLI
+//    hexa run tool/roadmap_83_auto_mark.hexa              # propose
+//    hexa run tool/roadmap_83_auto_mark.hexa --print      # propose + stdout
+//    hexa run tool/roadmap_83_auto_mark.hexa --self-test  # 4 scenarios
+//
+//  EXIT
+//    0 — proposal emitted (read action field for outcome)
+//    1 — self-test FAIL
+//    2 — verdict file unreadable
+//
+//  HARD CONSTRAINTS  (mirrors raw#9..#15)
+//    - hexa-only (no .py / .rs / .sh business logic)
+//    - PROPOSE_ONLY — never edit .roadmap (uchg, user dance required)
+//    - Idempotent — re-running overwrites the proposal with current verdict
+//    - No remote API; pure local read + write
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT    = "/Users/ghost/core/anima"
+let VERDICT_PATH  = "/Users/ghost/core/anima/state/h100_launch_completion_verdict.json"
+let ROADMAP_PATH  = "/Users/ghost/core/anima/.roadmap"
+let PROPOSAL_OUT  = "/Users/ghost/core/anima/state/roadmap_83_auto_mark_proposal.json"
+
+// ─── helpers (mirrors h100_post_launch_ingest.hexa) ──────────────────────
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+fn _ts_epoch() -> string {
+    return to_string(exec_with_status("date -u +%s")[0]).trim()
+}
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+fn _bool_str(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+// ─── argv parsing ─────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _flag(av, k) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+// ─── verdict probe ────────────────────────────────────────────────────────
+
+fn _read_verdict(path: string) {
+    let mut r = json_parse("{}")
+    r["present"] = false
+    r["overall"] = "MISSING"
+    r["action"]  = "WAIT"
+    r["ready"]   = false
+    if !_file_exists(path) { return r }
+    let raw = read_file(path)
+    if to_string(raw) == "" { return r }
+    let obj = json_parse(to_string(raw))
+    r["present"] = true
+    if obj.contains_key("overall") { r["overall"] = to_string(obj["overall"]) }
+    if obj.contains_key("ready_for_roadmap_83_done") {
+        r["ready"] = (to_string(obj["ready_for_roadmap_83_done"]) == "true")
+    }
+    if obj.contains_key("roadmap_83_action") {
+        r["action"] = to_string(obj["roadmap_83_action"])
+    } else {
+        // back-compat: derive from overall
+        if to_string(r["overall"]) == "VERIFIED" { r["action"] = "AUTO_MARK_DONE" }
+        else { r["action"] = "WAIT" }
+    }
+    return r
+}
+
+// ─── proposal renderer ────────────────────────────────────────────────────
+//
+// The "dance" is the user-side uchg unlock + edit + relock sequence.
+// We never run any of these — they are listed for the user to copy-paste
+// after they have personally confirmed VERIFIED + Φ + per-path PASS.
+
+fn _render_proposal(verdict, action: string, ts: string) -> string {
+    let mut s = "{\n"
+    s = s + "  \"schema\": \"anima/roadmap_83_auto_mark_proposal/1\",\n"
+    s = s + "  \"generated_at\": \"" + _json_escape(ts) + "\",\n"
+    s = s + "  \"generated_at_epoch\": " + _ts_epoch() + ",\n"
+    s = s + "  \"generator\": \"tool/roadmap_83_auto_mark.hexa\",\n"
+    s = s + "  \"source_verdict\": \"" + _json_escape(VERDICT_PATH) + "\",\n"
+    s = s + "  \"verdict_present\": " + _bool_str(to_string(verdict["present"]) == "true") + ",\n"
+    s = s + "  \"verdict_overall\": \"" + _json_escape(to_string(verdict["overall"])) + "\",\n"
+    s = s + "  \"verdict_ready_for_roadmap_83_done\": " + _bool_str(to_string(verdict["ready"]) == "true") + ",\n"
+    s = s + "  \"action\": \"" + _json_escape(action) + "\",\n"
+    s = s + "  \"executed\": false,\n"
+    s = s + "  \"approval_required\": true,\n"
+    s = s + "  \"proposed_roadmap_edit\": {\n"
+    s = s + "    \"file\": \"" + _json_escape(ROADMAP_PATH) + "\",\n"
+    s = s + "    \"entry\": 83,\n"
+    s = s + "    \"current_status\": \"planned\",\n"
+    s = s + "    \"proposed_status\": \"done\",\n"
+    s = s + "    \"line_pattern\": \"^roadmap 83 planned\",\n"
+    s = s + "    \"replacement\": \"roadmap 83 done\",\n"
+    s = s + "    \"recipe\": [\n"
+    s = s + "      \"step 1: hexa /Users/ghost/core/hexa-lang/tool/roadmap_with_unlock.hexa --file /Users/ghost/core/anima/.roadmap -- sed -i '' -e 's/^roadmap 83 planned/roadmap 83 done/' /Users/ghost/core/anima/.roadmap\",\n"
+    s = s + "      \"step 2: append done_at + done_evidence pointer to state/h100_launch_completion_verdict.json\",\n"
+    s = s + "      \"step 3: hexa run tool/roadmap_83_auto_mark.hexa --print  # confirm proposal still matches current state\"\n"
+    s = s + "    ]\n"
+    s = s + "  },\n"
+    s = s + "  \"policy\": {\n"
+    s = s + "    \"side_effects\": \"proposal_file_only\",\n"
+    s = s + "    \"modifies_roadmap\": false,\n"
+    s = s + "    \"triggers_remote_api\": false,\n"
+    s = s + "    \"safe_to_repeat\": true,\n"
+    s = s + "    \"note\": \"AUTO_MARK_DONE is a proposal flag only. The recommended apply path uses tool/roadmap_with_unlock.hexa (PR #25), which atomicizes unlock/edit/relock under a bash trap so the file is relocked even on signal/crash.\"\n"
+    s = s + "  }\n"
+    s = s + "}\n"
+    return s
+}
+
+fn _last_slash(p: string) -> int {
+    let mut i = len(p) - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ─── main run ─────────────────────────────────────────────────────────────
+
+fn run(also_print: bool) -> int {
+    let ts = _ts_iso()
+    println("── roadmap_83_auto_mark " + ts + " ──")
+
+    let v = _read_verdict(VERDICT_PATH)
+    let action = to_string(v["action"])
+
+    println("  verdict_present=" + to_string(v["present"]))
+    println("  verdict_overall=" + to_string(v["overall"]))
+    println("  verdict_ready=" + to_string(v["ready"]))
+    println("  action=" + action)
+
+    let body = _render_proposal(v, action, ts)
+    let pdir = PROPOSAL_OUT.substring(0, _last_slash(PROPOSAL_OUT))
+    if pdir != "" { exec_with_status("mkdir -p " + _sh_quote(pdir)) }
+    write_file(PROPOSAL_OUT, body)
+    println("  proposal=" + PROPOSAL_OUT)
+    if action == "AUTO_MARK_DONE" {
+        println("  >>> AUTO_MARK_DONE proposed — user must run the chflags dance to apply")
+    } else {
+        println("  >>> WAIT — verdict not yet VERIFIED")
+    }
+    if also_print { println(body) }
+    return 0
+}
+
+// ─── self-test ────────────────────────────────────────────────────────────
+
+fn _mk_v(present: bool, overall: string, ready: bool, action: string) {
+    let mut r = json_parse("{}")
+    r["present"] = present
+    r["overall"] = overall
+    r["ready"]   = ready
+    r["action"]  = action
+    return r
+}
+
+fn _action_for(overall: string, ready: bool) -> string {
+    if ready && overall == "VERIFIED" { return "AUTO_MARK_DONE" }
+    return "WAIT"
+}
+
+fn self_test() -> int {
+    println("── roadmap_83_auto_mark self-test ──")
+    let mut pass = 0
+    let mut fail = 0
+
+    // S1: verdict missing → action=WAIT
+    let a1 = _action_for("MISSING", false)
+    if a1 == "WAIT" { println("  S1 PASS (missing → WAIT)"); pass = pass + 1 }
+    else { println("  S1 FAIL got " + a1); fail = fail + 1 }
+
+    // S2: PENDING → WAIT
+    let a2 = _action_for("PENDING", false)
+    if a2 == "WAIT" { println("  S2 PASS (PENDING → WAIT)"); pass = pass + 1 }
+    else { println("  S2 FAIL got " + a2); fail = fail + 1 }
+
+    // S3: PARTIAL → WAIT
+    let a3 = _action_for("PARTIAL", false)
+    if a3 == "WAIT" { println("  S3 PASS (PARTIAL → WAIT)"); pass = pass + 1 }
+    else { println("  S3 FAIL got " + a3); fail = fail + 1 }
+
+    // S4: VERIFIED + ready=true → AUTO_MARK_DONE
+    let a4 = _action_for("VERIFIED", true)
+    if a4 == "AUTO_MARK_DONE" { println("  S4 PASS (VERIFIED → AUTO_MARK_DONE)"); pass = pass + 1 }
+    else { println("  S4 FAIL got " + a4); fail = fail + 1 }
+
+    // S5: FAILED → WAIT
+    let a5 = _action_for("FAILED", false)
+    if a5 == "WAIT" { println("  S5 PASS (FAILED → WAIT)"); pass = pass + 1 }
+    else { println("  S5 FAIL got " + a5); fail = fail + 1 }
+
+    // S6: proposal renderer never claims executed=true
+    let v6 = _mk_v(true, "VERIFIED", true, "AUTO_MARK_DONE")
+    let body6 = _render_proposal(v6, "AUTO_MARK_DONE", "2026-04-22T00:00:00Z")
+    if body6.contains("\"executed\": false") && body6.contains("\"approval_required\": true") {
+        println("  S6 PASS (renderer keeps executed=false, approval_required=true)")
+        pass = pass + 1
+    } else {
+        println("  S6 FAIL renderer output")
+        fail = fail + 1
+    }
+
+    println("roadmap_83_auto_mark selftest: " + to_string(pass) + "/6 PASS, " + to_string(fail) + " FAIL")
+    if fail > 0 { return 1 }
+    return 0
+}
+
+// ─── entry ────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") || _flag(av, "-h") {
+        println("usage: hexa run tool/roadmap_83_auto_mark.hexa [--self-test] [--print]")
+        return 0
+    }
+    if _flag(av, "--self-test") || _flag(av, "self-test") {
+        return self_test()
+    }
+    let also_print = _flag(av, "--print")
+    return run(also_print)
+}

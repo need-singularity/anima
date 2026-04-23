@@ -1,0 +1,557 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/snap.hexa — anima CLI `snap` topic (state sha256 tree / tamper detect)
+//
+//  PURPOSE
+//    BB2: build a sha256 tree baseline over state/ + config/ + .meta2-cert/
+//    and verify current on-disk state against it. Merkle-root-style summary
+//    enables a single-hash tamper detect gate.
+//
+//  SUBCOMMANDS
+//    anima snap create        build baseline → state/anima_snap_baseline.json
+//    anima snap verify        compare current vs baseline → drift_count (exit 1 if drift)
+//    anima snap diff          detailed verify view (per-file added/removed/modified)
+//    anima snap --json        machine-readable verdict
+//    anima snap --selftest    synthetic 2-file create → modify → verify drift
+//    anima snap --help
+//
+//  OUTPUT SCHEMA  (anima.snap.v1)
+//    {
+//      "schema": "anima.snap.v1",
+//      "created_at": "<iso-ts or REDACTED>",
+//      "root_dirs": ["state", "config", ".meta2-cert"],
+//      "file_count": N,
+//      "total_bytes": N,
+//      "sha256_tree": {"state/foo.json": "abc...", ...},
+//      "root_sha256": "xyz..."   // sha256 over sorted "path\tsha\n" concat
+//    }
+//
+//  EXIT CODES
+//    0  no drift (create = success · verify = unchanged set matches)
+//    1  drift detected (added / removed / modified > 0)  OR selftest failure
+//    2  fatal error (baseline missing on verify, etc.)
+//
+//  DESIGN
+//    raw#9  hexa-only (no .py)
+//    raw#10 idempotent (overwrite baseline); deterministic under HEXA_REPRODUCIBLE=1
+//    raw#11 snake_case
+//    raw#15 no-hardcode (ANIMA / git-root resolution)
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") { out = out + [s] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _json_escape(s: string) -> string {
+    let t = s.replace("\\", "\\\\").replace("\"", "\\\"")
+    return "\"" + t + "\""
+}
+
+fn _sha256_bin() -> string {
+    // prefer sha256sum (coreutils); fallback `shasum -a 256`.
+    let has = _str(exec("command -v sha256sum 2>/dev/null")).trim()
+    if has != "" { return "sha256sum" }
+    return "shasum -a 256"
+}
+
+// ─── scan one root_dir → emit lines "relpath<TAB>sha256<TAB>bytes" (sorted) ──
+
+fn _scan_lines(root: string, sub: string) -> string {
+    let full = root + "/" + sub
+    if !_dexists(full) { return "" }
+    let sha_cmd = _sha256_bin()
+    // find → while read, collect sha + byte size; prefix with `sub/`
+    // exclude the baseline/verify output files so scan is stable across runs
+    let cmd = "cd " + _shq(root) + " && "
+            + "find " + _shq(sub) + " -type f "
+            + "  -not -path 'state/anima_snap_baseline.json' "
+            + "  -not -path 'state/anima_snap_verify_last.json' "
+            + "  -print0 2>/dev/null "
+            + "| LC_ALL=C sort -z "
+            + "| while IFS= read -r -d '' f; do "
+            + "  sh=$(" + sha_cmd + " \"$f\" 2>/dev/null | awk '{print $1}'); "
+            + "  sz=$(wc -c < \"$f\" 2>/dev/null | tr -d ' '); "
+            + "  if [ -n \"$sh\" ] && [ -n \"$sz\" ]; then "
+            + "    printf '%s\\t%s\\t%s\\n' \"$f\" \"$sh\" \"$sz\"; "
+            + "  fi; "
+            + "done"
+    return _str(exec(cmd))
+}
+
+fn _collect_all(root: string, roots: array) -> string {
+    let mut all = ""
+    let i = 0
+    while i < len(roots) {
+        let sub = _str(roots[i])
+        let part = _scan_lines(root, sub)
+        if part != "" { all = all + part }
+        i = i + 1
+    }
+    return all
+}
+
+// parse a single "path\tsha\tbytes" line → tuple via pipe-joined string
+fn _parse_line(ln: string) -> array {
+    let p1 = ln.split("\t")
+    if len(p1) < 3 { return [] }
+    return [_str(p1[0]), _str(p1[1]), _str(p1[2])]
+}
+
+// compute root_sha256 from the canonical body "path\tsha\n..." (no bytes)
+fn _root_sha_from(lines_body: string) -> string {
+    // write to a temp and sha256 the content
+    let tmp = _str(exec("mktemp")).trim()
+    if tmp == "" { return "" }
+    write_file(tmp, lines_body)
+    let sha_cmd = _sha256_bin()
+    let out = _str(exec(sha_cmd + " " + _shq(tmp) + " 2>/dev/null | awk '{print $1}'")).trim()
+    exec("rm -f " + _shq(tmp))
+    return out
+}
+
+// build the baseline body (json) from the scan output
+fn _build_baseline_json(root: string, roots: array) -> string {
+    let raw = _collect_all(root, roots)
+    let lines = raw.split("\n")
+    let mut n = 0
+    let mut total = 0
+    let mut tree_body = ""
+    let mut canonical = ""   // "path\tsha\n..." for root_sha256
+    let mut first = true
+    let i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i]).trim()
+        if ln != "" {
+            let t = _parse_line(ln)
+            if len(t) == 3 {
+                let p = _str(t[0])
+                let sh = _str(t[1])
+                let szs = _str(t[2])
+                let sz = to_int(szs)
+                n = n + 1
+                total = total + sz
+                let comma = if first { "" } else { ",\n" }
+                first = false
+                tree_body = tree_body + comma + "    " + _json_escape(p) + ": " + _json_escape(sh)
+                canonical = canonical + p + "\t" + sh + "\n"
+            }
+        }
+        i = i + 1
+    }
+    let root_sha = _root_sha_from(canonical)
+    let mut roots_json = "["
+    let k = 0
+    while k < len(roots) {
+        if k > 0 { roots_json = roots_json + ", " }
+        roots_json = roots_json + _json_escape(_str(roots[k]))
+        k = k + 1
+    }
+    roots_json = roots_json + "]"
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.snap.v1\",\n"
+    body = body + "  \"created_at\": \"" + _ts_iso() + "\",\n"
+    body = body + "  \"root_dirs\": " + roots_json + ",\n"
+    body = body + "  \"file_count\": " + to_string(n) + ",\n"
+    body = body + "  \"total_bytes\": " + to_string(total) + ",\n"
+    body = body + "  \"sha256_tree\": {\n" + tree_body + "\n  },\n"
+    body = body + "  \"root_sha256\": \"" + root_sha + "\"\n"
+    body = body + "}\n"
+    return body
+}
+
+// ─── subcommand: create ──────────────────────────────────────────────────
+
+fn _roots_list() -> array {
+    return ["state", "config", ".meta2-cert"]
+}
+
+fn sub_create(root: string, json_mode: bool) -> int {
+    let out_path = root + "/state/anima_snap_baseline.json"
+    let body = _build_baseline_json(root, _roots_list())
+    write_file(out_path, body)
+    if json_mode {
+        println(_str(exec("cat " + _shq(out_path))))
+        return 0
+    }
+    let fc  = _str(exec("jq -r '.file_count // 0' "  + _shq(out_path) + " 2>/dev/null")).trim()
+    let tb  = _str(exec("jq -r '.total_bytes // 0' " + _shq(out_path) + " 2>/dev/null")).trim()
+    let rs  = _str(exec("jq -r '.root_sha256 // \"\"' " + _shq(out_path) + " 2>/dev/null")).trim()
+    println("anima snap create — baseline written")
+    println("  path:          " + out_path.replace(root + "/", ""))
+    println("  root_dirs:     state, config, .meta2-cert")
+    println("  file_count:    " + fc)
+    println("  total_bytes:   " + tb)
+    println("  root_sha256:   " + rs)
+    return 0
+}
+
+// ─── subcommand: verify / diff ───────────────────────────────────────────
+
+fn _load_baseline_tree(baseline_path: string) -> string {
+    // flatten baseline sha256_tree → lines "path\tsha\n" (sorted)
+    let cmd = "jq -r '.sha256_tree | to_entries[] | \"\\(.key)\\t\\(.value)\"' "
+            + _shq(baseline_path) + " 2>/dev/null | LC_ALL=C sort"
+    return _str(exec(cmd))
+}
+
+fn _current_tree(root: string) -> string {
+    // lines "path\tsha\n" from current disk (no byte column)
+    let raw = _collect_all(root, _roots_list())
+    let lines = raw.split("\n")
+    let mut out = ""
+    let i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i]).trim()
+        if ln != "" {
+            let t = _parse_line(ln)
+            if len(t) == 3 {
+                out = out + _str(t[0]) + "\t" + _str(t[1]) + "\n"
+            }
+        }
+        i = i + 1
+    }
+    // sort (LC_ALL=C) to match baseline ordering
+    let tmp = _str(exec("mktemp")).trim()
+    write_file(tmp, out)
+    let sorted = _str(exec("LC_ALL=C sort " + _shq(tmp) + " 2>/dev/null"))
+    exec("rm -f " + _shq(tmp))
+    return sorted
+}
+
+// build map path→sha from "path\tsha\n" body
+fn _lines_to_pairs(body: string) -> array {
+    let out = []
+    let lines = body.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i])
+        if ln != "" {
+            let p = ln.split("\t")
+            if len(p) >= 2 {
+                out = out + [_str(p[0]) + "|" + _str(p[1])]
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _pair_path(p: string) -> string {
+    let ps = p.split("|")
+    if len(ps) > 0 { return _str(ps[0]) }
+    return ""
+}
+
+fn _pair_sha(p: string) -> string {
+    let ps = p.split("|")
+    if len(ps) > 1 { return _str(ps[1]) }
+    return ""
+}
+
+fn _find_sha(pairs: array, path: string) -> string {
+    // linear search (OK for <10k files). For larger repos switch to sorted merge.
+    let i = 0
+    while i < len(pairs) {
+        let pp = _str(pairs[i])
+        if _pair_path(pp) == path { return _pair_sha(pp) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _contains_path(pairs: array, path: string) -> bool {
+    let i = 0
+    while i < len(pairs) {
+        if _pair_path(_str(pairs[i])) == path { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// returns [added[], removed[], modified[], unchanged_count]
+fn _diff_trees(baseline_body: string, current_body: string) -> array {
+    let bp = _lines_to_pairs(baseline_body)
+    let cp = _lines_to_pairs(current_body)
+    let mut added = []
+    let mut removed = []
+    let mut modified = []
+    let mut unchanged = 0
+    // removed + modified: baseline not in current OR sha differs
+    let i = 0
+    while i < len(bp) {
+        let pp = _str(bp[i])
+        let pth = _pair_path(pp)
+        let bsh = _pair_sha(pp)
+        if !_contains_path(cp, pth) {
+            removed = removed + [pth]
+        } else {
+            let csh = _find_sha(cp, pth)
+            if csh == bsh { unchanged = unchanged + 1 }
+            else { modified = modified + [pth] }
+        }
+        i = i + 1
+    }
+    // added: in current not in baseline
+    let j = 0
+    while j < len(cp) {
+        let pp = _str(cp[j])
+        let pth = _pair_path(pp)
+        if !_contains_path(bp, pth) { added = added + [pth] }
+        j = j + 1
+    }
+    return [added, removed, modified, unchanged]
+}
+
+fn _emit_verify_json(out_path: string, added, removed, modified, unchanged: int, drift_count: int) {
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"anima.snap.verify.v1\",\n"
+    body = body + "  \"ts\": \"" + _ts_iso() + "\",\n"
+    body = body + "  \"drift_count\": " + to_string(drift_count) + ",\n"
+    body = body + "  \"unchanged\": "  + to_string(unchanged) + ",\n"
+    body = body + "  \"added\": ["     + _json_array_of(added) + "],\n"
+    body = body + "  \"removed\": ["   + _json_array_of(removed) + "],\n"
+    body = body + "  \"modified\": ["  + _json_array_of(modified) + "]\n"
+    body = body + "}\n"
+    write_file(out_path, body)
+}
+
+fn _json_array_of(arr: array) -> string {
+    let mut out = ""
+    let i = 0
+    while i < len(arr) {
+        if i > 0 { out = out + ", " }
+        out = out + _json_escape(_str(arr[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn _print_list(label: string, items: array, max_show: int) {
+    if len(items) == 0 { return }
+    println("  " + label + " (" + to_string(len(items)) + ")")
+    let i = 0
+    while i < len(items) && i < max_show {
+        println("    - " + _str(items[i]))
+        i = i + 1
+    }
+    if len(items) > max_show {
+        println("    ... (+ " + to_string(len(items) - max_show) + " more)")
+    }
+}
+
+fn sub_verify(root: string, json_mode: bool, detailed: bool) -> int {
+    let baseline = root + "/state/anima_snap_baseline.json"
+    if !_fexists(baseline) {
+        println("anima snap verify: baseline missing (run `anima snap create` first)")
+        println("  expected: state/anima_snap_baseline.json")
+        exit(2)
+    }
+    let bb = _load_baseline_tree(baseline)
+    let cc = _current_tree(root)
+    let d = _diff_trees(bb, cc)
+    let added    = d[0]
+    let removed  = d[1]
+    let modified = d[2]
+    let unchanged = d[3]   // already int from _diff_trees
+    let drift = len(added) + len(removed) + len(modified)
+    let out_path = root + "/state/anima_snap_verify_last.json"
+    _emit_verify_json(out_path, added, removed, modified, unchanged, drift)
+    if json_mode {
+        println(_str(exec("cat " + _shq(out_path))))
+    } else {
+        println("anima snap verify — drift report")
+        println("  baseline:      state/anima_snap_baseline.json")
+        println("  unchanged:     " + to_string(unchanged))
+        println("  added:         " + to_string(len(added)))
+        println("  removed:       " + to_string(len(removed)))
+        println("  modified:      " + to_string(len(modified)))
+        println("  drift_count:   " + to_string(drift))
+        let max_show = if detailed { 200 } else { 10 }
+        _print_list("added",    added,    max_show)
+        _print_list("removed",  removed,  max_show)
+        _print_list("modified", modified, max_show)
+        if drift == 0 { println("  verdict:       ✓ no drift") }
+        else          { println("  verdict:       ✗ drift detected (exit 1)") }
+        println("  state:         " + out_path.replace(root + "/", ""))
+    }
+    if drift > 0 { return 1 }
+    return 0
+}
+
+// ─── selftest: synthetic 2-file create → modify → verify drift ──────────
+
+fn sub_selftest() {
+    let tmp = _str(exec("mktemp -d")).trim()
+    if tmp == "" { println("FAIL anima_cli/snap selftest (mktemp)"); exit(1) }
+    exec("mkdir -p " + tmp + "/state " + tmp + "/config " + tmp + "/.meta2-cert")
+    write_file(tmp + "/state/foo.json",    "{\"v\":1}\n")
+    write_file(tmp + "/config/bar.json",   "{\"k\":\"a\"}\n")
+    write_file(tmp + "/.meta2-cert/c.json","{\"id\":\"c1\"}\n")
+
+    // 1) create baseline at tmp
+    let roots = _roots_list()
+    let body = _build_baseline_json(tmp, roots)
+    write_file(tmp + "/state/anima_snap_baseline.json", body)
+    let fc_raw = _str(exec("jq -r '.file_count' " + _shq(tmp + "/state/anima_snap_baseline.json"))).trim()
+    let rs_raw = _str(exec("jq -r '.root_sha256' " + _shq(tmp + "/state/anima_snap_baseline.json"))).trim()
+    if fc_raw == "" || rs_raw == "" {
+        exec("rm -rf " + tmp)
+        println("FAIL anima_cli/snap selftest (baseline emit)")
+        exit(1)
+    }
+
+    // 2) verify immediately → drift MUST be 0
+    let bb1 = _load_baseline_tree(tmp + "/state/anima_snap_baseline.json")
+    let cc1 = _current_tree(tmp)
+    let d1 = _diff_trees(bb1, cc1)
+    let drift1 = len(d1[0]) + len(d1[1]) + len(d1[2])
+    if drift1 != 0 {
+        exec("rm -rf " + tmp)
+        println("FAIL anima_cli/snap selftest (immediate verify drift=" + to_string(drift1) + ")")
+        exit(1)
+    }
+
+    // 3) modify + add + remove → verify MUST detect drift
+    write_file(tmp + "/state/foo.json",    "{\"v\":2}\n")       // modified
+    write_file(tmp + "/state/new.json",    "{\"n\":true}\n")     // added
+    exec("rm -f " + tmp + "/config/bar.json")                    // removed
+
+    let bb2 = _load_baseline_tree(tmp + "/state/anima_snap_baseline.json")
+    let cc2 = _current_tree(tmp)
+    let d2 = _diff_trees(bb2, cc2)
+    let added2    = d2[0]
+    let removed2  = d2[1]
+    let modified2 = d2[2]
+    let drift2 = len(added2) + len(removed2) + len(modified2)
+
+    let ok = drift2 >= 3
+        && len(added2)    >= 1
+        && len(removed2)  >= 1
+        && len(modified2) >= 1
+
+    exec("rm -rf " + tmp)
+    if ok {
+        println("PASS anima_cli/snap selftest")
+        println("  baseline: file_count=" + fc_raw + " root_sha256=" + rs_raw.substring(0, 12) + "...")
+        println("  drift after mutate: added=" + to_string(len(added2))
+              + " removed=" + to_string(len(removed2))
+              + " modified=" + to_string(len(modified2)))
+        exit(0)
+    }
+    println("FAIL anima_cli/snap selftest (drift mismatch)")
+    println("  added="    + to_string(len(added2)))
+    println("  removed="  + to_string(len(removed2)))
+    println("  modified=" + to_string(len(modified2)))
+    exit(1)
+}
+
+// ─── help ────────────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima snap — state/ + config/ + .meta2-cert/ sha256 tree (tamper detect)")
+    println("")
+    println("  snap create        build baseline → state/anima_snap_baseline.json")
+    println("  snap verify        compare current vs baseline (exit 1 if drift)")
+    println("  snap diff          detailed verify view (per-file listing)")
+    println("  snap --json        machine-readable verdict")
+    println("  snap --selftest    synthetic 2-file create → modify → verify drift")
+    println("  snap --help")
+    println("")
+    println("OUTPUT")
+    println("  state/anima_snap_baseline.json     (schema anima.snap.v1)")
+    println("  state/anima_snap_verify_last.json  (schema anima.snap.verify.v1)")
+    println("")
+    println("EXIT CODES")
+    println("  0 no drift · 1 drift detected · 2 baseline missing")
+}
+
+// ─── entry ───────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help")     { sub_help(); return }
+    let json_mode = _arg_present(argv, "--json")
+    let root = _resolve_root()
+    if len(argv) == 0 {
+        sub_help()
+        return
+    }
+    let sub = _str(argv[0])
+    if sub == "create" {
+        let rc = sub_create(root, json_mode)
+        exit(rc)
+        return
+    }
+    if sub == "verify" {
+        let rc = sub_verify(root, json_mode, false)
+        exit(rc)
+        return
+    }
+    if sub == "diff" {
+        let rc = sub_verify(root, json_mode, true)
+        exit(rc)
+        return
+    }
+    if sub == "--json" {
+        // bare `anima snap --json` → default to verify json
+        let rc = sub_verify(root, true, false)
+        exit(rc)
+        return
+    }
+    println("anima snap: unknown subcommand: " + sub)
+    sub_help()
+    exit(2)
+}
+
+main()

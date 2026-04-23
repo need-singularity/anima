@@ -1,0 +1,996 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/proposal_emit.hexa
+//
+//  PURPOSE
+//    Scans canonical signal sources (blocker / roi / closure_axis style state +
+//    docs) and emits proposal candidates into the proposal stack defined by
+//    docs/anima_proposal_stack_paradigm_20260422.md (§2 schema, §3 cycle,
+//    §6 dedup).
+//
+//  SOURCES (all read-only)
+//    state/secret_scan_violations.json    (5 MEDIUM remaining)
+//    state/lint_violations.json           (raw)
+//    state/lint_autofix_audit.json        (manual_review = 72)
+//    state/code_quality_audit.json        (H41 dead_code KEEP, H42 dup_util 7)
+//    state/dist_skip_diagnosis.json       (RESOLVED but upstream pending)
+//    state/file_completion_ledger.json    (missing_files)
+//    state/v2_roi_selftest_batch_result.json  (J / FAIL docs lingering)
+//    docs/h100_roi_improvements_20260422.md   (~82-92 ROI items)
+//
+//  OUTPUTS
+//    state/proposals/inventory.json                        (SSOT, append/update)
+//    state/proposals/pending/<date>-<seq>_<slug>.json      (new proposals)
+//    state/proposals/refinement/<id>/v<N>.json             (dedup hit refinement)
+//
+//  DEDUP
+//    sha256(title.lower() + "\n" + first_evidence_path)
+//
+//  PROTECTION
+//    --dry            (default) — print plan, no writes
+//    --apply          — write inventory + new proposals + refinement bumps
+//    --selftest       — synthetic 3 violations → 2 unique (1 dedup)
+//    flood protect    — max 20 new proposals per --apply call (rest queued)
+//
+//  SCORING
+//    priority = base_impact * (1 - risk_level) / log(effort_hours + 2)
+//
+//  CONSTRAINTS
+//    - Never mutates anything outside state/proposals/.
+//    - Never auto-commits, never edits .roadmap.
+//    - evidence_sources entries carry { path, field, snapshot_sha256 }.
+//
+//  USAGE
+//    hexa run tool/proposal_emit.hexa
+//    hexa run tool/proposal_emit.hexa --apply
+//    hexa run tool/proposal_emit.hexa --selftest
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let PROP_ROOT  = "/Users/ghost/core/anima/state/proposals"
+let INV_PATH   = "/Users/ghost/core/anima/state/proposals/inventory.json"
+
+let SRC_SECRET   = "/Users/ghost/core/anima/state/secret_scan_violations.json"
+let SRC_LINT     = "/Users/ghost/core/anima/state/lint_violations.json"
+let SRC_AUTOFIX  = "/Users/ghost/core/anima/state/lint_autofix_audit.json"
+let SRC_QAUDIT   = "/Users/ghost/core/anima/state/code_quality_audit.json"
+let SRC_DISTSKIP = "/Users/ghost/core/anima/state/dist_skip_diagnosis.json"
+let SRC_FILEL    = "/Users/ghost/core/anima/state/file_completion_ledger.json"
+let SRC_V2ROI    = "/Users/ghost/core/anima/state/v2_roi_selftest_batch_result.json"
+let SRC_ROIDOC   = "/Users/ghost/core/anima/docs/h100_roi_improvements_20260422.md"
+
+let MAX_NEW_PER_APPLY = 20
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+fn _shq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _shq(p))[1] == 0
+}
+
+fn _ts_iso() -> string {
+    return to_string(exec_with_status("date -u +%Y-%m-%dT%H:%M:%SZ")[0]).trim()
+}
+
+fn _today_yyyymmdd() -> string {
+    return to_string(exec_with_status("date -u +%Y%m%d")[0]).trim()
+}
+
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn _sha256_str(s: string) -> string {
+    let cmd = "printf '%s' " + _shq(s) + " | shasum -a 256 | awk '{print $1}'"
+    return to_string(exec_with_status(cmd)[0]).trim()
+}
+
+fn _sha256_file(p: string) -> string {
+    if !_file_exists(p) { return "" }
+    let r = exec_with_status("shasum -a 256 " + _shq(p) + " | awk '{print $1}'")
+    return to_string(r[0]).trim()
+}
+
+fn _to_lower(s: string) -> string {
+    return to_string(exec_with_status("printf '%s' " + _shq(s) + " | tr '[:upper:]' '[:lower:]'")[0]).trim()
+}
+
+fn _slugify(s: string) -> string {
+    let cmd = "printf '%s' " + _shq(s) +
+        " | tr '[:upper:]' '[:lower:]'" +
+        " | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/(.{48}).*/\\1/'"
+    let r = to_string(exec_with_status(cmd)[0]).trim()
+    if len(r) == 0 { return "untitled" }
+    return r
+}
+
+fn _arg_present(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+
+fn _mkdir_p(p: string) {
+    exec_with_status("mkdir -p " + _shq(p))
+}
+
+fn _atomic_write(path: string, body: string) {
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    exec_with_status("mv -f " + _shq(tmp) + " " + _shq(path))
+}
+
+// ─── proposal scoring ──────────────────────────────────────────────────────
+// priority = base_impact * (1 - risk_level) / log(effort_hours + 2)
+//   base_impact ∈ [0, 100]   risk_level ∈ [0, 1]   effort_hours ≥ 0
+//
+// We approximate ln(x) by a small lookup since hexa stage0 lacks math.log.
+
+fn _ln_approx(x: float) -> float {
+    // ln(2)=0.6931, ln(4)=1.3863, ln(10)=2.3026, ln(50)=3.912, ln(170)=5.135
+    if x <= 1.0 { return 0.4054 }    // ln(1.5)
+    if x <= 2.0 { return 0.6931 }
+    if x <= 4.0 { return 1.3863 }
+    if x <= 8.0 { return 2.0794 }
+    if x <= 16.0 { return 2.7726 }
+    if x <= 32.0 { return 3.4657 }
+    if x <= 64.0 { return 4.1589 }
+    if x <= 128.0 { return 4.852 }
+    return 5.5
+}
+
+fn _score(base_impact: int, risk_level: float, effort_hours: float) -> int {
+    let ln_v = _ln_approx(effort_hours + 2.0)
+    let raw = (to_float(base_impact) * (1.0 - risk_level)) / ln_v
+    let mut clamped = raw
+    if clamped < 0.0 { clamped = 0.0 }
+    if clamped > 100.0 { clamped = 100.0 }
+    return to_int(to_string(clamped))
+}
+
+// ─── candidate emit struct (built as json map) ─────────────────────────────
+
+fn _mk_cand(title: string, kind: string, rationale: string,
+            ev_path: string, ev_field: string, ev_sha: string,
+            base_impact: int, risk_level: float, effort_hours: float,
+            loss_free: bool) -> map {
+    let mut m = json_parse("{}")
+    m["title"]            = title
+    m["kind"]             = kind
+    m["rationale"]        = rationale
+    m["ev_path"]          = ev_path
+    m["ev_field"]         = ev_field
+    m["ev_sha256"]        = ev_sha
+    m["base_impact"]      = base_impact
+    m["risk_level"]       = risk_level
+    m["effort_hours"]     = effort_hours
+    m["loss_free"]        = loss_free
+    m["score_priority"]   = _score(base_impact, risk_level, effort_hours)
+    m["dedup_key"]        = _sha256_str(_to_lower(title) + "\n" + ev_path)
+    return m
+}
+
+// ─── scanners — each returns array of candidate maps ──────────────────────
+
+fn _scan_secret() -> array {
+    let mut out = []
+    if !_file_exists(SRC_SECRET) { return out }
+    let raw = to_string(read_file(SRC_SECRET))
+    if len(raw.trim()) == 0 { return out }
+    let obj = json_parse(raw)
+    if !obj.contains_key("violations") { return out }
+    let viols = obj["violations"]
+    let sha = _sha256_file(SRC_SECRET)
+    // Group by file path to produce one proposal per file (dedup intra-source).
+    let mut seen = json_parse("{}")
+    let mut i = 0
+    while i < len(viols) {
+        let v = viols[i]
+        let p = to_string(v["path"])
+        if !seen.contains_key(p) {
+            seen[p] = 1
+            let sev = to_string(v["severity"])
+            let title = "secret_scan: " + sev + " entropy hit in " + p
+            let rat = "secret_scanner flagged " + sev + " entropy match (" +
+                to_string(v["pattern_id"]) + ", near keyword \"" +
+                to_string(v["near_keyword"]) + "\"). Manual review required to " +
+                "either redact, mark allowlist, or rotate credential."
+            out.push(_mk_cand(title, "fix", rat, p, "violations[].path", sha,
+                              60, 0.05, 1.0, true))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _scan_lint_autofix() -> array {
+    let mut out = []
+    if !_file_exists(SRC_AUTOFIX) { return out }
+    let raw = to_string(read_file(SRC_AUTOFIX))
+    if len(raw.trim()) == 0 { return out }
+    let obj = json_parse(raw)
+    if !obj.contains_key("entries") { return out }
+    let entries = obj["entries"]
+    let sha = _sha256_file(SRC_AUTOFIX)
+    // Group manual_review by check kind.
+    let mut buckets = json_parse("{}")
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let pol = to_string(e["policy"])
+        if pol == "manual_review" {
+            let k = to_string(e["check"]) + "::" + to_string(e["kind"])
+            if !buckets.contains_key(k) {
+                buckets[k] = []
+            }
+            buckets[k] = buckets[k] + [to_string(e["file"])]
+        }
+        i = i + 1
+    }
+    let keys = buckets.keys()
+    let mut j = 0
+    while j < len(keys) {
+        let k = to_string(keys[j])
+        let files = buckets[k]
+        let n = len(files)
+        let first_file = if n > 0 { to_string(files[0]) } else { "" }
+        let title = "lint_autofix manual_review: " + k + " (" + to_string(n) + " files)"
+        let rat = "lint_autofix classified " + to_string(n) + " violations of " +
+            k + " as manual_review. Either approve a mechanical rewrite policy " +
+            "(env-var rollout / allowlist) or mark these as documented exceptions."
+        // Effort scales linearly with bucket size; impact moderate; risk low (manual).
+        let eff = 0.5 + (to_float(n) * 0.15)
+        out.push(_mk_cand(title, "fix", rat, first_file,
+                          "entries[].file (kind=" + k + ")", sha,
+                          45, 0.1, eff, true))
+        j = j + 1
+    }
+    return out
+}
+
+fn _scan_qaudit() -> array {
+    let mut out = []
+    if !_file_exists(SRC_QAUDIT) { return out }
+    let raw = to_string(read_file(SRC_QAUDIT))
+    if len(raw.trim()) == 0 { return out }
+    let obj = json_parse(raw)
+    let sha = _sha256_file(SRC_QAUDIT)
+    if !obj.contains_key("summary") { return out }
+    let s = obj["summary"]
+    if s.contains_key("H41_dead_fns") {
+        let n = to_int(to_string(s["H41_dead_fns"]))
+        if n > 0 {
+            let title = "code_quality H41: " + to_string(n) + " dead functions (KEEP review)"
+            let rat = "H41 dead-code audit identified " + to_string(n) +
+                " functions with no caller. Decide per-fn: KEEP (intentional" +
+                " future-use), DELETE, or migrate to shared/util/."
+            out.push(_mk_cand(title, "fix", rat, SRC_QAUDIT,
+                              "summary.H41_dead_fns", sha, 30, 0.1, 4.0, true))
+        }
+    }
+    if s.contains_key("H42_dup_utils") {
+        let n = to_int(to_string(s["H42_dup_utils"]))
+        if n > 0 {
+            let title = "code_quality H42: " + to_string(n) + " duplicated utility candidates"
+            let rat = "H42 util-extract audit found " + to_string(n) +
+                " duplicated helper bodies (sh_quote / file_exists / ts_iso etc)." +
+                " Promote each to shared/util/ and replace inline copies after" +
+                " selftest pass."
+            out.push(_mk_cand(title, "tool", rat, SRC_QAUDIT,
+                              "summary.H42_dup_utils", sha, 50, 0.15, 6.0, true))
+        }
+    }
+    return out
+}
+
+fn _scan_distskip() -> array {
+    let mut out = []
+    if !_file_exists(SRC_DISTSKIP) { return out }
+    let raw = to_string(read_file(SRC_DISTSKIP))
+    if len(raw.trim()) == 0 { return out }
+    let obj = json_parse(raw)
+    let sha = _sha256_file(SRC_DISTSKIP)
+    let upstream = if obj.contains_key("upstream_fix_pending") {
+        to_string(obj["upstream_fix_pending"])
+    } else { "" }
+    if len(upstream) > 0 {
+        let title = "dist_skip upstream pending: hexa-lang builtin name mangling"
+        let rat = "dist_skip_diagnosis is RESOLVED locally via build_fixup_native" +
+            " workaround, but upstream fix still pending: " + upstream +
+            ". Track in hexa-lang repo and remove sed-fixup once landed."
+        out.push(_mk_cand(title, "deprecation", rat, SRC_DISTSKIP,
+                          "upstream_fix_pending", sha, 40, 0.05, 8.0, true))
+    }
+    return out
+}
+
+fn _scan_file_ledger() -> array {
+    let mut out = []
+    if !_file_exists(SRC_FILEL) { return out }
+    let raw = to_string(read_file(SRC_FILEL))
+    if len(raw.trim()) == 0 { return out }
+    let obj = json_parse(raw)
+    if !obj.contains_key("missing_files") { return out }
+    let missing = obj["missing_files"]
+    let sha = _sha256_file(SRC_FILEL)
+    let mut i = 0
+    while i < len(missing) {
+        let m = missing[i]
+        let p = to_string(m["path"])
+        let kind = if m.contains_key("kind") { to_string(m["kind"]) } else { "unknown" }
+        let title = "missing referenced file: " + p
+        let rat = "file_completion_ledger flagged " + p + " (kind=" + kind +
+            ") as referenced but absent. Either create the artifact, remove the" +
+            " reference, or mark it as deferred with explicit owner."
+        // Higher impact on tool/state kinds; cert kinds = high.
+        let mut imp = 35
+        if kind == "cert" { imp = 65 }
+        if kind == "tool" { imp = 55 }
+        if kind == "config" { imp = 45 }
+        out.push(_mk_cand(title, "fix", rat, p,
+                          "missing_files[].path", sha, imp, 0.1, 2.0, true))
+        i = i + 1
+    }
+    return out
+}
+
+fn _scan_v2roi() -> array {
+    let mut out = []
+    if !_file_exists(SRC_V2ROI) { return out }
+    let raw = to_string(read_file(SRC_V2ROI))
+    if len(raw.trim()) == 0 { return out }
+    let obj = json_parse(raw)
+    let sha = _sha256_file(SRC_V2ROI)
+    if !obj.contains_key("tools") { return out }
+    let tools = obj["tools"]
+    let mut i = 0
+    while i < len(tools) {
+        let t = tools[i]
+        let verdict = to_string(t["verdict"])
+        if verdict == "FAIL" {
+            let p = to_string(t["path"])
+            let stderr_s = if t.contains_key("stderr_summary") {
+                to_string(t["stderr_summary"])
+            } else { "" }
+            let title = "v2_roi_selftest FAIL: " + p
+            let rat = "selftest of " + p + " failed: " + stderr_s +
+                ". Likely shared root cause flagged in" +
+                " v2_roi_selftest_batch_result.fail_root_cause_hint." +
+                " Resolve before launch."
+            out.push(_mk_cand(title, "fix", rat, p,
+                              "tools[].verdict=FAIL", sha, 65, 0.15, 1.5, true))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ROI doc — count + propose batch tracker. We don't try to parse markdown row
+// by row in hexa; instead we shell out to grep to obtain the row count and the
+// title text of the top N un-applied items via awk.
+fn _scan_roi_doc() -> array {
+    let mut out = []
+    if !_file_exists(SRC_ROIDOC) { return out }
+    let sha = _sha256_file(SRC_ROIDOC)
+    let cnt_r = exec_with_status("grep -cE '^\\| [0-9]+ \\|' " + _shq(SRC_ROIDOC))
+    let n_str = to_string(cnt_r[0]).trim()
+    let n = if len(n_str) == 0 { 0 } else { to_int(n_str) }
+    if n <= 0 { return out }
+    let title = "h100 ROI batch: " + to_string(n) + " loss-free improvement items pending"
+    let rat = "docs/h100_roi_improvements_20260422.md enumerates " + to_string(n) +
+        " loss-free improvement items (cost, throughput, signal). Cluster into" +
+        " A/B/C/... groups, approve TOP-N for sub-agent batch, archive remainder."
+    out.push(_mk_cand(title, "cluster", rat, SRC_ROIDOC,
+                      "rows matching ^| <int> |", sha, 70, 0.1, 16.0, true))
+    return out
+}
+
+// ─── inventory IO ──────────────────────────────────────────────────────────
+
+fn _ensure_proposal_tree() {
+    _mkdir_p(PROP_ROOT)
+    _mkdir_p(PROP_ROOT + "/pending")
+    _mkdir_p(PROP_ROOT + "/refinement")
+    _mkdir_p(PROP_ROOT + "/approved")
+    _mkdir_p(PROP_ROOT + "/rejected")
+    _mkdir_p(PROP_ROOT + "/archived")
+    _mkdir_p(PROP_ROOT + "/debate")
+    _mkdir_p(PROP_ROOT + "/clusters")
+    _mkdir_p(PROP_ROOT + "/meta")
+}
+
+fn _load_inventory() -> map {
+    if !_file_exists(INV_PATH) {
+        return _load_inventory_blank()
+    }
+    let raw = to_string(read_file(INV_PATH))
+    if len(raw.trim()) == 0 {
+        return _load_inventory_blank()
+    }
+    let parsed = json_parse(raw)
+    // Migrate / fill missing optional keys so downstream code stays simple.
+    let mut inv = json_parse("{}")
+    inv["schema"]     = if parsed.contains_key("schema")     { to_string(parsed["schema"]) }     else { "anima.proposal_inventory.v1" }
+    inv["created_at"] = if parsed.contains_key("created_at") { to_string(parsed["created_at"]) } else { _ts_iso() }
+    inv["updated_at"] = if parsed.contains_key("updated_at") { to_string(parsed["updated_at"]) } else { _ts_iso() }
+    inv["proposals"]  = if parsed.contains_key("proposals")  { parsed["proposals"] }             else { [] }
+    inv["summary"]    = if parsed.contains_key("summary")    { parsed["summary"] }               else { json_parse("{\"total\":0,\"pending\":0,\"approved\":0,\"rejected\":0,\"archived\":0,\"debate\":0}") }
+    inv["seq_today"]  = if parsed.contains_key("seq_today")  { parsed["seq_today"] }             else { json_parse("{}") }
+    // SCHEMA COEXISTENCE (option C, 2026-04-22): preserve "entries" if the
+    // cluster_detect tool has populated it, so our rewrite does not clobber
+    // cluster meta. Downstream consumers may ignore this field — it is a
+    // transparent passthrough.
+    inv["entries"]    = if parsed.contains_key("entries")    { parsed["entries"] }               else { [] }
+    return inv
+}
+
+fn _load_inventory_blank() -> map {
+    let mut inv = json_parse("{}")
+    inv["schema"]      = "anima.proposal_inventory.v1"
+    inv["created_at"]  = _ts_iso()
+    inv["updated_at"]  = _ts_iso()
+    inv["proposals"]   = []
+    inv["entries"]     = []   // coexistence: cluster_detect's namespace
+    inv["summary"]     = json_parse("{\"total\":0,\"pending\":0,\"approved\":0,\"rejected\":0,\"archived\":0,\"debate\":0}")
+    inv["seq_today"]   = json_parse("{}")
+    return inv
+}
+
+fn _next_seq(inv: map, day: string) -> int {
+    let map_seq = inv["seq_today"]
+    if !map_seq.contains_key(day) { return 1 }
+    return to_int(to_string(map_seq[day])) + 1
+}
+
+fn _bump_seq(inv: map, day: string, n: int) -> map {
+    let mut m = inv
+    let mut s = m["seq_today"]
+    s[day] = n
+    m["seq_today"] = s
+    return m
+}
+
+fn _index_by_dedup(inv: map) -> map {
+    let mut idx = json_parse("{}")
+    let proposals = inv["proposals"]
+    let mut i = 0
+    while i < len(proposals) {
+        let p = proposals[i]
+        if p.contains_key("dedup_key") {
+            idx[to_string(p["dedup_key"])] = i
+        }
+        i = i + 1
+    }
+    return idx
+}
+
+fn _summary_recount(inv: map) -> map {
+    let mut m = inv
+    let proposals = m["proposals"]
+    let mut total = 0
+    let mut pend = 0
+    let mut appr = 0
+    let mut rej  = 0
+    let mut arch = 0
+    let mut deb  = 0
+    let mut i = 0
+    while i < len(proposals) {
+        let p = proposals[i]
+        total = total + 1
+        let st = to_string(p["user_status"])
+        if st == "pending"  { pend = pend + 1 }
+        if st == "approved" { appr = appr + 1 }
+        if st == "rejected" { rej  = rej  + 1 }
+        if st == "archived" { arch = arch + 1 }
+        if st == "debate"   { deb  = deb  + 1 }
+        i = i + 1
+    }
+    let mut s = json_parse("{}")
+    s["total"]    = total
+    s["pending"]  = pend
+    s["approved"] = appr
+    s["rejected"] = rej
+    s["archived"] = arch
+    s["debate"]   = deb
+    m["summary"]  = s
+    return m
+}
+
+// ─── proposal serialization ────────────────────────────────────────────────
+
+fn _proposal_to_json(p: map) -> string {
+    // Hand-rolled JSON to keep field ordering stable + readable.
+    let mut j = "{\n"
+    j = j + "  \"id\": \""              + _json_esc(to_string(p["id"]))              + "\",\n"
+    j = j + "  \"version\": "           + to_string(p["version"])                    + ",\n"
+    j = j + "  \"first_seen_ts\": \""   + _json_esc(to_string(p["first_seen_ts"]))   + "\",\n"
+    j = j + "  \"last_refined_ts\": \"" + _json_esc(to_string(p["last_refined_ts"])) + "\",\n"
+    j = j + "  \"title\": \""           + _json_esc(to_string(p["title"]))           + "\",\n"
+    j = j + "  \"kind\": \""            + _json_esc(to_string(p["kind"]))            + "\",\n"
+    j = j + "  \"rationale\": \""       + _json_esc(to_string(p["rationale"]))       + "\",\n"
+    j = j + "  \"evidence_sources\": [\n"
+    let evs = p["evidence_sources"]
+    let mut i = 0
+    while i < len(evs) {
+        let e = evs[i]
+        j = j + "    {\"path\": \"" + _json_esc(to_string(e["path"])) +
+            "\", \"field\": \"" + _json_esc(to_string(e["field"])) +
+            "\", \"snapshot_sha256\": \"" + _json_esc(to_string(e["snapshot_sha256"])) + "\"}"
+        if i + 1 < len(evs) { j = j + "," }
+        j = j + "\n"
+        i = i + 1
+    }
+    j = j + "  ],\n"
+    j = j + "  \"estimated_effort_hours\": " + to_string(p["estimated_effort_hours"]) + ",\n"
+    j = j + "  \"estimated_impact\": "       + to_string(p["estimated_impact"])       + ",\n"
+    j = j + "  \"risk_level\": "             + to_string(p["risk_level"])             + ",\n"
+    j = j + "  \"loss_free\": "              + (if to_string(p["loss_free"]) == "true" { "true" } else { "false" }) + ",\n"
+    j = j + "  \"depends_on\": [],\n"
+    j = j + "  \"conflicts_with\": [],\n"
+    j = j + "  \"merges_with\": [],\n"
+    j = j + "  \"refinement_history\": [\n"
+    let hist = p["refinement_history"]
+    let mut k = 0
+    while k < len(hist) {
+        let h = hist[k]
+        j = j + "    {\"v\": " + to_string(h["v"]) +
+            ", \"ts\": \"" + _json_esc(to_string(h["ts"])) +
+            "\", \"diff\": \"" + _json_esc(to_string(h["diff"])) + "\"}"
+        if k + 1 < len(hist) { j = j + "," }
+        j = j + "\n"
+        k = k + 1
+    }
+    j = j + "  ],\n"
+    j = j + "  \"score_priority\": " + to_string(p["score_priority"]) + ",\n"
+    j = j + "  \"user_status\": \""  + _json_esc(to_string(p["user_status"])) + "\",\n"
+    j = j + "  \"user_decision_at\": null,\n"
+    j = j + "  \"user_decision_reason\": null,\n"
+    j = j + "  \"implementation_module_path\": null,\n"
+    j = j + "  \"lineage_parent\": null,\n"
+    j = j + "  \"lineage_children\": [],\n"
+    j = j + "  \"veto_count\": 0,\n"
+    j = j + "  \"resurrection_eligible_after\": null,\n"
+    j = j + "  \"dedup_key\": \"" + _json_esc(to_string(p["dedup_key"])) + "\",\n"
+    j = j + "  \"source_signal\": \"" + _json_esc(to_string(p["source_signal"])) + "\"\n"
+    j = j + "}\n"
+    return j
+}
+
+fn _inventory_entry_to_json(p: map) -> string {
+    // Compact summary — full file lives in pending/<id>.json
+    let mut j = "    {\"id\": \"" + _json_esc(to_string(p["id"])) +
+        "\", \"version\": " + to_string(p["version"]) +
+        ", \"title\": \"" + _json_esc(to_string(p["title"])) +
+        "\", \"kind\": \"" + _json_esc(to_string(p["kind"])) +
+        "\", \"score_priority\": " + to_string(p["score_priority"]) +
+        ", \"user_status\": \"" + _json_esc(to_string(p["user_status"])) +
+        "\", \"first_seen_ts\": \"" + _json_esc(to_string(p["first_seen_ts"])) +
+        "\", \"last_refined_ts\": \"" + _json_esc(to_string(p["last_refined_ts"])) +
+        "\", \"dedup_key\": \"" + _json_esc(to_string(p["dedup_key"])) +
+        "\", \"source_signal\": \"" + _json_esc(to_string(p["source_signal"])) +
+        "\", \"path\": \"" + _json_esc(to_string(p["path"])) + "\"}"
+    return j
+}
+
+fn _inventory_to_json(inv: map) -> string {
+    let mut j = "{\n"
+    j = j + "  \"schema\": \""      + _json_esc(to_string(inv["schema"]))     + "\",\n"
+    j = j + "  \"created_at\": \""  + _json_esc(to_string(inv["created_at"])) + "\",\n"
+    j = j + "  \"updated_at\": \""  + _json_esc(to_string(inv["updated_at"])) + "\",\n"
+    j = j + "  \"summary\": "       + _summary_inline(inv["summary"])         + ",\n"
+    j = j + "  \"seq_today\": "     + _seq_today_inline(inv["seq_today"])     + ",\n"
+    // SCHEMA COEXISTENCE (option C): preserve cluster_detect's "entries"
+    // namespace. Serialized as-is via json_stringify so cluster meta
+    // (member_count / merges_with / signal_kind / …) round-trips losslessly.
+    let ents = if inv.contains_key("entries") { inv["entries"] } else { [] }
+    j = j + "  \"entries\": " + json_stringify(ents) + ",\n"
+    j = j + "  \"proposals\": [\n"
+    let proposals = inv["proposals"]
+    let mut i = 0
+    while i < len(proposals) {
+        j = j + _inventory_entry_to_json(proposals[i])
+        if i + 1 < len(proposals) { j = j + "," }
+        j = j + "\n"
+        i = i + 1
+    }
+    j = j + "  ]\n"
+    j = j + "}\n"
+    return j
+}
+
+fn _summary_inline(s: map) -> string {
+    return "{\"total\": " + to_string(s["total"]) +
+        ", \"pending\": " + to_string(s["pending"]) +
+        ", \"approved\": " + to_string(s["approved"]) +
+        ", \"rejected\": " + to_string(s["rejected"]) +
+        ", \"archived\": " + to_string(s["archived"]) +
+        ", \"debate\": " + to_string(s["debate"]) + "}"
+}
+
+fn _seq_today_inline(s: map) -> string {
+    let keys = s.keys()
+    let mut j = "{"
+    let mut i = 0
+    while i < len(keys) {
+        let k = to_string(keys[i])
+        if i > 0 { j = j + ", " }
+        j = j + "\"" + _json_esc(k) + "\": " + to_string(s[k])
+        i = i + 1
+    }
+    j = j + "}"
+    return j
+}
+
+// ─── core emit pipeline ────────────────────────────────────────────────────
+
+fn _gather(source_signal: string) -> array {
+    // Returns [(source_signal, candidate), ...]
+    return []
+}
+
+fn _print_plan(cands: array, dedup_idx: map, max_new: int) {
+    let mut new_n = 0
+    let mut hit_n = 0
+    let mut sample_lines = []
+    let mut i = 0
+    while i < len(cands) {
+        let c = cands[i]
+        let key = to_string(c["dedup_key"])
+        if dedup_idx.contains_key(key) {
+            hit_n = hit_n + 1
+        } else {
+            new_n = new_n + 1
+            if len(sample_lines) < 5 {
+                sample_lines.push("  + [score=" + to_string(c["score_priority"]) +
+                    "] " + to_string(c["title"]))
+            }
+        }
+        i = i + 1
+    }
+    let cap = if new_n > max_new { max_new } else { new_n }
+    let queued = if new_n > max_new { new_n - max_new } else { 0 }
+    println("── proposal_emit plan ──")
+    println("  candidates total       : " + to_string(len(cands)))
+    println("  dedup hits (existing)  : " + to_string(hit_n))
+    println("  new proposals          : " + to_string(new_n))
+    println("  applied this cycle     : " + to_string(cap) + "  (max " + to_string(max_new) + ")")
+    println("  queued (flood protect) : " + to_string(queued))
+    let mut k = 0
+    while k < len(sample_lines) {
+        println(to_string(sample_lines[k]))
+        k = k + 1
+    }
+}
+
+fn _apply(cands: array, source_signals: array, max_new: int) -> array {
+    // Returns [new_count, dedup_count, sample_titles_array]
+    _ensure_proposal_tree()
+    let inv0 = _load_inventory()
+    // Hoist mutable parts out of the map to avoid hexa stage0 nested-map-set
+    // ambiguity ("array_set: container is not an array (tag=4)" when assigning
+    // to inv["proposals"] then reading inv["seq_today"] later).
+    let mut props = inv0["proposals"]
+    let mut seq_map = inv0["seq_today"]
+    let schema_v   = to_string(inv0["schema"])
+    let created_at = to_string(inv0["created_at"])
+    // Build dedup index from props.
+    let mut idx = json_parse("{}")
+    let mut ii = 0
+    while ii < len(props) {
+        let p = props[ii]
+        if p.contains_key("dedup_key") {
+            idx[to_string(p["dedup_key"])] = ii
+        }
+        ii = ii + 1
+    }
+    let day = _today_yyyymmdd()
+    let now_ts = _ts_iso()
+    let mut new_n = 0
+    let mut hit_n = 0
+    let mut sample = []
+    let mut i = 0
+    while i < len(cands) {
+        let c = cands[i]
+        let signal = to_string(source_signals[i])
+        let key = to_string(c["dedup_key"])
+        if idx.contains_key(key) {
+            // Dedup hit → bump version + write refinement file.
+            hit_n = hit_n + 1
+            let pos = to_int(to_string(idx[key]))
+            let mut existing = props[pos]
+            let new_v = to_int(to_string(existing["version"])) + 1
+            existing["version"]         = new_v
+            existing["last_refined_ts"] = now_ts
+            existing["score_priority"]  = to_int(to_string(c["score_priority"]))
+            props[pos] = existing
+
+            let refdir = PROP_ROOT + "/refinement/" + to_string(existing["id"])
+            _mkdir_p(refdir)
+            let mut p_full = json_parse("{}")
+            p_full["id"]               = to_string(existing["id"])
+            p_full["version"]          = new_v
+            p_full["first_seen_ts"]    = to_string(existing["first_seen_ts"])
+            p_full["last_refined_ts"]  = now_ts
+            p_full["title"]            = to_string(c["title"])
+            p_full["kind"]             = to_string(c["kind"])
+            p_full["rationale"]        = to_string(c["rationale"])
+            let mut evs = []
+            let mut e = json_parse("{}")
+            e["path"]            = to_string(c["ev_path"])
+            e["field"]           = to_string(c["ev_field"])
+            e["snapshot_sha256"] = to_string(c["ev_sha256"])
+            evs.push(e)
+            p_full["evidence_sources"]      = evs
+            p_full["estimated_effort_hours"] = to_string(c["effort_hours"])
+            p_full["estimated_impact"]       = to_string(c["base_impact"])
+            p_full["risk_level"]             = to_string(c["risk_level"])
+            p_full["loss_free"]              = to_string(c["loss_free"])
+            p_full["score_priority"]         = to_int(to_string(c["score_priority"]))
+            p_full["user_status"]            = "pending"
+            p_full["dedup_key"]              = key
+            p_full["source_signal"]          = signal
+            p_full["refinement_history"]     = [json_parse("{\"v\": " + to_string(new_v) +
+                ", \"ts\": \"" + now_ts + "\", \"diff\": \"score_or_evidence_refresh\"}")]
+            _atomic_write(refdir + "/v" + to_string(new_v) + ".json",
+                          _proposal_to_json(p_full))
+        } else {
+            // New proposal — flood-protect.
+            if new_n >= max_new {
+                i = i + 1
+                continue
+            }
+            let seq = if seq_map.contains_key(day) {
+                to_int(to_string(seq_map[day])) + 1
+            } else { 1 }
+            seq_map[day] = seq
+            let seq_str = if seq < 10 { "00" + to_string(seq) }
+                         else { if seq < 100 { "0" + to_string(seq) } else { to_string(seq) } }
+            let pid = day + "-" + seq_str
+            let slug = _slugify(to_string(c["title"]))
+            let rel = "state/proposals/pending/" + pid + "_" + slug + ".json"
+            let abs = ANIMA_ROOT + "/" + rel
+
+            let mut p_full = json_parse("{}")
+            p_full["id"]               = pid
+            p_full["version"]          = 1
+            p_full["first_seen_ts"]    = now_ts
+            p_full["last_refined_ts"]  = now_ts
+            p_full["title"]            = to_string(c["title"])
+            p_full["kind"]             = to_string(c["kind"])
+            p_full["rationale"]        = to_string(c["rationale"])
+            let mut evs = []
+            let mut e = json_parse("{}")
+            e["path"]            = to_string(c["ev_path"])
+            e["field"]           = to_string(c["ev_field"])
+            e["snapshot_sha256"] = to_string(c["ev_sha256"])
+            evs.push(e)
+            p_full["evidence_sources"]      = evs
+            p_full["estimated_effort_hours"] = to_string(c["effort_hours"])
+            p_full["estimated_impact"]       = to_string(c["base_impact"])
+            p_full["risk_level"]             = to_string(c["risk_level"])
+            p_full["loss_free"]              = to_string(c["loss_free"])
+            p_full["score_priority"]         = to_int(to_string(c["score_priority"]))
+            p_full["user_status"]            = "pending"
+            p_full["dedup_key"]              = key
+            p_full["source_signal"]          = signal
+            p_full["refinement_history"]     = [json_parse("{\"v\": 1, \"ts\": \"" +
+                now_ts + "\", \"diff\": \"initial_emit\"}")]
+            _atomic_write(abs, _proposal_to_json(p_full))
+
+            // Append to inventory.
+            let mut entry = json_parse("{}")
+            entry["id"]              = pid
+            entry["version"]         = 1
+            entry["title"]           = to_string(c["title"])
+            entry["kind"]            = to_string(c["kind"])
+            entry["score_priority"]  = to_int(to_string(c["score_priority"]))
+            entry["user_status"]     = "pending"
+            entry["first_seen_ts"]   = now_ts
+            entry["last_refined_ts"] = now_ts
+            entry["dedup_key"]       = key
+            entry["source_signal"]   = signal
+            entry["path"]            = rel
+            props.push(entry)
+            idx[key] = len(props) - 1
+            new_n = new_n + 1
+            if len(sample) < 3 {
+                sample.push(pid + " :: " + to_string(c["title"]))
+            }
+        }
+        i = i + 1
+    }
+    // Recount summary from props.
+    let mut total = 0
+    let mut pend = 0
+    let mut appr = 0
+    let mut rej  = 0
+    let mut arch = 0
+    let mut deb  = 0
+    let mut z = 0
+    while z < len(props) {
+        let p = props[z]
+        total = total + 1
+        let st = to_string(p["user_status"])
+        if st == "pending"  { pend = pend + 1 }
+        if st == "approved" { appr = appr + 1 }
+        if st == "rejected" { rej  = rej  + 1 }
+        if st == "archived" { arch = arch + 1 }
+        if st == "debate"   { deb  = deb  + 1 }
+        z = z + 1
+    }
+    let mut summary = json_parse("{}")
+    summary["total"]    = total
+    summary["pending"]  = pend
+    summary["approved"] = appr
+    summary["rejected"] = rej
+    summary["archived"] = arch
+    summary["debate"]   = deb
+
+    // Reassemble inventory map fresh to dodge the nested-map mutation issue.
+    // Preserve "entries" (cluster_detect namespace) untouched — schema
+    // coexistence, option C 2026-04-22.
+    let mut inv = json_parse("{}")
+    inv["schema"]      = schema_v
+    inv["created_at"]  = created_at
+    inv["updated_at"]  = now_ts
+    inv["summary"]     = summary
+    inv["seq_today"]   = seq_map
+    inv["proposals"]   = props
+    if inv0.contains_key("entries") {
+        inv["entries"] = inv0["entries"]
+    } else {
+        inv["entries"] = []
+    }
+    _atomic_write(INV_PATH, _inventory_to_json(inv))
+    return [new_n, hit_n, sample]
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn _selftest() -> int {
+    println("── proposal_emit selftest ──")
+    // Synthetic 3 candidates: 2 unique + 1 duplicate of the 1st.
+    let sha_fake = _sha256_str("fake_evidence_blob_xyz")
+    let c1 = _mk_cand("Synthetic violation A", "fix", "rationale A",
+                      "/tmp/__selftest_a.json", "field_a", sha_fake,
+                      40, 0.1, 1.0, true)
+    let c2 = _mk_cand("Synthetic violation B", "fix", "rationale B",
+                      "/tmp/__selftest_b.json", "field_b", sha_fake,
+                      50, 0.2, 2.0, true)
+    let c3 = _mk_cand("Synthetic violation A", "fix", "rationale A dup",
+                      "/tmp/__selftest_a.json", "field_a", sha_fake,
+                      40, 0.1, 1.0, true)
+    let cands = [c1, c2, c3]
+    let signals = ["selftest", "selftest", "selftest"]
+
+    // Build a fake dedup index — empty (so all 3 enter; intra-batch dedup
+    // is the test).
+    let inv0 = _load_inventory_blank()
+    let mut idx = _index_by_dedup(inv0)
+    let mut new_n = 0
+    let mut hit_n = 0
+    let mut i = 0
+    while i < len(cands) {
+        let key = to_string(cands[i]["dedup_key"])
+        if idx.contains_key(key) {
+            hit_n = hit_n + 1
+        } else {
+            new_n = new_n + 1
+            idx[key] = i
+        }
+        i = i + 1
+    }
+    let s1 = (len(cands) == 3)
+    let s2 = (new_n == 2)
+    let s3 = (hit_n == 1)
+    let s4 = (to_string(c1["dedup_key"]) == to_string(c3["dedup_key"]))
+    let s5 = (to_string(c1["dedup_key"]) != to_string(c2["dedup_key"]))
+    println("S1 candidates=3              : " + (if s1 { "PASS" } else { "FAIL" }))
+    println("S2 unique=2                  : " + (if s2 { "PASS (got " + to_string(new_n) + ")" } else { "FAIL (got " + to_string(new_n) + ")" }))
+    println("S3 dedup_hits=1              : " + (if s3 { "PASS (got " + to_string(hit_n) + ")" } else { "FAIL (got " + to_string(hit_n) + ")" }))
+    println("S4 c1.dedup == c3.dedup      : " + (if s4 { "PASS" } else { "FAIL" }))
+    println("S5 c1.dedup != c2.dedup      : " + (if s5 { "PASS" } else { "FAIL" }))
+    let s6 = (to_int(to_string(c1["score_priority"])) > 0)
+    println("S6 score_priority > 0        : " + (if s6 { "PASS (=" + to_string(c1["score_priority"]) + ")" } else { "FAIL" }))
+    if s1 && s2 && s3 && s4 && s5 && s6 {
+        println("── selftest 6/6 PASS ──")
+        return 0
+    }
+    println("── selftest FAIL ──")
+    return 1
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = _argv()
+    if _arg_present(av, "--selftest") {
+        return _selftest()
+    }
+    let apply = _arg_present(av, "--apply")
+    let dry   = !apply
+
+    println("── proposal_emit (" + (if dry { "dry-run" } else { "apply" }) + ") ──")
+
+    // 1. Gather candidates from every source.
+    let sec_c   = _scan_secret()
+    let lint_c  = _scan_lint_autofix()
+    let qa_c    = _scan_qaudit()
+    let ds_c    = _scan_distskip()
+    let fl_c    = _scan_file_ledger()
+    let v2_c    = _scan_v2roi()
+    let roi_c   = _scan_roi_doc()
+
+    // Build parallel arrays (candidates + their source_signal label).
+    let mut all = []
+    let mut sigs = []
+    let mut i = 0
+    while i < len(sec_c)  { all.push(sec_c[i]);  sigs.push("secret_scan");        i = i + 1 }
+    i = 0
+    while i < len(lint_c) { all.push(lint_c[i]); sigs.push("lint_autofix");       i = i + 1 }
+    i = 0
+    while i < len(qa_c)   { all.push(qa_c[i]);   sigs.push("code_quality_audit"); i = i + 1 }
+    i = 0
+    while i < len(ds_c)   { all.push(ds_c[i]);   sigs.push("dist_skip");          i = i + 1 }
+    i = 0
+    while i < len(fl_c)   { all.push(fl_c[i]);   sigs.push("file_completion");    i = i + 1 }
+    i = 0
+    while i < len(v2_c)   { all.push(v2_c[i]);   sigs.push("v2_roi_selftest");    i = i + 1 }
+    i = 0
+    while i < len(roi_c)  { all.push(roi_c[i]);  sigs.push("h100_roi_doc");       i = i + 1 }
+
+    println("  per-source candidate counts:")
+    println("    secret_scan          : " + to_string(len(sec_c)))
+    println("    lint_autofix         : " + to_string(len(lint_c)))
+    println("    code_quality_audit   : " + to_string(len(qa_c)))
+    println("    dist_skip_diagnosis  : " + to_string(len(ds_c)))
+    println("    file_completion_ledg : " + to_string(len(fl_c)))
+    println("    v2_roi_selftest      : " + to_string(len(v2_c)))
+    println("    h100_roi_improvements: " + to_string(len(roi_c)))
+
+    // 2. Plan + dedup against current inventory.
+    _ensure_proposal_tree()
+    let inv0 = _load_inventory()
+    let idx0 = _index_by_dedup(inv0)
+    _print_plan(all, idx0, MAX_NEW_PER_APPLY)
+
+    if dry {
+        println("(dry-run — no writes. Pass --apply to persist.)")
+        return 0
+    }
+
+    // 3. Apply.
+    let res = _apply(all, sigs, MAX_NEW_PER_APPLY)
+    let new_n = to_int(to_string(res[0]))
+    let hit_n = to_int(to_string(res[1]))
+    let sample = res[2]
+    println("── apply done ──")
+    println("  new proposals : " + to_string(new_n))
+    println("  dedup hits    : " + to_string(hit_n))
+    println("  sample new ids:")
+    let mut k = 0
+    while k < len(sample) {
+        println("    " + to_string(sample[k]))
+        k = k + 1
+    }
+    println("  inventory     : " + INV_PATH)
+    return 0
+}
+
+exit(main())

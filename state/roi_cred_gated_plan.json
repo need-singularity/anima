@@ -1,0 +1,113 @@
+{
+  "schema": "anima/roi_cred_gated_plan/1",
+  "generated": "2026-04-22",
+  "task_origin": "ROI items A1 (weight pre-cache --apply) + A4 (corpus shard --apply) + C14 (persona swap-in R2 stage)",
+  "verdict": "DEFERRED_NO_CREDS",
+  "cred_status": {
+    "HF_TOKEN": "MISSING",
+    "ANIMA_R2_ACCESS_KEY": "PRESENT",
+    "ANIMA_R2_SECRET_KEY": "PRESENT",
+    "ANIMA_R2_ENDPOINT": "PRESENT",
+    "rclone_remotes_found": ["r2:"],
+    "rclone_remote_default_for_weight_precache_script": "r2anima:",
+    "rclone_remote_default_for_corpus_shard_script": "r2:",
+    "rclone_remote_mismatch_note": "tool/h100_weight_precache.bash defaults to RCLONE_R2_REMOTE=r2anima. Local rclone has only 'r2:'. To execute apply, either (a) export RCLONE_R2_REMOTE=r2 before running, or (b) add an 'r2anima' remote pointing to the same Cloudflare R2 endpoint."
+  },
+  "blocking_reason": "HF_TOKEN env var not set; tool/h100_weight_precache.bash --apply will exit 3 at pre-flight 3/3 before any network I/O. A4 corpus shard does NOT need HF_TOKEN, but the safe-stop policy keeps both items deferred together so cred remediation is a single step.",
+  "what_would_run": {
+    "a1_weight_precache_apply": {
+      "command": "RCLONE_R2_REMOTE=r2 HF_TOKEN=hf_... bash /Users/ghost/core/anima/tool/h100_weight_precache.bash --apply",
+      "manifest": "/Users/ghost/core/anima/state/h100_weight_precache_manifest.json",
+      "r2_bucket": "anima-weights",
+      "paths": [
+        {"id": "p1", "model_id": "Qwen/Qwen3-8B",                       "size_gb": 16.4, "r2_target": "anima-weights/p1/qwen3-8b/"},
+        {"id": "p2", "model_id": "unsloth/Meta-Llama-3.1-8B",           "size_gb": 16.0, "r2_target": "anima-weights/p2/llama-3-1-8b/"},
+        {"id": "p3", "model_id": "mistralai/Ministral-3-14B-Base-2512", "size_gb": 27.8, "r2_target": "anima-weights/p3/ministral-3-14b-base-2512/"},
+        {"id": "p4", "model_id": "google/gemma-4-31B",                  "size_gb": 65.4, "r2_target": "anima-weights/p4/gemma-4-31b/"}
+      ],
+      "expected_size_gb": 125.6,
+      "expected_wall_time_min": "120-240 (HF download + R2 mirror, ~125GB end-to-end on residential link; <30 min on gigabit)",
+      "side_effects": [
+        "writes /tmp/anima_weight_precache/{p1..p4}/ staging dirs",
+        "writes state/h100_weight_precache_progress.jsonl (per-path status)",
+        "writes state/h100_weight_precache_tokenizer_sha.json (operator must merge into manifest)",
+        "writes state/h100_weight_precache_completion.json on finish",
+        "rclone copy → cloudflare r2 anima-weights bucket (idempotent, --size-only)"
+      ],
+      "preflight_exit_codes": {"0": "ok", "3": "missing creds (current path)", "4": "partial fail"}
+    },
+    "a4_corpus_shard_apply": {
+      "command": "bash /Users/ghost/core/anima/tool/h100_corpus_shard_prestage.bash --apply",
+      "manifest": "/Users/ghost/core/anima/state/h100_corpus_shard_manifest.json",
+      "shards": [
+        {"name": "alm_r13",   "target": "anima-corpus/alm_r13.tar.zst",   "source_count": 13},
+        {"name": "p1_corpus", "target": "anima-corpus/p1_corpus.tar.zst", "source_count": 2},
+        {"name": "p2_corpus", "target": "anima-corpus/p2_corpus.tar.zst", "source_count": 2},
+        {"name": "p3_corpus", "target": "anima-corpus/p3_corpus.tar.zst", "source_count": 2},
+        {"name": "p4_corpus", "target": "anima-corpus/p4_corpus.tar.zst", "source_count": 2}
+      ],
+      "expected_size_gb": "~2-6 (tokenized jsonl + raw r13 corpus, zstd -19)",
+      "expected_wall_time_min": "10-30 (tar+zstd CPU-bound on M-series; upload network-bound)",
+      "side_effects": [
+        "writes /tmp/{shard}.tar.zst staging files",
+        "writes state/h100_corpus_shard_progress.jsonl",
+        "writes state/h100_corpus_shard_completion.json on finish",
+        "rclone copyto → cloudflare r2 anima-corpus bucket (idempotent via lsjson size match)"
+      ],
+      "cred_requirement": "rclone r2: remote ONLY (HF_TOKEN NOT required). Could run independently of A1, but bundled here for single cred-remediation step.",
+      "preflight_exit_codes": {"0": "ok", "1": "shard fail", "4": "rclone missing", "5": "remote not configured", "6": "tar/zstd/python3 missing"}
+    },
+    "c14_persona_swap_in_r2_stage": {
+      "ssot": "/Users/ghost/core/anima/config/serve_alm_persona.json",
+      "artifacts_inventory": [
+        {
+          "kind": "base_model_weights",
+          "key": "base_model_path",
+          "pod_path": "/workspace/base_model",
+          "current_status": "MISSING",
+          "stage_action": "BLOCKED_NOT_BUILT",
+          "rationale": "Qwen2.5-14B base weights are produced by H100 base load step; no local copy exists. Cannot stage to R2 until A1 completes for the relevant path (p3/p4 currently track Ministral/Gemma — Qwen2.5-14B is NOT in current weight precache manifest). Schema requires upstream decision: either add Qwen2.5-14B to weight manifest, OR rewrite serve_alm_persona swap-in to consume one of {p1..p4}."
+        },
+        {
+          "kind": "persona_lora_adapter",
+          "key": "persona_lora_path",
+          "pod_path": "/workspace/lora/persona_lora/dest1/",
+          "current_status": "MISSING",
+          "stage_action": "BLOCKED_NOT_BUILT",
+          "rationale": "Persona LoRA (activation-steering vectors at PERSONA_LAYER_IDX=20) is generated from contrast-pair training; no on-disk adapter exists. Must be built before R2 stage."
+        },
+        {
+          "kind": "fastapi_runtime_body",
+          "key": "fastapi_body_path",
+          "pod_path": "/workspace/serve_alm_persona.py",
+          "current_status": "STAGED_FOR_POD",
+          "stage_action": "RAW9_PROHIBITED",
+          "rationale": "raw#9 hexa-only — .py body is forbidden in repo and is deployed only via tool/h100_dispatch_kit.bash directly to the H100 pod. Not eligible for R2 stage."
+        },
+        {
+          "kind": "phi_extractor_h_last_ffi",
+          "key": "h_last_ffi_path",
+          "repo_path": "tool/phi_extractor_ffi_wire.hexa",
+          "current_status": "STAGED",
+          "stage_action": "ALREADY_LOCAL_NO_R2_NEEDED",
+          "rationale": "hexa source lives in repo; pod fetches via git/dispatch kit. R2 mirror is not part of swap-in protocol for hexa artifacts."
+        }
+      ],
+      "executable_now": false,
+      "executable_when": "After (a) Qwen2.5-14B base weights produced + base_model_path STAGED, AND (b) dest1 persona LoRA trained + persona_lora_path STAGED. Only then can a corresponding R2 stage script be authored.",
+      "no_op_today": "Zero of the 4 swap-in artifacts are eligible for R2 staging today (2 MISSING/not-built, 1 raw#9 prohibited, 1 hexa-already-local). C14 cannot be apply-executed even with HF_TOKEN present."
+    }
+  },
+  "remediation_to_unblock": [
+    "1. Obtain HF_TOKEN with read access to {Qwen/Qwen3-8B, unsloth/Meta-Llama-3.1-8B, mistralai/Ministral-3-14B-Base-2512, google/gemma-4-31B}; export HF_TOKEN=hf_...",
+    "2. Either set RCLONE_R2_REMOTE=r2 (since local has only 'r2:' remote) OR add an 'r2anima' rclone remote that mirrors the same R2 endpoint",
+    "3. Re-run this dispatcher; A1 + A4 will execute in background, C14 will still be DEFERRED until base weights + persona LoRA are built"
+  ],
+  "raw_compliance": [
+    "raw#9  hexa-only: no .py created (state json only)",
+    "raw#10 deterministic: timestamps + recorded sizes/paths",
+    "raw#12 실측 only: no fabricated 'apply success' — DEFERRED_NO_CREDS surfaced",
+    "raw#15 no-hardcode: all paths/manifests read from existing SSOTs",
+    "raw#20 H100 stop-gate: no launch triggered, .roadmap untouched"
+  ]
+}

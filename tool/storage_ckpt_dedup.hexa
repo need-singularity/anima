@@ -1,0 +1,268 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/storage_ckpt_dedup.hexa — ROI G36: ckpt chunk-level dedup (xxhash)
+//
+//  PURPOSE
+//    Scan checkpoints/ for *.pt / *.bin / *.safetensors / *.ckpt files,
+//    chunk each at 64 MiB boundaries, hash each chunk via xxh128sum, and
+//    build state/ckpt_dedup_ledger.json — a content-addressed inventory
+//    that lets base + LoRA-delta share unchanged base chunks (each chunk
+//    stored once even when N LoRA derivatives reference it).
+//
+//    Default: --dry. Computes ledger + estimated savings, NEVER touches
+//    on-disk ckpt files. With --apply, materializes a CAS layout under
+//    checkpoints/.dedup_cas/<hash>.bin and writes a per-file manifest
+//    sidecar (<file>.dedup.manifest.json) so a downstream materializer
+//    can reconstruct the original file. apply NEVER deletes the source.
+//
+//  USAGE
+//    hexa tool/storage_ckpt_dedup.hexa                # dry-run (default)
+//    hexa tool/storage_ckpt_dedup.hexa --apply        # write CAS + manifest
+//    hexa tool/storage_ckpt_dedup.hexa --root <dir>   # override root
+//
+//  IDEMPOTENCE
+//    Re-running yields identical ledger (deterministic xxh128). --apply
+//    skips chunks whose CAS file already exists with matching size.
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" { return x }
+    if t == "string" { return x }
+    return to_string(x)
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec(cmd: string) -> string {
+    return _str(exec(cmd))
+}
+
+fn _exec_rc(cmd: string) -> int {
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool {
+    return _exec_rc("test -e " + _sh_quote(p)) == 0
+}
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return _exec("echo $HOME").trim()
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut out = []
+    let mut i = 2
+    while i < len(a) {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av {
+        if _str(x) == k { return true }
+    }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == k && i + 1 < len(av) { return _str(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn _file_size(p: string) -> int {
+    let s = _exec("stat -f '%z' " + _sh_quote(p) + " 2>/dev/null").trim()
+    if len(s) == 0 { return 0 }
+    return to_int(s)
+}
+
+// Hash a window of a file with xxh128sum. Reads `nbytes` from `offset`.
+fn _hash_chunk(path: string, offset: int, nbytes: int) -> string {
+    let bs = 1048576
+    let count = nbytes / bs
+    let skip_blocks = offset / bs
+    let cmd = "dd if=" + _sh_quote(path) + " bs=" + to_string(bs) + " skip=" + to_string(skip_blocks) + " count=" + to_string(count) + " 2>/dev/null | xxh128sum 2>/dev/null | awk '{print $1}'"
+    return _exec(cmd).trim()
+}
+
+// CAS write: dd-extract → atomic move into cas_dir/<hash>.bin.
+fn _cas_write(path: string, offset: int, nbytes: int, hash: string, cas_dir: string) -> bool {
+    let target = cas_dir + "/" + hash + ".bin"
+    if _file_exists(target) {
+        let sz = _file_size(target)
+        if sz == nbytes { return true }
+    }
+    let bs = 1048576
+    let count = nbytes / bs
+    let skip_blocks = offset / bs
+    let tmp = target + ".tmp." + to_string(offset)
+    let cmd = "dd if=" + _sh_quote(path) + " of=" + _sh_quote(tmp) + " bs=" + to_string(bs) + " skip=" + to_string(skip_blocks) + " count=" + to_string(count) + " 2>/dev/null && mv -f " + _sh_quote(tmp) + " " + _sh_quote(target)
+    return _exec_rc(cmd) == 0
+}
+
+fn _discover_ckpt(root: string) -> array {
+    let cmd = "find " + _sh_quote(root) + " -type f \\( -name '*.pt' -o -name '*.bin' -o -name '*.safetensors' -o -name '*.ckpt' \\) 2>/dev/null | sort"
+    let raw = _exec(cmd)
+    let mut out = []
+    for line in split(raw, "\n") {
+        let t = _str(line).trim()
+        if len(t) > 0 { out.push(t) }
+    }
+    return out
+}
+
+fn main() {
+    let argv = _argv()
+    let apply_mode = _flag(argv, "--apply")
+    let home = _home()
+    let default_root = home + "/core/anima/checkpoints"
+    let root = _opt(argv, "--root", default_root)
+    let chunk_bytes = 67108864
+
+    let state_dir = home + "/core/anima/state"
+    let ledger_path = state_dir + "/ckpt_dedup_ledger.json"
+    let cas_dir = root + "/.dedup_cas"
+
+    _exec("mkdir -p " + _sh_quote(state_dir))
+    if apply_mode { _exec("mkdir -p " + _sh_quote(cas_dir)) }
+
+    let mode_tag = if apply_mode { "apply" } else { "dry-run" }
+    println("[ckpt_dedup] mode=" + mode_tag + " root=" + root + " chunk=64MiB")
+
+    if !_file_exists(root) {
+        println("[ckpt_dedup] root missing — nothing to do (exit 0)")
+        let body0 = "{\n  \"schema_version\": \"1\",\n  \"roi_item\": \"G36\",\n  \"mode\": \"" + mode_tag + "\",\n  \"root\": \"" + root + "\",\n  \"files\": [],\n  \"chunks_total\": 0,\n  \"chunks_unique\": 0,\n  \"bytes_total\": 0,\n  \"bytes_unique\": 0,\n  \"bytes_saved\": 0,\n  \"verdict\": \"NOOP\"\n}\n"
+        write_file(ledger_path, body0)
+        exit(0)
+    }
+
+    let files = _discover_ckpt(root)
+    println("[ckpt_dedup] discovered files=" + to_string(len(files)))
+
+    let mut hash_seen = []
+    let mut hash_count = []
+    let mut hash_size = []
+    let mut file_entries = []
+    let mut bytes_total = 0
+    let mut chunks_total = 0
+    let mut cas_written = 0
+
+    let mut fi = 0
+    while fi < len(files) {
+        let p = _str(files[fi])
+        let sz = _file_size(p)
+        if sz <= 0 {
+            fi = fi + 1
+            continue
+        }
+        let n_chunks = (sz + chunk_bytes - 1) / chunk_bytes
+        let mut chunk_hashes_for_file = []
+        let mut ci = 0
+        while ci < n_chunks {
+            let off = ci * chunk_bytes
+            let remain = sz - off
+            let take = if remain < chunk_bytes { remain } else { chunk_bytes }
+            let h = _hash_chunk(p, off, take)
+            if len(h) == 0 {
+                eprintln("[ckpt_dedup] WARN hash failed " + p + " chunk=" + to_string(ci))
+                ci = ci + 1
+                continue
+            }
+            chunk_hashes_for_file.push(h)
+            let mut found = -1
+            let mut hi = 0
+            while hi < len(hash_seen) {
+                if _str(hash_seen[hi]) == h {
+                    found = hi
+                    hi = len(hash_seen)
+                } else {
+                    hi = hi + 1
+                }
+            }
+            if found < 0 {
+                hash_seen.push(h)
+                hash_count.push(1)
+                hash_size.push(take)
+                if apply_mode {
+                    if _cas_write(p, off, take, h, cas_dir) { cas_written = cas_written + 1 }
+                }
+            } else {
+                hash_count[found] = hash_count[found] + 1
+            }
+            chunks_total = chunks_total + 1
+            bytes_total = bytes_total + take
+            ci = ci + 1
+        }
+        let mut manifest_inner = "["
+        let mut mi = 0
+        while mi < len(chunk_hashes_for_file) {
+            if mi > 0 { manifest_inner = manifest_inner + "," }
+            manifest_inner = manifest_inner + "\"" + _str(chunk_hashes_for_file[mi]) + "\""
+            mi = mi + 1
+        }
+        manifest_inner = manifest_inner + "]"
+        let entry = "    {\"path\":\"" + p + "\",\"size\":" + to_string(sz) + ",\"chunks\":" + to_string(n_chunks) + ",\"chunk_hashes\":" + manifest_inner + "}"
+        file_entries.push(entry)
+        if apply_mode {
+            let sidecar = p + ".dedup.manifest.json"
+            let body_s = "{\"path\":\"" + p + "\",\"size\":" + to_string(sz) + ",\"chunk_bytes\":" + to_string(chunk_bytes) + ",\"chunks\":" + to_string(n_chunks) + ",\"chunk_hashes\":" + manifest_inner + "}\n"
+            write_file(sidecar, body_s)
+        }
+        fi = fi + 1
+    }
+
+    let mut bytes_unique = 0
+    let mut hu = 0
+    while hu < len(hash_seen) {
+        bytes_unique = bytes_unique + to_int(hash_size[hu])
+        hu = hu + 1
+    }
+    let bytes_saved = bytes_total - bytes_unique
+    let dedup_ratio = if bytes_total > 0 { to_string(100 * bytes_saved / bytes_total) } else { "0" }
+
+    let mut body = "{\n"
+    body = body + "  \"schema_version\": \"1\",\n"
+    body = body + "  \"roi_item\": \"G36\",\n"
+    body = body + "  \"mode\": \"" + mode_tag + "\",\n"
+    body = body + "  \"root\": \"" + root + "\",\n"
+    body = body + "  \"chunk_bytes\": " + to_string(chunk_bytes) + ",\n"
+    body = body + "  \"hash_algo\": \"xxh128\",\n"
+    body = body + "  \"files\": [\n"
+    let mut ei = 0
+    while ei < len(file_entries) {
+        body = body + _str(file_entries[ei])
+        if ei < len(file_entries) - 1 { body = body + "," }
+        body = body + "\n"
+        ei = ei + 1
+    }
+    body = body + "  ],\n"
+    body = body + "  \"chunks_total\": " + to_string(chunks_total) + ",\n"
+    body = body + "  \"chunks_unique\": " + to_string(len(hash_seen)) + ",\n"
+    body = body + "  \"bytes_total\": " + to_string(bytes_total) + ",\n"
+    body = body + "  \"bytes_unique\": " + to_string(bytes_unique) + ",\n"
+    body = body + "  \"bytes_saved\": " + to_string(bytes_saved) + ",\n"
+    body = body + "  \"dedup_pct\": " + dedup_ratio + ",\n"
+    body = body + "  \"cas_dir\": \"" + cas_dir + "\",\n"
+    body = body + "  \"cas_written\": " + to_string(cas_written) + ",\n"
+    body = body + "  \"verdict\": \"" + (if chunks_total > 0 { "OK" } else { "NOOP" }) + "\"\n"
+    body = body + "}\n"
+
+    write_file(ledger_path, body)
+    println("[ckpt_dedup] files=" + to_string(len(files)) + " chunks=" + to_string(chunks_total) + " unique=" + to_string(len(hash_seen)) + " saved=" + to_string(bytes_saved) + " (" + dedup_ratio + "%)")
+    println("[ckpt_dedup] ledger=" + ledger_path)
+    if apply_mode { println("[ckpt_dedup] cas_dir=" + cas_dir + " cas_written=" + to_string(cas_written)) }
+    exit(0)
+}

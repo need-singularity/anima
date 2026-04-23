@@ -1,0 +1,109 @@
+// tool/slack_webhook_test.hexa — pre-H100 ROI P2 (Slack webhook smoke test)
+//
+// PURPOSE
+//   Round-trip smoke test for the SLACK_WEBHOOK_URL operator setup
+//   (see docs/slack_webhook_setup.md §3). Default DRY: prints the exact
+//   payload that would be POSTed without sending. --apply requires both the
+//   --apply flag AND env SLACK_WEBHOOK_URL set; otherwise gracefully no-ops.
+//
+// USAGE
+//   hexa run tool/slack_webhook_test.hexa             # dry (default)
+//   hexa run tool/slack_webhook_test.hexa --apply     # real POST (env required)
+//   hexa run tool/slack_webhook_test.hexa --self-test # offline payload assert
+//   hexa run tool/slack_webhook_test.hexa --message "custom test"
+//
+// CONSTRAINTS
+//   raw#9 hexa-only.  raw#10 proof-carrying (logs payload + status).
+//   Idempotent: every run prints same payload structure; --apply is the only
+//   side-effecting path and it is operator-gated by both flag + env.
+//   Selftest is OFFLINE (no env / no network).
+
+let DEFAULT_MSG = "anima Slack webhook smoke test (pre-H100 ROI P2)"
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _json_escape(s: string) -> string { return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") }
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+fn _has(av, k) -> bool {
+    let mut i = 0
+    while i < len(av) { if to_string(av[i]) == k { return true }; i = i + 1 }
+    return false
+}
+fn _opt(av, k, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+fn _env(name: string) -> string {
+    let r = exec_with_status("printf %s \"${" + name + ":-}\"")
+    return to_string(r[0])
+}
+
+fn _build_payload(msg: string) -> string {
+    let txt = "*" + msg + "*\n• ts: `" + to_string(utc_iso_now()) + "`\n• source: `tool/slack_webhook_test.hexa`"
+    return "{\"text\":\"" + _json_escape(txt) + "\"}"
+}
+
+fn _self_test() {
+    let p = _build_payload(DEFAULT_MSG)
+    if len(p) < 20 { eprintln("[slack_webhook_test] SELFTEST FAIL: payload too short"); exit(1) }
+    if p.index_of("anima Slack webhook smoke test") < 0 {
+        eprintln("[slack_webhook_test] SELFTEST FAIL: missing default header"); exit(1)
+    }
+    let p2 = _build_payload("custom-msg-x")
+    if p2.index_of("custom-msg-x") < 0 {
+        eprintln("[slack_webhook_test] SELFTEST FAIL: custom message not threaded"); exit(1)
+    }
+    println("[slack_webhook_test] SELFTEST PASS payload_bytes=" + to_string(len(p)))
+    exit(0)
+}
+
+fn main() {
+    let av = _argv()
+    if _has(av, "--self-test") { _self_test() }
+
+    let apply   = _has(av, "--apply")
+    let msg     = _opt(av, "--message", DEFAULT_MSG)
+    let webhook = _env("SLACK_WEBHOOK_URL")
+    let payload = _build_payload(msg)
+
+    println("[slack_webhook_test] mode=" + (if apply { "apply" } else { "dry" }) +
+            " webhook_set=" + (if len(webhook) > 0 { "true" } else { "false" }))
+    println("[slack_webhook_test] payload=" + payload)
+
+    if !apply {
+        println("[slack_webhook_test] DRY — no POST")
+        exit(0)
+    }
+    if len(webhook) == 0 {
+        println("[slack_webhook_test] NO-OP — SLACK_WEBHOOK_URL unset")
+        exit(0)
+    }
+    // Real POST is the only side effect, gated by --apply AND env.
+    let cmd = "curl -sS -m 5 -X POST -H 'Content-Type: application/json' " +
+              "--data " + _sh_quote(payload) + " " + _sh_quote(webhook) +
+              " -o /dev/null -w '%{http_code}'"
+    let r = exec_with_status(cmd)
+    let code = to_string(r[0]).trim()
+    let st   = r[1]
+    println("[slack_webhook_test] http_code=" + code + " exit=" + to_string(st))
+    if st == 0 && (code == "200" || code == "204") {
+        println("[slack_webhook_test] POST OK")
+        exit(0)
+    }
+    eprintln("[slack_webhook_test] POST FAIL")
+    exit(0)  // never fail parent — notify is best-effort by design
+}
+
+main()

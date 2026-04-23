@@ -1,0 +1,563 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/stats.hexa — anima CLI `stats` topic (repo metrics dashboard)
+//
+//  PURPOSE
+//    Single-page repo health snapshot. Counts hexa / bash / md / config /
+//    state / cert artifacts, roadmap status histogram, proposal stack
+//    buckets, schema-version distribution, recent git activity, and the
+//    top-10 largest tool/*.hexa files by LOC.
+//
+//  SUBCOMMANDS
+//    (default)          full report table
+//    --compact          1-page summary (10 key lines)
+//    --json             machine-readable snapshot
+//    --snapshot         write state/anima_stats_last.json (also with --json)
+//    --selftest         synthetic-repo smoke test
+//    --help             usage
+//
+//  DESIGN
+//    raw#9  hexa-only (no .py)
+//    raw#10 deterministic (HEXA_REPRODUCIBLE=1 redacts ts)
+//    raw#11 snake_case
+//    raw#15 no-hardcode (paths via _resolve_root)
+//    read-only — never mutates repo state except optional snapshot write.
+// ════════════════════════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    if t == "int" || t == "integer" || t == "number" || t == "float" {
+        return "" + x
+    }
+    return ""
+}
+
+fn _itoa(n) -> string {
+    // robust int→string for hexa runtimes where _str() only keeps strings
+    let s = "" + n
+    if s != "" { return s }
+    // fallback via exec/printf
+    return _str(exec("printf '%s' " + _str(n))).trim()
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    return _str(env("HOME")) + "/core/anima"
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _exec_line(cmd: string) -> string {
+    return _str(exec(cmd)).trim()
+}
+
+fn _count_files(root: string, sub: string, pattern: string) -> string {
+    let p = root + "/" + sub
+    if !_dexists(p) { return "0" }
+    let c = _exec_line("find " + p + " -type f -name '" + pattern + "' 2>/dev/null | wc -l | tr -d ' '")
+    if c == "" { return "0" }
+    return c
+}
+
+fn _loc_sum(root: string, sub: string, pattern: string) -> string {
+    let p = root + "/" + sub
+    if !_dexists(p) { return "0" }
+    let c = _exec_line("find " + p + " -type f -name '" + pattern + "' -print0 2>/dev/null | xargs -0 awk 'END{print NR}' 2>/dev/null")
+    if c == "" { return "0" }
+    return c
+}
+
+fn _roadmap_count(root: string, status: string) -> string {
+    // Match status case-insensitively — historical entries use lowercase
+    // ("done"/"active"/…) while the engine emits uppercase. Counting both.
+    let prog = root + "/state/roadmap_progress.json"
+    if !_fexists(prog) { return "0" }
+    // jq does the casefold via ascii_downcase; the input marker can be any case.
+    let expr = "[.entries[] | select((.status // \"\") | ascii_downcase == ((\"" + status + "\") | ascii_downcase))] | length"
+    let v = _exec_line("jq -r '" + expr + "' " + prog + " 2>/dev/null")
+    if v == "" { return "0" }
+    return v
+}
+
+fn _roadmap_total(root: string) -> string {
+    let prog = root + "/state/roadmap_progress.json"
+    if !_fexists(prog) { return "0" }
+    let v = _exec_line("jq -r '[.entries[]] | length' " + prog + " 2>/dev/null")
+    if v == "" { return "0" }
+    return v
+}
+
+fn _proposal_bucket(root: string, bucket: string) -> string {
+    let p = root + "/state/proposals/" + bucket
+    if !_dexists(p) { return "0" }
+    // Pending / rejected are flat *.json; approved/archived may nest.
+    let v = _exec_line("find " + p + " -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' '")
+    if v == "" { return "0" }
+    return v
+}
+
+fn _schema_top(root: string, n: int) -> array {
+    // Returns array of "count  schema" lines (top-N); expensive for large trees
+    // but deterministic. Uses ACTIVE schema field only from state/*.json.
+    let out = []
+    if !_dexists(root + "/state") { return out }
+    let n_s = _str(n)
+    let cmd = "find " + root + "/state -type f -name '*.json' 2>/dev/null"
+           + " | xargs -I{} sh -c \"jq -r '.schema // empty' '{}' 2>/dev/null\""
+           + " | sort | uniq -c | sort -rn | head -n " + n_s
+    let raw = _str(exec(cmd))
+    let lines = raw.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let line = _str(lines[i]).trim()
+        if line != "" { out = out + [line] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _git_commits_since(root: string, since: string) -> string {
+    let v = _exec_line("git -C " + root + " log --since='" + since + "' --oneline 2>/dev/null | wc -l | tr -d ' '")
+    if v == "" { return "0" }
+    return v
+}
+
+fn _branch_count(root: string) -> string {
+    let v = _exec_line("git -C " + root + " branch -a 2>/dev/null | wc -l | tr -d ' '")
+    if v == "" { return "0" }
+    return v
+}
+
+fn _top_tools(root: string, n: int) -> array {
+    // Largest tool/*.hexa by LOC — top-N. Skips tool/anima_cli/* subdir by
+    // convention (thin orchestrators), keeping list meaningful.
+    let out = []
+    if !_dexists(root + "/tool") { return out }
+    let n_s = _str(n)
+    let cmd = "find " + root + "/tool -maxdepth 2 -type f -name '*.hexa' 2>/dev/null"
+           + " | xargs wc -l 2>/dev/null | grep -v ' total$' | sort -rn | head -n " + n_s
+    let raw = _str(exec(cmd))
+    let lines = raw.split("\n")
+    let i = 0
+    while i < len(lines) {
+        let line = _str(lines[i]).trim()
+        if line != "" { out = out + [line] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _cert_count(root: string) -> string {
+    let p = root + "/.meta2-cert"
+    if !_dexists(p) { return "0" }
+    let v = _exec_line("find " + p + " -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' '")
+    if v == "" { return "0" }
+    return v
+}
+
+// ─── render helpers ──────────────────────────────────────────────────────
+
+fn _row(label: string, val: string) -> string {
+    // Left-pad label to 20 cols (hexa has no substr — build manually).
+    let need = 20 - label.len()
+    let p = ""
+    let i = 0
+    while i < need {
+        p = p + " "
+        i = i + 1
+    }
+    return "  " + label + p + val
+}
+
+fn _hdr(title: string) {
+    println("")
+    println("── " + title + " " + "──────────────────────────────")
+}
+
+// ─── full report ─────────────────────────────────────────────────────────
+
+fn sub_report(compact: bool) {
+    let root = _resolve_root()
+    let tool_n    = _count_files(root, "tool", "*.hexa")
+    let bash_n    = _count_files(root, "tool", "*.bash")
+    let hexa_loc  = _loc_sum(root, "tool", "*.hexa")
+    let bash_loc  = _loc_sum(root, "tool", "*.bash")
+    let md_loc    = _loc_sum(root, "docs", "*.md")
+    let cfg_n     = _count_files(root, "config", "*.json")
+    let state_n   = _count_files(root, "state", "*.json")
+    let docs_n    = _count_files(root, "docs", "*.md")
+    let cert_n    = _cert_count(root)
+    let rm_total  = _roadmap_total(root)
+    let rm_done   = _roadmap_count(root, "DONE")
+    let rm_active = _roadmap_count(root, "ACTIVE")
+    let rm_plan   = _roadmap_count(root, "PLANNED")
+    let rm_block  = _roadmap_count(root, "BLOCKED")
+    let pr_pend   = _proposal_bucket(root, "pending")
+    let pr_appr   = _proposal_bucket(root, "approved")
+    let pr_rej    = _proposal_bucket(root, "rejected")
+    let pr_arch   = _proposal_bucket(root, "archived")
+    let g_week    = _git_commits_since(root, "7 days ago")
+    let g_month   = _git_commits_since(root, "30 days ago")
+    let br_n      = _branch_count(root)
+
+    println("anima stats — repo metrics dashboard")
+    println("root: " + root + "  ts: " + _ts_iso())
+
+    if compact {
+        println("")
+        println(_row("tools (hexa)",    tool_n))
+        println(_row("tools (bash)",    bash_n))
+        println(_row("state/*.json",    state_n))
+        println(_row("certs",           cert_n))
+        println(_row("roadmap",         rm_done + " done / " + rm_active + " active / " + rm_plan + " planned / " + rm_block + " blocked"))
+        println(_row("proposals",       pr_pend + " pend / " + pr_appr + " appr / " + pr_rej + " rej / " + pr_arch + " arch"))
+        println(_row("docs (md)",       docs_n))
+        println(_row("git commits 7d",  g_week))
+        println(_row("git commits 30d", g_month))
+        println(_row("branches",        br_n))
+        return
+    }
+
+    _hdr("code")
+    println(_row("tool/*.hexa",         tool_n + " files  " + hexa_loc + " LOC"))
+    println(_row("tool/*.bash",         bash_n + " files  " + bash_loc + " LOC"))
+    println(_row("docs/*.md",           docs_n + " files  " + md_loc + " LOC"))
+
+    _hdr("artifacts")
+    println(_row("config/*.json",       cfg_n))
+    println(_row("state/*.json",        state_n))
+    println(_row(".meta2-cert",         cert_n))
+
+    _hdr("roadmap")
+    println(_row("total",               rm_total))
+    println(_row("done",                rm_done))
+    println(_row("active",              rm_active))
+    println(_row("planned",             rm_plan))
+    println(_row("blocked",             rm_block))
+
+    _hdr("proposal stack")
+    println(_row("pending",             pr_pend))
+    println(_row("approved",            pr_appr))
+    println(_row("rejected",            pr_rej))
+    println(_row("archived",            pr_arch))
+
+    _hdr("schema versions (top 10)")
+    let schemas = _schema_top(root, 10)
+    if len(schemas) == 0 {
+        println("  (none)")
+    } else {
+        let i = 0
+        while i < len(schemas) {
+            println("  " + _str(schemas[i]))
+            i = i + 1
+        }
+    }
+
+    _hdr("git activity")
+    println(_row("commits 7d",          g_week))
+    println(_row("commits 30d",         g_month))
+    println(_row("branches (all)",      br_n))
+
+    _hdr("top-10 largest tools")
+    let top = _top_tools(root, 10)
+    if len(top) == 0 {
+        println("  (none)")
+    } else {
+        let i = 0
+        while i < len(top) {
+            println("  " + _str(top[i]))
+            i = i + 1
+        }
+    }
+}
+
+// ─── json snapshot ───────────────────────────────────────────────────────
+
+fn _q(s: string) -> string {
+    // jq-safe quoting by round-tripping through jq -Rn
+    return _str(exec("printf '%s' " + "\"" + s.replace("\"","\\\"") + "\"" + " | jq -Rs ."))
+}
+
+fn _emit_json(root: string, outpath: string) {
+    // Build JSON via a single jq invocation w/ --arg variables so that we
+    // never hand-assemble string escapes. Deterministic key order.
+    let tool_n    = _count_files(root, "tool", "*.hexa")
+    let bash_n    = _count_files(root, "tool", "*.bash")
+    let hexa_loc  = _loc_sum(root, "tool", "*.hexa")
+    let bash_loc  = _loc_sum(root, "tool", "*.bash")
+    let md_loc    = _loc_sum(root, "docs", "*.md")
+    let cfg_n     = _count_files(root, "config", "*.json")
+    let state_n   = _count_files(root, "state", "*.json")
+    let docs_n    = _count_files(root, "docs", "*.md")
+    let cert_n    = _cert_count(root)
+    let rm_total  = _roadmap_total(root)
+    let rm_done   = _roadmap_count(root, "DONE")
+    let rm_active = _roadmap_count(root, "ACTIVE")
+    let rm_plan   = _roadmap_count(root, "PLANNED")
+    let rm_block  = _roadmap_count(root, "BLOCKED")
+    let pr_pend   = _proposal_bucket(root, "pending")
+    let pr_appr   = _proposal_bucket(root, "approved")
+    let pr_rej    = _proposal_bucket(root, "rejected")
+    let pr_arch   = _proposal_bucket(root, "archived")
+    let g_week    = _git_commits_since(root, "7 days ago")
+    let g_month   = _git_commits_since(root, "30 days ago")
+    let br_n      = _branch_count(root)
+    let ts        = _ts_iso()
+
+    // schema top10 as "N schema" lines
+    let schemas = _schema_top(root, 10)
+    let s_arr = "["
+    let i = 0
+    while i < len(schemas) {
+        let line = _str(schemas[i]).trim()
+        // split on first whitespace: <count> <schema>
+        let parts = line.split(" ")
+        let cnt = ""
+        let name = ""
+        let j = 0
+        let filled = false
+        while j < len(parts) {
+            let p = _str(parts[j]).trim()
+            if p != "" {
+                if !filled { cnt = p; filled = true }
+                else {
+                    if name == "" { name = p } else { name = name + " " + p }
+                }
+            }
+            j = j + 1
+        }
+        if i > 0 { s_arr = s_arr + "," }
+        s_arr = s_arr + "{\"schema\":\"" + name + "\",\"count\":" + cnt + "}"
+        i = i + 1
+    }
+    s_arr = s_arr + "]"
+
+    let top = _top_tools(root, 10)
+    let t_arr = "["
+    let i2 = 0
+    while i2 < len(top) {
+        let line = _str(top[i2]).trim()
+        let parts = line.split(" ")
+        let loc = ""
+        let path = ""
+        let j = 0
+        let filled = false
+        while j < len(parts) {
+            let p = _str(parts[j]).trim()
+            if p != "" {
+                if !filled { loc = p; filled = true }
+                else {
+                    if path == "" { path = p } else { path = path + " " + p }
+                }
+            }
+            j = j + 1
+        }
+        if i2 > 0 { t_arr = t_arr + "," }
+        t_arr = t_arr + "{\"loc\":" + loc + ",\"path\":\"" + path + "\"}"
+        i2 = i2 + 1
+    }
+    t_arr = t_arr + "]"
+
+    let body = "{"
+        + "\"schema\":\"anima.repo_stats.v1\","
+        + "\"generated_at\":\"" + ts + "\","
+        + "\"root\":\"" + root + "\","
+        + "\"code\":{"
+            + "\"tool_hexa_count\":" + tool_n + ","
+            + "\"tool_hexa_loc\":" + hexa_loc + ","
+            + "\"tool_bash_count\":" + bash_n + ","
+            + "\"tool_bash_loc\":" + bash_loc + ","
+            + "\"docs_md_count\":" + docs_n + ","
+            + "\"docs_md_loc\":" + md_loc
+        + "},"
+        + "\"artifacts\":{"
+            + "\"config_json\":" + cfg_n + ","
+            + "\"state_json\":" + state_n + ","
+            + "\"cert_count\":" + cert_n
+        + "},"
+        + "\"roadmap\":{"
+            + "\"total\":" + rm_total + ","
+            + "\"done\":" + rm_done + ","
+            + "\"active\":" + rm_active + ","
+            + "\"planned\":" + rm_plan + ","
+            + "\"blocked\":" + rm_block
+        + "},"
+        + "\"proposals\":{"
+            + "\"pending\":" + pr_pend + ","
+            + "\"approved\":" + pr_appr + ","
+            + "\"rejected\":" + pr_rej + ","
+            + "\"archived\":" + pr_arch
+        + "},"
+        + "\"schemas_top10\":" + s_arr + ","
+        + "\"git\":{"
+            + "\"commits_7d\":" + g_week + ","
+            + "\"commits_30d\":" + g_month + ","
+            + "\"branches\":" + br_n
+        + "},"
+        + "\"top_tools\":" + t_arr
+    + "}"
+
+    // Validate + pretty-print through jq (also catches malformed numerics)
+    let tmp = "/tmp/anima_stats_emit.json"
+    exec("cat > " + tmp + " <<'JSONEOF'\n" + body + "\nJSONEOF")
+    let pretty = _str(exec("jq -S . " + tmp + " 2>/dev/null"))
+    exec("rm -f " + tmp)
+    if pretty.trim() == "" {
+        // fall back to raw body (jq unavailable / malformed)
+        pretty = body + "\n"
+    }
+    if outpath == "" {
+        println(pretty.trim())
+    } else {
+        exec("mkdir -p \"$(dirname " + outpath + ")\"")
+        let tmp2 = outpath + ".tmp"
+        exec("cat > " + tmp2 + " <<'JSONEOF'\n" + pretty.trim() + "\nJSONEOF")
+        exec("mv " + tmp2 + " " + outpath)
+        println("wrote " + outpath)
+    }
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────
+
+fn sub_selftest() {
+    // synthetic mini repo under /tmp with a known layout; verify counts.
+    let sandbox = "/tmp/anima_stats_selftest"
+    exec("rm -rf " + sandbox + " && mkdir -p " + sandbox + "/tool " + sandbox + "/config " + sandbox + "/state " + sandbox + "/docs " + sandbox + "/.meta2-cert")
+    exec("printf 'fn main(){println(\"a\")}\\n' > " + sandbox + "/tool/a.hexa")
+    exec("printf 'fn main(){println(\"b\")}\\n' > " + sandbox + "/tool/b.hexa")
+    exec("printf '#!/usr/bin/env bash\\necho c\\n' > " + sandbox + "/tool/c.bash")
+    exec("printf '{\"k\":1}\\n' > " + sandbox + "/config/one.json")
+    exec("printf '{\"schema\":\"x.v1\"}\\n' > " + sandbox + "/state/s1.json")
+    exec("printf '{\"schema\":\"x.v1\"}\\n' > " + sandbox + "/state/s2.json")
+    exec("printf '{\"schema\":\"y.v1\"}\\n' > " + sandbox + "/state/s3.json")
+    exec("printf '# doc\\n' > " + sandbox + "/docs/d.md")
+    exec("printf '{\"id\":\"cert-1\"}\\n' > " + sandbox + "/.meta2-cert/c1.json")
+    // roadmap
+    exec("mkdir -p " + sandbox + "/state && printf '{\"entries\":[{\"status\":\"DONE\"},{\"status\":\"ACTIVE\"},{\"status\":\"PLANNED\"}]}\\n' > " + sandbox + "/state/roadmap_progress.json")
+    // proposals
+    exec("mkdir -p " + sandbox + "/state/proposals/pending " + sandbox + "/state/proposals/approved " + sandbox + "/state/proposals/rejected " + sandbox + "/state/proposals/archived")
+    exec("printf '{}\\n' > " + sandbox + "/state/proposals/pending/p1.json")
+    exec("printf '{}\\n' > " + sandbox + "/state/proposals/pending/p2.json")
+    exec("printf '{}\\n' > " + sandbox + "/state/proposals/approved/a1.json")
+
+    let ok = true
+    // use internal helpers with sandbox root
+    let c_hexa = _count_files(sandbox, "tool", "*.hexa")
+    if c_hexa != "2" { println("FAIL hexa_count=" + c_hexa); ok = false }
+    let c_bash = _count_files(sandbox, "tool", "*.bash")
+    if c_bash != "1" { println("FAIL bash_count=" + c_bash); ok = false }
+    let c_cfg = _count_files(sandbox, "config", "*.json")
+    if c_cfg != "1" { println("FAIL cfg_count=" + c_cfg); ok = false }
+    let c_state = _count_files(sandbox, "state", "*.json")
+    // state: s1 s2 s3 roadmap_progress + p1 p2 a1 = 7
+    if c_state != "7" { println("FAIL state_count=" + c_state); ok = false }
+    let c_docs = _count_files(sandbox, "docs", "*.md")
+    if c_docs != "1" { println("FAIL docs_count=" + c_docs); ok = false }
+    let c_cert = _cert_count(sandbox)
+    if c_cert != "1" { println("FAIL cert_count=" + c_cert); ok = false }
+    let rm_done = _roadmap_count(sandbox, "DONE")
+    if rm_done != "1" { println("FAIL rm_done=" + rm_done); ok = false }
+    let pr_pend = _proposal_bucket(sandbox, "pending")
+    if pr_pend != "2" { println("FAIL pr_pend=" + pr_pend); ok = false }
+    let pr_appr = _proposal_bucket(sandbox, "approved")
+    if pr_appr != "1" { println("FAIL pr_appr=" + pr_appr); ok = false }
+    let schemas = _schema_top(sandbox, 10)
+    if len(schemas) < 2 { println("FAIL schema_top len=" + _str(len(schemas))); ok = false }
+
+    exec("rm -rf " + sandbox)
+    if ok {
+        println("PASS anima_cli/stats selftest")
+        exit(0)
+    }
+    println("FAIL anima_cli/stats selftest")
+    exit(1)
+}
+
+fn sub_help() {
+    println("anima stats — repo metrics dashboard")
+    println("")
+    println("  anima stats              full report table")
+    println("  anima stats --compact    1-page summary (10 rows)")
+    println("  anima stats --json       machine-readable snapshot")
+    println("  anima stats --snapshot   write state/anima_stats_last.json")
+    println("")
+    println("  --selftest   synthetic-repo test")
+    println("  --help       this help")
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help")     { sub_help(); return }
+
+    let root = _resolve_root()
+    let want_snapshot = _arg_present(argv, "--snapshot")
+    let want_json     = _arg_present(argv, "--json")
+
+    if want_snapshot {
+        let outp = root + "/state/anima_stats_last.json"
+        _emit_json(root, outp)
+        if want_json {
+            // also echo to stdout for pipelines
+            _emit_json(root, "")
+        }
+        return
+    }
+    if want_json {
+        _emit_json(root, "")
+        return
+    }
+
+    let compact = _arg_present(argv, "--compact")
+    sub_report(compact)
+}
+
+main()

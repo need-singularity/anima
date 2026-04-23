@@ -1,0 +1,194 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  edu/lora/rewind.hexa — Path B Day 4 #27 (ckpt rewind companion)
+//
+//  PURPOSE
+//    Checkpoint rewind helper for CPGD. Provides deep snapshot of matrix W
+//    and restoration on AN11(b) gate violation. Co-lands with
+//    edu/lora/hard_gate.hexa which is the detector + orchestrator.
+//
+//  API (exposed semantics)
+//    fn rewind_snapshot(W: matrix) -> matrix
+//        Deep-copies W row-by-row so mutations to W don't affect snapshot.
+//
+//    fn rewind_restore(snapshot: matrix) -> matrix
+//        Returns a fresh deep copy of snapshot so the caller may freely
+//        mutate the restored W without affecting the saved ckpt.
+//
+//    fn rewind_diff_max(a: matrix, b: matrix) -> float
+//        max |a[i,j] - b[i,j]| over all cells (used for self-verification
+//        of snapshot/restore byte-integrity).
+//
+//  SELFTEST
+//    hexa run edu/lora/rewind.hexa --selftest
+//        1) snapshot W, mutate W, verify snapshot unaffected.
+//        2) restore, verify restored == snapshot bit-for-bit.
+//        3) verify restored is an independent copy (mutating does not
+//           alter the snapshot).
+//
+//  raw#9 strict · hexa-only · deterministic · LLM=none · CPU-only
+// ════════════════════════════════════════════════════════════════════════════
+
+let DIM = 16
+let ROWS = 16
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ─── snapshot / restore (deep copy) ───────────────────────────────────────
+
+fn rewind_snapshot(W: array) -> array {
+    let rows = len(W)
+    let mut snap = []
+    let mut i = 0
+    while i < rows {
+        let src = W[i]
+        let cols = len(src)
+        let mut row = []
+        let mut j = 0
+        while j < cols {
+            row = push(row, to_float(src[j]))
+            j = j + 1
+        }
+        snap = push(snap, row)
+        i = i + 1
+    }
+    return snap
+}
+
+fn rewind_restore(snap: array) -> array {
+    return rewind_snapshot(snap)
+}
+
+fn rewind_diff_max(a: array, b: array) -> float {
+    let rows_a = len(a)
+    let rows_b = len(b)
+    let rows = if rows_a < rows_b { rows_a } else { rows_b }
+    let mut max_d = 0.0
+    let mut i = 0
+    while i < rows {
+        let ra = a[i]
+        let rb = b[i]
+        let cols_a = len(ra)
+        let cols_b = len(rb)
+        let cols = if cols_a < cols_b { cols_a } else { cols_b }
+        let mut j = 0
+        while j < cols {
+            let d = fabs(to_float(ra[j]) - to_float(rb[j]))
+            if d > max_d { max_d = d }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return max_d
+}
+
+// ─── test matrix ──────────────────────────────────────────────────────────
+
+fn make_test_matrix(rows: int, cols: int, seed_offset: float) -> array {
+    let mut M = []
+    let mut i = 0
+    while i < rows {
+        let mut row = []
+        let mut j = 0
+        while j < cols {
+            let v = to_float(i) * 17.0 + to_float(j) * 3.14 + seed_offset
+            row = push(row, v)
+            j = j + 1
+        }
+        M = push(M, row)
+        i = i + 1
+    }
+    return M
+}
+
+fn mutate_matrix_inplace(W: array, scale: float) -> array {
+    let rows = len(W)
+    let mut i = 0
+    while i < rows {
+        let row = W[i]
+        let cols = len(row)
+        let mut j = 0
+        while j < cols {
+            row[j] = to_float(row[j]) + scale
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return W
+}
+
+// ─── selftest ─────────────────────────────────────────────────────────────
+
+fn selftest_rewind() -> bool {
+    println("[rewind] selftest — snapshot/restore deep-copy integrity")
+
+    // 1) snapshot is independent of source mutations
+    let mut W = make_test_matrix(ROWS, DIM, 0.0)
+    let snap = rewind_snapshot(W)
+    let d_pre = rewind_diff_max(W, snap)
+    if d_pre > 0.0 {
+        println("[rewind] FAIL step-1: snapshot differs from source initially, max_d=" + to_string(d_pre))
+        return false
+    }
+    W = mutate_matrix_inplace(W, 42.0)
+    let d_after_mut = rewind_diff_max(W, snap)
+    if d_after_mut < 1.0 {
+        println("[rewind] FAIL step-1: snapshot tracked source mutation (alias leak), max_d=" + to_string(d_after_mut))
+        return false
+    }
+    println("[rewind] step-1 OK: source mutated by 42, snapshot unchanged (max_d=" + to_string(d_after_mut) + ")")
+
+    // 2) restore produces an exact copy of snapshot
+    let restored = rewind_restore(snap)
+    let d_rest = rewind_diff_max(restored, snap)
+    if d_rest != 0.0 {
+        println("[rewind] FAIL step-2: restore not bit-equal to snapshot, max_d=" + to_string(d_rest))
+        return false
+    }
+    println("[rewind] step-2 OK: restore is bit-equal to snapshot")
+
+    // 3) restored is an independent copy
+    let mut restored2 = rewind_restore(snap)
+    restored2 = mutate_matrix_inplace(restored2, 99.0)
+    let d_snap_intact = rewind_diff_max(snap, restored)
+    if d_snap_intact != 0.0 {
+        println("[rewind] FAIL step-3: snapshot drifted after mutating a restored copy, max_d=" + to_string(d_snap_intact))
+        return false
+    }
+    println("[rewind] step-3 OK: restoration produced an independent copy")
+
+    println("[rewind] selftest PASS — snapshot/restore semantics verified")
+    return true
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut mode = "selftest"
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--selftest" { mode = "selftest" }
+        if a == "--help"     { mode = "help" }
+        k = k + 1
+    }
+    if mode == "help" {
+        println("usage:")
+        println("  hexa run edu/lora/rewind.hexa --selftest")
+        return
+    }
+    let ok = selftest_rewind()
+    if ok { exit(0) } else { exit(1) }
+}

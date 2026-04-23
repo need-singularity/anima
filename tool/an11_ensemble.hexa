@@ -1,0 +1,422 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/an11_ensemble.hexa — ROI item D23 — AN11 a/b/c ensemble weighted avg
+//
+//  PURPOSE
+//    AN11 3-condition gate (rules/anima.json#AN11) is currently evaluated by
+//    three independent verifiers (a/b/c).  A single false-negative on any
+//    branch flips the overall verdict and creates a single-point-failure
+//    surface.  This tool consumes the three latest verdict artifacts, computes
+//    a weighted-average ensemble score, and emits a single ensemble verdict
+//    file for monitor / dashboard / launchd consumption.
+//
+//  INPUTS (auto-detected, latest matching file per branch)
+//    a → state/an11_a_verdict.json     OR latest state/{dest}_r{N}_an11_a.json
+//    b → state/an11_b_verdict.json     OR latest state/{dest}_r{N}_an11_b.json
+//    c → state/an11_c_verdict.json     OR latest state/{dest}_r{N}_an11_c.json
+//
+//    Branch verdict extraction:
+//      verdict == "PASS" → score 1.0
+//      verdict == "FAIL" → score 0.0
+//      missing/other     → score 0.0 + branch flagged "MISSING"
+//
+//  WEIGHTS
+//    Default: a=0.4, b=0.3, c=0.3   (override via --weights a:0.5,b:0.25,c:0.25)
+//    Sum is renormalised; score = sum(w_i * branch_i) / sum(w_i).
+//
+//  ENSEMBLE VERDICT THRESHOLD
+//    score >= 0.66  → PASS         (≥ 2/3 weighted majority OR a+b/a+c)
+//    score >= 0.40  → DEGRADED     (1 strong branch only)
+//    else           → FAIL
+//
+//  OUTPUT
+//    state/an11_ensemble_result.json
+//
+//  USAGE
+//    hexa run tool/an11_ensemble.hexa
+//    hexa run tool/an11_ensemble.hexa --dry-run         (synth pass on a, fail on b,c)
+//    hexa run tool/an11_ensemble.hexa --weights a:0.5,b:0.25,c:0.25
+//    hexa run tool/an11_ensemble.hexa --print
+//
+//  EXIT CODES
+//    0 = PASS / DEGRADED / FAIL emitted (read verdict field for outcome)
+//    2 = I/O failure (verdict file not writable)
+//    3 = --dry-run scenario emitted
+//
+//  HARD CONSTRAINTS
+//    - Hexa-only, deterministic, no LLM
+//    - Idempotent: same inputs → same output bytes (modulo timestamp)
+//    - Never panics on missing inputs (treated as MISSING branch)
+//    - Read-only on every artifact except its own emit file
+//    - DOES NOT modify .roadmap or any AN11 source verdict
+// ════════════════════════════════════════════════════════════════════════════
+
+let ANIMA_ROOT  = "/Users/ghost/core/anima"
+let OUT_PATH    = "/Users/ghost/core/anima/state/an11_ensemble_result.json"
+
+let DEFAULT_WA = 0.4
+let DEFAULT_WB = 0.3
+let DEFAULT_WC = 0.3
+
+let THRESH_PASS     = 0.66
+let THRESH_DEGRADED = 0.40
+
+// ── shell / io helpers ───────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return to_string(x)
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/ts_iso.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _ts_iso() -> string { return _str(exec("date -u +%FT%TZ")).trim() }
+
+// INLINE_DEPRECATED[H42]: see shared/util/file_exists.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _file_exists(p: string) -> bool {
+    return _str(exec("test -e " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _bool_str(b: bool) -> string { if b { return "true" } else { return "false" } }
+
+// INLINE_DEPRECATED[H42]: see shared/util/json_escape.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+// ── argv parsing (stage1: argv begins at index 2) ────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) {
+        o.push(a[i])
+        i = i + 1
+    }
+    return o
+}
+
+fn _has_flag(av: array, k: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _get_val(av: array, k: string, dflt: string) -> string {
+    let mut i = 0
+    let n = len(av)
+    while i < n - 1 {
+        if _str(av[i]) == k { return _str(av[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+// ── tolerant JSON field readers (stage0-safe, no json_parse dependency) ──
+
+fn _read_or_empty(p: string) -> string {
+    if !_file_exists(p) { return "" }
+    let raw = read_file(p)
+    return _str(raw)
+}
+
+fn _field_str(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    // hand-search for the next ':' AFTER the key (stage1 index_of ignores `from` arg)
+    let n0 = len(blob)
+    let key_end = k + len(needle)
+    let mut colon = -1
+    let mut ci = key_end
+    while ci < n0 {
+        if blob.substring(ci, ci + 1) == ":" {
+            colon = ci
+            break
+        }
+        ci = ci + 1
+    }
+    if colon < 0 { return "" }
+    // skip whitespace then expect opening quote
+    let mut i = colon + 1
+    let n = len(blob)
+    while i < n {
+        let c = blob.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 } else { break }
+    }
+    if i >= n { return "" }
+    let first = blob.substring(i, i + 1)
+    if first != "\"" { return "" }
+    let start = i + 1
+    let mut j = start
+    while j < n {
+        let cc = blob.substring(j, j + 1)
+        if cc == "\\" { j = j + 2 } else {
+            if cc == "\"" { return blob.substring(start, j) }
+            j = j + 1
+        }
+    }
+    return ""
+}
+
+// ── per-branch loader ────────────────────────────────────────────────────
+//
+// Each branch produces a record with: present, verdict, source_path, score.
+
+fn _glob_latest(pattern: string) -> string {
+    let cmd = "ls -1t " + pattern + " 2>/dev/null | head -n 1"
+    return _str(exec(cmd)).trim()
+}
+
+fn _resolve_branch(branch: string) -> string {
+    // 1) canonical state/an11_<x>_verdict.json (only if it carries a verdict field)
+    let canon = ANIMA_ROOT + "/state/an11_" + branch + "_verdict.json"
+    if _file_exists(canon) {
+        let blob = _read_or_empty(canon)
+        if blob.index_of("\"verdict\"") >= 0 { return canon }
+    }
+    // 2) latest state/*_r*_an11_<x>.json (live verifier emits)
+    let glob = ANIMA_ROOT + "/state/*_r*_an11_" + branch + ".json"
+    let g = _glob_latest(glob)
+    if g != "" && _file_exists(g) { return g }
+    return ""
+}
+
+fn _load_branch(branch: string) -> array {
+    // returns [present_bool, verdict_str, source_path, score_float]
+    let path = _resolve_branch(branch)
+    let mut out = []
+    if path == "" {
+        out.push(false)
+        out.push("MISSING")
+        out.push("")
+        out.push(0.0)
+        return out
+    }
+    let blob = _read_or_empty(path)
+    let v = _field_str(blob, "verdict")
+    let mut score = 0.0
+    let mut verdict_norm = "MISSING"
+    if v == "PASS" {
+        score = 1.0
+        verdict_norm = "PASS"
+    } else {
+        if v == "FAIL" {
+            score = 0.0
+            verdict_norm = "FAIL"
+        } else {
+            // ambiguous / no verdict key
+            verdict_norm = "MISSING"
+            score = 0.0
+        }
+    }
+    out.push(true)
+    out.push(verdict_norm)
+    out.push(path)
+    out.push(score)
+    return out
+}
+
+// ── weight parsing: "a:0.5,b:0.25,c:0.25" ───────────────────────────────
+
+fn _extract_weight(spec: string, key: string, dflt: float) -> float {
+    if spec == "" { return dflt }
+    let needle = key + ":"
+    let k = spec.index_of(needle)
+    if k < 0 { return dflt }
+    let start = k + len(needle)
+    let n = len(spec)
+    let mut j = start
+    while j < n {
+        let c = spec.substring(j, j + 1)
+        if c == "," || c == " " { break }
+        j = j + 1
+    }
+    let s = spec.substring(start, j)
+    if s == "" { return dflt }
+    return to_float(s)
+}
+
+// ── verdict roll-up ──────────────────────────────────────────────────────
+
+fn _verdict_for_score(score: float) -> string {
+    let mut verdict = "FAIL"
+    if score >= 0.66 {
+        verdict = "PASS"
+    } else {
+        if score >= 0.40 {
+            verdict = "DEGRADED"
+        }
+    }
+    return verdict
+}
+
+// ── synthetic dry-run branches ───────────────────────────────────────────
+
+fn _synth_branch(verdict: string) -> array {
+    let mut out = []
+    let present = (verdict == "PASS" || verdict == "FAIL")
+    out.push(present)
+    out.push(verdict)
+    out.push("__SYNTH__")
+    let mut s = 0.0
+    if verdict == "PASS" { s = 1.0 }
+    out.push(s)
+    return out
+}
+
+// ── render emit ──────────────────────────────────────────────────────────
+
+fn _branch_obj(branch: string, rec: array) -> string {
+    let present = rec[0]
+    let verdict = _str(rec[1])
+    let src = _str(rec[2])
+    let score = to_float(rec[3])
+    let mut s = "{\n"
+    s = s + "      \"branch\":     \"" + branch + "\",\n"
+    s = s + "      \"present\":    " + _bool_str(present) + ",\n"
+    s = s + "      \"verdict\":    \"" + _json_escape(verdict) + "\",\n"
+    s = s + "      \"source\":     \"" + _json_escape(src) + "\",\n"
+    s = s + "      \"score\":      " + to_string(score) + "\n"
+    s = s + "    }"
+    return s
+}
+
+fn _emit(out_path: string, ts: string, dry: bool, weights: array, a_rec: array, b_rec: array, c_rec: array, weighted_score: float, ensemble_verdict: string, note: string) {
+    let wa = to_float(weights[0])
+    let wb = to_float(weights[1])
+    let wc = to_float(weights[2])
+    let mut body = "{\n"
+    body = body + "  \"schema\":          \"anima/an11_ensemble_result/1\",\n"
+    body = body + "  \"tool\":            \"tool/an11_ensemble.hexa\",\n"
+    body = body + "  \"generated_at\":    \"" + _json_escape(ts) + "\",\n"
+    body = body + "  \"dry_run\":         " + _bool_str(dry) + ",\n"
+    body = body + "  \"weights\": {\n"
+    body = body + "    \"a\": " + to_string(wa) + ",\n"
+    body = push_str_noop("")
+    body = body + "    \"b\": " + to_string(wb) + ",\n"
+    body = body + "    \"c\": " + to_string(wc) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"branches\": [\n    " + _branch_obj("a", a_rec) + ",\n    " + _branch_obj("b", b_rec) + ",\n    " + _branch_obj("c", c_rec) + "\n  ],\n"
+    body = body + "  \"weighted_score\":  " + to_string(weighted_score) + ",\n"
+    body = body + "  \"thresholds\": {\n"
+    body = body + "    \"pass_min\":      " + to_string(THRESH_PASS) + ",\n"
+    body = body + "    \"degraded_min\":  " + to_string(THRESH_DEGRADED) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"verdict\":         \"" + _json_escape(ensemble_verdict) + "\",\n"
+    body = body + "  \"note\":            \"" + _json_escape(note) + "\",\n"
+    body = body + "  \"policy\": {\n"
+    body = body + "    \"side_effects\":      \"verdict_file_only\",\n"
+    body = body + "    \"modifies_roadmap\":  false,\n"
+    body = body + "    \"safe_to_repeat\":    true,\n"
+    body = body + "    \"deterministic\":     true\n"
+    body = body + "  }\n"
+    body = body + "}\n"
+    write_file(out_path, body)
+}
+
+// helper: no-op string concat (placeholder to keep emit shape consistent)
+fn push_str_noop(s: string) -> string { return s }
+
+// helper: extract ckpt key from source path basename (e.g. "alm_r0", "alm_r12", "alm_r13_an11_a_live").
+// Used to detect cross-branch source mismatch — ensemble weighted score is only
+// meaningful when a/b/c sources share the same training round.
+fn _ckpt_key(path: string) -> string {
+    if path == "" { return "" }
+    // basename: scan backwards for last "/"
+    let mut last_slash = -1
+    let mut i = 0
+    while i < len(path) {
+        if path.substring(i, i + 1) == "/" { last_slash = i }
+        i = i + 1
+    }
+    let mut base = path
+    if last_slash >= 0 { base = path.substring(last_slash + 1, len(path)) }
+    // strip the "_an11_<x>...json" suffix to leave the ckpt prefix
+    let an = base.index_of("_an11_")
+    if an >= 0 { return base.substring(0, an) }
+    return base
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = _argv()
+    let dry = _has_flag(av, "--dry-run")
+    let also_print = _has_flag(av, "--print")
+    let wspec = _get_val(av, "--weights", "")
+
+    let wa_in = _extract_weight(wspec, "a", DEFAULT_WA)
+    let wb_in = _extract_weight(wspec, "b", DEFAULT_WB)
+    let wc_in = _extract_weight(wspec, "c", DEFAULT_WC)
+    let wsum_pre = wa_in + wb_in + wc_in
+    let mut wa = DEFAULT_WA
+    let mut wb = DEFAULT_WB
+    let mut wc = DEFAULT_WC
+    if wsum_pre > 0.0 {
+        wa = wa_in / wsum_pre
+        wb = wb_in / wsum_pre
+        wc = wc_in / wsum_pre
+    }
+    let mut weights = []
+    weights.push(wa)
+    weights.push(wb)
+    weights.push(wc)
+
+    let mut a_rec = []
+    let mut b_rec = []
+    let mut c_rec = []
+    let mut note = "live_inputs"
+    if dry {
+        a_rec = _synth_branch("PASS")
+        b_rec = _synth_branch("FAIL")
+        c_rec = _synth_branch("PASS")
+        note = "synthetic_dry_run (a=PASS, b=FAIL, c=PASS)"
+    } else {
+        a_rec = _load_branch("a")
+        b_rec = _load_branch("b")
+        c_rec = _load_branch("c")
+    }
+
+    let sa = to_float(a_rec[3])
+    let sb = to_float(b_rec[3])
+    let sc = to_float(c_rec[3])
+    let weighted_score = sa * wa + sb * wb + sc * wc
+    let mut verdict = _verdict_for_score(weighted_score)
+    // 2026-04-22: cross-branch source ckpt consistency check.
+    // If a/b/c sources point to DIFFERENT training rounds (e.g. r0 vs r12 vs r13),
+    // the weighted score is meaningless — emit SOURCE_MISMATCH instead of FAIL.
+    if !dry {
+        let pa = _str(a_rec[2])
+        let pb = _str(b_rec[2])
+        let pc = _str(c_rec[2])
+        let key_a = _ckpt_key(pa)
+        let key_b = _ckpt_key(pb)
+        let key_c = _ckpt_key(pc)
+        if pa != "" && pb != "" && pc != "" {
+            if !(key_a == key_b && key_b == key_c) {
+                verdict = "SOURCE_MISMATCH"
+                note = "source_mismatch: a=" + key_a + " b=" + key_b + " c=" + key_c + " (need consistent ckpt e.g. alm_r13_*_live for valid ensemble)"
+            }
+        }
+    }
+
+    let ts = _ts_iso()
+    println("[an11_ensemble] " + ts + "  weights a=" + to_string(wa) + " b=" + to_string(wb) + " c=" + to_string(wc))
+    println("  a verdict=" + _str(a_rec[1]) + " score=" + to_string(sa) + " src=" + _str(a_rec[2]))
+    println("  b verdict=" + _str(b_rec[1]) + " score=" + to_string(sb) + " src=" + _str(b_rec[2]))
+    println("  c verdict=" + _str(c_rec[1]) + " score=" + to_string(sc) + " src=" + _str(c_rec[2]))
+    println("  weighted_score=" + to_string(weighted_score) + "  verdict=" + verdict)
+
+    _emit(OUT_PATH, ts, dry, weights, a_rec, b_rec, c_rec, weighted_score, verdict, note)
+    println("  emit=" + OUT_PATH)
+    if also_print {
+        let body = read_file(OUT_PATH)
+        println(_str(body))
+    }
+    if dry { exit(3) }
+    exit(0)
+}

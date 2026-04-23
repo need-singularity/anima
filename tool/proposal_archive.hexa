@@ -1,0 +1,468 @@
+// tool/proposal_archive.hexa — anima proposal stack: approved → archived
+//
+// PURPOSE
+//   After USER has spawned a sub-agent that built the module per the
+//   proposed_implementation_<id>.md spec, USER explicitly archives via:
+//     hexa tool/proposal_archive.hexa --id <N> --module-path <path>
+//   We verify (a) module file exists, (b) `hexa <module> --selftest` exits 0,
+//   then move approved/<id>.json → archived/<id>.json + write
+//   implementation_module_path. P4 (§5 + §8 transition gate).
+//
+// USAGE
+//   hexa tool/proposal_archive.hexa --id <N> --module-path <abs-or-rel>
+//   hexa tool/proposal_archive.hexa --selftest
+//
+// EXIT
+//   0 success | 1 validation fail | 3 user error
+//
+// HARD CONSTRAINTS
+//   - module-path is REQUIRED (no auto-discovery — user must name what was built).
+//   - Module file must exist on disk.
+//   - `hexa <module> --selftest` must exit 0.
+//   - Re-run on already-archived id → noop exit 0.
+
+let DEFAULT_ROOT     = "/Users/ghost/core/anima"
+let PROPOSALS_DIR    = DEFAULT_ROOT + "/state/proposals"
+let APPROVED_DIR     = PROPOSALS_DIR + "/approved"
+let ARCHIVED_DIR     = PROPOSALS_DIR + "/archived"
+let INVENTORY_PATH   = PROPOSALS_DIR + "/inventory.json"
+
+let HEXA_BIN         = "/Users/ghost/core/hexa-lang/hexa"
+
+// ─── shared helpers ──────────────────────────────────────────────────
+
+fn _str(x) -> string { return to_string(x) }
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _fexists(p: string) -> bool {
+    let r = to_string(exec("ls -d " + _sh_quote(p) + " 2>/dev/null")).trim()
+    return r == p
+}
+
+fn _now_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _ensure_dir(p: string) { exec("mkdir -p " + _sh_quote(p)) }
+
+fn _atomic_write(path: string, body: string) {
+    let mut last_sl = -1
+    let mut k = 0
+    while k < len(path) {
+        if path.substring(k, k + 1) == "/" { last_sl = k }
+        k = k + 1
+    }
+    if last_sl > 0 { _ensure_dir(path.substring(0, last_sl)) }
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    exec("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _is_numeric_str(s: string) -> bool {
+    if s == "" { return false }
+    let mut start = 0
+    if s.substring(0, 1) == "-" {
+        if len(s) == 1 { return false }
+        start = 1
+    }
+    let mut saw_dot = false
+    let mut i = start
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "." {
+            if saw_dot { return false }
+            saw_dot = true
+        } else if c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            // ok
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn _is_string_key(k: string) -> bool {
+    if k == "id" { return true }
+    if k == "title" { return true }
+    if k == "kind" { return true }
+    if k == "rationale" { return true }
+    if k == "user_status" { return true }
+    if k == "first_seen_ts" { return true }
+    if k == "last_refined_ts" { return true }
+    if k == "user_decision_at" { return true }
+    if k == "user_decision_reason" { return true }
+    if k == "implementation_module_path" { return true }
+    if k == "resurrection_eligible_after" { return true }
+    if k == "estimated_effort" { return true }
+    if k == "estimated_impact" { return true }
+    if k == "lineage_parent" { return true }
+    if k == "source_signal" { return true }
+    if k == "path" { return true }
+    if k == "schema" { return true }
+    if k == "created_at" { return true }
+    if k == "updated_at" { return true }
+    return false
+}
+
+fn _json_esc(s: string) -> string {
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { out = out + "\\\\" }
+        else if c == "\"" { out = out + "\\\"" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn _list_dir(dir: string) -> array {
+    if !_fexists(dir) { return [] }
+    let raw = to_string(exec("ls -1 " + _sh_quote(dir) + " 2>/dev/null"))
+    let mut out = []
+    let mut buf = ""
+    let mut i = 0
+    while i < len(raw) {
+        let c = raw.substring(i, i + 1)
+        if c == "\n" {
+            if len(buf) > 0 { out = out.push(buf) }
+            buf = ""
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    if len(buf) > 0 { out = out.push(buf) }
+    return out
+}
+
+fn _resolve_proposal_file(dir: string, id: string) -> string {
+    if !_fexists(dir) { return "" }
+    let exact = dir + "/" + id + ".json"
+    if _fexists(exact) { return exact }
+    let files = _list_dir(dir)
+    let mut i = 0
+    let suffix = "-" + id + ".json"
+    let prefix = id + "_"
+    let prefix_dot = id + ".json"
+    while i < len(files) {
+        let f = files[i]
+        if f == prefix_dot { return dir + "/" + f }
+        if len(f) >= len(suffix) {
+            let tail = f.substring(len(f) - len(suffix), len(f))
+            if tail == suffix { return dir + "/" + f }
+        }
+        if len(f) >= len(prefix) {
+            let head = f.substring(0, len(prefix))
+            if head == prefix { return dir + "/" + f }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _load_inventory() {
+    if !_fexists(INVENTORY_PATH) {
+        return json_parse("{\"schema\":\"anima.proposals.inventory.v1\",\"updated_at\":\"\",\"proposals\":[]}")
+    }
+    return json_parse(read_file(INVENTORY_PATH))
+}
+
+fn _inv_find_idx(inv, id: string) -> int {
+    if !inv.contains_key("proposals") { return -1 }
+    let ps = inv["proposals"]
+    let mut i = 0
+    while i < len(ps) {
+        let p = ps[i]
+        if p.contains_key("id") && _str(p["id"]) == id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _serialize_value(k: string, v, indent: string) -> string {
+    let ts = _str(v)
+    if ts == "void" { return "null" }
+    if ts == "true" || ts == "false" { return ts }
+
+    if len(ts) >= 1 && ts.substring(0, 1) == "[" {
+        let n = len(v)
+        if n == 0 { return "[]" }
+        let mut out = "[\n"
+        let mut i = 0
+        while i < n {
+            out = out + indent + "  " + _serialize_value("", v[i], indent + "  ")
+            if i + 1 < n { out = out + "," }
+            out = out + "\n"
+            i = i + 1
+        }
+        out = out + indent + "]"
+        return out
+    }
+
+    if len(ts) >= 1 && ts.substring(0, 1) == "{" {
+        let mks = keys(v)
+        let n = len(mks)
+        if n == 0 { return "{}" }
+        let mut out = "{\n"
+        let mut i = 0
+        while i < n {
+            let mk = mks[i]
+            out = out + indent + "  \"" + _json_esc(mk) + "\": " + _serialize_value(mk, v[mk], indent + "  ")
+            if i + 1 < n { out = out + "," }
+            out = out + "\n"
+            i = i + 1
+        }
+        out = out + indent + "}"
+        return out
+    }
+
+    if k != "" && _is_string_key(k) { return "\"" + _json_esc(ts) + "\"" }
+    if _is_numeric_str(ts) { return ts }
+    return "\"" + _json_esc(ts) + "\""
+}
+
+fn _proposal_to_json(p) -> string {
+    let ks = keys(p)
+    let mut out = "{\n"
+    let mut i = 0
+    while i < len(ks) {
+        let k = ks[i]
+        out = out + "    \"" + _json_esc(k) + "\": " + _serialize_value(k, p[k], "    ")
+        if i + 1 < len(ks) { out = out + "," }
+        out = out + "\n"
+        i = i + 1
+    }
+    out = out + "  }"
+    return out
+}
+
+fn _save_inventory(inv) {
+    let ks = keys(inv)
+    let mut body = "{\n"
+    let mut emitted_updated = false
+    let mut i = 0
+    while i < len(ks) {
+        let k = ks[i]
+        if k == "proposals" { i = i + 1; continue }
+        let mut v = inv[k]
+        if k == "updated_at" {
+            emitted_updated = true
+            v = _now_iso()
+        }
+        body = body + "  \"" + _json_esc(k) + "\": " + _serialize_value(k, v, "  ") + ",\n"
+        i = i + 1
+    }
+    if !emitted_updated {
+        body = body + "  \"updated_at\": \"" + _now_iso() + "\",\n"
+    }
+    let ps = if inv.contains_key("proposals") { inv["proposals"] } else { [] }
+    body = body + "  \"proposals\": [\n"
+    let mut j = 0
+    while j < len(ps) {
+        body = body + "  " + _proposal_to_json(ps[j])
+        if j + 1 < len(ps) { body = body + "," }
+        body = body + "\n"
+        j = j + 1
+    }
+    body = body + "  ]\n"
+    body = body + "}\n"
+    _atomic_write(INVENTORY_PATH, body)
+}
+
+fn _per_proposal_load(path: string) {
+    return json_parse(read_file(path))
+}
+
+fn _per_proposal_save(path: string, p) {
+    let raw = _proposal_to_json(p)
+    _atomic_write(path, raw + "\n")
+}
+
+fn _set_field(p, k: string, v) { p[k] = v }
+
+// ─── module verification ─────────────────────────────────────────────
+
+fn _resolve_module_abs(module_path: string) -> string {
+    // Allow absolute or repo-relative.
+    if len(module_path) >= 1 && module_path.substring(0, 1) == "/" {
+        return module_path
+    }
+    return DEFAULT_ROOT + "/" + module_path
+}
+
+fn _verify_module_selftest(module_abs: string) -> array {
+    if !_fexists(module_abs) {
+        return [false, "module file not found: " + module_abs]
+    }
+    // Run hexa <module> --selftest, capture exit code via $?.
+    // To avoid metachars in exec, write a tiny wrapper script.
+    let wrap = "/tmp/anima_proposal_archive_selftest_wrap.sh"
+    let body = "#!/bin/sh\n" + _sh_quote(HEXA_BIN) + " " + _sh_quote(module_abs) + " --selftest >/tmp/anima_proposal_archive_selftest.out 2>&1\necho $?\n"
+    write_file(wrap, body)
+    exec("chmod +x " + _sh_quote(wrap))
+    let rc_str = to_string(exec(_sh_quote(wrap))).trim()
+    if rc_str == "0" {
+        return [true, "module selftest PASS"]
+    }
+    let out = to_string(exec("cat /tmp/anima_proposal_archive_selftest.out"))
+    return [false, "module selftest exit=" + rc_str + " output:\n" + out]
+}
+
+// ─── core action ─────────────────────────────────────────────────────
+
+fn _do_archive(id: string, module_path: string) -> array {
+    if id == "" { return [3, "proposal_archive: --id required"] }
+    if module_path == "" { return [3, "proposal_archive: --module-path required (user must name built module)"] }
+
+    let approved_path = _resolve_proposal_file(APPROVED_DIR, id)
+    let archived_path = _resolve_proposal_file(ARCHIVED_DIR, id)
+
+    if archived_path != "" && approved_path == "" {
+        return [0, "proposal_archive: id=" + id + " already archived at " + archived_path + " (noop)"]
+    }
+
+    if approved_path == "" {
+        return [1, "proposal_archive: id=" + id + " not found in approved/ — must be approved + implemented first"]
+    }
+
+    let module_abs = _resolve_module_abs(module_path)
+    let v = _verify_module_selftest(module_abs)
+    if !v[0] {
+        return [1, "proposal_archive: module verification FAILED — " + _str(v[1])]
+    }
+
+    let p = _per_proposal_load(approved_path)
+    _set_field(p, "user_status", "archived")
+    _set_field(p, "implementation_module_path", module_path)
+    _set_field(p, "user_decision_at", _now_iso())
+
+    let mut last_sl = -1
+    let mut k = 0
+    while k < len(approved_path) {
+        if approved_path.substring(k, k + 1) == "/" { last_sl = k }
+        k = k + 1
+    }
+    let basename = approved_path.substring(last_sl + 1, len(approved_path))
+    let dst = ARCHIVED_DIR + "/" + basename
+
+    _per_proposal_save(dst, p)
+    exec("rm -f " + _sh_quote(approved_path))
+
+    let inv = _load_inventory()
+    let idx = _inv_find_idx(inv, id)
+    if idx >= 0 {
+        let ps = inv["proposals"]
+        let entry = ps[idx]
+        _set_field(entry, "user_status", "archived")
+        _set_field(entry, "implementation_module_path", module_path)
+        _set_field(entry, "user_decision_at", _now_iso())
+        ps[idx] = entry
+        inv["proposals"] = ps
+    }
+    _save_inventory(inv)
+
+    return [0, "proposal_archive: id=" + id + " moved approved → archived at " + dst + " (module verified: " + module_path + ")"]
+}
+
+// ─── selftest ────────────────────────────────────────────────────────
+
+fn _selftest() -> array {
+    let id = "99999999-T04"
+    let approved_path = APPROVED_DIR + "/" + id + ".json"
+    let archived_path = ARCHIVED_DIR + "/" + id + ".json"
+    // Synthetic module that exits 0 on --selftest.
+    let module_path = "tool/proposal_" + id + "_synthetic.hexa"
+    let module_abs = DEFAULT_ROOT + "/" + module_path
+
+    _ensure_dir(APPROVED_DIR)
+    _ensure_dir(ARCHIVED_DIR)
+    exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(archived_path) + " " + _sh_quote(module_abs))
+
+    // S0: missing module-path → exit 3
+    _atomic_write(approved_path, "{\n  \"id\": \"" + id + "\",\n  \"title\": \"selftest archive\",\n  \"kind\": \"tool\",\n  \"user_status\": \"approved\"\n}\n")
+    let r0 = _do_archive(id, "")
+    if r0[0] != 3 {
+        exec("rm -f " + _sh_quote(approved_path))
+        return [false, "S0: missing module-path should exit 3, got " + _str(r0[0])]
+    }
+
+    // S1: nonexistent module → exit 1 (validation fail)
+    let r1 = _do_archive(id, "tool/nonexistent_proposal_archive_test.hexa")
+    if r1[0] != 1 {
+        exec("rm -f " + _sh_quote(approved_path))
+        return [false, "S1: nonexistent module should exit 1, got " + _str(r1[0])]
+    }
+
+    // S2: write a synthetic hexa module that --selftest exits 0
+    let synth_body = "// synthetic for proposal_archive selftest\nlet argv = args()\nlet mut has = false\nlet mut i = 0\nwhile i < len(argv) { if to_string(argv[i]) == \"--selftest\" { has = true }; i = i + 1 }\nif has { println(\"synthetic selftest PASS\"); exit(0) }\nprintln(\"synthetic noop\"); exit(0)\n"
+    _atomic_write(module_abs, synth_body)
+
+    let r2 = _do_archive(id, module_path)
+    if r2[0] != 0 {
+        exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(archived_path) + " " + _sh_quote(module_abs))
+        return [false, "S2: archive returned " + _str(r2[0]) + " — " + _str(r2[1])]
+    }
+    if !_fexists(archived_path) {
+        exec("rm -f " + _sh_quote(module_abs))
+        return [false, "S2: archived file missing"]
+    }
+
+    // S3: idempotent re-archive → noop exit 0
+    let r3 = _do_archive(id, module_path)
+    if r3[0] != 0 {
+        exec("rm -f " + _sh_quote(archived_path) + " " + _sh_quote(module_abs))
+        return [false, "S3: idempotent re-archive returned " + _str(r3[0])]
+    }
+
+    // Cleanup synthetic.
+    exec("rm -f " + _sh_quote(archived_path) + " " + _sh_quote(module_abs))
+
+    return [true, "S0 missing-arg + S1 missing-module + S2 archive + S3 idempotent → 4/4 PASS"]
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────────
+
+let argv = args()
+
+if _arg_present(argv, "--selftest") {
+    println("── proposal_archive selftest ──")
+    let r = _selftest()
+    println(_str(r[1]))
+    println("── selftest result: " + (if r[0] { "4/4 PASS" } else { "FAIL" }) + " ──")
+    if r[0] { exit(0) }
+    exit(1)
+}
+
+let id          = _arg_value(argv, "--id", "")
+let module_path = _arg_value(argv, "--module-path", "")
+let r = _do_archive(id, module_path)
+println(_str(r[1]))
+exit(r[0])

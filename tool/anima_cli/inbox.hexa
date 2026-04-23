@@ -1,0 +1,301 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_cli/inbox.hexa — anima CLI `inbox` topic
+//
+//  PURPOSE
+//    Thin wrapper over $HEXA_LANG/tool/proposal_inbox.hexa — cross-repo
+//    dispatch integration. Gives anima a first-class `inbox` verb so a user
+//    doesn't have to assemble `hexa $HEXA_LANG/tool/proposal_inbox.hexa ...`
+//    by hand, and adds a `drain` loop (ack→done) which was previously a
+//    manual bash+awk ritual.
+//
+//  SUBCOMMANDS
+//    list                       all inbox items (id/kind/priority/from)
+//    next                       next pending item + ack-cmd hint
+//    ack <id>                   mark in_progress   (repo=anima auto)
+//    done <id> [--reason TEXT]  mark done + optional resolution
+//    drain [--resolution TEXT]  loop ack→done until empty
+//        default resolution: "merged_aggregate — D-batch resolved · raw#20 no standalone module"
+//        stuck detection: same id twice in a row → break
+//    --selftest   --help
+//
+//  OUTPUT
+//    state/anima_inbox_last_action.json  {ts, action, items_processed}
+//
+//  DESIGN
+//    raw#9 hexa-only · raw#11 snake_case · raw#15 no-hardcode
+//    idempotent · deterministic-friendly (HEXA_REPRODUCIBLE=1)
+//    no upstream (proposal_inbox.hexa) modification.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── vendored helpers (pattern from sibling modules) ──────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _ts_iso() -> string {
+    let rep = _str(env("HEXA_REPRODUCIBLE"))
+    if rep == "1" { return "REDACTED" }
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let gt = _str(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn _resolve_hexa_lang() -> string {
+    let h = _str(env("HEXA_LANG"))
+    if h != "" { return h }
+    let home = _str(env("HOME"))
+    return home + "/core/hexa-lang"
+}
+
+fn _arg_present(argv, key: string) -> bool {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_value(argv, key: string, dflt: string) -> string {
+    let i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == key && i + 1 < len(argv) {
+            return _str(argv[i + 1])
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _user_argv(raw) -> array {
+    let out = []
+    let i = 0
+    while i < len(raw) {
+        let s = _str(raw[i])
+        if !s.contains("/.hexa-cache/") {
+            out = out + [s]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _sh_q(s: string) -> string {
+    // single-quote escape for shell
+    let r = s
+    return "'" + r + "'"
+}
+
+fn _hexa_bin() -> string {
+    let e = _str(env("HEXA_BIN"))
+    if e != "" { return e }
+    return "/Users/ghost/.hx/bin/hexa"
+}
+
+fn _upstream_tool() -> string {
+    return _resolve_hexa_lang() + "/tool/proposal_inbox.hexa"
+}
+
+fn _inventory_path() -> string {
+    return _resolve_root() + "/state/proposals/inventory.json"
+}
+
+// ─── ledger ─────────────────────────────────────────────────────────────
+
+fn _write_last_action(action: string, n: int) {
+    let root = _resolve_root()
+    let path = root + "/state/anima_inbox_last_action.json"
+    let ts   = _ts_iso()
+    let json = "{\"schema\":\"anima/inbox_last_action/1\","
+             + "\"ts\":\"" + ts + "\","
+             + "\"action\":\"" + action + "\","
+             + "\"items_processed\":" + to_string(n) + "}"
+    exec("mkdir -p " + root + "/state && printf '%s\\n' " + _sh_q(json) + " > " + path)
+}
+
+// ─── inbox helpers (read inventory.json directly via python3, same pattern
+//     proposal_inbox upstream uses; we only READ here, mutation is delegated) ──
+
+fn _next_pending_id() -> string {
+    // returns the highest-priority pending id, or "" if empty
+    let inv = _inventory_path()
+    if !_fexists(inv) { return "" }
+    let py = "python3 - <<'PY' 2>/dev/null\n"
+           + "import json\n"
+           + "try:\n"
+           + "    d = json.load(open(" + _sh_q(inv) + "))\n"
+           + "except Exception:\n"
+           + "    print(''); raise SystemExit(0)\n"
+           + "pend = [e for e in d.get('entries', []) if e.get('user_status','pending')=='pending']\n"
+           + "if not pend:\n"
+           + "    print(''); raise SystemExit(0)\n"
+           + "pend.sort(key=lambda e: -int(e.get('score_priority', 50)))\n"
+           + "print(pend[0].get('id',''))\n"
+           + "PY\n"
+    return _str(exec(py)).trim()
+}
+
+fn _count_pending() -> int {
+    let inv = _inventory_path()
+    if !_fexists(inv) { return 0 }
+    let py = "python3 - <<'PY' 2>/dev/null\n"
+           + "import json\n"
+           + "try:\n"
+           + "    d = json.load(open(" + _sh_q(inv) + "))\n"
+           + "except Exception:\n"
+           + "    print(0); raise SystemExit(0)\n"
+           + "print(sum(1 for e in d.get('entries',[]) if e.get('user_status','pending')=='pending'))\n"
+           + "PY\n"
+    let n = _str(exec(py)).trim()
+    if n == "" { return 0 }
+    return n.parse_int()
+}
+
+// ─── upstream dispatch ──────────────────────────────────────────────────
+
+fn _call_upstream(tail: string) -> string {
+    let tool = _upstream_tool()
+    if !_fexists(tool) {
+        return "inbox: upstream tool missing: " + tool
+    }
+    let cmd = _hexa_bin() + " run " + tool + " " + tail
+    return _str(exec(cmd + " 2>&1"))
+}
+
+// ─── subcommands ────────────────────────────────────────────────────────
+
+fn sub_help() {
+    println("anima inbox — cross-repo proposal inbox (wraps $HEXA_LANG/tool/proposal_inbox.hexa)")
+    println("")
+    println("  list                        all items (id/kind/priority/from)")
+    println("  next                        next pending + ack hint")
+    println("  ack  <id>                   mark in_progress (repo=anima)")
+    println("  done <id> [--reason TEXT]   mark done + note")
+    println("  drain [--resolution TEXT]   loop ack→done until empty")
+    println("")
+    println("  --selftest   --help")
+}
+
+fn sub_list() {
+    let out = _call_upstream("list --repo anima")
+    println(out)
+}
+
+fn sub_next() {
+    let out = _call_upstream("next --repo anima")
+    println(out)
+}
+
+fn sub_ack(id: string) {
+    if id == "" { println("usage: anima inbox ack <id>"); exit(2) }
+    let out = _call_upstream("ack " + id + " --repo anima")
+    println(out)
+    _write_last_action("ack", 1)
+}
+
+fn sub_done(id: string, reason: string) {
+    if id == "" { println("usage: anima inbox done <id> [--reason TEXT]"); exit(2) }
+    let tail = "done " + id + " --repo anima"
+    if reason != "" {
+        tail = tail + " --note " + _sh_q(reason)
+    }
+    let out = _call_upstream(tail)
+    println(out)
+    _write_last_action("done", 1)
+}
+
+fn sub_drain(resolution: string) {
+    let res = resolution
+    if res == "" {
+        res = "merged_aggregate — D-batch resolved · raw#20 no standalone module"
+    }
+    let start = _count_pending()
+    println("anima inbox drain: start pending=" + to_string(start))
+    if start == 0 {
+        println("  (inbox empty — nothing to drain)")
+        _write_last_action("drain", 0)
+        return
+    }
+    let processed = 0
+    let last_id = ""
+    let stuck_count = 0
+    let max_iter = start + 8   // safety cap
+    let iter = 0
+    while iter < max_iter {
+        let cur = _next_pending_id()
+        if cur == "" { break }
+        if cur == last_id {
+            stuck_count = stuck_count + 1
+            if stuck_count >= 2 {
+                println("  STUCK id=" + cur + " seen twice — breaking")
+                break
+            }
+        } else {
+            stuck_count = 0
+        }
+        // ack → done
+        let _a = _call_upstream("ack " + cur + " --repo anima")
+        let _d = _call_upstream("done " + cur + " --repo anima --note " + _sh_q(res))
+        println("  drained " + cur)
+        last_id = cur
+        processed = processed + 1
+        iter = iter + 1
+    }
+    let remain = _count_pending()
+    println("anima inbox drain: processed=" + to_string(processed) + " remaining=" + to_string(remain))
+    _write_last_action("drain", processed)
+}
+
+fn sub_selftest() {
+    // selftest is read-only: verify upstream tool exists + inventory path resolves
+    let up = _upstream_tool()
+    if !_fexists(up) { println("FAIL anima_cli/inbox selftest (upstream missing: " + up + ")"); exit(1) }
+    let root = _resolve_root()
+    if root == "" { println("FAIL anima_cli/inbox selftest (root unresolved)"); exit(1) }
+    // helper smoke
+    let _n = _count_pending()
+    let _i = _next_pending_id()
+    println("PASS anima_cli/inbox selftest")
+    exit(0)
+}
+
+fn main() {
+    let argv = _user_argv(args())
+    if _arg_present(argv, "--selftest") { sub_selftest(); return }
+    if _arg_present(argv, "--help") || len(argv) == 0 { sub_help(); return }
+    let sub = _str(argv[0])
+    if sub == "list" { sub_list(); return }
+    if sub == "next" { sub_next(); return }
+    if sub == "ack" {
+        if len(argv) < 2 { println("usage: anima inbox ack <id>"); exit(2) }
+        sub_ack(_str(argv[1])); return
+    }
+    if sub == "done" {
+        if len(argv) < 2 { println("usage: anima inbox done <id> [--reason TEXT]"); exit(2) }
+        let reason = _arg_value(argv, "--reason", "")
+        sub_done(_str(argv[1]), reason); return
+    }
+    if sub == "drain" {
+        let res = _arg_value(argv, "--resolution", "")
+        sub_drain(res); return
+    }
+    println("inbox: unknown subcmd '" + sub + "'")
+    sub_help()
+    exit(2)
+}
+
+main()

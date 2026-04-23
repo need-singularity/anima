@@ -1,0 +1,591 @@
+// tool/proposal_conflict_resolve.hexa — user-triggered debate resolution
+//
+// PURPOSE
+//   Resolve a debate created by proposal_conflict_detect.hexa:
+//     - Move loser proposal pending/<loser>.json → rejected/<loser>.json
+//       (record conflict reference in user_decision_reason)
+//     - Keep winner in pending/ (caller may then approve via proposal_approve)
+//     - Update debate/<pair_slug>.json: status=resolved, winner, resolved_at
+//
+//   Spec source: docs/anima_proposal_stack_paradigm_20260422.md
+//     §6 보호 mechanisms — conflict
+//     §3 cycle step 6 — debate folder
+//     §5 sample CLI — `tool/proposal_debate_resolve.hexa --pair X,Y --winner X`
+//
+// USAGE
+//   hexa tool/proposal_conflict_resolve.hexa --pair <id1>,<id2> --winner <id> --reason "..."
+//   hexa tool/proposal_conflict_resolve.hexa --revoke <pair_slug>
+//   hexa tool/proposal_conflict_resolve.hexa --selftest
+//
+// IDEMPOTENCY
+//   - Re-running with the SAME winner is a no-op (returns success).
+//   - Re-running with a DIFFERENT winner against an already-resolved debate
+//     ERRORS (exit 4) — the user must --revoke first then re-resolve.
+//
+// HARD CONSTRAINTS
+//   - DO NOT modify .roadmap (uchg)
+//   - atomic write (tmp + mv) — also atomic move for proposal relocation
+//   - user-explicit trigger only (no implicit/automatic resolve path)
+
+let DEFAULT_PROPOSALS = "/Users/ghost/core/anima/state/proposals"
+
+// ─── helpers ────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec_out(cmd: string) -> string {
+    return to_string(exec(cmd))
+}
+
+fn _file_exists(p: string) -> bool {
+    return _exec_out("test -e " + _sh_quote(p) + " && echo 1 || echo 0").trim() == "1"
+}
+
+fn _now_iso() -> string {
+    return _exec_out("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _json_esc(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+}
+
+fn _is_map(v) -> bool {
+    let t = type_of(v)
+    return t == "map" || t == "object" || t == "dict"
+}
+
+fn _is_array(v) -> bool {
+    let t = type_of(v)
+    return t == "array" || t == "arr" || t == "list"
+}
+
+fn _is_string(v) -> bool {
+    let t = type_of(v)
+    return t == "string" || t == "str"
+}
+
+fn _is_bool(v) -> bool {
+    let t = type_of(v)
+    return t == "bool" || t == "boolean"
+}
+
+fn _is_null(v) -> bool {
+    let t = type_of(v)
+    return t == "null" || t == "nil" || t == "none"
+}
+
+fn _is_int(v) -> bool {
+    let t = type_of(v)
+    return t == "int" || t == "integer"
+}
+
+fn _is_float(v) -> bool {
+    let t = type_of(v)
+    return t == "float" || t == "number" || t == "double"
+}
+
+// Generic JSON value serializer (used for round-tripping arbitrary proposal fields).
+fn _json_value(v) -> string {
+    if _is_null(v)   { return "null" }
+    if _is_bool(v)   { if v { return "true" }; return "false" }
+    if _is_int(v)    { return to_string(v) }
+    if _is_float(v)  { return to_string(v) }
+    if _is_string(v) { return "\"" + _json_esc(to_string(v)) + "\"" }
+    if _is_array(v) {
+        let mut s = "["
+        let mut i = 0
+        while i < len(v) {
+            if i > 0 { s = s + ", " }
+            s = s + _json_value(v[i])
+            i = i + 1
+        }
+        s = s + "]"
+        return s
+    }
+    if _is_map(v) {
+        let kk = keys(v)
+        let mut s = "{"
+        let mut i = 0
+        while i < len(kk) {
+            if i > 0 { s = s + ", " }
+            let k = to_string(kk[i])
+            s = s + "\"" + _json_esc(k) + "\": " + _json_value(v[k])
+            i = i + 1
+        }
+        s = s + "}"
+        return s
+    }
+    return "\"" + _json_esc(to_string(v)) + "\""
+}
+
+fn _atomic_write(path: string, body: string) {
+    let mut last_sl = -1
+    let mut i = 0
+    while i < len(path) {
+        if path.substring(i, i + 1) == "/" { last_sl = i }
+        i = i + 1
+    }
+    if last_sl > 0 {
+        let dir = path.substring(0, last_sl)
+        exec("mkdir -p " + _sh_quote(dir))
+    }
+    let tmp = path + ".tmp"
+    write_file(tmp, body)
+    exec("mv -f " + _sh_quote(tmp) + " " + _sh_quote(path))
+}
+
+fn _atomic_move(src: string, dst: string) {
+    let mut last_sl = -1
+    let mut i = 0
+    while i < len(dst) {
+        if dst.substring(i, i + 1) == "/" { last_sl = i }
+        i = i + 1
+    }
+    if last_sl > 0 {
+        let dir = dst.substring(0, last_sl)
+        exec("mkdir -p " + _sh_quote(dir))
+    }
+    exec("mv -f " + _sh_quote(src) + " " + _sh_quote(dst))
+}
+
+fn _has(o, k: string) -> bool { return has_key(o, k) }
+
+fn _get_str(o, k: string, dflt: string) -> string {
+    if !_has(o, k) { return dflt }
+    return to_string(o[k])
+}
+
+fn _pair_slug(a: string, b: string) -> string {
+    if a <= b { return a + "__vs__" + b }
+    return b + "__vs__" + a
+}
+
+fn _split_pair(s: string) -> array {
+    let comma = s.index_of(",")
+    if comma < 0 { return [s, ""] }
+    let a = s.substring(0, comma).trim()
+    let b = s.substring(comma + 1, len(s)).trim()
+    return [a, b]
+}
+
+// ─── resolve core ──────────────────────────────────────────────────
+
+// Returns 0 on success, non-zero on error.
+fn resolve_pair(proposals_root: string, id1: string, id2: string, winner: string, reason: string) -> int {
+    let pending_dir  = proposals_root + "/pending"
+    let rejected_dir = proposals_root + "/rejected"
+    let debate_dir   = proposals_root + "/debate"
+
+    // Validate winner
+    if winner != id1 && winner != id2 {
+        eprintln("proposal_conflict_resolve: --winner " + winner + " must be one of [" + id1 + ", " + id2 + "]")
+        return 2
+    }
+    let loser = if winner == id1 { id2 } else { id1 }
+
+    let slug = _pair_slug(id1, id2)
+    let debate_path = debate_dir + "/" + slug + ".json"
+    if !_file_exists(debate_path) {
+        eprintln("proposal_conflict_resolve: debate not found: " + debate_path)
+        eprintln("  hint: run tool/proposal_conflict_detect.hexa --apply first")
+        return 3
+    }
+
+    let dbt = json_parse(read_file(debate_path))
+    let st = _get_str(dbt, "status", "open")
+
+    // Idempotency
+    if st == "resolved" {
+        let existing_winner = _get_str(dbt, "winner", "")
+        if existing_winner == winner {
+            println("proposal_conflict_resolve: already resolved with same winner=" + winner + " — no-op")
+            return 0
+        }
+        eprintln("proposal_conflict_resolve: ALREADY RESOLVED with winner=" + existing_winner)
+        eprintln("  refusing to overwrite with different winner=" + winner)
+        eprintln("  hint: run --revoke " + slug + " first, then re-resolve")
+        return 4
+    }
+
+    let winner_path = pending_dir + "/" + winner + ".json"
+    let loser_path  = pending_dir + "/" + loser + ".json"
+    if !_file_exists(winner_path) {
+        eprintln("proposal_conflict_resolve: winner pending file not found: " + winner_path)
+        return 5
+    }
+    if !_file_exists(loser_path) {
+        eprintln("proposal_conflict_resolve: loser pending file not found: " + loser_path)
+        return 5
+    }
+
+    // Mutate loser proposal: add user_status=rejected, conflict reason
+    let loser_obj = json_parse(read_file(loser_path))
+    let loser_id  = _get_str(loser_obj, "id", loser)
+    // Build updated loser body — preserve all keys, set rejection fields.
+    let now = _now_iso()
+    let conflict_reason = "lost debate vs " + winner + " — " + reason
+    let mut updated = "{\n"
+    let kk = keys(loser_obj)
+    let mut wrote_status = false
+    let mut wrote_decision_at = false
+    let mut wrote_decision_reason = false
+    let mut idx = 0
+    while idx < len(kk) {
+        let k = to_string(kk[idx])
+        let v = loser_obj[k]
+        let mut val_str = ""
+        if k == "user_status" {
+            val_str = "\"rejected\""
+            wrote_status = true
+        } else if k == "user_decision_at" {
+            val_str = "\"" + now + "\""
+            wrote_decision_at = true
+        } else if k == "user_decision_reason" {
+            val_str = "\"" + _json_esc(conflict_reason) + "\""
+            wrote_decision_reason = true
+        } else {
+            val_str = _json_value(v)
+        }
+        updated = updated + "  \"" + _json_esc(k) + "\": " + val_str
+        if idx + 1 < len(kk) || !wrote_status || !wrote_decision_at || !wrote_decision_reason {
+            updated = updated + ","
+        }
+        updated = updated + "\n"
+        idx = idx + 1
+    }
+    if !wrote_status {
+        updated = updated + "  \"user_status\": \"rejected\""
+        if !wrote_decision_at || !wrote_decision_reason { updated = updated + "," }
+        updated = updated + "\n"
+    }
+    if !wrote_decision_at {
+        updated = updated + "  \"user_decision_at\": \"" + now + "\""
+        if !wrote_decision_reason { updated = updated + "," }
+        updated = updated + "\n"
+    }
+    if !wrote_decision_reason {
+        updated = updated + "  \"user_decision_reason\": \"" + _json_esc(conflict_reason) + "\"\n"
+    }
+    updated = updated + "}\n"
+
+    // Atomic write to rejected/ and remove pending source
+    let rejected_path = rejected_dir + "/" + loser_id + ".json"
+    _atomic_write(rejected_path, updated)
+    exec("rm -f " + _sh_quote(loser_path))
+
+    // Update debate file → resolved
+    let mut dbtj = "{\n"
+    dbtj = dbtj + "  \"schema\": \"" + _json_esc(_get_str(dbt, "schema", "anima.proposal.debate.v1")) + "\",\n"
+    dbtj = dbtj + "  \"pair_slug\": \"" + _json_esc(slug) + "\",\n"
+    dbtj = dbtj + "  \"ids\": [\"" + _json_esc(if id1 <= id2 { id1 } else { id2 }) + "\", \"" + _json_esc(if id1 <= id2 { id2 } else { id1 }) + "\"],\n"
+    dbtj = dbtj + "  \"kind\": \"" + _json_esc(_get_str(dbt, "kind", "")) + "\",\n"
+    dbtj = dbtj + "  \"reason\": \"" + _json_esc(_get_str(dbt, "reason", "")) + "\",\n"
+    dbtj = dbtj + "  \"status\": \"resolved\",\n"
+    dbtj = dbtj + "  \"created_at\": \"" + _json_esc(_get_str(dbt, "created_at", "")) + "\",\n"
+    dbtj = dbtj + "  \"awaiting\": null,\n"
+    dbtj = dbtj + "  \"resolved_at\": \"" + now + "\",\n"
+    dbtj = dbtj + "  \"winner\": \"" + _json_esc(winner) + "\",\n"
+    dbtj = dbtj + "  \"loser\": \"" + _json_esc(loser) + "\",\n"
+    dbtj = dbtj + "  \"resolution_reason\": \"" + _json_esc(reason) + "\"\n"
+    dbtj = dbtj + "}\n"
+    _atomic_write(debate_path, dbtj)
+
+    println("proposal_conflict_resolve: resolved " + slug)
+    println("  winner : " + winner + "  (kept in pending/)")
+    println("  loser  : " + loser  + "  (moved to rejected/" + loser_id + ".json)")
+    println("  debate : " + debate_path + "  (status=resolved, winner=" + winner + ")")
+    return 0
+}
+
+// Returns 0 on success.
+fn revoke_pair(proposals_root: string, pair_slug: string) -> int {
+    let pending_dir  = proposals_root + "/pending"
+    let rejected_dir = proposals_root + "/rejected"
+    let debate_dir   = proposals_root + "/debate"
+    let debate_path  = debate_dir + "/" + pair_slug + ".json"
+    if !_file_exists(debate_path) {
+        eprintln("proposal_conflict_resolve: debate not found: " + debate_path)
+        return 3
+    }
+    let dbt = json_parse(read_file(debate_path))
+    let st = _get_str(dbt, "status", "open")
+    if st != "resolved" {
+        eprintln("proposal_conflict_resolve: cannot revoke — debate status=" + st)
+        return 6
+    }
+    let loser = _get_str(dbt, "loser", "")
+    if len(loser) == 0 {
+        eprintln("proposal_conflict_resolve: revoke failed — debate has no recorded loser")
+        return 7
+    }
+    let rejected_path = rejected_dir + "/" + loser + ".json"
+    if !_file_exists(rejected_path) {
+        eprintln("proposal_conflict_resolve: revoke — rejected file missing: " + rejected_path)
+        return 8
+    }
+    // Move loser back to pending, clear rejection fields
+    let loser_obj = json_parse(read_file(rejected_path))
+    let kk = keys(loser_obj)
+    let mut restored = "{\n"
+    let mut idx = 0
+    while idx < len(kk) {
+        let k = to_string(kk[idx])
+        let v = loser_obj[k]
+        let mut val_str = ""
+        if k == "user_status" {
+            val_str = "\"pending\""
+        } else if k == "user_decision_at" {
+            val_str = "null"
+        } else if k == "user_decision_reason" {
+            val_str = "null"
+        } else {
+            val_str = _json_value(v)
+        }
+        restored = restored + "  \"" + _json_esc(k) + "\": " + val_str
+        if idx + 1 < len(kk) { restored = restored + "," }
+        restored = restored + "\n"
+        idx = idx + 1
+    }
+    restored = restored + "}\n"
+    let pending_path = pending_dir + "/" + loser + ".json"
+    _atomic_write(pending_path, restored)
+    exec("rm -f " + _sh_quote(rejected_path))
+
+    // Reset debate status → open
+    let id_a = if has_key(dbt, "ids") { to_string(dbt["ids"][0]) } else { "" }
+    let id_b = if has_key(dbt, "ids") { to_string(dbt["ids"][1]) } else { "" }
+    let mut dbtj = "{\n"
+    dbtj = dbtj + "  \"schema\": \"" + _json_esc(_get_str(dbt, "schema", "anima.proposal.debate.v1")) + "\",\n"
+    dbtj = dbtj + "  \"pair_slug\": \"" + _json_esc(pair_slug) + "\",\n"
+    dbtj = dbtj + "  \"ids\": [\"" + _json_esc(id_a) + "\", \"" + _json_esc(id_b) + "\"],\n"
+    dbtj = dbtj + "  \"kind\": \"" + _json_esc(_get_str(dbt, "kind", "")) + "\",\n"
+    dbtj = dbtj + "  \"reason\": \"" + _json_esc(_get_str(dbt, "reason", "")) + "\",\n"
+    dbtj = dbtj + "  \"status\": \"open\",\n"
+    dbtj = dbtj + "  \"created_at\": \"" + _json_esc(_get_str(dbt, "created_at", "")) + "\",\n"
+    dbtj = dbtj + "  \"awaiting\": \"user_resolution\",\n"
+    dbtj = dbtj + "  \"resolved_at\": null,\n"
+    dbtj = dbtj + "  \"winner\": null,\n"
+    dbtj = dbtj + "  \"loser\": null,\n"
+    dbtj = dbtj + "  \"resolution_reason\": null\n"
+    dbtj = dbtj + "}\n"
+    _atomic_write(debate_path, dbtj)
+
+    println("proposal_conflict_resolve: revoked " + pair_slug)
+    println("  loser " + loser + " restored to pending/, debate reset to status=open")
+    return 0
+}
+
+// ─── selftest ──────────────────────────────────────────────────────
+//
+// Synthetic 2-conflict-pair → resolve flow:
+//   S1 build sandbox + 4 pending + 2 debates
+//   S2 resolve pair#1 → loser moved to rejected/, debate status=resolved
+//   S3 idempotent re-resolve (same winner) → no-op success
+//   S4 mismatched re-resolve (different winner) → error exit 4
+//   S5 revoke pair#1 → loser back in pending/, debate=open
+//   S6 resolve pair#2 with new winner → success
+
+fn _seed_proposal(path: string, id: string) {
+    let body = "{\n  \"id\": \"" + id + "\",\n  \"version\": 1,\n  \"title\": \"synthetic " + id + "\",\n  \"kind\": \"tool\",\n  \"user_status\": \"pending\"\n}\n"
+    _atomic_write(path, body)
+}
+
+fn _seed_debate(path: string, slug: string, a: string, b: string, kind: string, reason: string) {
+    let lo = if a <= b { a } else { b }
+    let hi = if a <= b { b } else { a }
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"anima.proposal.debate.v1\",\n"
+    j = j + "  \"pair_slug\": \"" + slug + "\",\n"
+    j = j + "  \"ids\": [\"" + lo + "\", \"" + hi + "\"],\n"
+    j = j + "  \"kind\": \"" + kind + "\",\n"
+    j = j + "  \"reason\": \"" + reason + "\",\n"
+    j = j + "  \"status\": \"open\",\n"
+    j = j + "  \"created_at\": \"" + _now_iso() + "\",\n"
+    j = j + "  \"awaiting\": \"user_resolution\",\n"
+    j = j + "  \"resolved_at\": null,\n"
+    j = j + "  \"winner\": null,\n"
+    j = j + "  \"loser\": null,\n"
+    j = j + "  \"resolution_reason\": null\n"
+    j = j + "}\n"
+    _atomic_write(path, j)
+}
+
+fn _selftest() -> int {
+    println("── proposal_conflict_resolve selftest ──")
+    let sandbox = "/tmp/anima_pcresolve_selftest"
+    let pend = sandbox + "/pending"
+    let rej  = sandbox + "/rejected"
+    let deb  = sandbox + "/debate"
+    exec("rm -rf " + _sh_quote(sandbox))
+    exec("mkdir -p " + _sh_quote(pend) + " " + _sh_quote(rej) + " " + _sh_quote(deb))
+
+    let mut fails = 0
+
+    // Seed 4 pending + 2 debates (pair P1=B1/B2, pair P2=B3/B4)
+    _seed_proposal(pend + "/B1.json", "B1")
+    _seed_proposal(pend + "/B2.json", "B2")
+    _seed_proposal(pend + "/B3.json", "B3")
+    _seed_proposal(pend + "/B4.json", "B4")
+    _seed_debate(deb + "/B1__vs__B2.json", "B1__vs__B2", "B1", "B2", "explicit", "synthetic conflict 1")
+    _seed_debate(deb + "/B3__vs__B4.json", "B3__vs__B4", "B3", "B4", "file_direction", "synthetic conflict 2")
+
+    // S1: resolve pair#1 with winner=B1
+    let r1 = resolve_pair(sandbox, "B1", "B2", "B1", "B1 has stronger evidence")
+    if r1 != 0 {
+        eprintln("  FAIL S1 resolve returned " + to_string(r1))
+        fails = fails + 1
+    } else if !_file_exists(rej + "/B2.json") {
+        eprintln("  FAIL S1 loser B2 not in rejected/")
+        fails = fails + 1
+    } else if _file_exists(pend + "/B2.json") {
+        eprintln("  FAIL S1 loser B2 still in pending/")
+        fails = fails + 1
+    } else if !_file_exists(pend + "/B1.json") {
+        eprintln("  FAIL S1 winner B1 missing from pending/")
+        fails = fails + 1
+    } else {
+        let dbt = json_parse(read_file(deb + "/B1__vs__B2.json"))
+        if _get_str(dbt, "status", "") != "resolved" {
+            eprintln("  FAIL S1 debate status not resolved")
+            fails = fails + 1
+        } else if _get_str(dbt, "winner", "") != "B1" {
+            eprintln("  FAIL S1 debate winner not B1")
+            fails = fails + 1
+        } else {
+            // Verify rejected file has conflict reason
+            let rj = json_parse(read_file(rej + "/B2.json"))
+            let rsn = _get_str(rj, "user_decision_reason", "")
+            if rsn.index_of("lost debate vs B1") < 0 {
+                eprintln("  FAIL S1 rejected reason missing — got: " + rsn)
+                fails = fails + 1
+            } else {
+                println("  S1 PASS: pair#1 resolved (B1 wins, B2 → rejected)")
+            }
+        }
+    }
+
+    // S2: idempotent re-resolve (same winner) → success no-op
+    let r2 = resolve_pair(sandbox, "B1", "B2", "B1", "B1 has stronger evidence")
+    if r2 != 0 {
+        eprintln("  FAIL S2 idempotent re-resolve returned " + to_string(r2))
+        fails = fails + 1
+    } else {
+        println("  S2 PASS: idempotent re-resolve (same winner) is no-op")
+    }
+
+    // S3: mismatched re-resolve (different winner) → error 4
+    let r3 = resolve_pair(sandbox, "B1", "B2", "B2", "trying to flip winner")
+    if r3 != 4 {
+        eprintln("  FAIL S3 mismatched re-resolve returned " + to_string(r3) + " (expected 4)")
+        fails = fails + 1
+    } else {
+        println("  S3 PASS: mismatched re-resolve refused (exit 4)")
+    }
+
+    // S4: revoke pair#1 → loser back to pending
+    let r4 = revoke_pair(sandbox, "B1__vs__B2")
+    if r4 != 0 {
+        eprintln("  FAIL S4 revoke returned " + to_string(r4))
+        fails = fails + 1
+    } else if !_file_exists(pend + "/B2.json") {
+        eprintln("  FAIL S4 B2 not restored to pending/")
+        fails = fails + 1
+    } else if _file_exists(rej + "/B2.json") {
+        eprintln("  FAIL S4 B2 still in rejected/")
+        fails = fails + 1
+    } else {
+        let dbt = json_parse(read_file(deb + "/B1__vs__B2.json"))
+        if _get_str(dbt, "status", "") != "open" {
+            eprintln("  FAIL S4 debate status not reset to open")
+            fails = fails + 1
+        } else {
+            println("  S4 PASS: revoke restored loser to pending, debate=open")
+        }
+    }
+
+    // S5: resolve pair#2 with winner=B4
+    let r5 = resolve_pair(sandbox, "B3", "B4", "B4", "B4 covers both axes")
+    if r5 != 0 {
+        eprintln("  FAIL S5 resolve pair#2 returned " + to_string(r5))
+        fails = fails + 1
+    } else if !_file_exists(rej + "/B3.json") {
+        eprintln("  FAIL S5 loser B3 not in rejected/")
+        fails = fails + 1
+    } else {
+        println("  S5 PASS: pair#2 resolved (B4 wins, B3 → rejected)")
+    }
+
+    exec("rm -rf " + _sh_quote(sandbox))
+
+    let passed = 5 - fails
+    if fails == 0 {
+        println("proposal_conflict_resolve selftest: 5/5 PASS")
+        return 0
+    }
+    println("proposal_conflict_resolve selftest: " + to_string(passed) + "/5 (fails=" + to_string(fails) + ")")
+    return 1
+}
+
+// ─── CLI ────────────────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+
+fn _flag(av: array, k: string) -> bool {
+    for x in av { if to_string(x) == k { return true } }
+    return false
+}
+
+fn _opt(av: array, k: string, d: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn main() -> int {
+    let av = _argv()
+    if _flag(av, "--help") {
+        println("usage: hexa tool/proposal_conflict_resolve.hexa --pair <id1>,<id2> --winner <id> --reason \"...\"")
+        println("       hexa tool/proposal_conflict_resolve.hexa --revoke <pair_slug>")
+        println("       hexa tool/proposal_conflict_resolve.hexa --selftest")
+        return 0
+    }
+    if _flag(av, "--selftest") { return _selftest() }
+
+    let proposals_root = _opt(av, "--root", DEFAULT_PROPOSALS)
+
+    let revoke_slug = _opt(av, "--revoke", "")
+    if len(revoke_slug) > 0 {
+        return revoke_pair(proposals_root, revoke_slug)
+    }
+
+    let pair_str = _opt(av, "--pair", "")
+    let winner   = _opt(av, "--winner", "")
+    let reason   = _opt(av, "--reason", "")
+    if len(pair_str) == 0 || len(winner) == 0 || len(reason) == 0 {
+        eprintln("usage: --pair <id1>,<id2> --winner <id> --reason \"...\"")
+        eprintln("   or: --revoke <pair_slug>")
+        eprintln("   or: --selftest")
+        return 2
+    }
+    let p = _split_pair(pair_str)
+    let id1 = to_string(p[0])
+    let id2 = to_string(p[1])
+    if len(id1) == 0 || len(id2) == 0 {
+        eprintln("--pair must be \"<id1>,<id2>\"")
+        return 2
+    }
+    return resolve_pair(proposals_root, id1, id2, winner, reason)
+}
+
+main()

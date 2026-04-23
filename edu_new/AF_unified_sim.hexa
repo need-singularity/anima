@@ -1,0 +1,412 @@
+// edu_new/AF_unified_sim.hexa — unified A+F simulator
+//
+// PARADIGM REF: docs/new_paradigm_edu_lattice_unified_20260421.md
+// ROLE: time-step simulator that combines
+//   • A drill — tension-drop dynamics + fixpoint (w2==w3) seal judgment
+//   • F drill — NxN lattice with 1/r² attraction
+// and emits per-tick coherence logs + final active/drop/sealed ratio
+// for 3×3, 5×5, 10×10 grids under deterministic seeds.
+//
+// CLI:
+//   hexa run edu_new/AF_unified_sim.hexa            — runs default 3/5/10 suite
+//   hexa run edu_new/AF_unified_sim.hexa <size> <seed> <ticks>
+//
+// EMITTED CERT: state/edu_af_unified_<size>.json
+//
+// IMPLEMENTATION NOTE: we inline the unit-cell + lattice primitives from
+// A_tension_drop.hexa / F_lattice_unified.hexa rather than `import`-ing
+// because the stage0 module loader falls back to raw-file on this run
+// path.  Helpers are byte-compatible across the three files.
+
+// ─── INLINED primitives (A_tension_drop.hexa ⨯ F_lattice_unified.hexa) ──
+
+let ASCII_TABLE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-|.↔/+=() <>:;'\""
+
+fn char_code(c: string) -> int {
+    let t     = ASCII_TABLE
+    let n     = len(t)
+    let mut i = 0
+    while i < n {
+        if t.substring(i, i + 1) == c { return i + 1 }
+        i = i + 1
+    }
+    return 127
+}
+
+fn hash_proj(s: string) -> int {
+    let mut acc = 1469598103
+    let mut i   = 0
+    let n       = len(s)
+    while i < n {
+        let c = s.substring(i, i + 1)
+        acc   = acc * 31 + char_code(c)
+        acc   = acc % 2147483647
+        i     = i + 1
+    }
+    return acc
+}
+
+fn judge(seed: string, step: int) -> string {
+    let h = hash_proj(seed + "|k=" + str(step))
+    return "w_" + str(h)
+}
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+fn parse_int(s: string) -> int {
+    let n     = len(s)
+    if n == 0 { return 0 }
+    let sign  = if s.substring(0, 1) == "-" { -1 } else { 1 }
+    let start = if sign == -1 { 1 } else { 0 }
+    let mut acc = 0
+    let mut i   = start
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let d = digit_val(c)
+        if d >= 0 { acc = acc * 10 + d }
+        i = i + 1
+    }
+    return acc * sign
+}
+
+fn make_cell(a_id: string, b_id: string, t0: int, seed: int) -> string {
+    let raw_g = hash_proj(a_id + "|" + b_id + "|s=" + str(seed))
+    let g     = (raw_g % 2001) - 1000
+    return a_id + "|" + b_id + "|" + str(t0) + "|" + str(g) + "|active"
+}
+
+fn split5(cell: string) -> [string] {
+    let mut out = []
+    let mut buf = ""
+    let n       = len(cell)
+    let mut i   = 0
+    let mut cnt = 0
+    while i < n {
+        let c = cell.substring(i, i + 1)
+        if c == "|" && cnt < 4 {
+            out = out.push(buf)
+            buf = ""
+            cnt = cnt + 1
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    out = out.push(buf)
+    while len(out) < 5 { out = out.push("") }
+    return out
+}
+
+fn cell_a(c: string) -> string { return split5(c)[0] }
+fn cell_b(c: string) -> string { return split5(c)[1] }
+fn cell_t(c: string) -> int    { return parse_int(split5(c)[2]) }
+fn cell_g(c: string) -> int    { return parse_int(split5(c)[3]) }
+fn cell_s(c: string) -> string { return split5(c)[4] }
+
+fn rebuild(a: string, b: string, t: int, g: int, s: string) -> string {
+    return a + "|" + b + "|" + str(t) + "|" + str(g) + "|" + s
+}
+
+fn cell_set_t(c: string, t_new: int) -> string {
+    let p = split5(c)
+    return rebuild(p[0], p[1], t_new, parse_int(p[3]), p[4])
+}
+
+fn cell_set_s(c: string, s_new: string) -> string {
+    let p = split5(c)
+    return rebuild(p[0], p[1], parse_int(p[2]), parse_int(p[3]), s_new)
+}
+
+fn clamp_int(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn fixpoint_seal(cell: string) -> bool {
+    let seed = cell_a(cell) + "<->" + cell_b(cell) + "|g=" + str(cell_g(cell))
+    let w1   = judge(seed, 1)
+    let w2   = judge(w1,   2)
+    let w3   = judge(w2,   3)
+    return w2 == w3
+}
+
+fn tension_step(cell: string, attraction: int, upper: int, lower: int) -> string {
+    let s = cell_s(cell)
+    if s != "active" { return cell }
+    let t0    = cell_t(cell)
+    let g     = cell_g(cell)
+    // gap/2 gives per-tick basin drift of ±500 (gap in [-1000,+1000])
+    // → transitions complete in ~10 ticks from T0=5000 to UPPER/LOWER gate.
+    let t_new = clamp_int(t0 + attraction + (g / 2), 0, 10000)
+    let c1    = cell_set_t(cell, t_new)
+    if t_new > upper {
+        return cell_set_s(c1, "drop")
+    }
+    if t_new < lower {
+        if fixpoint_seal(c1) { return cell_set_s(c1, "sealed") }
+    }
+    return c1
+}
+
+fn make_lattice(size: int, tension0: int, seed: int) -> [string] {
+    let mut cells = []
+    let mut r     = 0
+    while r < size {
+        let mut c = 0
+        while c < size {
+            let a_id = "n_" + str(r) + "_" + str(c) + "_a"
+            let b_id = "n_" + str(r) + "_" + str(c) + "_b"
+            let per  = seed + (r * size + c)
+            cells    = cells.push(make_cell(a_id, b_id, tension0, per))
+            c        = c + 1
+        }
+        r = r + 1
+    }
+    return cells
+}
+
+fn lattice_idx(size: int, r: int, c: int) -> int { return r * size + c }
+
+fn iabs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn sign_of(x: int) -> int {
+    if x > 0 { return 1 }
+    if x < 0 { return -1 }
+    return 0
+}
+
+fn attraction_at(lattice: [string], size: int, r: int, c: int,
+                 k_numer: int) -> int {
+    let mut acc = 0
+    let mut rr  = 0
+    while rr < size {
+        let mut cc = 0
+        while cc < size {
+            if rr != r || cc != c {
+                let j    = lattice_idx(size, rr, cc)
+                let cell = lattice[j]
+                if cell_s(cell) == "active" {
+                    let d   = iabs(rr - r) + iabs(cc - c)
+                    let d2  = d * d
+                    let g   = cell_g(cell)
+                    let t   = cell_t(cell)
+                    let contrib = (sign_of(g) * t) / d2
+                    acc = acc + contrib
+                }
+            }
+            cc = cc + 1
+        }
+        rr = rr + 1
+    }
+    if k_numer <= 0 { return 0 }
+    return acc / k_numer
+}
+
+fn lattice_step(lattice: [string], size: int, upper: int, lower: int,
+                k_numer: int) -> [string] {
+    let mut out = []
+    let mut r   = 0
+    while r < size {
+        let mut c = 0
+        while c < size {
+            let j    = lattice_idx(size, r, c)
+            let cell = lattice[j]
+            let a    = attraction_at(lattice, size, r, c, k_numer)
+            let next = tension_step(cell, a, upper, lower)
+            out      = out.push(next)
+            c        = c + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+fn count_states(lattice: [string]) -> string {
+    let mut act = 0
+    let mut drp = 0
+    let mut sld = 0
+    let n       = len(lattice)
+    let mut i   = 0
+    while i < n {
+        let s = cell_s(lattice[i])
+        if s == "active" { act = act + 1 }
+        if s == "drop"   { drp = drp + 1 }
+        if s == "sealed" { sld = sld + 1 }
+        i = i + 1
+    }
+    return str(act) + "|" + str(drp) + "|" + str(sld) + "|" + str(n)
+}
+
+fn counts_get(counts: string, idx: int) -> int {
+    let mut parts = []
+    let mut buf   = ""
+    let n         = len(counts)
+    let mut i     = 0
+    while i < n {
+        let c = counts.substring(i, i + 1)
+        if c == "|" {
+            parts = parts.push(buf)
+            buf   = ""
+        } else {
+            buf = buf + c
+        }
+        i = i + 1
+    }
+    parts = parts.push(buf)
+    if idx < 0 || idx >= len(parts) { return 0 }
+    return parse_int(parts[idx])
+}
+
+fn coherence(lattice: [string], size: int) -> int {
+    let counts = count_states(lattice)
+    let sld    = counts_get(counts, 2)
+    let tot    = counts_get(counts, 3)
+    if tot == 0 { return 0 }
+    return (sld * 1000) / tot
+}
+
+// ─── simulator ────────────────────────────────────────────────────
+//
+// Tunables:
+//   T0        initial per-cell tension (middle of [0,10000])
+//   UPPER     drop threshold
+//   LOWER     seal threshold
+//   K_NUMER   attraction normalizer (larger → weaker coupling)
+//
+// The simulator runs `ticks` ticks of lattice_step, logging coherence
+// per tick, then emits a JSON summary cert.  Seed determines the per-cell
+// gap distribution — same seed across runs gives byte-identical cert.
+
+let T0       = 5000
+let UPPER    = 9000
+let LOWER    = 1000
+let K_NUMER  = 100
+
+fn run_sim(size: int, seed: int, ticks: int) -> string {
+    println("─ AF sim size=" + str(size) + " seed=" + str(seed)
+        + " ticks=" + str(ticks) + " ─")
+    let mut L = make_lattice(size, T0, seed)
+    println("  t=0 counts=" + count_states(L) + " coh=" + str(coherence(L, size)))
+
+    let mut t = 0
+    while t < ticks {
+        L = lattice_step(L, size, UPPER, LOWER, K_NUMER)
+        t = t + 1
+        // Log every 1/5 of the run (min 1).
+        let step_log = if ticks / 5 > 0 { ticks / 5 } else { 1 }
+        if t % step_log == 0 || t == ticks {
+            println("  t=" + str(t) + " counts=" + count_states(L)
+                + " coh=" + str(coherence(L, size)))
+        }
+    }
+
+    let final_counts = count_states(L)
+    let act = counts_get(final_counts, 0)
+    let drp = counts_get(final_counts, 1)
+    let sld = counts_get(final_counts, 2)
+    let tot = counts_get(final_counts, 3)
+    println("  FINAL active=" + str(act) + " drop=" + str(drp)
+        + " sealed=" + str(sld) + " total=" + str(tot)
+        + " coherence=" + str(coherence(L, size)))
+    return final_counts
+}
+
+fn emit_cert(path: string, size: int, seed: int, ticks: int, counts: string) {
+    let act = counts_get(counts, 0)
+    let drp = counts_get(counts, 1)
+    let sld = counts_get(counts, 2)
+    let tot = counts_get(counts, 3)
+    let coh = if tot > 0 { (sld * 1000) / tot } else { 0 }
+    let body = "{\n"
+        + "  \"verifier\": \"edu_af_unified\",\n"
+        + "  \"paradigm_ref\": \"docs/new_paradigm_edu_lattice_unified_20260421.md\",\n"
+        + "  \"size\": " + str(size) + ",\n"
+        + "  \"seed\": " + str(seed) + ",\n"
+        + "  \"ticks\": " + str(ticks) + ",\n"
+        + "  \"T0\": " + str(T0) + ",\n"
+        + "  \"upper\": " + str(UPPER) + ",\n"
+        + "  \"lower\": " + str(LOWER) + ",\n"
+        + "  \"k_numer\": " + str(K_NUMER) + ",\n"
+        + "  \"active\": " + str(act) + ",\n"
+        + "  \"drop\": " + str(drp) + ",\n"
+        + "  \"sealed\": " + str(sld) + ",\n"
+        + "  \"total\": " + str(tot) + ",\n"
+        + "  \"coherence_per_mille\": " + str(coh) + "\n"
+        + "}\n"
+    write_file(path, body)
+    println("  cert=" + path)
+}
+
+fn ratio_reasonable(size: int, counts: string) -> bool {
+    let tot = counts_get(counts, 3)
+    let act = counts_get(counts, 0)
+    let drp = counts_get(counts, 1)
+    let sld = counts_get(counts, 2)
+    // Invariants:
+    //  - total conserved
+    //  - no negative count
+    //  - at least one transition occurred (some cell no longer active)
+    if tot != size * size { return false }
+    if act < 0 || drp < 0 || sld < 0 { return false }
+    if act + drp + sld != tot { return false }
+    // At least one cell must have transitioned (drop OR sealed > 0).
+    // For the default UPPER/LOWER/K_NUMER tuning + reasonable tick count,
+    // 1/r² attraction pulls a fraction of cells past a threshold.
+    if drp + sld < 1 { return false }
+    return true
+}
+
+fn main() {
+    let argv = args()
+    if len(argv) >= 5 {
+        let size  = parse_int(argv[2])
+        let seed  = parse_int(argv[3])
+        let ticks = parse_int(argv[4])
+        let c     = run_sim(size, seed, ticks)
+        emit_cert("state/edu_af_unified_" + str(size) + ".json",
+                  size, seed, ticks, c)
+        if ratio_reasonable(size, c) { exit(0) } else { exit(1) }
+    }
+
+    // Default suite: 3/5/10 grid sweep, fewer ticks at larger size to stay
+    // under the stage0 RSS cap + keep the run tractable in the interpreter.
+    let mut any_fail = 0
+
+    let c3 = run_sim(3,  42, 10)
+    emit_cert("state/edu_af_unified_3.json",  3,  42, 10, c3)
+    if !ratio_reasonable(3,  c3) { any_fail = any_fail + 1 }
+
+    let c5 = run_sim(5, 137,  6)
+    emit_cert("state/edu_af_unified_5.json",  5, 137,  6, c5)
+    if !ratio_reasonable(5,  c5) { any_fail = any_fail + 1 }
+
+    let c10 = run_sim(10, 271, 2)
+    emit_cert("state/edu_af_unified_10.json", 10, 271, 2, c10)
+    if !ratio_reasonable(10, c10) { any_fail = any_fail + 1 }
+
+    println("")
+    println("=== AF unified suite ===")
+    println("  3x3  : " + c3)
+    println("  5x5  : " + c5)
+    println("  10x10: " + c10)
+    if any_fail == 0 {
+        println("AF_unified_sim: PASS")
+        exit(0)
+    } else {
+        println("AF_unified_sim: FAIL (" + str(any_fail) + " sim(s) out of bounds)")
+        exit(1)
+    }
+}
