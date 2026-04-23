@@ -28,7 +28,7 @@ Total session burn: **~$6.44**. All pods removed. `pods=0`.
 
 ```bash
 cd /Users/ghost/core/anima
-git log -1 --oneline              # expect 96b99446 or later
+git log -1 --oneline              # expect 68f8efae or later
 bin/anima compute status          # expect pods=0, all stages READY/CLOSED
 bin/anima doctor                  # expect 10/10 PASS
 jq '.convergence | {total_issues, resolved, pending, final_status}' \
@@ -55,7 +55,7 @@ If any of those don't match, something regressed — read
 ## What's next (priority-ordered)
 
 ### Tier 1 — high-value, low-cost
-1. **#89 research paper draft** (`docs/papers/phi_paradigm_paper_v1_preliminary.md` exists; expand with Stage-2/3 empirical results — gram spectrum substrate_indep, AN11 triple, JSD=1.0 bits). No compute.
+1. **#89 research paper** — v1→**v1.5 landed** (`68f8efae`, 2026-04-23 evening). §10 addendum has Stage-2 v2 metric + AN11 triple + Mk.VI VERIFIED. Remaining = v2 (post-H100-trained deltas, real AN11(b), Mk.XII, r14 Korean, LaTeX). Next incremental step = LaTeX skeleton or figure generation; full v2 blocked on H100 run.
 2. **Dashboard #84** (Grafana on htz) — infra setup but no pod burn. Observability for future long runs.
 
 ### Tier 2 — needs infra/external deps
