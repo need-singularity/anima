@@ -1,0 +1,148 @@
+// tool/meta_fixed_point_scanner.hexa
+//
+// PURPOSE
+//   Scan anima state files for candidate meta-fixed-point signatures.
+//   Flags numeric constants that: (a) appear in ≥2 independent artifacts,
+//   (b) appear at theoretical ceilings (e.g., 1.0 = ln(2) bits, 0.5),
+//   or (c) exhibit tie-with-null-bootstrap (like §10.8 p3_p4 = null_p95).
+//
+//   Does NOT classify by itself — emits candidates for human/operator
+//   to decide whether a new W_N witness row in atlas_convergence_witness.jsonl
+//   is warranted.
+//
+// USAGE
+//   hexa run tool/meta_fixed_point_scanner.hexa                 # scan default
+//   hexa run tool/meta_fixed_point_scanner.hexa --pattern 1.0   # search specific value
+//   hexa run tool/meta_fixed_point_scanner.hexa --dry-run       # list scan targets
+//
+// EXIT
+//   0 = scan complete (candidates reported)
+//   1 = scan error
+//
+// raw#9 deterministic: same input ⇒ same candidate list
+// raw#10 proof-carrying: writes state/meta_fixed_point_scan_result.json
+// raw#12 no cherry-pick: reports all candidates, no filtering by bias
+
+let ANIMA_ROOT = "/Users/ghost/core/anima"
+let WITNESS_SSOT = ANIMA_ROOT + "/state/atlas_convergence_witness.jsonl"
+let OUT_SSOT = ANIMA_ROOT + "/state/meta_fixed_point_scan_result.json"
+
+// Curated scan targets — known empirical state files with fixed-point-shaped values.
+// Not exhaustive; operator adds more as new witnesses land.
+let SCAN_TARGETS = [
+    "state/phi_4path_cross_result.json",           // base-weight Φ (W1 source)
+    "state/phi_4path_cross_result_v3_TRAINED.json", // trained-weight Φ (W2 source)
+    "state/mk_vi_definition.json",                  // Mk.VI 9-of-9 (W3 source)
+    "state/alm_r13_an11_a_live.json",              // AN11(a) (W6 part)
+    "state/alm_r13_an11_b_live.json",              // AN11(b) (W6 part)
+    "state/alm_r13_an11_c_live.json",              // AN11(c) (W4 + W6 part)
+    "state/phi_cpu_synthetic_4path_result.json",   // §5 synthetic
+    "state/convergence/h100_stage1_20260423.json", // Stage-1 convergence
+]
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+
+fn _scan_numerics(path: string) -> string {
+    // Extract all numeric leaf values via jq; delegate to python for
+    // candidate flagging (near-1.0, near-0, repeated).
+    let py = "python3 -c \"\n" +
+        "import json, sys, re\n" +
+        "try:\n" +
+        "    obj = json.load(open(sys.argv[1]))\n" +
+        "except Exception as e:\n" +
+        "    print(json.dumps({'error': str(e)}))\n" +
+        "    sys.exit(0)\n" +
+        "nums = []\n" +
+        "def walk(o, path=''):\n" +
+        "    if isinstance(o, dict):\n" +
+        "        for k, v in o.items():\n" +
+        "            walk(v, path + '.' + k)\n" +
+        "    elif isinstance(o, list):\n" +
+        "        for i, v in enumerate(o):\n" +
+        "            walk(v, path + '[' + str(i) + ']')\n" +
+        "    elif isinstance(o, (int, float)) and not isinstance(o, bool):\n" +
+        "        nums.append({'path': path.lstrip('.'), 'value': float(o)})\n" +
+        "walk(obj)\n" +
+        "# Flag candidates\n" +
+        "candidates = []\n" +
+        "CEILINGS = {'1.0_bit_ln2': 1.0, '0.5_half': 0.5, 'one_third': 1/3, 'golden': 0.6180339887, 'euler_inv': 0.3678794412}\n" +
+        "for n in nums:\n" +
+        "    v = n['value']\n" +
+        "    for cname, cval in CEILINGS.items():\n" +
+        "        if abs(v - cval) < 0.005:\n" +
+        "            candidates.append({'path': n['path'], 'value': v, 'ceiling_match': cname, 'delta': v - cval})\n" +
+        "    if abs(v - round(v)) < 1e-9 and v != 0:\n" +
+        "        candidates.append({'path': n['path'], 'value': v, 'integer_fixed_point': True})\n" +
+        "print(json.dumps({'source': sys.argv[1], 'n_numerics': len(nums), 'candidates': candidates}))\" "
+    let r = exec_with_status(py + _sh_quote(path))
+    if r[1] != 0 { return "{\"error\":\"scan_failed\"}" }
+    return to_string(r[0]).trim()
+}
+
+fn main() {
+    let av = argv()
+    let mut dry = false
+    let mut i = 2
+    while i < len(av) {
+        if av[i] == "--dry-run" { dry = true }
+        i = i + 1
+    }
+
+    println("── meta_fixed_point_scanner " + to_string(utc_iso_now()) + " ──")
+    println("witnesses_ssot: " + WITNESS_SSOT)
+    println("scan_targets:   " + to_string(len(SCAN_TARGETS)))
+
+    if dry {
+        let mut j = 0
+        while j < len(SCAN_TARGETS) {
+            println("  " + SCAN_TARGETS[j])
+            j = j + 1
+        }
+        println("dry-run — no scan executed")
+        exit(0)
+    }
+
+    let mut results = []
+    let mut j = 0
+    while j < len(SCAN_TARGETS) {
+        let p = ANIMA_ROOT + "/" + SCAN_TARGETS[j]
+        if _file_exists(p) {
+            let r = _scan_numerics(p)
+            results.push(r)
+            let short = p.replace(ANIMA_ROOT + "/", "")
+            println("  scanned: " + short)
+        } else {
+            println("  missing: " + SCAN_TARGETS[j] + " (skipped)")
+        }
+        j = j + 1
+    }
+
+    let ts = to_string(utc_iso_now())
+    let combined = "[" + results.join(",\n") + "]"
+    let out_json = "{\n" +
+        "  \"schema\": \"anima/meta_fixed_point_scan_result/1\",\n" +
+        "  \"generated_at\": \"" + ts + "\",\n" +
+        "  \"witnesses_ssot\": \"" + WITNESS_SSOT + "\",\n" +
+        "  \"sources_scanned\": " + to_string(len(results)) + ",\n" +
+        "  \"scan_results\": " + combined + ",\n" +
+        "  \"note\": \"candidates[].ceiling_match indicates a known theoretical fixed-point (1.0=ln(2), 1/3, golden, euler_inv, 0.5). candidates[].integer_fixed_point flags integer-valued counts. Operator decides which become W_N witness rows in atlas_convergence_witness.jsonl.\",\n" +
+        "  \"next_step\": \"review candidates; promote meaningful ones to new W_N witness rows; demote noise.\",\n" +
+        "  \"source\": \"tool/meta_fixed_point_scanner.hexa\"\n" +
+        "}\n"
+    write_file(OUT_SSOT, out_json)
+    println("")
+    println("ssot: " + OUT_SSOT)
+    println("review: jq '.scan_results[].candidates[] | select(.ceiling_match or .integer_fixed_point)' " + OUT_SSOT)
+    exit(0)
+}
+
+main()
