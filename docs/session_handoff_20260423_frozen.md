@@ -141,3 +141,27 @@ Notable markers:
 ---
 
 **End of frozen handoff.** Do not regenerate.
+
+---
+
+## Postscript — 2026-04-23 session continuation (after frozen-at b86167f4)
+
+Additional work landed after the frozen snapshot, captured here so the file
+reflects final session state without re-authoring §1-§5:
+
+| Commit | What |
+|---|---|
+| `7ebd01f0` | D3 — Stage-2/3 artifact map (`docs/stage2_3_artifact_map_20260423.md`), surfaces G1/G2/G3 gaps beyond P12/P13 |
+| `b45f4a46` | **P13 RESOLVED** — upstream hexa-lang 968900b8/4238b758/388eece8 landed (Phase C.2 + rebuilt Linux binary), anima rclone'd new 1.69 MiB binary to R2 + bumped `EXPECTED_SHA` in `fetch_hexa_binary_url.bash` to `42d01578...` |
+| `8552db1c` | D1 — pytorch PEFT backend as §2.5.b pod-install heredoc (gpt2 default, torch+peft+transformers+safetensors, final.safetensors + final.json dual emit) |
+| `d2914e01` | P13 follow-on — Mac stage0 rebuild verified (`.last_index_of()` + `real_args()` dispatch confirmed); `_last_idx_char` helper + 2 call sites deleted in `tool/an11_a_verifier.hexa`. `nth_positional` dup-detect still pending pod test |
+| `fee79c47` | Upstream `hxa-20260423-009` audit — anima not affected (no `use`+`real_args`/`starts_with` intersection; `.last_index_of()` via `use` file verified working) |
+| `33cbdf2b` | Session drift sync — auto-gen handoff regen + 9 SSOT files from tool runs |
+
+**Convergence final (2026-04-23)**: total 13 · resolved 12 · violations 0 · pending 1 (P12 only).
+
+**P12 status**: architectural surface complete — `docs/pod_bootstrap_checklist_20260423.md` §2.5 (MLX) + §2.5.b (PEFT/pytorch) both document pod-install heredocs matching the orchestrator CLI. Remaining work is pod-side operator execution of the train → verify → promote cycle; no further anima-local minimum-path work identified.
+
+**P13 follow-on remaining**: `nth_positional` dup-detect removal in `tool/an11_a_verifier.hexa` — gated on a live-pod run verifying `real_args()` dispatch with the new binary. Safe to defer until next pod launch.
+
+**Next-session entry**: same as §3 — `bin/anima compute status` + this frozen doc + `docs/pod_bootstrap_checklist_20260423.md`. If P12 pod cycle intended, start from checklist §0.
