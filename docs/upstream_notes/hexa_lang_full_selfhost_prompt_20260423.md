@@ -26,7 +26,7 @@
 
 ### 1.2 이번 세션에서 발견된 **self-host 결손** 6건
 
-(anima `state/h100_stage1_launch_state.json:_meta.convergence` I7–I11 + I8 상세)
+(anima `state/convergence/h100_stage1_20260423.json:.convergence` I7–I11 + I8 상세)
 
 | # | 결손 | 근본 원인 | 현재 우회 |
 |---|---|---|---|
@@ -120,7 +120,7 @@
 - anima `hexa-lang/1fdc0100` — Linux x86_64 static musl binary 첫 배포
 - anima `55bdad56` — R2 binary 배포 + fetch_hexa_binary_url.bash
 - anima `ce55eafa` — pod live bootstrap (6 lang_gap 세부기록)
-- anima `state/h100_stage1_launch_state.json:_meta.convergence` — 12 이슈 (11 resolved, P12 PENDING_ARCHITECTURAL)
+- anima `state/convergence/h100_stage1_20260423.json:.convergence` — 13 이슈 (11 resolved, P12 PENDING_ARCHITECTURAL_BACKEND, P13 PENDING_UPSTREAM)
 - hexa-lang inbox `hxa-20260422-004` DONE — exec_capture / now / setenv hx_ prefix mangling
 - hexa-lang inbox `hxa-20260423-002` NEW (prio 85, lang_gap) — "Linux x86_64 hexa run driver missing"
 
