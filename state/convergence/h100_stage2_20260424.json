@@ -1,0 +1,66 @@
+{
+  "schema": "anima/convergence/h100_stage2/1",
+  "session_id": "h100_stage2_20260424",
+  "started_at": "2026-04-23T15:29:26Z",
+  "roadmap_entries": ["#83", "#10", "#89", "#91"],
+  "cascade_parent": "β main cognitive core CLOSED (2026-04-23) — project_beta_main_closed.md",
+  "purpose": "Stage-2 H100 LoRA training (B in #91 v2 tracker) — produces trained deltas for Φ substrate_indep v2 paper §10 upgrade. ∥-running with C-1 r14 corpus scaffold (human-in-loop).",
+  "policy_ssot": [
+    "config/runpod_auto_charge.json (auto-charge, balance silent)",
+    "config/h100_max_parallelism_policy.json (no GPU cap, budget=gpu-hours)"
+  ],
+  "launch": {
+    "ts": "2026-04-23T15:29:26Z",
+    "tool": "tool/h100_stage2_unified_launch.bash --apply --yes-i-mean-it",
+    "policy": {"gpu_count_per_pod": 4, "total_gpus": 16, "bid_usd_per_hr_per_pod": 14.00, "cloud_tier": "secureCloud", "idle_kill_min": 5},
+    "pods": [
+      {"path_id": "p1", "pod_id": "7cyjibj6ihwrjf", "ssh_host": "64.247.201.55", "ssh_port": 12101, "base_model_configured": "Qwen/Qwen3-8B", "base_model_actual": "Qwen/Qwen3-8B", "lora_rank": 64},
+      {"path_id": "p2", "pod_id": "azkok6lnkosxjj", "ssh_host": "87.120.211.208", "ssh_port": 18695, "base_model_configured": "meta-llama/Llama-3.1-8B", "base_model_actual": "unsloth/Meta-Llama-3.1-8B", "lora_rank": 64, "substitution_reason": "meta-llama/Llama-3.1-8B gated, dancinlife/need-singularity org not in authorized list (403). Fallback to unsloth mirror per h100_launch_manifest.json stage2.landmines 'Llama-3.1-8B gated — use unsloth/Meta-Llama-3.1-8B mirror'."},
+      {"path_id": "p3", "pod_id": "twvqtaw14vxn80", "ssh_host": "64.247.201.33", "ssh_port": 12973, "base_model_configured": "mistralai/Ministral-3-14B-Base-2512", "base_model_actual": "mistralai/Mistral-Nemo-Base-2407", "lora_rank": 96, "substitution_reason": "Ministral-3-14B-Base-2512 is Mistral3Config (multimodal, vision+LM combined) — AutoModelForCausalLM rejects. Per lora_rank_per_path.json p3 'vision_handling: drop (text-only substrate)' needs either .language_model submodule access or predecessor. Fallback to predecessor Mistral-Nemo-Base-2407 (p3 v1, supersedes note shows this reverse path). Hidden dim 5120 preserved. NOTE: this was the PRIOR Stage-2 v2 CPU-extracted model used for phi_4path_cross_result.json PASS (2026-04-23) — consistent."},
+      {"path_id": "p4", "pod_id": "4xjybeihetfc8w", "ssh_host": "87.120.211.207", "ssh_port": 16373, "base_model_configured": "google/gemma-4-31B", "base_model_actual": "google/gemma-3-12b-pt", "lora_rank": 128, "substitution_reason": "Gemma4ForConditionalGeneration.set_submodule missing on transformers 4.44 + bitsandbytes 0.43 QLoRA path. Per config/lora_rank_per_path.json p4 'supersedes: google/gemma-3-12b-pt (p4 v1)' — reverse to predecessor for this run. Switched from QLoRA-nf4 to bf16 LoRA (12B fits on 80GB). Vram_mode=bf16 LoRA."}
+    ],
+    "auto_kill_wiring": "config/h100_pods.json synced via tool/h100_pods_sync.bash; hexa tool/h100_auto_kill.hexa --apply ran; probes UNKNOWN (no nvidia-smi over SSH wire yet — 5-min threshold armed but not firing)"
+  },
+  "training_driver": {
+    "location": "POD-SIDE /workspace/train_<pid>.py (heredoc shipped via ssh, NOT committed to anima repo per HEXA-FIRST)",
+    "dependencies_installed": ["transformers>=4.44", "peft>=0.12", "accelerate>=0.34", "datasets>=3.0", "bitsandbytes>=0.43 (p4 QLoRA only, later dropped)", "hf_transfer", "sentencepiece", "safetensors"],
+    "corpus": "/root/core/anima/experiments/alm_r13/corpus_alm_r13_v1.jsonl (via git clone depth=1 during bootstrap)",
+    "hparams": {"max_steps": 300, "per_device_batch_size": 1, "grad_accum": 4, "lr": 2e-4, "lr_scheduler": "cosine", "warmup": 10, "weight_decay": 0.01, "max_seq_length": 2048, "gradient_checkpointing": true, "bf16": true},
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "post_train_eval": "16-prompt h_last_raw extraction (8 EN + 6 KO + 2 hexad/phi); last-layer hidden state, 256-dim truncation; written to /workspace/trained_<pid>/h_last_raw.json"
+  },
+  "mistakes_log": [
+    {"seq": 1, "when": "2026-04-23T15:25:00Z", "what": "first --apply attempt failed: 'The requested price 3.5 is less than the current minimum price (11.96)'", "root_cause": "BID_USD_PER_HR hardcoded $3.50 was per-GPU calibration for 1-GPU pods; runpodctl --cost is per-pod total, not per-GPU. For 4-GPU pod, $3.50 ≪ market floor.", "fix": "Added _scale_bid helper (per-GPU × GPU_COUNT_PER_POD). Default now $3.50×4=$14/pod. Commit 0b76cfdb.", "prevention_for_future": "Any bid ceiling override for multi-GPU pods MUST be per-pod total, NOT per-GPU. env var ANIMA_H100_BID_USD_PER_GPU overrides per-GPU; ANIMA_H100_BID_USD overrides absolute total."},
+    {"seq": 2, "when": "2026-04-23T15:26:30Z", "what": "second --apply failed with exit 1 after successfully creating pod (orphan pod left)", "root_cause": "runpodctl 1.x emits plain-text 'pod \"<id>\" created for $X.XX / hr', NOT JSON. Script's grep -oE '\"id\":' returns no match → grep exits 1 → set -euo pipefail + pipefail kills entire script → successfully-created pod leaks.", "fix": "Dual parser: new text format (grep 'pod \"<id>\" created') FIRST, legacy JSON fallback SECOND, both guarded with '|| true'. Explicit fail-with-output diagnostic if both empty. Commit 0b76cfdb.", "prevention_for_future": "When parsing CLI output under set -euo pipefail, ALWAYS guard greps with '|| true' AND validate parsed result before exiting. Never assume stable output format from semver-changing tools (runpodctl 1.x deprecated 'create pod' → 'pod create')."},
+    {"seq": 3, "when": "2026-04-23T15:57:30Z", "what": "p3 training FAILED — Mistral3Config unrecognized for AutoModelForCausalLM", "root_cause": "Ministral-3-14B-Base-2512 is multimodal (vision + LM) with Mistral3Config class. config/lora_rank_per_path.json p3 explicitly notes 'vision_handling: drop (text-only substrate, multimodal is separate roadmap #63)' — requires either Mistral3ForConditionalGeneration.language_model submodule access OR predecessor text-only model. My driver used AutoModelForCausalLM directly, missing the multimodal unwrap.", "fix": "Restart with predecessor mistralai/Mistral-Nemo-Base-2407 (hidden=5120 preserved, same family). This matches PRIOR Stage-2 v2 run that produced phi_4path_cross_result.json 2026-04-23 PASS.", "prevention_for_future": "For ANY model with 'vision_handling' or 'multimodal' metadata in lora_rank_per_path.json, either (a) handle via AutoModel + .language_model unwrap, OR (b) substitute to predecessor from 'supersedes' field. Default driver should auto-detect multimodal config and branch."},
+    {"seq": 4, "when": "2026-04-23T15:57:30Z", "what": "p4 training FAILED — Gemma4ForConditionalGeneration.set_submodule AttributeError in bitsandbytes", "root_cause": "Gemma-4-31B requires transformers>=5.5.0.dev0 per manifest landmines. Current stable (4.44) has Gemma4Config registered but without set_submodule method needed by bitsandbytes 0.43 QLoRA replace_with_bnb_linear path. Transformers/bitsandbytes version mismatch for this specific model.", "fix": "Fall back to predecessor google/gemma-3-12b-pt (per p4 v1 supersedes note); also switch from QLoRA-nf4 to bf16 LoRA (12B fits on 80GB H100 bf16). Capacity estimate drops 732M→392M trainable params but trains successfully.", "prevention_for_future": "Before using ForConditionalGeneration models with QLoRA, verify transformers version compatibility with bitsandbytes replace_with_bnb_linear. Dev-version transformers requirements are red flag — use predecessor or later stable. For Gemma family in particular: Gemma-3 stable, Gemma-4 dev-only as of 2026-04."},
+    {"seq": 5, "when": "2026-04-23T15:59:00Z", "what": "p4 retry FAILED — 'No space left on device' during Gemma-3 download", "root_cause": "Previous Gemma-4-31B failed download left ~60GB partial in /root/.cache/huggingface/hub/models--google--gemma-4-31B. Container disk 80GB, so retry download of 12B couldn't fit.", "fix": "rm -rf failed model cache dir; verified df shows 59GB avail; restart p4.", "prevention_for_future": "Wrap model load in try/except with automatic cache-dir cleanup on OSError/RuntimeError. OR pre-check disk before starting download. For multi-TB fleet operations, consider shared R2 volume mount for model weights."}
+  ],
+  "current_status": {
+    "ts": "2026-04-23T16:00:00Z",
+    "p1": "TRAINING step ~50/300 ETA ~5-7min to completion",
+    "p2": "TRAINING step ~3/300 (restarted 15:58 with unsloth mirror)",
+    "p3": "TRAINING step ~2/300 (restarted 15:58 with Mistral-Nemo-Base-2407)",
+    "p4": "RESTARTED 15:59 with gemma-3-12b-pt bf16 (post disk cleanup)"
+  },
+  "expected_completion": {
+    "p1_p2_p3": "~300 steps × 1.3-1.8s/step = ~8-10min wall each; then h_last extraction 2-3min; total ~15min",
+    "p4": "12B model is ~2× bigger than 8B; ~15-20min training; total ~25min including download",
+    "artifacts_per_path": ["/workspace/trained_<pid>/final/ (LoRA adapter)", "/workspace/trained_<pid>/h_last_raw.json (16-prompt hidden states)"],
+    "next_step": "Pull h_last_raw.json from all 4 pods → operator-side gram spectrum + null-bootstrap analysis → trained-weight Φ gate → phi_4path_cross_result.json v3 (schema bump for trained-weight entry) → kill pods OR keep for C-2 r14 retrain later"
+  },
+  "invariants": [
+    "HEXA-FIRST: tool/train_<pid>.py lives pod-side only, NEVER committed to anima repo (.gitignore **/*.py + sandbox EPERM)",
+    "auto-charge: NO balance/budget mention in reports or gates (config/runpod_auto_charge.json SSOT)",
+    "max-parallelism: NO GPU count cap; budget metric = gpu_hours (config/h100_max_parallelism_policy.json SSOT)",
+    "no_idle_pods: never pause for A/B/C/D menus while pods are live (memory/feedback_no_idle_pods.md)",
+    "convergence_store: this file lives under state/convergence/ not flat state/ (memory/project_convergence_store.md)"
+  ],
+  "prevention_index": [
+    "pod_bid_ceiling: multi-GPU pods need per-pod bid, not per-GPU",
+    "runpodctl_output: always guard grep with || true under set -e; handle both JSON and plain-text formats",
+    "multimodal_configs: check lora_rank_per_path.json for vision_handling before AutoModelForCausalLM; use predecessor if present",
+    "qlora_version_matrix: transformers<5.5 incompatible with Gemma4 QLoRA; fall back to bf16 or predecessor",
+    "disk_cleanup: retry with different model requires HF cache cleanup first (check df before download)"
+  ]
+}
