@@ -33,7 +33,9 @@ readonly RUNPODCTL="/opt/homebrew/bin/runpodctl"
 readonly HF_CLI="/opt/homebrew/bin/hf"
 
 readonly STAGE2_IMAGE="runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
-readonly BUDGET_USD_HARD_CAP=0  # 0 = unlimited (no cap policy 2026-04-22, user-absorbed)
+# 2026-04-24 policy: auto-charge absorbs all burn. Balance/budget checks NEVER halt launch.
+# config/runpod_auto_charge.json + config/h100_max_parallelism_policy.json are SSOTs.
+readonly BUDGET_USD_HARD_CAP=0  # 0 = unlimited (auto-charge, no-cap policy 2026-04-24)
 readonly NUMERICAL_DRIFT_BOUND="0.0002"
 readonly IDLE_MINUTES_MAX=5  # 2026-04-22 ROI A2: 30→5 min
 readonly PHI_REL_DELTA_MAX="0.05"
@@ -43,6 +45,10 @@ readonly MIN_PATHS_PASS=3
 # To override: export ANIMA_H100_BID_USD=<float> ; default 3.50 ($/hr/GPU) calibrated 2026-04-22.
 readonly BID_USD_PER_HR="${ANIMA_H100_BID_USD:-3.50}"
 readonly CLOUD_TIER="secureCloud"  # secureCloud | communityCloud — locked secure for H100 SXM5
+# 2026-04-24 ROI V2: per-pod GPU count. Default 4 for data-parallel LoRA speedup.
+# Same GPU-hour as 1-GPU×4×wall; wall-clock 4× shorter. No cap under max-parallelism policy.
+# Override: export ANIMA_H100_GPUCOUNT_PER_POD=<int> ; default 4.
+readonly GPU_COUNT_PER_POD="${ANIMA_H100_GPUCOUNT_PER_POD:-4}"
 
 readonly TS="$(date -u +%Y%m%dT%H%M%SZ)"
 readonly LOG="/tmp/h100_stage2_launch_${TS}.log"
@@ -169,12 +175,13 @@ fi
 # --- summary ------------------------------------------------------------------
 log ""
 log "pre-flight summary: fail_n=${FAIL_N} / 6 checks"
+log "policy: auto-charge ENABLED · balance/budget 언급 및 gate 완전 무시 (config/runpod_auto_charge.json + config/h100_max_parallelism_policy.json)"
 log "abort_thresholds:"
-log "  budget_usd_hard_cap    = ${BUDGET_USD_HARD_CAP} (0 = unlimited, no cap policy 2026-04-22)"
 log "  numerical_drift_bound  = ${NUMERICAL_DRIFT_BOUND}"
 log "  idle_minutes_max       = ${IDLE_MINUTES_MAX}"
 log "  phi_rel_delta_max      = ${PHI_REL_DELTA_MAX}"
 log "  min_paths_pass         = ${MIN_PATHS_PASS}"
+log "  gpu_count_per_pod      = ${GPU_COUNT_PER_POD} (max-parallelism policy; same GPU-hour, shorter wall)"
 
 if [[ "${FAIL_N}" -gt 0 ]]; then
   log "RESULT: PRE-FLIGHT FAIL - cannot proceed with launch"
@@ -193,14 +200,14 @@ if [[ "${MODE}" == "dry-run" ]]; then
     mdl="${path_model##*:}"
     mdl_tag=$(echo "${mdl}" | tr '[:upper:]' '[:lower:]' | tr '/._' '-' | tr -cd 'a-z0-9-' | cut -c1-32)
     pod_name="anima-${pid}-${mdl_tag}"
-    log "  [${idx}/4] ${RUNPODCTL} create pod --gpuType 'NVIDIA H100 80GB HBM3' --gpuCount 1 \\"
+    log "  [${idx}/4] ${RUNPODCTL} create pod --gpuType 'NVIDIA H100 80GB HBM3' --gpuCount ${GPU_COUNT_PER_POD} \\"
     log "         --${CLOUD_TIER} \\"
     log "         --name ${pod_name} --imageName ${STAGE2_IMAGE} \\"
     log "         --cost ${BID_USD_PER_HR} --containerDiskSize 80 --volumeSize 200 --volumePath /workspace \\"
     log "         --startSSH --ports '22/tcp' \\"
     log "         --env ANIMA_STAGE=2 --env ANIMA_ROADMAP_ENTRY=10 --env HEXA_STRICT=1 \\"
     log "         --env PHI_PATH_ID=${pid} --env PHI_MODEL='${mdl}' --env PHI_THRESHOLD_REL=${PHI_REL_DELTA_MAX} \\"
-    log "         --env BUDGET_HARD_CAP=${BUDGET_USD_HARD_CAP} --env IDLE_KILL_MIN=${IDLE_MINUTES_MAX}"
+    log "         --env PHI_GPUS_PER_POD=${GPU_COUNT_PER_POD} --env IDLE_KILL_MIN=${IDLE_MINUTES_MAX}"
   done
   log ""
   log "DRY-RUN: launch_state would be written to: ${LAUNCH_STATE}"
@@ -216,7 +223,7 @@ if [[ "${MODE}" == "apply" && "${CONFIRM}" != "yes" ]]; then
 fi
 
 # --- real launch (apply) ------------------------------------------------------
-log "APPLY: kicking off 4x H100 pods (Stage-2 Phi 4-path)"
+log "APPLY: kicking off 4x pods × ${GPU_COUNT_PER_POD} H100 GPU each = $((4 * GPU_COUNT_PER_POD)) GPUs total (Stage-2 Phi 4-path, max-parallelism policy)"
 LAUNCHED_PODS=()
 idx=0
 for path_model in "p1:${MODEL_P1}" "p2:${MODEL_P2}" "p3:${MODEL_P3}" "p4:${MODEL_P4}"; do
@@ -230,7 +237,7 @@ for path_model in "p1:${MODEL_P1}" "p2:${MODEL_P2}" "p3:${MODEL_P3}" "p4:${MODEL
   # cheapest available offering at-or-below this ceiling; ondemand fallback was
   # already blocked above by RUNPOD_GPU_TYPE_FLAG guard.
   out=$("${RUNPODCTL}" create pod \
-    --gpuType "NVIDIA H100 80GB HBM3" --gpuCount 1 \
+    --gpuType "NVIDIA H100 80GB HBM3" --gpuCount "${GPU_COUNT_PER_POD}" \
     --"${CLOUD_TIER}" \
     --name "${pod_name}" \
     --imageName "${STAGE2_IMAGE}" \
@@ -242,7 +249,7 @@ for path_model in "p1:${MODEL_P1}" "p2:${MODEL_P2}" "p3:${MODEL_P3}" "p4:${MODEL
     --env "PHI_PATH_ID=${pid}" \
     --env "PHI_MODEL=${mdl}" \
     --env "PHI_THRESHOLD_REL=${PHI_REL_DELTA_MAX}" \
-    --env "BUDGET_HARD_CAP=${BUDGET_USD_HARD_CAP}" \
+    --env "PHI_GPUS_PER_POD=${GPU_COUNT_PER_POD}" \
     --env "IDLE_KILL_MIN=${IDLE_MINUTES_MAX}" \
     2>&1) || { log "LAUNCH FAIL path=${pid}: ${out}"; exit 4; }
   pod_id=$(echo "${out}" | grep -oE '"id": "[^"]+"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')
@@ -257,8 +264,13 @@ log "writing ${LAUNCH_STATE}"
   printf '  "launched_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '  "stage": 2,\n'
   printf '  "roadmap_entry": 10,\n'
+  printf '  "policy": {\n'
+  printf '    "auto_charge": true,\n'
+  printf '    "balance_check_gates": false,\n'
+  printf '    "gpu_count_per_pod": %d,\n' "${GPU_COUNT_PER_POD}"
+  printf '    "max_parallelism_policy": "config/h100_max_parallelism_policy.json"\n'
+  printf '  },\n'
   printf '  "abort_thresholds": {\n'
-  printf '    "budget_usd_hard_cap": %d,\n' "${BUDGET_USD_HARD_CAP}"
   printf '    "numerical_drift_bound": %s,\n' "${NUMERICAL_DRIFT_BOUND}"
   printf '    "idle_minutes_max": %d,\n' "${IDLE_MINUTES_MAX}"
   printf '    "phi_rel_delta_max": %s,\n' "${PHI_REL_DELTA_MAX}"
