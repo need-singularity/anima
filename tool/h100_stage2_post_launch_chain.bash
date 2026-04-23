@@ -92,9 +92,30 @@ for r in json.load(sys.stdin):
 "
 
 # --- step 1: SSH available ----------------------------------------------------
-log "step 1/4: waiting for SSH on all pods (max 90s)"
+# 2026-04-24 ROI V9 재발생금지: 90s → 600s max (cold-start pods commonly
+# take 2-3min on RunPod secureCloud). Configurable via env ANIMA_CHAIN_SSH_MAX_SEC.
+readonly SSH_MAX_SEC="${ANIMA_CHAIN_SSH_MAX_SEC:-600}"
+readonly SSH_RETRY_INTERVAL=15
+readonly SSH_MAX_ATTEMPTS=$(( SSH_MAX_SEC / SSH_RETRY_INTERVAL ))
+
+# Cleanup helper: on ABORT, auto-remove pods to prevent idle burn.
+# Matches round-3 ABORT incident (2026-04-24): 4 pods left RUNNING after
+# chain ABORT, burning ~$48/hr without useful work.
+_cleanup_abort_pods() {
+  log "  [CLEANUP] auto-removing ${POD_COUNT} pods (ABORT prevention, 재발생금지)"
+  for row in $(echo "${PODS_JSON}" | python3 -c "
+import json, sys
+for r in json.load(sys.stdin):
+    print(f\"{r['pod_id']}\")
+"); do
+    /opt/homebrew/bin/runpodctl remove pod "$row" 2>&1 | tail -1 | sed 's/^/    /'
+  done
+  bash "${ANIMA_ROOT}/tool/h100_pods_sync.bash" 2>&1 | tail -1 | sed 's/^/    /'
+}
+
+log "step 1/4: waiting for SSH on all pods (max ${SSH_MAX_SEC}s, ${SSH_MAX_ATTEMPTS} retries × ${SSH_RETRY_INTERVAL}s)"
 SSH_OK=0
-for i in 1 2 3 4 5 6 7 8 9; do
+for i in $(seq 1 ${SSH_MAX_ATTEMPTS}); do
   SSH_OK=1
   for row in $(echo "${PODS_JSON}" | python3 -c "
 import json, sys
@@ -107,11 +128,15 @@ for r in json.load(sys.stdin):
     fi
   done
   [[ $SSH_OK -eq 1 ]] && break
-  log "  retry in 10s (attempt $i/9)"
-  sleep 10
+  log "  retry in ${SSH_RETRY_INTERVAL}s (attempt $i/${SSH_MAX_ATTEMPTS})"
+  sleep ${SSH_RETRY_INTERVAL}
 done
-[[ $SSH_OK -eq 1 ]] || { log "ABORT: SSH not available within 90s"; exit 2; }
-log "  SSH OK all 4 pods"
+if [[ $SSH_OK -ne 1 ]]; then
+  log "ABORT: SSH not available within ${SSH_MAX_SEC}s"
+  _cleanup_abort_pods
+  exit 2
+fi
+log "  SSH OK all pods"
 
 # --- step 2: bootstrap (parallel) --------------------------------------------
 log "step 2/4: bootstrap (apt+hexa+git clone) on all 4 pods (parallel)"
