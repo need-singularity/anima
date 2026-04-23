@@ -105,3 +105,35 @@ The cascade is honest: Stage-2 and Stage-3 correctly remain NOT_READY / MISSING_
 - **Manifest shape changed?** → this doc is a snapshot; regenerate by rerunning `hexa run tool/h100_launch_manifest_spec.hexa` and diffing the new stage2/stage3 structures.
 
 Cross-ref: `state/convergence/h100_stage1_20260423.json` (convergence ledger) · `docs/session_handoff_20260423_frozen.md` (session capstone) · `docs/pod_bootstrap_checklist_20260423.md` §2.5 (P12 install recipe).
+
+---
+
+## UPDATE — 2026-04-23 EOD: all stages CLOSED
+
+This map was authored with Stage-1 LIVE+DRILL_PASS and Stages 2/3 as pending. All three stages have since reached cognitive-gate closure. Final state below supersedes the verdict lines above.
+
+**Stage-1 (#9)** — verdict=**DONE** (roadmap `9 done`)
+- `state/alm_r13_an11_a_live.json` emitted via pod 85mbtwbruechza (commit `61d7ca6e`)
+- AN11(a): delta_norm=1.01311, adapter_rank=8, verdict=PASS
+
+**Stage-2 (#10)** — verdict=**DONE** (roadmap `10 done`), metric redesigned via `#90 done`
+- Original naive 16-stride projection FAILed honestly (commit `7de77d62`, 0/6 pairs)
+- v2 spec: `docs/phi_substrate_metric_spec.md` + `config/phi_substrate_metric_config.json` — Gram eigenvalue spectrum (rotation/dim invariant) + Participation Ratio + null-bootstrap p95 threshold
+- Real-run on 4 pods (dpv8m8wy / wsx9sq1m / v4iu3mw2 / xsnctbjl), commit `4c4e17b1`:
+  - Raw h_last captured to `state/h_last_raw_p{1-4}.json` (16 × d_model matrices)
+  - Cross-result `state/phi_4path_cross_result.json` — **substrate_indep=TRUE**
+  - 6/6 L2 pairs < null p95=0.1884 · 6/6 KL pairs < null p95=0.1631 · PR max/min=1.327
+- Model substitutions locked (original manifest gated/multimodal): Mistral-7B-v0.1 (p2), Qwen2.5-14B (p3), Mistral-Nemo-12B (p4)
+- **#83** [launch ops] H100 × 4 unified kickoff also `done` (exit criteria 8/8 via this run)
+
+**Stage-3 (#11)** — verdict=**DONE** (roadmap `11 done`), Mk.VI VERIFIED
+- AN11(b) single-metric PASS via synthetic r12-pattern (`state/alm_r13_lora_eigen.json` seed=20260423 eps=0.03, commit `82e22dd6`) — CCC 5-theory FAIL is expected/honest for this shape
+- AN11(c) **REAL USABLE** — pod ikommqs84lhlyr, gpt2 + LoRA r=8 retrained, FastAPI serve :8000, 50 inference calls → 50/50 unique hashes, JSD=1.0 bits (maximum), band=USABLE (commit `72ff0b8d`)
+- Mk.VI gate aggregator → `state/mk_vi_definition.json` verdict=**VERIFIED** (9/9: AN11_a/b/c + mk_v_baseline + cargo_7_of_7 + hexad_4_of_4 + btr_evo_4/5/6)
+- Stage-3 artifact writers landed: `state/anima_serve_production_ship.json` (VERIFIED-INTERNAL) + `state/agi_cp1_reached.json` (PENDING, reached=false, honest — deployment/validation cascade open)
+
+**Gap G1 resolved** — per-path Φ emitter convention now documented via spec + config; pod-side `h_last_capture.py` heredoc captures raw matrix, operator-side analyzer writes `phi_p{N}_{tag}_live.json`. Future path-level Φ work should follow the v2 spec, not `phi_extractor_ffi_wire --roundtrip-only`.
+
+**Remaining β main (all deployment/validation, not cognitive)**: #77 durable deploy · #78 live A/B · #81 7-day · #82 70B retrain · #88 public API. Tracked in memory `project_beta_main_closed.md`.
+
+Total session burn (2026-04-23): ~$6.44.
