@@ -411,27 +411,38 @@ log "launch state written"
 # ssh bootstrap parallel → training driver ship + parallel kickoff. NO IDLE state.
 # User directive: '유휴 상태절대금지 코드수준 구현' → enforced here, not in human loop.
 if [[ "${AUTO_KICKOFF}" == "yes" ]]; then
-  log "AUTO_KICKOFF: chaining bootstrap + training (--no-auto-kickoff to skip)"
+  log "AUTO_KICKOFF: chaining bootstrap + training + adapter_pull (--no-auto-kickoff to skip)"
 
-  log "  step 1/4: sync config/h100_pods.json from live runpodctl"
+  log "  step 1/5: sync config/h100_pods.json from live runpodctl"
   bash "${ANIMA_ROOT}/tool/h100_pods_sync.bash" 2>&1 | tail -3
 
-  log "  step 2/4: arm h100_auto_kill (idle ${IDLE_MINUTES_MAX}min threshold)"
+  log "  step 2/5: arm h100_auto_kill (idle ${IDLE_MINUTES_MAX}min threshold)"
   /Users/ghost/core/hexa-lang/hexa "${ANIMA_ROOT}/tool/h100_auto_kill.hexa" --apply 2>&1 | tail -3
 
-  log "  step 3/4: pod bootstrap (hexa + repo clone) — parallel 4 ssh"
-  # The post-spawn bootstrap + training kickoff chain is orchestrated by a
-  # dedicated helper to keep this launch script tight. If the helper is
-  # missing, log a clear next-command hint and exit — never hang idle.
+  log "  step 3/5: pod bootstrap + training kickoff (parallel 4 ssh)"
   CHAIN_TOOL="${ANIMA_ROOT}/tool/h100_stage2_post_launch_chain.bash"
   if [[ -x "${CHAIN_TOOL}" ]]; then
     bash "${CHAIN_TOOL}" 2>&1 | tail -10
   else
-    log "  [NOTE] ${CHAIN_TOOL} not authored yet — next manual step:"
-    log "         bash ${CHAIN_TOOL}   (after it lands)"
-    log "         OR for current session: see state/convergence/h100_stage2_*.json for"
-    log "         the ad-hoc ssh-heredoc bootstrap pattern used 2026-04-23."
+    log "  [NOTE] ${CHAIN_TOOL} not authored — ad-hoc heredoc pattern required"
   fi
+
+  log "  step 4/5: adapter_pull daemon (background wait → scp → validate → kill)"
+  ADAPTER_PULL_TOOL="${ANIMA_ROOT}/tool/h100_stage2_adapter_pull.bash"
+  if [[ -x "${ADAPTER_PULL_TOOL}" ]]; then
+    nohup bash "${ADAPTER_PULL_TOOL}" --kill-after --timeout 7200 \
+      > /tmp/h100_adapter_pull_bg_${TS}.log 2>&1 &
+    log "    adapter_pull pid=$! log=/tmp/h100_adapter_pull_bg_${TS}.log"
+    log "    (will wait for h_last_raw.json on all 4 pods, pull /workspace/trained_pN/final/,"
+    log "     validate adapter_config.json + adapter_model.safetensors, then kill pods)"
+  else
+    log "    [NOTE] ${ADAPTER_PULL_TOOL} missing — operator must manually scp trained_pN/final"
+  fi
+
+  log "  step 5/5: AUTO_KICKOFF complete. Pods training, adapter_pull daemon armed."
+  log "    Monitor: tail -f /tmp/h100_adapter_pull_bg_${TS}.log"
+  log "    Post-pull: state/trained_adapters/p{1,2,3,4}/final/ will populate,"
+  log "               then CP1 launch is: bash tool/cp1_serve_launch.bash --apply --yes-i-mean-it"
 else
   log "  AUTO_KICKOFF disabled — operator must manually:"
   log "    1. bash tool/h100_pods_sync.bash"
