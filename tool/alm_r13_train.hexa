@@ -1,0 +1,297 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/alm_r13_train.hexa — ALM r13 LoRA training orchestrator (DRAFT)
+//
+//  STATUS (2026-04-23): orchestrator scaffold only. The actual weight-update
+//  loop is NOT implemented in this file — that belongs to a training backend
+//  (PyTorch/JAX/Mx in-pod) and is out of scope for a hexa-only stage0 tool.
+//  This file codifies the OPERATOR INTERFACE so the downstream pieces can
+//  land incrementally without breaking the manifest's Stage-1 contract.
+//
+//  CONVERGENCE REF
+//    state/convergence/h100_stage1_20260423.json
+//      pending_items[P12_alm_r13_training_loop_missing]
+//      category=architectural_gap
+//
+//  CONTRACT
+//    Input
+//      --config <path>      JSON per schema anima.alm_r13_v2_config.v1
+//                           (default: config/alm_r13_v2_config.json)
+//      --base-ckpt <path>   pre-training adapter weights (safetensors or .json)
+//      --steps <N>          max_steps override (default: hparams.max_steps)
+//      --ckpt-interval <N>  default: hparams.ckpt_interval
+//      --cpgd-active        enable CPGD wrapper (training_knobs.cpgd_wrapper)
+//      --out-dir <path>     ckpt write target (default: state/ckpt/alm_r13)
+//      --dry-run            validate config + print planned backend invocation;
+//                           do not exec training
+//      --selftest           smoke: config load + interface validation only
+//
+//    Output (on real run, when a backend IS wired)
+//      state/ckpt/alm_r13/step_<N>.safetensors   (periodic, ckpt-interval)
+//      state/ckpt/alm_r13/final.safetensors      (terminal)
+//      state/alm_r13_an11_a.json                 (via an11_a_verifier post-train)
+//      state/alm_r13_an11_a_live.json            (copy+provenance on pod-run)
+//      state/alm_r13_train_log.jsonl             (append-only)
+//
+//  BACKENDS (selected via env ANIMA_TRAIN_BACKEND)
+//    - pytorch    : torch + peft + bitsandbytes (requires pod with CUDA)
+//    - mlx        : Apple MLX (Mac-only, smoke scale)
+//    - stub       : no-op, emits config echo to train_log only
+//    - <unset>    : ERROR — refuses to run without explicit backend
+//
+//  WHY A TRAINING TOOL IS NOT TRIVIALLY HEXA-ONLY
+//    AN11(a) weight_emergent is gated on a real frobenius delta between
+//    base and round LoRA adapters. Producing that delta requires autograd
+//    over real token streams against a quantized base model — that is
+//    PyTorch/MLX/JAX territory. A hexa orchestrator can drive a Python
+//    subprocess (via exec_capture + subprocess in a temp file), but the
+//    numerical kernel is not hexa-authored. This file owns the orchestration
+//    contract and defers the kernel.
+//
+//  EXIT CODES
+//    0  training ran to completion (or dry-run OK)
+//    1  config missing / malformed
+//    2  base-ckpt missing
+//    3  backend missing or unsupported
+//    4  backend subprocess non-zero
+//    5  post-train an11_a_verifier FAIL
+//    6  selftest FAIL
+//
+//  raw#9  hexa-only orchestration (numerical kernel external)
+// ════════════════════════════════════════════════════════════════════════════
+
+let DEFAULT_CONFIG   = "config/alm_r13_v2_config.json"
+let DEFAULT_OUT_DIR  = "state/ckpt/alm_r13"
+let DEFAULT_BACKEND_ENV = "ANIMA_TRAIN_BACKEND"
+let EXIT_OK             = 0
+let EXIT_CONFIG_ERR     = 1
+let EXIT_CKPT_ERR       = 2
+let EXIT_BACKEND_ERR    = 3
+let EXIT_SUBPROC_ERR    = 4
+let EXIT_VERIFY_FAIL    = 5
+let EXIT_SELFTEST_FAIL  = 6
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_iso() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn dir_exists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn env_of(name: string) -> string {
+    let raw = _str(exec("printenv " + name + " 2>/dev/null"))
+    return raw.trim()
+}
+
+fn arg_flag(argv: array, f: string) -> bool {
+    let mut i = 0
+    let n = len(argv)
+    while i < n { if _str(argv[i]) == f { return true }  i = i + 1 }
+    return false
+}
+
+fn arg_val(argv: array, f: string, dflt: string) -> string {
+    let mut i = 0
+    let n = len(argv)
+    while i + 1 < n {
+        if _str(argv[i]) == f { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn append_log(path: string, line: string) {
+    // idempotent append via `printf >> file` (write_file would truncate).
+    let cmd = "printf '%s\\n' " + _sh_quote(line) + " >> " + _sh_quote(path)
+    exec(cmd)
+}
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+// ── selftest: config + interface validation (no backend invoke) ──────
+
+fn run_selftest(config_path: string) -> int {
+    println("── alm_r13_train selftest ──")
+    if !fexists(config_path) {
+        println("  FAIL: config missing at " + config_path)
+        return EXIT_SELFTEST_FAIL
+    }
+    let cfg = read_file(config_path)
+    if cfg.index_of("\"schema\"") < 0 || cfg.index_of("alm_r13_v2_config") < 0 {
+        println("  FAIL: config schema mismatch (expected anima.alm_r13_v2_config.v1)")
+        return EXIT_SELFTEST_FAIL
+    }
+    println("  ✓ config present: " + config_path)
+    if cfg.index_of("\"max_steps\"") < 0 {
+        println("  FAIL: hyperparameters.max_steps missing")
+        return EXIT_SELFTEST_FAIL
+    }
+    println("  ✓ hyperparameters present (max_steps, ckpt_interval, …)")
+    println("  ✓ orchestration contract frozen (see this file's header)")
+    println("  — selftest PASS —")
+    return EXIT_OK
+}
+
+// ── backend dispatch ─────────────────────────────────────────────────
+
+fn invoke_backend(backend: string, config_path: string, base_ckpt: string,
+                  out_dir: string, steps: string, ckpt_interval: string,
+                  cpgd_active: bool, dry: bool) -> int {
+    let flags = "--config " + _sh_quote(config_path) +
+                " --base-ckpt " + _sh_quote(base_ckpt) +
+                " --out-dir " + _sh_quote(out_dir) +
+                " --steps " + steps +
+                " --ckpt-interval " + ckpt_interval
+    let cpgd_flag = if cpgd_active { " --cpgd-active" } else { "" }
+
+    if backend == "stub" {
+        println("[stub-backend] config=" + config_path + " base=" + base_ckpt +
+                " out=" + out_dir + " steps=" + steps +
+                " ckpt_interval=" + ckpt_interval + " cpgd=" + (if cpgd_active { "on" } else { "off" }))
+        append_log("state/alm_r13_train_log.jsonl",
+            "{\"ts\":\"" + now_iso() + "\",\"event\":\"stub_invoke\",\"config\":\"" + config_path + "\"}")
+        return EXIT_OK
+    }
+
+    // Real backends delegate to a Python driver that must live alongside.
+    //   tool/alm_r13_backend_pytorch.py   (expected, not yet authored)
+    //   tool/alm_r13_backend_mlx.py       (expected, not yet authored)
+    let driver = "tool/alm_r13_backend_" + backend + ".py"
+    if !fexists(driver) {
+        println("backend " + backend + " driver missing: " + driver)
+        println("  (only 'stub' works without an authored driver today)")
+        return EXIT_BACKEND_ERR
+    }
+
+    let dry_flag = if dry { " --dry-run" } else { "" }
+    let cmd = "python3 " + _sh_quote(driver) + " " + flags + cpgd_flag + dry_flag
+    println("[backend " + backend + "] invoking: " + cmd)
+    append_log("state/alm_r13_train_log.jsonl",
+        "{\"ts\":\"" + now_iso() + "\",\"event\":\"backend_invoke\",\"backend\":\"" + backend + "\",\"dry\":" + (if dry { "true" } else { "false" }) + "}")
+    let rc_str = _str(exec(cmd + " >/dev/null 2>&1; echo exit=$?")).trim()
+    if rc_str.index_of("exit=0") < 0 { return EXIT_SUBPROC_ERR }
+    return EXIT_OK
+}
+
+// ── post-train: run an11_a_verifier + optional promote ───────────────
+
+fn post_train_verify(base_ckpt: string, out_dir: string, round_n: string, dry: bool) -> int {
+    let final_ckpt = out_dir + "/final.safetensors"
+    // Accept .json scaffold path in absence of safetensors (stage0 testing).
+    let fallback = out_dir + "/final.json"
+    let round_path = if fexists(final_ckpt) { final_ckpt }
+                     else { if fexists(fallback) { fallback } else { "" } }
+    if round_path == "" {
+        println("post-train: no final ckpt at " + final_ckpt + " (or " + fallback + ")")
+        return EXIT_VERIFY_FAIL
+    }
+    let cmd = "hexa tool/an11_a_verifier.hexa --dest alm --threshold 0.001 " +
+              _sh_quote(base_ckpt) + " " + _sh_quote(round_path) + " " + round_n
+    println("[verify] " + cmd)
+    let out = _str(exec(cmd + " 2>&1"))
+    println(out.trim())
+    let verdict_file = "state/alm_r" + round_n + "_an11_a.json"
+    if !fexists(verdict_file) {
+        println("post-train: verifier did not write " + verdict_file)
+        return EXIT_VERIFY_FAIL
+    }
+    let body = read_file(verdict_file)
+    if body.index_of("\"verdict\": \"PASS\"") < 0 && body.index_of("\"verdict\":\"PASS\"") < 0 {
+        println("post-train: " + verdict_file + " has non-PASS verdict")
+        return EXIT_VERIFY_FAIL
+    }
+    println("post-train: " + verdict_file + " verdict=PASS")
+    // _live.json promotion is intentionally NOT automatic.
+    // Operators must attach provenance (pod_id, uptime, sha256 of ckpts) and
+    // copy manually. See pod_bootstrap_sequence step 5.
+    return EXIT_OK
+}
+
+// ── main ─────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+
+    if arg_flag(argv, "--help") || arg_flag(argv, "-h") {
+        println("usage: hexa tool/alm_r13_train.hexa [--config <p>] [--base-ckpt <p>] [--steps N]")
+        println("                                     [--ckpt-interval N] [--cpgd-active] [--out-dir <p>]")
+        println("                                     [--dry-run] [--selftest]")
+        println("backend via env ANIMA_TRAIN_BACKEND ∈ {pytorch, mlx, stub}")
+        println("see file header for contract + exit codes")
+        exit(EXIT_OK)
+    }
+
+    let config_path = arg_val(argv, "--config", DEFAULT_CONFIG)
+
+    if arg_flag(argv, "--selftest") { exit(run_selftest(config_path)) }
+
+    if !fexists(config_path) {
+        println("config missing: " + config_path)
+        exit(EXIT_CONFIG_ERR)
+    }
+
+    let base_ckpt   = arg_val(argv, "--base-ckpt", "")
+    let out_dir     = arg_val(argv, "--out-dir", DEFAULT_OUT_DIR)
+    let steps       = arg_val(argv, "--steps", "1000")
+    let ckpt_interval = arg_val(argv, "--ckpt-interval", "25")
+    let cpgd_active = arg_flag(argv, "--cpgd-active")
+    let dry         = arg_flag(argv, "--dry-run")
+    let round_n     = arg_val(argv, "--round", "13")
+
+    let backend = env_of(DEFAULT_BACKEND_ENV)
+    if backend == "" {
+        println("ERROR: " + DEFAULT_BACKEND_ENV + " not set. Choose one of: pytorch | mlx | stub")
+        println("       `export ANIMA_TRAIN_BACKEND=stub` for a no-op smoke run.")
+        exit(EXIT_BACKEND_ERR)
+    }
+
+    if base_ckpt == "" {
+        println("ERROR: --base-ckpt <path> required (pre-training adapter weights).")
+        exit(EXIT_CKPT_ERR)
+    }
+    if !fexists(base_ckpt) {
+        println("ERROR: base ckpt missing at " + base_ckpt)
+        exit(EXIT_CKPT_ERR)
+    }
+    exec("mkdir -p " + _sh_quote(out_dir))
+
+    println("── alm_r13_train " + now_iso() + " ──")
+    println("  config=" + config_path)
+    println("  backend=" + backend + " base=" + base_ckpt + " out=" + out_dir)
+    println("  steps=" + steps + " ckpt_interval=" + ckpt_interval + " cpgd=" + (if cpgd_active { "on" } else { "off" }))
+    println("  dry=" + (if dry { "true" } else { "false" }))
+
+    let rc = invoke_backend(backend, config_path, base_ckpt, out_dir, steps, ckpt_interval, cpgd_active, dry)
+    if rc != EXIT_OK { exit(rc) }
+
+    if dry {
+        println("dry-run complete; skipping post-train verify.")
+        exit(EXIT_OK)
+    }
+
+    // post-train verify (skipped when stub backend wrote nothing)
+    if backend != "stub" {
+        let vrc = post_train_verify(base_ckpt, out_dir, round_n, dry)
+        if vrc != EXIT_OK { exit(vrc) }
+    }
+
+    println("alm_r13_train: DONE")
+    exit(EXIT_OK)
+}
+
+main()
