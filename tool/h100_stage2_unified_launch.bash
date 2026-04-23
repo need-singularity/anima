@@ -41,14 +41,22 @@ readonly IDLE_MINUTES_MAX=5  # 2026-04-22 ROI A2: 30→5 min
 readonly PHI_REL_DELTA_MAX="0.05"
 readonly MIN_PATHS_PASS=3
 # 2026-04-22 ROI V1: spot bid lock — H100 SXM5 secure-cloud bid ceiling.
-# runpodctl uses --cost as $/hr price CEILING (bid). secureCloud=stable supply for H100.
-# To override: export ANIMA_H100_BID_USD=<float> ; default 3.50 ($/hr/GPU) calibrated 2026-04-22.
-readonly BID_USD_PER_HR="${ANIMA_H100_BID_USD:-3.50}"
-readonly CLOUD_TIER="secureCloud"  # secureCloud | communityCloud — locked secure for H100 SXM5
+# runpodctl uses --cost as $/hr price CEILING (bid) for the ENTIRE pod (all GPUs total).
+# secureCloud=stable supply for H100.
 # 2026-04-24 ROI V2: per-pod GPU count. Default 4 for data-parallel LoRA speedup.
 # Same GPU-hour as 1-GPU×4×wall; wall-clock 4× shorter. No cap under max-parallelism policy.
 # Override: export ANIMA_H100_GPUCOUNT_PER_POD=<int> ; default 4.
 readonly GPU_COUNT_PER_POD="${ANIMA_H100_GPUCOUNT_PER_POD:-4}"
+# 2026-04-24 ROI V3: bid MUST scale with GPU count since --cost is per-pod total.
+# per-GPU ceiling default 3.50 (calibrated 2026-04-22); total bid = per-GPU × count.
+# Override absolute: export ANIMA_H100_BID_USD=<float>  (overrides scaling)
+# Override per-GPU: export ANIMA_H100_BID_USD_PER_GPU=<float>  (keeps scaling)
+readonly BID_USD_PER_HR_PER_GPU="${ANIMA_H100_BID_USD_PER_GPU:-3.50}"
+_scale_bid() {
+  awk -v per="${BID_USD_PER_HR_PER_GPU}" -v n="${GPU_COUNT_PER_POD}" 'BEGIN { printf "%.2f", per * n }'
+}
+readonly BID_USD_PER_HR="${ANIMA_H100_BID_USD:-$(_scale_bid)}"
+readonly CLOUD_TIER="secureCloud"  # secureCloud | communityCloud — locked secure for H100 SXM5
 
 readonly TS="$(date -u +%Y%m%dT%H%M%SZ)"
 readonly LOG="/tmp/h100_stage2_launch_${TS}.log"
@@ -79,8 +87,11 @@ log "anima_root=${ANIMA_ROOT}"
 # 2026-04-22 ROI A3+V1: spot enforce, ondemand fallback block, bid lock verification.
 if [[ "${RUNPOD_GPU_TYPE_FLAG:-}" == "ondemand" ]]; then echo "ABORT: ondemand disallowed per manifest"; exit 4; fi
 # V1 spot bid lock: BID_USD_PER_HR must be a positive float; CLOUD_TIER must be secureCloud (H100 SXM5).
-if ! awk -v v="${BID_USD_PER_HR}" 'BEGIN{exit !(v+0>0 && v+0<=10)}'; then
-  echo "ABORT: BID_USD_PER_HR=${BID_USD_PER_HR} out of sane range (0,10] $/hr"; exit 4
+# 2026-04-24: upper bound scales with GPU_COUNT_PER_POD (--cost is per-pod total, not per-GPU).
+# Sane per-GPU ceiling ≤ $10/hr ⇒ per-pod ceiling ≤ $10 × GPUs. Extra 20% slack for market spikes.
+_BID_UPPER=$(awk -v n="${GPU_COUNT_PER_POD}" 'BEGIN { printf "%.2f", 10 * n * 1.2 }')
+if ! awk -v v="${BID_USD_PER_HR}" -v max="${_BID_UPPER}" 'BEGIN{exit !(v+0>0 && v+0<=max+0)}'; then
+  echo "ABORT: BID_USD_PER_HR=${BID_USD_PER_HR} out of sane range (0,${_BID_UPPER}] $/hr (per-pod total for ${GPU_COUNT_PER_POD} GPUs)"; exit 4
 fi
 if [[ "${CLOUD_TIER}" != "secureCloud" && "${CLOUD_TIER}" != "communityCloud" ]]; then
   echo "ABORT: CLOUD_TIER=${CLOUD_TIER} invalid (must be secureCloud|communityCloud)"; exit 4
@@ -252,7 +263,17 @@ for path_model in "p1:${MODEL_P1}" "p2:${MODEL_P2}" "p3:${MODEL_P3}" "p4:${MODEL
     --env "PHI_GPUS_PER_POD=${GPU_COUNT_PER_POD}" \
     --env "IDLE_KILL_MIN=${IDLE_MINUTES_MAX}" \
     2>&1) || { log "LAUNCH FAIL path=${pid}: ${out}"; exit 4; }
-  pod_id=$(echo "${out}" | grep -oE '"id": "[^"]+"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')
+  # 2026-04-24 fix: runpodctl 1.x emits plain-text `pod "<id>" created for $X.XX / hr`
+  # (not JSON `"id":"..."`). Support both formats; set -e + pipefail safe via || true.
+  pod_id=$(echo "${out}" | grep -oE 'pod "[a-z0-9]+" created' | head -1 | sed 's/pod "\([^"]*\)".*/\1/' || true)
+  if [[ -z "${pod_id}" ]]; then
+    pod_id=$(echo "${out}" | grep -oE '"id": "[^"]+"' | head -1 | sed 's/.*"\([^"]*\)"/\1/' || true)
+  fi
+  if [[ -z "${pod_id}" ]]; then
+    log "LAUNCH FAIL path=${pid}: could not parse pod_id from runpodctl output:"
+    log "${out}"
+    exit 4
+  fi
   log "    -> pod_id=${pod_id}"
   LAUNCHED_PODS+=("${pid}:${pod_id}:${pod_name}")
 done
