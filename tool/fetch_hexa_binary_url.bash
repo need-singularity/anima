@@ -12,9 +12,15 @@
 #
 # SOURCE
 #   r2:anima-models/bin/hexa_v2_linux_x86_64
-#   sha256 = 3ff995fc8b68e3a5b9e46a803a269e03204ff0b439a668a6dfadc58acc01d496
-#   size   = 5580408 bytes (5.32 MiB), static musl ELF
-#   upstream build: hexa-lang 1fdc0100 build/hexa_v2_linux_x86_64
+#   sha256 = 42d015789305a97470bedac12f24a6abd9314db8382ce57ee5dd2cbab1265025
+#   size   = 1771168 bytes (1.69 MiB), static musl ELF
+#   upstream build: hexa-lang 388eece8 build/hexa_v2_linux
+#     (Phase C.2 __hexa_strlit_init per-module namespacing fix landed,
+#      plus M4 .pad_start/.pad_end codegen + hexa_cc regen safety)
+#
+# PREVIOUS
+#   3ff995fc... 5.32 MiB from hexa-lang 1fdc0100 — pre-Phase-C.2, stale.
+#   Deprecated 2026-04-23 when upstream roadmap 66 Phase C.2 landed (968900b8).
 #
 # RATIONALE
 #   R2 bucket anima-models is private (no public r2.dev domain). Presigned
@@ -23,7 +29,7 @@
 set -euo pipefail
 
 readonly R2_PATH="r2:anima-models/bin/hexa_v2_linux_x86_64"
-readonly EXPECTED_SHA="3ff995fc8b68e3a5b9e46a803a269e03204ff0b439a668a6dfadc58acc01d496"
+readonly EXPECTED_SHA="42d015789305a97470bedac12f24a6abd9314db8382ce57ee5dd2cbab1265025"
 
 expire="168h"
 want_export=0
