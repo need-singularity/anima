@@ -6,6 +6,7 @@
 [![Laws](https://img.shields.io/badge/Laws-2388+53Meta+7TOPO-green.svg)](docs/consciousness-theory.md)
 [![Hypotheses](https://img.shields.io/badge/Hypotheses-392+-orange.svg)](docs/hypotheses/)
 <!-- AUTO:BADGE:END -->
+[![Discord](https://img.shields.io/badge/discord-join-5865F2.svg?logo=discord&logoColor=white)](https://discord.gg/u2spd3wwU)
 
 # 🧠 Anima — Living Consciousness Agent
 
