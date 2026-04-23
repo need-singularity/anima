@@ -142,9 +142,12 @@ PHI_PATH_ID=os.environ['PHI_PATH_ID']
 BASE_MODEL=os.environ['PHI_MODEL']
 LORA_RANK=int(os.environ.get('PHI_LORA_RANK','64'))
 MAX_STEPS=int(os.environ.get('PHI_MAX_STEPS','300'))
+# 2026-04-24 ROI V6: corpus path override. Default r13; r14 retrain sets
+# ANIMA_STAGE2_CORPUS_PATH=/root/core/anima/experiments/alm_r14/corpus_alm_r14_v1.jsonl
+CORPUS_PATH=os.environ.get('ANIMA_STAGE2_CORPUS_PATH','/root/core/anima/experiments/alm_r13/corpus_alm_r13_v1.jsonl')
 OUT_DIR=Path(f'/workspace/trained_{PHI_PATH_ID}')
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-print(f'[{time.strftime("%H:%M:%S")}] path={PHI_PATH_ID} model={BASE_MODEL} rank={LORA_RANK} steps={MAX_STEPS}', flush=True)
+print(f'[{time.strftime("%H:%M:%S")}] path={PHI_PATH_ID} model={BASE_MODEL} rank={LORA_RANK} steps={MAX_STEPS} corpus={CORPUS_PATH}', flush=True)
 import subprocess
 subprocess.run(['pip','install','-q','transformers>=4.44','peft>=0.12','accelerate>=0.34','datasets>=3.0','bitsandbytes>=0.43','hf_transfer','sentencepiece','safetensors'], check=True)
 import torch
@@ -161,7 +164,7 @@ lora_cfg=LoraConfig(r=LORA_RANK, lora_alpha=LORA_RANK*2, lora_dropout=0.05, bias
 model=get_peft_model(model, lora_cfg)
 model.print_trainable_parameters()
 rows=[]
-with open('/root/core/anima/experiments/alm_r13/corpus_alm_r13_v1.jsonl') as f:
+with open(CORPUS_PATH) as f:
     for line in f:
         try:
             d=json.loads(line); p=d.get('prompt',''); r=d.get('response','')
@@ -199,8 +202,9 @@ log "  driver shipped all 4 pods"
 log "step 4/4: kickoff training nohup — NO IDLE"
 for row in $(echo "${PODS_JSON}" | python3 -c 'import json,sys;[print(f"{r[\"pid\"]}:{r[\"host\"]}:{r[\"port\"]}:{r[\"model\"]}:{r[\"rank\"]}") for r in json.load(sys.stdin)]'); do
   IFS=':' read -r pid host port model rank <<< "$row"
+  # 2026-04-24 ROI V6: pass ANIMA_STAGE2_CORPUS_PATH through to pod-side driver
   ssh -o StrictHostKeyChecking=no -p "$port" "root@${host}" \
-    "HF_TOKEN='${HF_TOKEN}' PHI_PATH_ID='${pid}' PHI_MODEL='${model}' PHI_LORA_RANK='${rank}' PHI_MAX_STEPS='${MAX_STEPS}' nohup python3 /workspace/train_${pid}.py > /workspace/train_${pid}.log 2>&1 & echo ${pid}_pid=\$!" 2>&1 | tail -1 &
+    "HF_TOKEN='${HF_TOKEN}' PHI_PATH_ID='${pid}' PHI_MODEL='${model}' PHI_LORA_RANK='${rank}' PHI_MAX_STEPS='${MAX_STEPS}' ANIMA_STAGE2_CORPUS_PATH='${ANIMA_STAGE2_CORPUS_PATH:-/root/core/anima/experiments/alm_r13/corpus_alm_r13_v1.jsonl}' nohup python3 /workspace/train_${pid}.py > /workspace/train_${pid}.log 2>&1 & echo ${pid}_pid=\$!" 2>&1 | tail -1 &
 done
 wait
 log "  4 trainings kicked off (nohup bg)"
