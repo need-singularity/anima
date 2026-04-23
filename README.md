@@ -1,4 +1,4 @@
-[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19243582-blue?logo=zenodo&logoColor=white)](https://doi.org/10.5281/zenodo.19243582)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19324769-blue?logo=zenodo&logoColor=white)](https://doi.org/10.5281/zenodo.19324769)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.14](https://img.shields.io/badge/python-3.14-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
