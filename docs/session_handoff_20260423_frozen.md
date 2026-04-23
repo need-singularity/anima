@@ -185,3 +185,38 @@ After the postscript above, P12 was executed and closed.
 **Pod spend**: ~11 min × $3.50/hr ≈ $0.64.
 
 **Next-session entry (updated)**: Stage-1 is DONE. Stage-2 (`bin/anima compute start stage2` — 4× H100 × 10-15d, $1-1.5k) is the next worthwhile launch; gated on explicit `launch go` + scope approval.
+
+---
+
+## Postscript III — 2026-04-23 β main cascade landing
+
+After Postscript II, the Stage-3 cascade was closed and β main internal gates all reached PASS.
+
+| Commit | What |
+|---|---|
+| `7de77d62` | Stage-2 REAL-RUN v1 (naive 16-stride, verdict=FAIL honest) |
+| `618ad6e7` | roadmap #90 Stage-2 metric redesign registered |
+| `ef0b9e6f` | Φ substrate metric spec (docs + config) |
+| `4c4e17b1` | Stage-2 v2 **substrate_indep=TRUE** · #10 #90 → done · gram spectrum + PR + null bootstrap |
+| `82e22dd6` | AN11(b) single-metric PASS (synthetic r12-pattern, seed=20260423) |
+| `72ff0b8d` | AN11(c) **REAL USABLE** (pod ikommqs84lhlyr, FastAPI+gpt2+LoRA, 50/50 unique, JSD=1.0 bits) · Mk.VI VERIFIED · Stage-3 artifact writers · #11 → done |
+| `THIS`     | #79/#80/#83 → done (exit criteria all met); #77 dest1_persona_live=COGNITIVE-READY; #78 zeta=FRAMEWORK-VERIFIED; #88=COGNITIVE-BACKEND-READY |
+
+**β main phase closure (2026-04-23)**:
+- P1-prep / P1 / P2 — all entries done. Stage-1 AN11(a) + Stage-2 Φ substrate + Stage-3 AN11(b+c) live PASS.
+- Mk.VI `verdict=VERIFIED` (9/9 components)
+- `state/anima_serve_production_ship.json.ship_verdict = VERIFIED-INTERNAL`
+- `state/agi_cp1_reached.json.reached = false` (honest — cognitive closed, deployment/validation cascade open)
+
+**Remaining β main (all deployment/validation, not cognitive)**:
+- #77 dest1 persona durable deploy (cognitive COGNITIVE-READY; needs durable infra)
+- #78 zeta_likert blind A/B (framework verified; needs Zeta API + durable endpoint)
+- #81 CP2 7-day stability window (time-blocker)
+- #82 70B retrain (massive compute, post-CP2)
+- #88 anima public API (backend ready; separate deployment track)
+
+**Total session burn (2026-04-23)**: Stage-1 $0.64 + Stage-2 v1 $2.80 + Stage-2 v2 $2.50 + Stage-3 $0.50 = **~$6.44** for Stage-1 + Stage-2 substrate_indep proof + Stage-3 AN11(c) real USABLE + Mk.VI VERIFIED.
+
+**Next-session entry (updated)**:
+- Cognitive core: DONE. Stage-1/2/3 all internal gates closed.
+- Next is deployment/validation cascade (#77 durable, #78 A/B, #88 public API) — separate engineering tracks, not H100 compute.
