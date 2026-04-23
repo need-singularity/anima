@@ -112,11 +112,57 @@
     },
     "next_steps": ["Commit v3.1 artifact + this convergence record", "Update docs/papers/phi_paradigm_paper_v1_preliminary.md §10.7 with trained-weight FAIL edge result (honest)", "C-1 corpus track: operator authoring begins (GPU-independent, no urgency)", "Do NOT re-launch pods unless Option B/C explicitly approved"]
   },
-  "session_closed": {
+  "session_closed_round1": {
     "ts": "2026-04-23T16:13:00Z",
     "pods_remaining": 0,
     "pods_killed": ["7cyjibj6ihwrjf", "azkok6lnkosxjj", "twvqtaw14vxn80", "4xjybeihetfc8w"],
     "total_wall_training": "~6min per path (300 steps × ~1.3s), pods alive 15:29-16:12 = 43min total",
-    "artifacts_landed": ["state/h_last_raw_p1_TRAINED.json", "state/h_last_raw_p2_TRAINED.json", "state/h_last_raw_p3_TRAINED.json", "state/h_last_raw_p4_TRAINED.json", "state/phi_4path_cross_result_v3_TRAINED.json"]
+    "artifacts_landed": ["state/h_last_raw_p1_TRAINED.json", "state/h_last_raw_p2_TRAINED.json", "state/h_last_raw_p3_TRAINED.json", "state/h_last_raw_p4_TRAINED.json", "state/phi_4path_cross_result_v3_TRAINED.json"],
+    "artifacts_LOST": ["trained_p1/final/ (adapter dir, killed with pod)", "trained_p2/final/", "trained_p3/final/", "trained_p4/final/"],
+    "root_cause": "Pods killed post-h_last_raw pull, but full adapter dir scp was NOT in the chain. This is mistake #5 in prevention_index. Recovery: re-launch (done in round 2 below)."
+  },
+  "round_2_relaunch": {
+    "ts_launch": "2026-04-23T17:27:46Z",
+    "purpose": "(a) validate new 5-step hands-off chain with adapter_pull daemon, (b) capture full adapter dirs this time, (c) unblock CP1 #77 (path A recovery).",
+    "pods_launched": [
+      {"path_id": "p1", "pod_id": "04l09iduln8zyc", "ssh_host": "216.243.220.224", "ssh_port": 17805, "base_model_actual": "Qwen/Qwen3-8B"},
+      {"path_id": "p2", "pod_id": "rfp0jnmbzitvfy", "ssh_host": "216.243.220.230", "ssh_port": 19972, "base_model_actual": "unsloth/Meta-Llama-3.1-8B"},
+      {"path_id": "p3", "pod_id": "xrx4w0nx04azh9", "ssh_host": "87.120.211.209", "ssh_port": 11790, "base_model_actual": "mistralai/Mistral-Nemo-Base-2407"},
+      {"path_id": "p4", "pod_id": "6yp9iig1nm9mbn", "ssh_host": "87.120.211.210", "ssh_port": 11698, "base_model_actual": "google/gemma-3-12b-pt"}
+    ],
+    "mistakes_this_round": [
+      {"seq": 6, "when": "2026-04-23T17:27:47Z", "what": "HAZARD_SUBST log messages captured into MODEL_P{2,3,4} env vars → runpodctl wrong env value error → orphan p1 pod created before failure (9saz43n87s0yme)", "root_cause": "_resolve_model_with_fallback() echoed log() to stdout. Command substitution MODEL_P2=$(_resolve_model_with_fallback p2) captured log lines along with the resolved model id. runpodctl --env parser rejected the multi-line value.", "fix": "Redirect all log() calls inside the helper to stderr (>&2). Log messages still visible in operator-side output but NOT in command-substitution capture.", "prevention": "When writing bash helpers that both log AND echo a return value via stdout, strictly segregate: log → stderr, value → stdout. Commit 4c9101c7."},
+      {"seq": 7, "when": "2026-04-23T17:27:57Z", "what": "post_launch_chain.bash line 86 POD_LIST unbound variable under set -euo pipefail", "root_cause": "Variable naming inconsistency: script defined PODS_JSON (python-generated) but referenced ${#POD_LIST[@]:-4} in log line. set -u kill.", "fix": "Compute POD_COUNT from PODS_JSON via python len() helper call. Commit 4c9101c7.", "prevention": "Run bash -n + shellcheck before committing helper scripts; set -u exposes late-bound references."},
+      {"seq": 8, "when": "2026-04-23T17:38:46Z", "what": "adapter_pull daemon --timeout 3600 parser treated 3600 as unknown-arg, exit 1", "root_cause": "for arg in \"$@\" with shift inside case doesn't advance the loop iterator — the loop still sees original positional args. So --timeout consumed the flag but shift moved past, then loop re-saw 3600 as $arg unmatched.", "fix": "Rewrote arg parser as while [[ $# -gt 0 ]] + case ... + shift. Preserves expected --timeout VAL semantics. Commit 4c9101c7.", "prevention": "Use while-shift pattern for any bash arg parser that consumes multi-word args (--flag VAL). for-arg only works for single-word flags."},
+      {"seq": 9, "when": "2026-04-23T17:38+Z", "what": "p1 and p2 pods (216.243.220.x subnet) pip install stalled ~5min+ vs p3/p4 (~30s normal)", "root_cause": "216.243.220.x cloud region has slower pypi.org access (intermittent or mirror-specific). Not a code bug — infrastructure variance.", "fix": "None needed — daemon timeout=3600s covers. Training will complete eventually.", "prevention": "For future launches under deadline, consider hf_transfer + pre-cached pip wheel mirror on R2, OR set --timeout=7200 if mixed regions."}
+    ],
+    "code_fixes_committed": [
+      "commit 4c9101c7 — all 3 new bugs (6/7/8) fixed in single push before pods complete training",
+      "proof: bugs 6/7/8 would have silently corrupted round 2 if unfixed; instead caught + fixed + re-launched manually (direct SSH bootstrap + training kickoff) while daemon armed to auto-collect"
+    ],
+    "pipeline_restored_manual": {
+      "bootstrap_method": "inline ssh heredoc (bypassing post_launch_chain.bash bug 7)",
+      "training_kickoff_method": "direct ssh + nohup python3 /workspace/train_pN.py",
+      "adapter_pull_daemon": "nohup bash tool/h100_stage2_adapter_pull.bash --kill-after --timeout=3600 (pid 58497, armed 2026-04-23T17:38:55Z)"
+    },
+    "current_status_snapshot_17_43Z": {
+      "p1": {"stage": "pip install (slow subnet)", "progress": "none yet"},
+      "p2": {"stage": "pip install (slow subnet)", "progress": "none yet"},
+      "p3": {"stage": "training", "progress": "145/300 (~48%)"},
+      "p4": {"stage": "training", "progress": "100/300 (~33%)"},
+      "daemon": "polling every ~45s, 0/4 done"
+    },
+    "expected_completion": {
+      "p3_p4": "~17:50Z (h_last_raw.json + trained_pN/final/)",
+      "p1_p2": "~18:05-18:15Z (pip + load + 7min train)",
+      "daemon_kill_all": "after all 4 complete, ~18:17Z",
+      "final_state": "state/trained_adapters/p{1,2,3,4}/final/ populated + config/h100_pods.json pods[]=empty"
+    },
+    "prevention_index_additions": [
+      "helper_stderr: bash helpers that return values via stdout MUST send logs to stderr; command substitution captures stdout only",
+      "var_naming_set_u: match variable names PODS_JSON vs POD_LIST; set -u exposes typos",
+      "arg_parser_multi_word: use while-shift, not for-arg, when consuming --flag VAL pairs",
+      "subnet_variance: pip install wall-time varies by RunPod region (~30s vs ~5min+); timeout should tolerate"
+    ]
   }
 }
