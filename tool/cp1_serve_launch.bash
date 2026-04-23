@@ -31,7 +31,9 @@
 set -euo pipefail
 
 readonly ANIMA_ROOT="/Users/ghost/core/anima"
-readonly ADAPTER_PATH="${CP1_ADAPTER_PATH:-${ANIMA_ROOT}/state/trained_adapters/p1}"
+# 2026-04-24 ROI V8: adapter_pull writes to state/trained_adapters/pN/final/
+# (preserving pod-side layout), so default path is final/.
+readonly ADAPTER_PATH="${CP1_ADAPTER_PATH:-${ANIMA_ROOT}/state/trained_adapters/p1/final}"
 readonly BASE_MODEL="${CP1_BASE_MODEL:-Qwen/Qwen3-8B}"
 readonly GPU_COUNT="${CP1_GPU_COUNT:-1}"
 readonly BID_USD="${CP1_BID_USD:-4.00}"
