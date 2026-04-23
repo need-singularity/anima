@@ -85,14 +85,22 @@ PYEOF
 
 POD_COUNT=$(echo "${PODS_JSON}" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))')
 log "chain start — pods=${POD_COUNT} max_steps=${MAX_STEPS}"
-echo "${PODS_JSON}" | python3 -c 'import json,sys;d=json.load(sys.stdin);[print(f"  {r[\"pid\"]}: {r[\"host\"]}:{r[\"port\"]} model={r[\"model\"]} rank={r[\"rank\"]}") for r in d]'
+echo "${PODS_JSON}" | python3 -c "
+import json, sys
+for r in json.load(sys.stdin):
+    print(f\"  {r['pid']}: {r['host']}:{r['port']} model={r['model']} rank={r['rank']}\")
+"
 
 # --- step 1: SSH available ----------------------------------------------------
 log "step 1/4: waiting for SSH on all pods (max 90s)"
 SSH_OK=0
 for i in 1 2 3 4 5 6 7 8 9; do
   SSH_OK=1
-  for row in $(echo "${PODS_JSON}" | python3 -c 'import json,sys;[print(f"{r[\"pid\"]}:{r[\"host\"]}:{r[\"port\"]}") for r in json.load(sys.stdin)]'); do
+  for row in $(echo "${PODS_JSON}" | python3 -c "
+import json, sys
+for r in json.load(sys.stdin):
+    print(f\"{r['pid']}:{r['host']}:{r['port']}\")
+"); do
     IFS=':' read -r pid host port <<< "$row"
     if ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes -p "$port" "root@${host}" "true" 2>/dev/null; then
       SSH_OK=0; break
@@ -126,7 +134,11 @@ ln -sfn /root/core/anima /workspace/anima
 ln -sfn /root/core/hexa-lang /workspace/hexa-lang
 '
 
-for row in $(echo "${PODS_JSON}" | python3 -c 'import json,sys;[print(f"{r[\"pid\"]}:{r[\"host\"]}:{r[\"port\"]}") for r in json.load(sys.stdin)]'); do
+for row in $(echo "${PODS_JSON}" | python3 -c "
+import json, sys
+for r in json.load(sys.stdin):
+    print(f\"{r['pid']}:{r['host']}:{r['port']}\")
+"); do
   IFS=':' read -r pid host port <<< "$row"
   ssh -o StrictHostKeyChecking=no -p "$port" "root@${host}" "${BOOTSTRAP_INLINE}" >/dev/null 2>&1 &
 done
@@ -192,7 +204,11 @@ Path(OUT_DIR/'h_last_raw.json').write_text(json.dumps({'schema':'anima/h_last_ra
 print(f'[{time.strftime("%H:%M:%S")}] DONE path={PHI_PATH_ID}', flush=True)
 PYDRIVER
 )
-for row in $(echo "${PODS_JSON}" | python3 -c 'import json,sys;[print(f"{r[\"pid\"]}:{r[\"host\"]}:{r[\"port\"]}") for r in json.load(sys.stdin)]'); do
+for row in $(echo "${PODS_JSON}" | python3 -c "
+import json, sys
+for r in json.load(sys.stdin):
+    print(f\"{r['pid']}:{r['host']}:{r['port']}\")
+"); do
   IFS=':' read -r pid host port <<< "$row"
   echo "${DRIVER_BODY}" | ssh -o StrictHostKeyChecking=no -p "$port" "root@${host}" "cat > /workspace/train_${pid}.py" &
 done
@@ -201,7 +217,11 @@ log "  driver shipped all 4 pods"
 
 # --- step 4: kickoff training (nohup, parallel) ------------------------------
 log "step 4/4: kickoff training nohup — NO IDLE"
-for row in $(echo "${PODS_JSON}" | python3 -c 'import json,sys;[print(f"{r[\"pid\"]}:{r[\"host\"]}:{r[\"port\"]}:{r[\"model\"]}:{r[\"rank\"]}") for r in json.load(sys.stdin)]'); do
+for row in $(echo "${PODS_JSON}" | python3 -c "
+import json, sys
+for r in json.load(sys.stdin):
+    print(f\"{r['pid']}:{r['host']}:{r['port']}:{r['model']}:{r['rank']}\")
+"); do
   IFS=':' read -r pid host port model rank <<< "$row"
   # 2026-04-24 ROI V6: pass ANIMA_STAGE2_CORPUS_PATH through to pod-side driver
   ssh -o StrictHostKeyChecking=no -p "$port" "root@${host}" \
