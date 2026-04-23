@@ -165,3 +165,23 @@ reflects final session state without re-authoring §1-§5:
 **P13 follow-on remaining**: `nth_positional` dup-detect removal in `tool/an11_a_verifier.hexa` — gated on a live-pod run verifying `real_args()` dispatch with the new binary. Safe to defer until next pod launch.
 
 **Next-session entry**: same as §3 — `bin/anima compute status` + this frozen doc + `docs/pod_bootstrap_checklist_20260423.md`. If P12 pod cycle intended, start from checklist §0.
+
+---
+
+## Postscript II — 2026-04-23 continuation (Stage-1 CLOSED)
+
+After the postscript above, P12 was executed and closed.
+
+| Commit | What |
+|---|---|
+| `1b895d73` | PR #39 squash-merge — 130-commit branch → main |
+| `4e87d369` | 6 broken non-JSON symlinks removed |
+| `4caa9a85` | 6 roadmap entries flipped active@100% → done |
+| `61d7ca6e` | **P12 RESOLVED** — pod 85mbtwbruechza H100 SXM: ALM r13 PEFT LoRA gpt2 100-step (3.74s), AN11(a) verdict=PASS (delta_norm=1.01311, adapter_rank=8). Two bugs fixed inline: (a) P13 follow-on `nth_positional` → `real_args()` refactor; (b) synthetic_json rank-first key order for hexa `index_of(":",k)` start-pos workaround |
+| `929e30c2` | #9 roadmap → done + convergence 13/13/0 |
+
+**Convergence FINAL final (2026-04-23)**: total 13 · resolved 13 · violations 0 · pending 0.
+**Stage-2 UNLOCKED**: AN11(a) PASS ✓ + cell-eigenvec-16 VERIFIED ✓.
+**Pod spend**: ~11 min × $3.50/hr ≈ $0.64.
+
+**Next-session entry (updated)**: Stage-1 is DONE. Stage-2 (`bin/anima compute start stage2` — 4× H100 × 10-15d, $1-1.5k) is the next worthwhile launch; gated on explicit `launch go` + scope approval.
