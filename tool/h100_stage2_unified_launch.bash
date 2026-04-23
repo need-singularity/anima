@@ -71,12 +71,16 @@ warn()       { printf '  [WARN] %s\n' "$*"; }
 # --- argv ---------------------------------------------------------------------
 MODE="dry-run"
 CONFIRM=""
+AUTO_KICKOFF="yes"   # 2026-04-24 default: NO IDLE — bootstrap + training auto-chained post-spawn.
+                     # Disable with --no-auto-kickoff (manual multi-step flow, old behavior).
 for arg in "$@"; do
   case "$arg" in
-    --dry-run)       MODE="dry-run" ;;
-    --apply)         MODE="apply" ;;
-    --yes-i-mean-it) CONFIRM="yes" ;;
-    --help|-h)       sed -n '1,20p' "$0"; exit 0 ;;
+    --dry-run)            MODE="dry-run" ;;
+    --apply)              MODE="apply" ;;
+    --yes-i-mean-it)      CONFIRM="yes" ;;
+    --auto-kickoff)       AUTO_KICKOFF="yes" ;;
+    --no-auto-kickoff)    AUTO_KICKOFF="no" ;;
+    --help|-h)            sed -n '1,20p' "$0"; exit 0 ;;
     *) log "unknown arg: $arg"; exit 2 ;;
   esac
 done
@@ -117,6 +121,98 @@ if [[ -f "${SUBSTRATES_CFG}" ]]; then
   MODEL_P3=$(grep -A3 '"id": "p3"' "${SUBSTRATES_CFG}" | grep -oE '"model": "[^"]+"' | head -1 | sed 's/"model": "\(.*\)"/\1/')
   MODEL_P4=$(grep -A3 '"id": "p4"' "${SUBSTRATES_CFG}" | grep -oE '"model": "[^"]+"' | head -1 | sed 's/"model": "\(.*\)"/\1/')
   log "    p1=${MODEL_P1}  p2=${MODEL_P2}  p3=${MODEL_P3}  p4=${MODEL_P4}"
+
+  # 2026-04-24 ROI V4: HF accessibility pre-check + auto-fallback from fallback_chain.
+  # Prevents mid-launch pod-side failures (p2 gated / p3 multimodal / p4 qlora incompat
+  # — captured in state/convergence/h100_stage2_20260424.json mistakes 3-5).
+  HF_TOKEN_FILE="${HOME}/.cache/huggingface/token"
+  HF_TOKEN_VAL=""
+  if [[ -f "${HF_TOKEN_FILE}" ]]; then
+    HF_TOKEN_VAL="$(cat "${HF_TOKEN_FILE}")"
+  fi
+
+  _hf_accessible() {
+    # HEAD /config.json — returns 0 iff 200 OK (accessible).
+    local model="$1"
+    local code
+    if [[ -n "${HF_TOKEN_VAL}" ]]; then
+      code=$(curl -s -o /dev/null -w '%{http_code}' -L \
+        -H "Authorization: Bearer ${HF_TOKEN_VAL}" \
+        "https://huggingface.co/${model}/resolve/main/config.json" 2>/dev/null || echo 000)
+    else
+      code=$(curl -s -o /dev/null -w '%{http_code}' -L \
+        "https://huggingface.co/${model}/resolve/main/config.json" 2>/dev/null || echo 000)
+    fi
+    [[ "${code}" == "200" ]]
+  }
+
+  _resolve_model_with_fallback() {
+    # _resolve_model_with_fallback <pid>  → echoes resolved model id
+    local pid="$1"
+    local primary fallbacks hazards_n
+    primary=$(python3 -c 'import json,sys
+c=json.load(open(sys.argv[1]))
+for p in c["paths"]:
+    if p["id"]==sys.argv[2]:
+        print(p["model"]); break' "${SUBSTRATES_CFG}" "${pid}" 2>/dev/null)
+    fallbacks=$(python3 -c 'import json,sys
+c=json.load(open(sys.argv[1]))
+for p in c["paths"]:
+    if p["id"]==sys.argv[2]:
+        fc=p.get("fallback_chain",[])
+        print(" ".join(fc)); break' "${SUBSTRATES_CFG}" "${pid}" 2>/dev/null)
+    hazards_n=$(python3 -c 'import json,sys
+c=json.load(open(sys.argv[1]))
+for p in c["paths"]:
+    if p["id"]==sys.argv[2]:
+        print(len(p.get("training_hazards",[]))); break' "${SUBSTRATES_CFG}" "${pid}" 2>/dev/null || echo 0)
+
+    # HAZARD-AWARE: if primary has known training_hazards (multimodal wrapper,
+    # dev-version transformers dep, etc.), bypass HF HEAD check and use
+    # fallback_chain[0] directly. HEAD returns 200 for these but runtime
+    # model-loading fails — cannot be detected at HTTP level.
+    if [[ "${hazards_n}" -gt 0 ]]; then
+      local first_fb
+      first_fb=$(echo "${fallbacks}" | awk '{print $1}')
+      if [[ -n "${first_fb}" ]] && [[ "${first_fb}" != "${primary}" ]]; then
+        if _hf_accessible "${first_fb}"; then
+          log "  [HAZARD_SUBST] ${pid}: ${primary} → ${first_fb} (training_hazards=${hazards_n}, bypass HEAD)"
+          echo "${first_fb}"
+          return 0
+        fi
+      fi
+    fi
+
+    # No hazards path: trust primary if accessible
+    if _hf_accessible "${primary}"; then
+      echo "${primary}"
+      return 0
+    fi
+    log "  [WARN] ${pid}: primary ${primary} UNREACHABLE — trying fallback chain"
+    for fb in ${fallbacks}; do
+      if [[ "${fb}" == "${primary}" ]]; then continue; fi
+      if _hf_accessible "${fb}"; then
+        log "  [SUBST] ${pid}: ${primary} → ${fb}"
+        echo "${fb}"
+        return 0
+      fi
+    done
+    log "  [FAIL] ${pid}: NO fallback accessible for primary=${primary}"
+    echo ""
+    return 1
+  }
+
+  log "  HF accessibility pre-check (2026-04-24 ROI V4):"
+  MODEL_P1_RESOLVED=$(_resolve_model_with_fallback p1) || FAIL_N=$((FAIL_N+1))
+  MODEL_P2_RESOLVED=$(_resolve_model_with_fallback p2) || FAIL_N=$((FAIL_N+1))
+  MODEL_P3_RESOLVED=$(_resolve_model_with_fallback p3) || FAIL_N=$((FAIL_N+1))
+  MODEL_P4_RESOLVED=$(_resolve_model_with_fallback p4) || FAIL_N=$((FAIL_N+1))
+  # Apply resolved substitutions
+  [[ -n "${MODEL_P1_RESOLVED}" ]] && MODEL_P1="${MODEL_P1_RESOLVED}"
+  [[ -n "${MODEL_P2_RESOLVED}" ]] && MODEL_P2="${MODEL_P2_RESOLVED}"
+  [[ -n "${MODEL_P3_RESOLVED}" ]] && MODEL_P3="${MODEL_P3_RESOLVED}"
+  [[ -n "${MODEL_P4_RESOLVED}" ]] && MODEL_P4="${MODEL_P4_RESOLVED}"
+  log "  resolved: p1=${MODEL_P1}  p2=${MODEL_P2}  p3=${MODEL_P3}  p4=${MODEL_P4}"
 else
   mark_fail "substrates config missing: ${SUBSTRATES_CFG}"
 fi
@@ -309,10 +405,40 @@ log "writing ${LAUNCH_STATE}"
   printf '}\n'
 } > "${LAUNCH_STATE}"
 
-log "launch state written; auto_kill wiring note:"
-log "NOTE: operator must append ${#LAUNCHED_PODS[@]} pod entries to ${AUTO_KILL_PODS}"
-log "      with last_activity_source=nvidia_smi, idle_threshold_min=${IDLE_MINUTES_MAX}, then run:"
-log "      hexa run tool/h100_auto_kill.hexa --apply"
+log "launch state written"
 
-log "APPLY: complete. 4 pods launched. Monitor via: runpodctl pod list"
+# 2026-04-24 ROI V5: AUTO_KICKOFF chain — pods spawn → pods_sync → auto_kill arm →
+# ssh bootstrap parallel → training driver ship + parallel kickoff. NO IDLE state.
+# User directive: '유휴 상태절대금지 코드수준 구현' → enforced here, not in human loop.
+if [[ "${AUTO_KICKOFF}" == "yes" ]]; then
+  log "AUTO_KICKOFF: chaining bootstrap + training (--no-auto-kickoff to skip)"
+
+  log "  step 1/4: sync config/h100_pods.json from live runpodctl"
+  bash "${ANIMA_ROOT}/tool/h100_pods_sync.bash" 2>&1 | tail -3
+
+  log "  step 2/4: arm h100_auto_kill (idle ${IDLE_MINUTES_MAX}min threshold)"
+  /Users/ghost/core/hexa-lang/hexa "${ANIMA_ROOT}/tool/h100_auto_kill.hexa" --apply 2>&1 | tail -3
+
+  log "  step 3/4: pod bootstrap (hexa + repo clone) — parallel 4 ssh"
+  # The post-spawn bootstrap + training kickoff chain is orchestrated by a
+  # dedicated helper to keep this launch script tight. If the helper is
+  # missing, log a clear next-command hint and exit — never hang idle.
+  CHAIN_TOOL="${ANIMA_ROOT}/tool/h100_stage2_post_launch_chain.bash"
+  if [[ -x "${CHAIN_TOOL}" ]]; then
+    bash "${CHAIN_TOOL}" 2>&1 | tail -10
+  else
+    log "  [NOTE] ${CHAIN_TOOL} not authored yet — next manual step:"
+    log "         bash ${CHAIN_TOOL}   (after it lands)"
+    log "         OR for current session: see state/convergence/h100_stage2_*.json for"
+    log "         the ad-hoc ssh-heredoc bootstrap pattern used 2026-04-23."
+  fi
+else
+  log "  AUTO_KICKOFF disabled — operator must manually:"
+  log "    1. bash tool/h100_pods_sync.bash"
+  log "    2. hexa run tool/h100_auto_kill.hexa --apply"
+  log "    3. ssh to each pod + bootstrap + ship training driver + kickoff"
+fi
+
+log "APPLY: complete. ${#LAUNCHED_PODS[@]} pods launched (GPU per pod: ${GPU_COUNT_PER_POD}, total: $(( ${#LAUNCHED_PODS[@]} * GPU_COUNT_PER_POD )))"
+log "Monitor: runpodctl pod list | jq '.[] | {id,name,desiredStatus,costPerHr}'"
 exit 0
