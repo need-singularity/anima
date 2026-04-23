@@ -190,7 +190,7 @@ chmod +x /root/core/anima/tool/alm_r13_backend_mlx.py
 Verify install before training:
 ```bash
 cd /root/core/anima
-echo '{"weights":[0.0,0.0,0.0,0.0],"rank":4}' > /tmp/_b.json
+echo '{"rank":4,"weights":[0.0,0.0,0.0,0.0]}' > /tmp/_b.json
 ANIMA_TRAIN_BACKEND=mlx hexa run tool/alm_r13_train.hexa \
   --base-ckpt /tmp/_b.json --out-dir /tmp/_o --steps 20 --dry-run
 # expect [dry-run] banner + exit 0
@@ -285,7 +285,7 @@ def _peft_train(base_model, out_dir, rank, steps, ckpt_interval, cpgd, seed=42):
         if "lora_" in n:
             flat.extend(p.detach().cpu().flatten().float().tolist()[:64])
     if len(flat) == 0: flat = [0.0]
-    synth = {"weights": flat, "rank": rank, "_meta": {
+    synth = {"rank": rank, "weights": flat, "_meta": {
         "backend": "pytorch-peft", "base_model": base_model, "steps": steps,
         "ckpt_interval": ckpt_interval, "cpgd_active": cpgd,
         "train_sec": round(dt, 3), "targets": targets}}
@@ -339,7 +339,7 @@ ANIMA_TRAIN_BACKEND=pytorch ANIMA_BASE_MODEL=gpt2 hexa run tool/alm_r13_train.he
 Real train → verify → promote cycle (pod-side only; ~1-3 min on H100 with gpt2):
 ```bash
 rm -rf /tmp/_opt && mkdir -p /tmp/_opt
-echo '{"weights":[0.0,0.0,0.0,0.0],"rank":8}' > /tmp/_b.json
+echo '{"rank":8,"weights":[0.0,0.0,0.0,0.0]}' > /tmp/_b.json
 ANIMA_TRAIN_BACKEND=pytorch hexa run tool/alm_r13_train.hexa \
   --base-ckpt /tmp/_b.json --out-dir /tmp/_opt --steps 100 --ckpt-interval 25
 # orchestrator auto-runs post_train_verify → state/alm_r13_an11_a.json verdict=PASS
