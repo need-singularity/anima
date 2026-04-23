@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # tool/build_fixup_native.bash — N73 fix for hexa-cc transpiler bug
 #
+# STATUS (2026-04-23): sed-fixup OBSOLETE — resolved upstream in hexa-lang
+#   373696e7 via runtime.c terminal `#define` shims (setenv/exec_capture/now/push).
+#   Script kept as no-op fallback (sed finds 0 matches after transpiler regen
+#   with fixed runtime.c) until downstream rebuild sweep completes.
+#
 # PURPOSE
 #   `hexa build` fails for tools using `exec_capture()` and `now()` because the
 #   transpiler emits raw identifier `exec_capture` / `now` in C output, while
