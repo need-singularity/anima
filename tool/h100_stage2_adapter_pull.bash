@@ -40,13 +40,13 @@ log() { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 
 KILL_AFTER=0
 TIMEOUT_SEC=3600
-for arg in "$@"; do
-  case "$arg" in
-    --kill-after)    KILL_AFTER=1 ;;
-    --timeout)       shift; TIMEOUT_SEC="$1" ;;
-    --timeout=*)     TIMEOUT_SEC="${arg#*=}" ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --kill-after)    KILL_AFTER=1; shift ;;
+    --timeout)       TIMEOUT_SEC="$2"; shift 2 ;;
+    --timeout=*)     TIMEOUT_SEC="${1#*=}"; shift ;;
     --help|-h)       sed -n '1,30p' "$0"; exit 0 ;;
-    *)               log "unknown arg: $arg"; exit 1 ;;
+    *)               log "unknown arg: $1"; exit 1 ;;
   esac
 done
 

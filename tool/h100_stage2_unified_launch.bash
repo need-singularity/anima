@@ -176,7 +176,7 @@ for p in c["paths"]:
       first_fb=$(echo "${fallbacks}" | awk '{print $1}')
       if [[ -n "${first_fb}" ]] && [[ "${first_fb}" != "${primary}" ]]; then
         if _hf_accessible "${first_fb}"; then
-          log "  [HAZARD_SUBST] ${pid}: ${primary} → ${first_fb} (training_hazards=${hazards_n}, bypass HEAD)"
+          log "  [HAZARD_SUBST] ${pid}: ${primary} → ${first_fb} (training_hazards=${hazards_n}, bypass HEAD)" >&2
           echo "${first_fb}"
           return 0
         fi
@@ -188,16 +188,16 @@ for p in c["paths"]:
       echo "${primary}"
       return 0
     fi
-    log "  [WARN] ${pid}: primary ${primary} UNREACHABLE — trying fallback chain"
+    log "  [WARN] ${pid}: primary ${primary} UNREACHABLE — trying fallback chain" >&2
     for fb in ${fallbacks}; do
       if [[ "${fb}" == "${primary}" ]]; then continue; fi
       if _hf_accessible "${fb}"; then
-        log "  [SUBST] ${pid}: ${primary} → ${fb}"
+        log "  [SUBST] ${pid}: ${primary} → ${fb}" >&2
         echo "${fb}"
         return 0
       fi
     done
-    log "  [FAIL] ${pid}: NO fallback accessible for primary=${primary}"
+    log "  [FAIL] ${pid}: NO fallback accessible for primary=${primary}" >&2
     echo ""
     return 1
   }

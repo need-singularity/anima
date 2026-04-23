@@ -83,7 +83,8 @@ print(json.dumps(rows))
 PYEOF
 )
 
-log "chain start — pods=${#POD_LIST[@]:-4} max_steps=${MAX_STEPS}"
+POD_COUNT=$(echo "${PODS_JSON}" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))')
+log "chain start — pods=${POD_COUNT} max_steps=${MAX_STEPS}"
 echo "${PODS_JSON}" | python3 -c 'import json,sys;d=json.load(sys.stdin);[print(f"  {r[\"pid\"]}: {r[\"host\"]}:{r[\"port\"]} model={r[\"model\"]} rank={r[\"rank\"]}") for r in d]'
 
 # --- step 1: SSH available ----------------------------------------------------
