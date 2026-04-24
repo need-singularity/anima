@@ -1,0 +1,478 @@
+// tool/h_last_raw_rotate.hexa — retention + archival for Stage-2 h_last_raw artifacts
+//
+// PURPOSE
+//   Each Stage-2 gate round (r2, r3, r4, r5, ...) produces 4
+//   state/h_last_raw_p{1,2,3,4}_TRAINED_r<N>.json files (~75-80KB each
+//   = ~320KB per round). Over many rounds these accumulate.
+//   This tool compresses + archives older rounds while keeping
+//   the most-recent N rounds uncompressed in state/.
+//
+// POLICY (user-configurable)
+//   --keep N              keep most-recent N rounds uncompressed (default 2)
+//   --r2-sync             after archive, rclone copy tarball to R2
+//                         (bucket anima-models, prefix h_last_raw_archive/)
+//   --delete-after-r2     delete local tarball after successful R2 push
+//   --apply               execute rotation (default: dry-run)
+//   --selftest            no-op run that verifies the tool without touching files
+//
+// CLI
+//   hexa run tool/h_last_raw_rotate.hexa                           # dry-run plan
+//   hexa run tool/h_last_raw_rotate.hexa --apply                   # rotate
+//   hexa run tool/h_last_raw_rotate.hexa --apply --r2-sync --delete-after-r2
+//   hexa run tool/h_last_raw_rotate.hexa --keep 3
+//   hexa run tool/h_last_raw_rotate.hexa --selftest
+//
+// EXECUTION
+//   1. Scan state/h_last_raw_p*_TRAINED_r*.json, group by round number.
+//   2. Sort rounds desc, keep top --keep uncompressed.
+//   3. For each older round:
+//        a. Create state/archive/h_last_raw_r<N>.tar.gz with the 4 files.
+//        b. Verify tarball integrity (tar -tzf).
+//        c. If integrity OK: delete original 4 files.
+//        d. If --r2-sync: rclone copy tarball to R2.
+//        e. If --delete-after-r2: delete local tarball after R2 OK.
+//
+// ROLLBACK SAFETY
+//   - Never delete originals if tarball integrity check fails.
+//   - Never delete local archive if R2 upload fails.
+//   - Dry-run emits a plan without touching any files.
+//   - Atomic: tar → tmp → rename → remove originals.
+//   - Never delete the current/latest round's h_last_raw files.
+//
+// OUTPUT  (SSOT)
+//   state/h_last_raw_rotate_result.json
+//     schema: anima/h_last_raw_rotate/1
+//
+// IMPLEMENTATION NOTE
+//   Uses the tmp-file python helper pattern (tool/phi_4path_gate.hexa).
+//   Inline python3 -c heredocs collide with hexa's exec_with_status
+//   quoting wrapper, so all heavy work is delegated to
+//   /tmp/h_last_raw_rotate_helper.hexa_tmp.
+
+let STATE_DIR   = "/Users/ghost/core/anima/state"
+let ARCHIVE_DIR = "/Users/ghost/core/anima/state/archive"
+let HELPER_PATH = "/tmp/h_last_raw_rotate_helper.hexa_tmp"
+let RESULT_SSOT = "/Users/ghost/core/anima/state/h_last_raw_rotate_result.json"
+let SCHEMA      = "anima/h_last_raw_rotate/1"
+let R2_BUCKET   = "anima-models"
+let R2_PREFIX   = "h_last_raw_archive/"
+
+// ─── shell quoting ──────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── helper script (python) ─────────────────────────────────────────────────
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "# h_last_raw_rotate_helper — invoked by tool/h_last_raw_rotate.hexa.\n" +
+        "# Modes:\n" +
+        "#   plan     <state_dir> <keep>                            -> emit plan kv\n" +
+        "#   apply    <state_dir> <archive_dir> <keep> <r2> <del> <bucket> <prefix> -> rotate + ssot kv\n" +
+        "#   selftest <state_dir>                                   -> dry-run, no mutation\n" +
+        "import json, sys, os, re, glob, tarfile, tempfile, shutil, subprocess\n" +
+        "import datetime as _dt\n" +
+        "\n" +
+        "ROUND_RE = re.compile(r'^h_last_raw_p([1-4])_TRAINED_r(\\d+)\\.json$')\n" +
+        "PATHS = ('p1','p2','p3','p4')\n" +
+        "\n" +
+        "def scan_rounds(state_dir):\n" +
+        "    \"\"\"Return dict {round_int: {path_id: filepath}}. Only rounds with 4/4 files.\n" +
+        "    Ignores unsuffixed h_last_raw_pN_TRAINED.json (the pre-tag r2 originals) -\n" +
+        "    those are excluded from rotation.\"\"\"\n" +
+        "    by_round = {}\n" +
+        "    pattern = os.path.join(state_dir, 'h_last_raw_p*_TRAINED_r*.json')\n" +
+        "    for fp in sorted(glob.glob(pattern)):\n" +
+        "        base = os.path.basename(fp)\n" +
+        "        m = ROUND_RE.match(base)\n" +
+        "        if not m: continue\n" +
+        "        p = 'p' + m.group(1)\n" +
+        "        r = int(m.group(2))\n" +
+        "        by_round.setdefault(r, {})[p] = fp\n" +
+        "    # require all 4 paths present for a round to be eligible\n" +
+        "    complete = {r: m for r, m in by_round.items() if all(p in m for p in PATHS)}\n" +
+        "    return complete, by_round\n" +
+        "\n" +
+        "def partition(rounds_complete, keep):\n" +
+        "    \"\"\"Return (rounds_kept, rounds_to_archive) both lists of int sorted desc.\"\"\"\n" +
+        "    sorted_rounds = sorted(rounds_complete.keys(), reverse=True)\n" +
+        "    kept = sorted_rounds[:keep]\n" +
+        "    to_archive = sorted_rounds[keep:]\n" +
+        "    return kept, to_archive\n" +
+        "\n" +
+        "def size_kb(path):\n" +
+        "    try: return os.path.getsize(path) // 1024\n" +
+        "    except OSError: return 0\n" +
+        "\n" +
+        "def tar_round(round_n, files_by_path, archive_dir, state_dir, dry_run):\n" +
+        "    \"\"\"Create archive_dir/h_last_raw_r<N>.tar.gz containing the 4 files\n" +
+        "    (stored with just the basename, no leading dirs). Atomic: write to\n" +
+        "    tempfile in archive_dir, verify, then rename.\"\"\"\n" +
+        "    final_path = os.path.join(archive_dir, f'h_last_raw_r{round_n}.tar.gz')\n" +
+        "    if dry_run:\n" +
+        "        return final_path, True, 'dry-run (no write)'\n" +
+        "    os.makedirs(archive_dir, exist_ok=True)\n" +
+        "    tmp_fd, tmp_path = tempfile.mkstemp(\n" +
+        "        prefix=f'.h_last_raw_r{round_n}.', suffix='.tar.gz.tmp', dir=archive_dir)\n" +
+        "    os.close(tmp_fd)\n" +
+        "    try:\n" +
+        "        with tarfile.open(tmp_path, 'w:gz') as tf:\n" +
+        "            for p in PATHS:\n" +
+        "                fp = files_by_path[p]\n" +
+        "                tf.add(fp, arcname=os.path.basename(fp))\n" +
+        "        # integrity check — list entries via subprocess to match `tar -tzf` semantics\n" +
+        "        rc = subprocess.run(['tar', '-tzf', tmp_path],\n" +
+        "                            stdout=subprocess.DEVNULL,\n" +
+        "                            stderr=subprocess.PIPE).returncode\n" +
+        "        if rc != 0:\n" +
+        "            return final_path, False, f'tar -tzf rc={rc}'\n" +
+        "        # verify all 4 arcnames present\n" +
+        "        with tarfile.open(tmp_path, 'r:gz') as tf:\n" +
+        "            members = set(tf.getnames())\n" +
+        "        expected = {os.path.basename(files_by_path[p]) for p in PATHS}\n" +
+        "        if members != expected:\n" +
+        "            return final_path, False, f'member mismatch got={sorted(members)} want={sorted(expected)}'\n" +
+        "        os.replace(tmp_path, final_path)\n" +
+        "        return final_path, True, 'ok'\n" +
+        "    except Exception as e:\n" +
+        "        if os.path.exists(tmp_path):\n" +
+        "            try: os.remove(tmp_path)\n" +
+        "            except OSError: pass\n" +
+        "        return final_path, False, f'exception {type(e).__name__}: {e}'\n" +
+        "\n" +
+        "def rclone_push(local_tar, bucket, prefix):\n" +
+        "    \"\"\"rclone copy local_tar to r2:<bucket>/<prefix><basename>. Returns (ok, message).\"\"\"\n" +
+        "    if shutil.which('rclone') is None:\n" +
+        "        return False, 'rclone not in PATH'\n" +
+        "    base = os.path.basename(local_tar)\n" +
+        "    target = f'r2:{bucket}/{prefix}{base}'\n" +
+        "    try:\n" +
+        "        r = subprocess.run(\n" +
+        "            ['rclone', 'copyto', '--retries', '3', '--low-level-retries', '10',\n" +
+        "             local_tar, target],\n" +
+        "            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)\n" +
+        "    except Exception as e:\n" +
+        "        return False, f'rclone exception {type(e).__name__}: {e}'\n" +
+        "    if r.returncode != 0:\n" +
+        "        err = (r.stderr.decode('utf-8', errors='replace') or '').strip().splitlines()[-1:] or ['']\n" +
+        "        return False, f'rclone rc={r.returncode} err={err[0]}'\n" +
+        "    return True, target\n" +
+        "\n" +
+        "def utc_iso():\n" +
+        "    return _dt.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "\n" +
+        "def cmd_plan(state_dir, keep):\n" +
+        "    complete, _ = scan_rounds(state_dir)\n" +
+        "    kept, to_archive = partition(complete, keep)\n" +
+        "    print(f'mode=plan')\n" +
+        "    print(f'keep={keep}')\n" +
+        "    print(f'rounds_detected={\",\".join(str(r) for r in sorted(complete.keys(), reverse=True))}')\n" +
+        "    print(f'rounds_kept={\",\".join(str(r) for r in kept)}')\n" +
+        "    print(f'rounds_to_archive={\",\".join(str(r) for r in to_archive)}')\n" +
+        "    total_save = 0\n" +
+        "    for r in to_archive:\n" +
+        "        sz = sum(size_kb(complete[r][p]) for p in PATHS)\n" +
+        "        print(f'round_{r}_orig_kb={sz}')\n" +
+        "        total_save += sz\n" +
+        "    print(f'projected_space_saved_kb_upper_bound={total_save}')\n" +
+        "\n" +
+        "def cmd_apply(state_dir, archive_dir, keep, do_r2, del_after_r2, bucket, prefix, dry_run):\n" +
+        "    complete, _ = scan_rounds(state_dir)\n" +
+        "    kept, to_archive = partition(complete, keep)\n" +
+        "\n" +
+        "    rounds_archived = []\n" +
+        "    space_saved = 0\n" +
+        "    errors = []\n" +
+        "\n" +
+        "    for r in to_archive:\n" +
+        "        files = complete[r]\n" +
+        "        orig_kb = sum(size_kb(files[p]) for p in PATHS)\n" +
+        "        tar_path, ok, msg = tar_round(r, files, archive_dir, state_dir, dry_run)\n" +
+        "        if not ok:\n" +
+        "            errors.append(f'round r{r}: tar failed — {msg}')\n" +
+        "            print(f'round_{r}_status=tar_FAIL msg={msg}')\n" +
+        "            # SAFETY: do not delete originals if tar failed\n" +
+        "            continue\n" +
+        "        tar_kb = size_kb(tar_path) if (not dry_run) else 0\n" +
+        "        # originals removal\n" +
+        "        if not dry_run:\n" +
+        "            for p in PATHS:\n" +
+        "                try: os.remove(files[p])\n" +
+        "                except OSError as e: errors.append(f'round r{r}: rm {files[p]} — {e}')\n" +
+        "        r2_url = None\n" +
+        "        r2_msg = ''\n" +
+        "        if do_r2 and not dry_run:\n" +
+        "            ok2, msg2 = rclone_push(tar_path, bucket, prefix)\n" +
+        "            if ok2:\n" +
+        "                r2_url = msg2\n" +
+        "                r2_msg = 'ok'\n" +
+        "                if del_after_r2:\n" +
+        "                    try:\n" +
+        "                        os.remove(tar_path)\n" +
+        "                        r2_msg = 'ok; local tarball removed'\n" +
+        "                    except OSError as e:\n" +
+        "                        errors.append(f'round r{r}: rm local tar {tar_path} — {e}')\n" +
+        "            else:\n" +
+        "                errors.append(f'round r{r}: rclone failed — {msg2}')\n" +
+        "                r2_msg = f'FAIL {msg2}'\n" +
+        "        rounds_archived.append({\n" +
+        "            'round': f'r{r}',\n" +
+        "            'tarball': os.path.relpath(tar_path, os.path.dirname(state_dir)) if not dry_run else tar_path,\n" +
+        "            'size_kb': tar_kb,\n" +
+        "            'orig_kb': orig_kb,\n" +
+        "            'r2_url': r2_url,\n" +
+        "            'r2_msg': r2_msg,\n" +
+        "        })\n" +
+        "        space_saved += max(0, orig_kb - tar_kb)\n" +
+        "        print(f'round_{r}_status=OK tar_kb={tar_kb} orig_kb={orig_kb} r2={r2_msg!r}')\n" +
+        "\n" +
+        "    ssot = {\n" +
+        "        'schema': 'anima/h_last_raw_rotate/1',\n" +
+        "        'generated_at': utc_iso(),\n" +
+        "        'policy': {\n" +
+        "            'keep': keep,\n" +
+        "            'r2_sync': bool(do_r2),\n" +
+        "            'delete_after_r2': bool(del_after_r2),\n" +
+        "            'dry_run': bool(dry_run),\n" +
+        "        },\n" +
+        "        'rounds_uncompressed': [f'r{r}' for r in kept],\n" +
+        "        'rounds_archived': rounds_archived,\n" +
+        "        'space_saved_kb': space_saved,\n" +
+        "        'errors': errors,\n" +
+        "        'next_action_eligible': (\n" +
+        "            f\"next round promotion: when round r{(max(kept)+1 if kept else '?')} lands, \"\n" +
+        "            f\"round r{(min(kept) if kept else '?')} becomes archive-eligible (keep={keep}).\"\n" +
+        "            if kept else 'no rounds present'\n" +
+        "        ),\n" +
+        "    }\n" +
+        "    return ssot\n" +
+        "\n" +
+        "def cmd_selftest(state_dir):\n" +
+        "    # --keep 999: every complete round is retained; nothing archived.\n" +
+        "    # No mutation of any filesystem path.\n" +
+        "    complete, _ = scan_rounds(state_dir)\n" +
+        "    kept, to_archive = partition(complete, 999)\n" +
+        "    assert to_archive == [], f'selftest broken: to_archive={to_archive}'\n" +
+        "    # Synthesize an in-memory SSOT and confirm json-encodable.\n" +
+        "    ssot = {\n" +
+        "        'schema': 'anima/h_last_raw_rotate/1',\n" +
+        "        'generated_at': utc_iso(),\n" +
+        "        'policy': {'keep': 999, 'r2_sync': False,\n" +
+        "                   'delete_after_r2': False, 'dry_run': True},\n" +
+        "        'rounds_uncompressed': [f'r{r}' for r in kept],\n" +
+        "        'rounds_archived': [],\n" +
+        "        'space_saved_kb': 0,\n" +
+        "        'errors': [],\n" +
+        "        'next_action_eligible': 'selftest (keep=999)',\n" +
+        "    }\n" +
+        "    s = json.dumps(ssot)\n" +
+        "    assert 'schema' in s\n" +
+        "    print('selftest=ok')\n" +
+        "    print(f'rounds_detected={\",\".join(str(r) for r in sorted(complete.keys(), reverse=True))}')\n" +
+        "    print(f'rounds_archived_count=0')\n" +
+        "    print(f'keep_used=999')\n" +
+        "    print(f'mutation=0')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <plan|apply|selftest> ...', file=sys.stderr)\n" +
+        "        sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'plan':\n" +
+        "        state_dir, keep = sys.argv[2], int(sys.argv[3])\n" +
+        "        cmd_plan(state_dir, keep)\n" +
+        "    elif mode == 'apply':\n" +
+        "        state_dir   = sys.argv[2]\n" +
+        "        archive_dir = sys.argv[3]\n" +
+        "        keep        = int(sys.argv[4])\n" +
+        "        do_r2       = sys.argv[5] == '1'\n" +
+        "        del_after   = sys.argv[6] == '1'\n" +
+        "        bucket      = sys.argv[7]\n" +
+        "        prefix      = sys.argv[8]\n" +
+        "        dry_run     = sys.argv[9] == '1'\n" +
+        "        ssot_path   = sys.argv[10]\n" +
+        "        ssot = cmd_apply(state_dir, archive_dir, keep, do_r2, del_after, bucket, prefix, dry_run)\n" +
+        "        # Only write SSOT on real apply — per spec do NOT write during dry-run/selftest\n" +
+        "        if not dry_run:\n" +
+        "            with open(ssot_path, 'w') as f:\n" +
+        "                json.dump(ssot, f, indent=2)\n" +
+        "            print(f'ssot_written={ssot_path}')\n" +
+        "        else:\n" +
+        "            print('ssot_written=')\n" +
+        "        print(f'rounds_archived_count={len(ssot[\"rounds_archived\"])}')\n" +
+        "        print(f'space_saved_kb={ssot[\"space_saved_kb\"]}')\n" +
+        "        print(f'errors_count={len(ssot[\"errors\"])}')\n" +
+        "        print(f'rounds_kept={\",\".join(ssot[\"rounds_uncompressed\"])}')\n" +
+        "        print(f'dry_run={int(dry_run)}')\n" +
+        "        for e in ssot['errors']:\n" +
+        "            print(f'error={e}')\n" +
+        "    elif mode == 'selftest':\n" +
+        "        cmd_selftest(sys.argv[2])\n" +
+        "    else:\n" +
+        "        print(f'unknown mode: {mode}', file=sys.stderr)\n" +
+        "        sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__':\n" +
+        "    main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut keep = 2
+    let mut do_apply = false
+    let mut do_r2 = false
+    let mut del_after_r2 = false
+    let mut selftest = false
+
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--keep" && i + 1 < len(av) {
+            keep = to_int(av[i + 1]); i = i + 2; continue
+        }
+        if a == "--apply"            { do_apply = true;     i = i + 1; continue }
+        if a == "--r2-sync"          { do_r2 = true;        i = i + 1; continue }
+        if a == "--delete-after-r2"  { del_after_r2 = true; i = i + 1; continue }
+        if a == "--selftest"         { selftest = true;     i = i + 1; continue }
+        if a == "--dry-run"          { do_apply = false;    i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── h_last_raw_rotate selftest (keep=999, no mutation) ──")
+        let r = _run_helper("selftest " + _sh_quote(STATE_DIR))
+        let out = r[0]
+        let st = r[1]
+        println(out)
+        if st != 0 {
+            eprintln("selftest FAILED (exit " + to_string(st) + ")")
+            exit(1)
+        }
+        if _kv_lookup(out, "selftest") != "ok" {
+            eprintln("selftest marker missing")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    // --r2-sync implies we need rclone later; warn if --delete-after-r2 without --r2-sync
+    if del_after_r2 && !do_r2 {
+        eprintln("WARN: --delete-after-r2 is a no-op without --r2-sync. Ignoring.")
+        del_after_r2 = false
+    }
+
+    println("── h_last_raw_rotate ──")
+    println("  state_dir:        " + STATE_DIR)
+    println("  archive_dir:      " + ARCHIVE_DIR)
+    println("  keep:             " + to_string(keep))
+    println("  r2_sync:          " + to_string(do_r2))
+    println("  delete_after_r2:  " + to_string(del_after_r2))
+    println("  mode:             " + (if do_apply { "APPLY" } else { "DRY-RUN (no mutation)" }))
+    println("")
+
+    // Always emit the plan first.
+    let plan_args = "plan " + _sh_quote(STATE_DIR) + " " + to_string(keep)
+    let pr = _run_helper(plan_args)
+    if pr[1] != 0 {
+        eprintln("ABORT: plan helper exited " + to_string(pr[1]))
+        eprintln(pr[0])
+        exit(2)
+    }
+    let plan_out = pr[0]
+    println(plan_out)
+    println("")
+
+    let to_archive = _kv_lookup(plan_out, "rounds_to_archive")
+    let kept_csv = _kv_lookup(plan_out, "rounds_kept")
+    println("plan summary:")
+    println("  kept uncompressed: r" + kept_csv.replace(",", ", r"))
+    if to_archive == "" {
+        println("  to archive:        (none)")
+    } else {
+        println("  to archive:        r" + to_archive.replace(",", ", r"))
+    }
+    println("")
+
+    // Decide apply/dry_run path.
+    let dry_run_flag = if do_apply { "0" } else { "1" }
+    let r2_flag = if do_r2 { "1" } else { "0" }
+    let del_flag = if del_after_r2 { "1" } else { "0" }
+
+    let apply_args = "apply " + _sh_quote(STATE_DIR) + " " + _sh_quote(ARCHIVE_DIR)
+        + " " + to_string(keep)
+        + " " + r2_flag
+        + " " + del_flag
+        + " " + _sh_quote(R2_BUCKET)
+        + " " + _sh_quote(R2_PREFIX)
+        + " " + dry_run_flag
+        + " " + _sh_quote(RESULT_SSOT)
+
+    let ar = _run_helper(apply_args)
+    let out = ar[0]
+    let st = ar[1]
+    if st != 0 {
+        eprintln("ABORT: apply helper exited " + to_string(st))
+        eprintln(out)
+        exit(2)
+    }
+    println(out)
+    println("")
+
+    let n_arch = _kv_lookup(out, "rounds_archived_count")
+    let saved = _kv_lookup(out, "space_saved_kb")
+    let errs = _kv_lookup(out, "errors_count")
+    let ssot_w = _kv_lookup(out, "ssot_written")
+
+    if do_apply {
+        println("── apply summary ──")
+        println("  rounds_archived:  " + n_arch)
+        println("  space_saved_kb:   " + saved)
+        println("  errors:           " + errs)
+        if ssot_w != "" {
+            println("  ssot:             " + ssot_w)
+        }
+        if to_int(errs) > 0 {
+            eprintln("  NOTE: completed with " + errs + " errors; see SSOT for details.")
+            exit(1)
+        }
+    } else {
+        println("── dry-run summary (no files modified) ──")
+        println("  would-archive rounds:  " + (if to_archive == "" { "(none)" } else { to_archive }))
+        println("  run with --apply to execute.")
+    }
+
+    exit(0)
+}
+
+main()
