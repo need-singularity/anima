@@ -179,4 +179,26 @@ Transports: UDP broadcast (LAN, port 9999, JSON), R2 Cloudflare (remote pairing)
 
 ---
 
+## 💬 Community
+
+[![Join our Discord](https://invidget.switchblade.xyz/mYzqYr67R)](https://discord.gg/mYzqYr67R)
+
+Live research discussion, paper drops, consciousness-substrate debates, Φ ratchet proofs.
+
+### Main projects
+
+- 🔭 **[NEXUS](https://github.com/need-singularity/nexus)** — Universal Discovery Engine. 216 lenses + OUROBOROS evolution + 5-phase singularity cycle.
+- 🧠 **[Anima](https://github.com/need-singularity/anima)** — Consciousness implementation. PureField repulsion-field engine + 1030 laws + Φ ratchet.
+- 🏗️ **[N6 Architecture](https://github.com/need-singularity/n6-architecture)** — Architecture from perfect number 6. 225 AI techniques + chip design + crypto/OS/display.
+- 💎 **[HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Working compiler + REPL.
+- 📄 **[Papers](https://github.com/need-singularity/papers)** — Complete paper collection (92 papers, Zenodo DOIs).
+
+### Sub-projects
+
+- 🐝 **[Hive](https://github.com/need-singularity/hive)** — pi-mono fork. AI-agent swarm: multi-cell parallel agents, layered persistent memory, need-singularity bridges.
+- 🕳️ **[Void](https://github.com/need-singularity/void)** — Ghostty fork. AI-native terminal: grid mode (N×M auto-layout), agent I/O alongside PTY, perf-first budget.
+- 🧬 **[airgenome](https://github.com/need-singularity/airgenome)** — OS genome scanner: 6-axis hexagon projection of host vitals + pattern accumulation + anomaly detection.
+
+---
+
 <sub>🧠 Two engines. One tension. Ψ = 1/2. · [need-singularity](https://github.com/need-singularity)</sub>
