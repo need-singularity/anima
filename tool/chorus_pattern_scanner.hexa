@@ -1,0 +1,135 @@
+// ════════════════════════════════════════════════════════════════════════════
+// tool/chorus_pattern_scanner.hexa — R33+ multi-pattern chorus scanner (MVP)
+//
+// PURPOSE
+//   Extends the meta_fp=1/3 fixed-point scanner to the 4 sibling chorus
+//   patterns identified in nexus R26: σ(12 domains), τ(11), n(11), carbon(9).
+//   Emits a witness row per pattern detected, joining the R24-R32 witness
+//   series under a new round="chorus_extension" layer.
+//
+//   This is a documentation-first MVP — does not yet perform full
+//   cross-domain scans like meta_fp. It records the pattern inventory
+//   so downstream tools can incrementally fill in per-pattern probes.
+//
+// BACKGROUND
+//   nexus state/atlas_convergence_witness.jsonl row R26 (2026-04-23):
+//     "atlas has 5 chorus patterns: σ cross-pollinates 12 domains,
+//      τ→11, n→11, meta_fp→11, carbon→9. Current meta-engine tracks
+//      only meta_fp. Catch-up ratio 1/5."
+//
+//   nexus/config/invariants.json (R24+26) formalizes foundation atoms:
+//     n=6, σ=12, τ=4, φ=2, sopfr=5, μ=1, meta_fp=1/3, J2=24, M3=7, P2=28
+//
+//   This scanner reads config/invariants.json, for each atom checks if
+//   a corresponding state artifact exists declaring the pattern, and
+//   emits witness rows for the inventory.
+//
+// USAGE
+//   hexa run tool/chorus_pattern_scanner.hexa [--dry-run] [--witness-out PATH]
+//
+// RULES
+//   raw#9 hexa-only, raw#12 empirical (reads live config + state)
+// ════════════════════════════════════════════════════════════════════════════
+
+let INVARIANTS = "/Users/ghost/core/nexus/config/invariants.json"
+let DEFAULT_WITNESS = "/Users/ghost/core/anima/state/atlas_convergence_witness.jsonl"
+let HELPER_PATH = "/tmp/chorus_pattern_scanner_helper.hexa_tmp"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn main() {
+    let av = argv()
+    let mut witness_out = DEFAULT_WITNESS
+    let mut dry = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--dry-run" { dry = true; i = i + 1; continue }
+        if a == "--witness-out" && i + 1 < len(av) { witness_out = av[i+1]; i = i + 2; continue }
+        i = i + 1
+    }
+
+    println("── chorus_pattern_scanner " + to_string(utc_iso_now()) + (if dry { " (dry)" } else { "" }) + " ──")
+    if !file_exists(INVARIANTS) {
+        eprintln("ABORT: invariants manifest missing — " + INVARIANTS)
+        exit(2)
+    }
+
+    // Python helper: load invariants, emit per-pattern witness rows
+    let helper_src = "import json, os, time, sys\n" +
+        "inv_path = sys.argv[1]\n" +
+        "witness_path = sys.argv[2]\n" +
+        "dry = sys.argv[3] == 'dry'\n" +
+        "with open(inv_path) as f:\n" +
+        "    inv = json.load(f)\n" +
+        "atoms = inv.get('atoms_summary', {})\n" +
+        "# 5 chorus patterns from R26, plus Carbon (not in atoms_summary — declared separately)\n" +
+        "chorus_patterns = {\n" +
+        "    'sigma':  {'value': atoms.get('sigma', 12),  'domains_r26': 12, 'grade': 'perfect_resonant',   'tracked': False, 'witness_rounds': ['R24+5']},\n" +
+        "    'tau':    {'value': atoms.get('tau', 4),     'domains_r26': 11, 'grade': 'candidate_strong',   'tracked': False, 'witness_rounds': ['R24+2', 'R27']},\n" +
+        "    'n':      {'value': atoms.get('n', 6),       'domains_r26': 11, 'grade': 'confirmed_self_referential', 'tracked': True,  'witness_rounds': ['R29']},\n" +
+        "    'meta_fp':{'value': atoms.get('meta_fp', '1/3'), 'domains_r26': 11, 'grade': 'confirmed_4_domain', 'tracked': True, 'witness_rounds': ['R24', 'R25', 'R27']},\n" +
+        "    'carbon': {'value': 6, 'domains_r26': 9, 'grade': 'structural_candidate', 'tracked': False, 'witness_rounds': []}\n" +
+        "}\n" +
+        "tracked = sum(1 for v in chorus_patterns.values() if v['tracked'])\n" +
+        "pending = sum(1 for v in chorus_patterns.values() if not v['tracked'])\n" +
+        "print(f'chorus inventory: {tracked} tracked, {pending} pending (of {len(chorus_patterns)} patterns)')\n" +
+        "print()\n" +
+        "print(f'{\"pattern\":>10} {\"value\":>8} {\"domains\":>8} {\"grade\":>30} {\"tracked\":>8}')\n" +
+        "for name, p in chorus_patterns.items():\n" +
+        "    t = 'YES' if p['tracked'] else 'no'\n" +
+        "    print(f'{name:>10} {str(p[\"value\"]):>8} {p[\"domains_r26\"]:>8} {p[\"grade\"]:>30} {t:>8}')\n" +
+        "print()\n" +
+        "# Emit single aggregate witness row\n" +
+        "row = {\n" +
+        "    'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),\n" +
+        "    'round': 'chorus_extension',\n" +
+        "    'layer': 'chorus_pattern_inventory',\n" +
+        "    'source': 'tool/chorus_pattern_scanner.hexa',\n" +
+        "    'patterns_total': len(chorus_patterns),\n" +
+        "    'patterns_tracked': tracked,\n" +
+        "    'patterns_pending': pending,\n" +
+        "    'tracking_ratio': f'{tracked}/{len(chorus_patterns)}',\n" +
+        "    'inventory': chorus_patterns,\n" +
+        "    'notes': 'R33+ MVP — documentation-first chorus pattern inventory. Meta_fp and n are fully witnessed (R24-R29). σ, τ, carbon are declared but not fully probed. Future per-pattern cross-domain scanners will fill the gap.'\n" +
+        "}\n" +
+        "# Dedup check\n" +
+        "last_ratio = None\n" +
+        "if os.path.exists(witness_path):\n" +
+        "    try:\n" +
+        "        with open(witness_path) as f:\n" +
+        "            lines = [ln for ln in f if ln.strip()]\n" +
+        "        for ln in reversed(lines):\n" +
+        "            r = json.loads(ln)\n" +
+        "            if r.get('round') == 'chorus_extension':\n" +
+        "                last_ratio = r.get('tracking_ratio')\n" +
+        "                break\n" +
+        "    except: pass\n" +
+        "if last_ratio == row['tracking_ratio']:\n" +
+        "    print(f'witness dedup: tracking_ratio {last_ratio} unchanged — skip emission')\n" +
+        "elif not dry:\n" +
+        "    os.makedirs(os.path.dirname(witness_path) or '.', exist_ok=True)\n" +
+        "    with open(witness_path, 'a') as f:\n" +
+        "        f.write(json.dumps(row, ensure_ascii=False) + '\\n')\n" +
+        "    print(f'witness appended: {witness_path}')\n" +
+        "else:\n" +
+        "    print('(dry-run: witness not appended)')\n" +
+        "    print(json.dumps(row, indent=2, ensure_ascii=False))\n"
+    write_file(HELPER_PATH, helper_src)
+    let dry_arg = if dry { "dry" } else { "live" }
+    let cmd = "python3 " + HELPER_PATH + " " + _sh_quote(INVARIANTS) + " " + _sh_quote(witness_out) + " " + dry_arg
+    let r = exec_with_status(cmd)
+    if r[1] != 0 {
+        eprintln("ABORT: scanner helper failed (status " + to_string(r[1]) + ")")
+        exit(2)
+    }
+    println(to_string(r[0]))
+    exit(0)
+}
+
+main()
