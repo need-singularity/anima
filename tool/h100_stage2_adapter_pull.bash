@@ -103,8 +103,13 @@ while true; do
   sleep 30
 done
 
-# --- step 2: pull full adapter dirs ------------------------------------------
-log "step 2/4: scp -r /workspace/trained_pN/final/ → state/trained_adapters/pN/"
+# --- step 2: pull full adapter dirs + h_last_raw.json ------------------------
+# NOTE: r5 regression (2026-04-24) — prior version pulled only `final/`, losing
+# h_last_raw.json at pod kill and forcing a separate forward-pass rerun.
+# Now we also scp /workspace/trained_pN/h_last_raw.json → state/h_last_raw_p<pid>_TRAINED_pending.json
+# (caller renames with round tag). Failure to pull h_last_raw is a WARNING,
+# not a fatal (adapter is the primary artifact; h_last_raw can be regenerated).
+log "step 2/4: scp -r /workspace/trained_pN/final/ → state/trained_adapters/pN/ (+ h_last_raw.json)"
 pull_fail=0
 for entry in ${POD_LIST}; do
   IFS=':' read -r pid pod_id host port <<< "$entry"
@@ -118,6 +123,14 @@ for entry in ${POD_LIST}; do
   else
     log "    [FAIL] ${pid} adapter pull failed"
     pull_fail=$((pull_fail + 1))
+  fi
+  # also pull h_last_raw.json if present on pod
+  h_out="${ANIMA_ROOT}/state/h_last_raw_${pid}_TRAINED_pending.json"
+  if scp -o StrictHostKeyChecking=no -P "$port" \
+    "root@${host}:/workspace/trained_${pid}/h_last_raw.json" "${h_out}" 2>/dev/null; then
+    log "    [PASS] ${pid} h_last_raw pulled → ${h_out}"
+  else
+    log "    [WARN] ${pid} h_last_raw not pulled (non-fatal; can regenerate)"
   fi
 done
 
