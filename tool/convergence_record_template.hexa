@@ -1,0 +1,347 @@
+// tool/convergence_record_template.hexa — generator for state/convergence/*.json
+//
+// PURPOSE
+//   Produce a pre-filled session convergence record from a short CLI invocation,
+//   populating stable invariants + policy SSOT defaults, leaving session-specific
+//   containers (launch, incidents, artifacts, final_state, …) as empty shells
+//   for the operator to fill post-session. Eliminates schema drift between
+//   hand-written convergence files.
+//
+// USAGE
+//   hexa run tool/convergence_record_template.hexa \
+//     --session-id <id>              # required (e.g., h100_stage2_r5_20260501)
+//     --roadmap-entries <csv>        # required (e.g., "10,86,91")
+//     --purpose <text>               # required (one-liner)
+//     --cascade-parent <ref>         # optional (string or omit → null)
+//     --out <path>                   # default state/convergence/<session-id>.json
+//     --force                        # overwrite if output exists
+//     --dry-run                      # print JSON to stdout, no file write
+//     --selftest                     # self-invoke with test args, verify, clean up
+//
+// EXIT
+//   0 = success (file written or dry-run/selftest OK)
+//   2 = output exists without --force, OR required arg missing/invalid
+//   3 = selftest assertion failed
+//
+// INVARIANTS (hard-coded here; edit only when policy itself shifts)
+//   - 7 entries in invariants_honored
+//   - 3 entries in policy_ssot
+//   - schema derives from --session-id: "anima/convergence/<schema_tag>/1"
+//
+// IMPLEMENTATION NOTE
+//   JSON emission is delegated to a python tmp-file helper (HEXA-FIRST
+//   compliant — not a .py in-repo). Inline python3 -c "..." quoting was found
+//   to be fragile with hexa exec_with_status, so we write the helper to
+//   /tmp/convergence_record_template_helper.hexa_tmp (same pattern as
+//   tool/alm_r14_validator.hexa).
+
+let REPO_ROOT   = "/Users/ghost/core/anima"
+let OUT_DIR     = REPO_ROOT + "/state/convergence"
+let HELPER_PATH = "/tmp/convergence_record_template_helper.hexa_tmp"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _json_escape(s: string) -> string {
+    return s
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+}
+
+fn _file_exists_sh(p: string) -> bool {
+    let r = exec_with_status("test -f " + _sh_quote(p) + " && echo 1 || echo 0")
+    return to_string(r[0]).trim() == "1"
+}
+
+fn _utc_now() -> string {
+    let r = exec_with_status("date -u +%FT%TZ")
+    return to_string(r[0]).trim()
+}
+
+// Derive schema tag from session-id.
+//   h100_stage2_r4_20260424 → anima/convergence/h100_stage2_r4/1
+//   h100_stage2_r5_20260501 → anima/convergence/h100_stage2_r5/1
+//   test_selftest_<ts>      → anima/convergence/test_selftest/1
+// Rule: strip trailing date/ts segment if it looks numeric (≥ 6 digits)
+fn _derive_schema_tag(session_id: string) -> string {
+    let parts = session_id.split("_")
+    let n = len(parts)
+    if n < 2 { return session_id }
+    let last = parts[n - 1]
+    // numeric check
+    let mut is_num = last.len() >= 6
+    let mut ci = 0
+    while ci < last.len() && is_num {
+        let c = last.substring(ci, ci + 1)
+        if c < "0" || c > "9" { is_num = false }
+        ci = ci + 1
+    }
+    if !is_num { return session_id }
+    // rebuild without last segment
+    let mut out = parts[0]
+    let mut i = 1
+    while i < n - 1 {
+        out = out + "_" + parts[i]
+        i = i + 1
+    }
+    return out
+}
+
+// Parse CSV roadmap entries → JSON-array-of-strings like ["#10","#86","#91"]
+fn _roadmap_csv_to_json(csv: string) -> string {
+    let raw = csv.split(",")
+    let mut out = "["
+    let mut first = true
+    let mut i = 0
+    while i < len(raw) {
+        let tok = raw[i].trim()
+        if tok.len() > 0 {
+            let clean = if tok.substring(0, 1) == "#" { tok.substring(1, tok.len()) } else { tok }
+            if !first { out = out + ", " }
+            out = out + "\"#" + _json_escape(clean) + "\""
+            first = false
+        }
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+fn _die(msg: string, code: int) {
+    eprintln(msg)
+    exit(code)
+}
+
+fn _build_record(
+    session_id: string,
+    schema_tag: string,
+    started_at: string,
+    roadmap_json: string,
+    cascade_parent: string,
+    cascade_parent_given: bool,
+    purpose: string
+) -> string {
+    // Delegate JSON emission to python for reliable formatting + indent=2.
+    let helper_src = "import json, sys\n" +
+        "session_id    = sys.argv[1]\n" +
+        "schema_tag    = sys.argv[2]\n" +
+        "started_at    = sys.argv[3]\n" +
+        "roadmap_json  = sys.argv[4]\n" +
+        "cascade_given = sys.argv[5] == '1'\n" +
+        "cascade_val   = sys.argv[6]\n" +
+        "purpose       = sys.argv[7]\n" +
+        "roadmap_entries = json.loads(roadmap_json)\n" +
+        "rec = {\n" +
+        "  'schema': f'anima/convergence/{schema_tag}/1',\n" +
+        "  'session_id': session_id,\n" +
+        "  'started_at': started_at,\n" +
+        "  'closed_at': '',\n" +
+        "  'roadmap_entries': roadmap_entries,\n" +
+        "  'cascade_parent': (cascade_val if cascade_given else None),\n" +
+        "  'purpose': purpose,\n" +
+        "  'policy_ssot': [\n" +
+        "    'config/runpod_auto_charge.json (auto-charge, balance silent)',\n" +
+        "    'config/h100_max_parallelism_policy.json (no GPU cap, budget=gpu-hours)',\n" +
+        "    '$WS/nexus/tool/minimal_path.json (H-MINPATH, H-DIAG3, H-SILENT)'\n" +
+        "  ],\n" +
+        "  'launch': {\n" +
+        "    'attempts': 0,\n" +
+        "    'pods': [],\n" +
+        "    'result': 'TBD'\n" +
+        "  },\n" +
+        "  'incidents': [],\n" +
+        "  'code_fixes_committed': [],\n" +
+        "  'artifacts_landed': [],\n" +
+        "  'final_state': {},\n" +
+        "  'next_step_options': [],\n" +
+        "  'invariants_honored': [\n" +
+        "    'HEXA-FIRST: no .py files authored in repo (pod-side training drivers only, .gitignore enforces)',\n" +
+        "    'auto-charge: no balance/budget halting during H100 chains',\n" +
+        "    'convergence_store: this file lives under state/convergence/ not flat state/',\n" +
+        "    'max-parallelism: no GPU count cap; budget metric = gpu_hours',\n" +
+        "    'sopfr(6)=5: meta-engine a..e cap enforced in hexa-lang roadmap_progress_check.hexa',\n" +
+        "    'no_idle_pods: never pause for A/B/C/D menus while pods are live',\n" +
+        "    'diagnostic_before_retry_x3: H-DIAG3 rule \\u2014 2 consecutive same-strategy fails require new diagnostic evidence before attempt 3'\n" +
+        "  ],\n" +
+        "  'prevention_index_additions': [],\n" +
+        "  'meta_lessons': []\n" +
+        "}\n" +
+        "sys.stdout.write(json.dumps(rec, indent=2, ensure_ascii=False) + '\\n')\n"
+    write_file(HELPER_PATH, helper_src)
+
+    let cascade_flag = if cascade_parent_given { "1" } else { "0" }
+    let cmd = "python3 " + HELPER_PATH +
+        " " + _sh_quote(session_id) +
+        " " + _sh_quote(schema_tag) +
+        " " + _sh_quote(started_at) +
+        " " + _sh_quote(roadmap_json) +
+        " " + cascade_flag +
+        " " + _sh_quote(cascade_parent) +
+        " " + _sh_quote(purpose)
+    let r = exec_with_status(cmd)
+    if r[1] != 0 {
+        _die("ABORT: python helper failed (exit " + to_string(r[1]) + ")", 2)
+    }
+    return to_string(r[0])
+}
+
+fn _atomic_write(path: string, body: string) {
+    let tmp = path + ".tmp." + to_string(_utc_now()).replace(":", "").replace("-", "")
+    write_file(tmp, body)
+    let r = exec_with_status("mv " + _sh_quote(tmp) + " " + _sh_quote(path))
+    if r[1] != 0 {
+        _die("ABORT: atomic mv failed (" + path + ")", 2)
+    }
+}
+
+fn _run_selftest() {
+    let ts = _utc_now().replace(":", "").replace("-", "")
+    let sid = "test_selftest_" + ts
+    let out = "/tmp/convergence_selftest_" + ts + ".json"
+
+    println("── convergence_record_template selftest ──")
+    println("sid: " + sid)
+    println("out: " + out)
+
+    let roadmap_json = _roadmap_csv_to_json("999")
+    let body = _build_record(
+        sid,
+        _derive_schema_tag(sid),
+        _utc_now(),
+        roadmap_json,
+        "",
+        false,
+        "selftest purpose"
+    )
+    _atomic_write(out, body)
+
+    // 1) file created
+    if !_file_exists_sh(out) { _die("SELFTEST FAIL: file not created", 3) }
+
+    // 2-5) check content with python
+    let check_cmd = "python3 -c \"import json,sys;" +
+        "d=json.load(open(sys.argv[1]));" +
+        "assert 'schema' in d, 'schema missing';" +
+        "assert len(d['invariants_honored'])==7, f'invariants {len(d[chr(39)+\\\"invariants_honored\\\"+chr(39)])}';" +
+        "assert len(d['policy_ssot'])==3, 'policy_ssot wrong';" +
+        "assert d['roadmap_entries']==['#999'], f'roadmap {d[chr(39)+\\\"roadmap_entries\\\"+chr(39)]}';" +
+        "print('CHECK_OK')\" " + _sh_quote(out)
+    let cr = exec_with_status(check_cmd)
+    let cr_out = to_string(cr[0]).trim()
+    if cr[1] != 0 || !cr_out.ends_with("CHECK_OK") {
+        eprintln("SELFTEST FAIL: content check")
+        eprintln("  exit=" + to_string(cr[1]))
+        eprintln("  stdout=" + cr_out)
+        exit(3)
+    }
+
+    // cleanup
+    let rm = exec_with_status("rm -f " + _sh_quote(out))
+    if rm[1] != 0 { _die("SELFTEST FAIL: cleanup rm failed", 3) }
+
+    println("  [PASS] file created")
+    println("  [PASS] schema field present")
+    println("  [PASS] 7 invariants present")
+    println("  [PASS] 3 policy_ssot present")
+    println("  [PASS] roadmap_entries = [\"#999\"]")
+    println("  [PASS] cleanup OK")
+    println("selftest: OK")
+    exit(0)
+}
+
+fn main() {
+    let av = argv()
+    let mut session_id = ""
+    let mut roadmap_csv = ""
+    let mut purpose = ""
+    let mut cascade_parent = ""
+    let mut cascade_given = false
+    let mut out_path = ""
+    let mut force = false
+    let mut dry_run = false
+    let mut selftest = false
+
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--session-id" && i + 1 < len(av) {
+            session_id = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--roadmap-entries" && i + 1 < len(av) {
+            roadmap_csv = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--purpose" && i + 1 < len(av) {
+            purpose = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--cascade-parent" && i + 1 < len(av) {
+            cascade_parent = av[i + 1]; cascade_given = true; i = i + 2; continue
+        }
+        if a == "--out" && i + 1 < len(av) {
+            out_path = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--force"    { force = true; i = i + 1; continue }
+        if a == "--dry-run"  { dry_run = true; i = i + 1; continue }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/convergence_record_template.hexa \\")
+            println("  --session-id <id> --roadmap-entries <csv> --purpose <text>")
+            println("  [--cascade-parent <ref>] [--out <path>] [--force] [--dry-run] [--selftest]")
+            exit(0)
+        }
+        i = i + 1
+    }
+
+    if selftest { _run_selftest(); return }
+
+    if session_id == "" { _die("ABORT: --session-id required", 2) }
+    if roadmap_csv == "" { _die("ABORT: --roadmap-entries required", 2) }
+    if purpose == ""    { _die("ABORT: --purpose required", 2) }
+
+    if out_path == "" {
+        out_path = OUT_DIR + "/" + session_id + ".json"
+    }
+
+    let roadmap_json = _roadmap_csv_to_json(roadmap_csv)
+    let schema_tag = _derive_schema_tag(session_id)
+    let started_at = _utc_now()
+
+    let body = _build_record(
+        session_id,
+        schema_tag,
+        started_at,
+        roadmap_json,
+        cascade_parent,
+        cascade_given,
+        purpose
+    )
+
+    if dry_run {
+        // print with trailing newline already present
+        let trimmed = body
+        print(trimmed)
+        exit(0)
+    }
+
+    if _file_exists_sh(out_path) && !force {
+        _die("ABORT: " + out_path + " exists — use --force to overwrite or pick different --session-id", 2)
+    }
+
+    _atomic_write(out_path, body)
+    println("── convergence_record_template " + started_at + " ──")
+    println("session_id:  " + session_id)
+    println("schema_tag:  " + schema_tag)
+    println("out:         " + out_path)
+    println("roadmap:     " + roadmap_json)
+    if cascade_given { println("cascade:     " + cascade_parent) } else { println("cascade:     (null)") }
+    println("wrote " + out_path)
+    exit(0)
+}
+
+main()
