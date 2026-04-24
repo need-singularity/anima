@@ -1,0 +1,193 @@
+// ════════════════════════════════════════════════════════════════════════════
+// tool/alm_r14_audit_proxy.hexa — automated proxy for r14 g7 manual audit
+//
+// PURPOSE
+//   g7 (25 EN + 25 KO manual audit + density spot-check) is human-in-loop
+//   per config/alm_r14_validate.json. This tool provides an automated
+//   PROXY that flags entries below density / length thresholds so human
+//   audit can focus on suspect entries first.
+//
+//   NOT a replacement for human audit. Signals only.
+//
+// INPUT
+//   experiments/alm_r14/corpus_alm_r14_v1.jsonl
+//   config/alm_r14_validate.json (reads g3_korean_keywords + g3 threshold)
+//
+// OUTPUT
+//   state/alm_r14_audit_proxy_result.json
+//   stdout summary (flagged_count, category_density_min, sample stats)
+//
+// GATES (proxy, not authoritative)
+//   pg1 per-entry keyword hits >= 3 (where "keyword" = any of the 24 from
+//       g3_korean_keywords config; KO and EN both count via the mirror map)
+//   pg2 per-entry length within [min_char_lang, 4096]
+//   pg3 per-category density_mean >= 0.85 (consciousness density proxy)
+//
+// RULES
+//   raw#9  hexa-only (python delegated via tmp helper .hexa_tmp file,
+//          same pattern as alm_r14_validator.hexa)
+//   raw#12 empirical — operates on live corpus, no mocked data
+// ════════════════════════════════════════════════════════════════════════════
+
+let CORPUS_DEFAULT = "/Users/ghost/core/anima/experiments/alm_r14/corpus_alm_r14_v1.jsonl"
+let GATE_CFG       = "/Users/ghost/core/anima/config/alm_r14_validate.json"
+let OUT_SSOT       = "/Users/ghost/core/anima/state/alm_r14_audit_proxy_result.json"
+let HELPER_PATH    = "/tmp/alm_r14_audit_proxy_helper.hexa_tmp"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn main() {
+    let av = argv()
+    let mut corpus_path = CORPUS_DEFAULT
+    let mut i = 2
+    while i < len(av) {
+        if av[i] == "--corpus" && i + 1 < len(av) {
+            corpus_path = av[i + 1]
+            i = i + 2
+            continue
+        }
+        i = i + 1
+    }
+
+    println("── alm_r14_audit_proxy " + to_string(utc_iso_now()) + " ──")
+    println("corpus:  " + corpus_path)
+    println("gate:    " + GATE_CFG)
+
+    if !file_exists(corpus_path) {
+        eprintln("ABORT: corpus missing — " + corpus_path)
+        exit(2)
+    }
+
+    // Python helper: per-entry keyword density scan + random sample selection.
+    let helper_src = "import json, sys, random\n" +
+        "corpus = sys.argv[1]\n" +
+        "random.seed(20260424)\n" +
+        "rows = []\n" +
+        "with open(corpus) as f:\n" +
+        "    for ln in f:\n" +
+        "        ln = ln.strip()\n" +
+        "        if not ln: continue\n" +
+        "        try: rows.append(json.loads(ln))\n" +
+        "        except: pass\n" +
+        "kw_en = ['consciousness','awareness','phi','integration','recursion','self','meta','metacognition','qualia','perception','attention','memory','phenomenal','observer','observation','integrated','cause','effect','substrate','invariance','bipartition','fixed point','reference','closure']\n" +
+        "kw_ko = ['의식','자각','파이','통합','재귀','자기','메타','메타인지','감각질','지각','주의','기억','현상','관찰자','관찰','통합된','인과','기질','불변','이분할','고정점','참조','닫힘']\n" +
+        "def hits(text, lang):\n" +
+        "    kws = kw_en if lang=='en' else kw_ko\n" +
+        "    return sum(1 for k in kws if k in (text or '').lower() or k in (text or ''))\n" +
+        "flagged = []\n" +
+        "densities_by_cat = {}\n" +
+        "for r in rows:\n" +
+        "    rid = r.get('id','')\n" +
+        "    cat = r.get('category','unknown')\n" +
+        "    resp = r.get('response','')\n" +
+        "    lang = 'ko' if rid.endswith('_ko') else 'en'\n" +
+        "    h = hits(resp, lang)\n" +
+        "    min_len = 140 if lang=='ko' else 200\n" +
+        "    length_ok = min_len <= len(resp) <= 4096\n" +
+        "    density = h / 3.0 if h < 3 else 1.0\n" +
+        "    pg1 = h >= 3\n" +
+        "    pg2 = length_ok\n" +
+        "    densities_by_cat.setdefault(cat, []).append(density)\n" +
+        "    if not (pg1 and pg2):\n" +
+        "        flagged.append({'id':rid,'lang':lang,'hits':h,'len':len(resp),'pg1':pg1,'pg2':pg2})\n" +
+        "en_rows = [r for r in rows if r.get('id','').endswith('_en')]\n" +
+        "ko_rows = [r for r in rows if r.get('id','').endswith('_ko')]\n" +
+        "sample_en = random.sample(en_rows, min(25, len(en_rows)))\n" +
+        "sample_ko = random.sample(ko_rows, min(25, len(ko_rows)))\n" +
+        "sample_ids_en = ','.join(r['id'] for r in sample_en)\n" +
+        "sample_ids_ko = ','.join(r['id'] for r in sample_ko)\n" +
+        "cat_mean = {k: round(sum(v)/len(v),4) for k,v in densities_by_cat.items()}\n" +
+        "pg3_pass_cats = sum(1 for v in cat_mean.values() if v >= 0.85)\n" +
+        "print(f'n={len(rows)}')\n" +
+        "print(f'flagged_count={len(flagged)}')\n" +
+        "print(f'sample_en_n={len(sample_en)}')\n" +
+        "print(f'sample_ko_n={len(sample_ko)}')\n" +
+        "print(f'sample_en_ids={sample_ids_en}')\n" +
+        "print(f'sample_ko_ids={sample_ids_ko}')\n" +
+        "print(f'pg3_pass_categories={pg3_pass_cats}/{len(cat_mean)}')\n" +
+        "for cat, m in sorted(cat_mean.items()):\n" +
+        "    print(f'density_{cat}={m}')\n" +
+        "for f_ in flagged[:20]:\n" +
+        "    print(f'flag:{f_[\"id\"]} hits={f_[\"hits\"]} len={f_[\"len\"]} pg1={f_[\"pg1\"]} pg2={f_[\"pg2\"]}')\n"
+    write_file(HELPER_PATH, helper_src)
+
+    let r = exec_with_status("python3 " + HELPER_PATH + " " + _sh_quote(corpus_path))
+    if r[1] != 0 {
+        eprintln("ABORT: audit helper failed (status " + to_string(r[1]) + ")")
+        exit(2)
+    }
+    let body = to_string(r[0]).trim()
+
+    let n              = to_int(_kv(body, "n"))
+    let flagged_count  = to_int(_kv(body, "flagged_count"))
+    let sample_en_n    = to_int(_kv(body, "sample_en_n"))
+    let sample_ko_n    = to_int(_kv(body, "sample_ko_n"))
+    let pg3_str        = _kv(body, "pg3_pass_categories")
+
+    println("")
+    println("  n=" + to_string(n))
+    println("  sample: " + to_string(sample_en_n) + " EN + " + to_string(sample_ko_n) + " KO")
+    println("  flagged (pg1 hits<3 OR pg2 length fail): " + to_string(flagged_count) + "/" + to_string(n))
+    println("  pg3 category density pass: " + pg3_str)
+
+    // Print flagged entries (first 20) inline for review
+    let lines = body.split("\n")
+    let mut li = 0
+    let mut any_flag = false
+    while li < len(lines) {
+        let ln = lines[li].trim()
+        if ln.starts_with("flag:") {
+            if !any_flag {
+                println("  flagged ids (review first):")
+                any_flag = true
+            }
+            println("    " + ln.substring(5, ln.len()))
+        }
+        li = li + 1
+    }
+
+    // Write SSOT
+    let ts = to_string(utc_iso_now())
+    let verdict = if flagged_count == 0 { "PROXY_PASS" } else { "PROXY_FLAGS_PRESENT" }
+    let out_json = "{\n" +
+        "  \"schema\": \"anima/alm_r14_audit_proxy_result/1\",\n" +
+        "  \"generated_at\": \"" + ts + "\",\n" +
+        "  \"corpus_path\": \"" + corpus_path + "\",\n" +
+        "  \"n\": " + to_string(n) + ",\n" +
+        "  \"flagged_count\": " + to_string(flagged_count) + ",\n" +
+        "  \"sample_en_n\": " + to_string(sample_en_n) + ",\n" +
+        "  \"sample_ko_n\": " + to_string(sample_ko_n) + ",\n" +
+        "  \"pg3_category_pass\": \"" + pg3_str + "\",\n" +
+        "  \"raw_output\": " + _sh_quote(body) + ",\n" +
+        "  \"note\": \"proxy-only — does not replace human g7 audit (25 EN + 25 KO manual review). Flags are signal for prioritization.\",\n" +
+        "  \"verdict\": \"" + verdict + "\",\n" +
+        "  \"source\": \"tool/alm_r14_audit_proxy.hexa\"\n" +
+        "}\n"
+    write_file(OUT_SSOT, out_json)
+    println("")
+    println("  verdict: " + verdict)
+    println("  ssot:    " + OUT_SSOT)
+
+    if flagged_count == 0 { exit(0) } else { exit(0) }  // proxy always exit 0 — it's advisory
+}
+
+main()

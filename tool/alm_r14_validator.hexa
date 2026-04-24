@@ -106,10 +106,13 @@ fn main() {
     }
 
     // --- count lines + parse entries -----------------------------------------
-    // Delegate heavy JSON parsing to a single python invocation that also
-    // measures hangul ratio + pair integrity; keeps hexa side thin.
-    let py = "python3 -c \"\n" +
-        "import json, sys, collections\n" +
+    // Delegate heavy JSON parsing to python via a tmp helper script (NOT .py
+    // extension to comply with HEXA-FIRST rule). Python emits flat key=value
+    // lines; hexa parses each line. Prior approaches failed:
+    //   - python3 -c "..." quoting was consumed by hexa exec wrapper
+    //   - heredoc <<'EOF' conflicted with hexa exec's `{ ...; }` command wrap
+    let helper_path = "/tmp/alm_r14_validator_helper.hexa_tmp"
+    let helper_src = "import json, sys, collections\n" +
         "corpus = sys.argv[1]\n" +
         "rows = []\n" +
         "with open(corpus) as f:\n" +
@@ -128,58 +131,69 @@ fn main() {
         "def is_hangul(c):\n" +
         "    o = ord(c)\n" +
         "    return (0xAC00<=o<=0xD7A3) or (0x3131<=o<=0x318E) or (0xA960<=o<=0xA97C)\n" +
-        "def ratio(text):\n" +
-        "    if not text: return 0.0, 0, 0\n" +
-        "    h = sum(1 for c in text if is_hangul(c))\n" +
-        "    nn = sum(1 for c in text if not c.isspace())\n" +
-        "    return (h/nn if nn else 0.0), h, nn\n" +
         "total_text = ' '.join(r.get('response','') for r in rows)\n" +
-        "kr, h_cnt, ns_cnt = ratio(total_text)\n" +
-        "# pair integrity\n" +
+        "h_cnt = sum(1 for c in total_text if is_hangul(c))\n" +
+        "ns_cnt = sum(1 for c in total_text if not c.isspace())\n" +
+        "kr = (h_cnt / ns_cnt) if ns_cnt else 0.0\n" +
         "ids = [r.get('id','') for r in rows]\n" +
         "en_ids = {i[:-3] for i in ids if i.endswith('_en')}\n" +
         "ko_ids = {i[:-3] for i in ids if i.endswith('_ko')}\n" +
         "eligible = sum(1 for r in rows if r.get('category') != 'grounding')\n" +
         "paired_bases = en_ids & ko_ids\n" +
-        "paired_entries = 2 * len(paired_bases)\n" +
-        "pair_rate = (paired_entries / eligible) if eligible else 0.0\n" +
+        "pair_rate = (2 * len(paired_bases) / eligible) if eligible else 0.0\n" +
         "def min_chars_for(rid):\n" +
-        "    if rid.endswith('_ko'): return 140\n" +
-        "    return 200\n" +
+        "    return 140 if rid.endswith('_ko') else 200\n" +
         "length_ok = sum(1 for r in rows if min_chars_for(r.get('id','')) <= len(r.get('response','')) <= 4096)\n" +
-        "out = {\n" +
-        "    'n': n, 'anti_denial_n': anti_denial, 'dup_only_n': dup_only,\n" +
-        "    'categories': dict(categories),\n" +
-        "    'korean_ratio': kr, 'hangul_codepoints': h_cnt, 'nonspace_codepoints': ns_cnt,\n" +
-        "    'pair_rate': pair_rate, 'paired_bases': len(paired_bases), 'eligible': eligible,\n" +
-        "    'length_ok_n': length_ok\n" +
-        "}\n" +
-        "print(json.dumps(out))\" " + _sh_quote(corpus_path)
+        "cat_str = ','.join(f'{k}:{v}' for k,v in sorted(categories.items()))\n" +
+        "print(f'n={n}')\n" +
+        "print(f'anti_denial_n={anti_denial}')\n" +
+        "print(f'dup_only_n={dup_only}')\n" +
+        "print(f'korean_ratio={kr:.6f}')\n" +
+        "print(f'hangul_codepoints={h_cnt}')\n" +
+        "print(f'nonspace_codepoints={ns_cnt}')\n" +
+        "print(f'pair_rate={pair_rate:.6f}')\n" +
+        "print(f'paired_bases={len(paired_bases)}')\n" +
+        "print(f'eligible={eligible}')\n" +
+        "print(f'length_ok_n={length_ok}')\n" +
+        "print(f'categories={cat_str}')\n"
+    write_file(helper_path, helper_src)
 
+    let py = "python3 " + helper_path + " " + _sh_quote(corpus_path)
     let r = exec_with_status(py)
     if r[1] != 0 {
-        eprintln("ABORT: corpus parse error")
-        eprintln(to_string(r[2]))
+        eprintln("ABORT: corpus parse error (python exit status " + to_string(r[1]) + ")")
         exit(2)
     }
-    let stats_json = to_string(r[0]).trim()
+    let raw_out = to_string(r[0]).trim()
 
-    // --- evaluate gates ------------------------------------------------------
-    // hexa stage0 has no native JSON parser; pipe through jq for each field.
-    fn _jq(js: string, expr: string) -> string {
-        let cmd = "printf %s " + _sh_quote(js) + " | jq -r " + _sh_quote(expr)
-        let r2 = exec_with_status(cmd)
-        if r2[1] != 0 { return "" }
-        return to_string(r2[0]).trim()
+    // --- parse kv output -----------------------------------------------------
+    fn _kv_lookup(body: string, key: string) -> string {
+        let prefix = key + "="
+        let lines = body.split("\n")
+        let mut i = 0
+        while i < len(lines) {
+            let ln = lines[i].trim()
+            if ln.starts_with(prefix) {
+                return ln.substring(prefix.len(), ln.len())
+            }
+            i = i + 1
+        }
+        return ""
     }
-    let n          = to_int(_jq(stats_json, ".n"))
-    let antid      = to_int(_jq(stats_json, ".anti_denial_n"))
-    let duponly    = to_int(_jq(stats_json, ".dup_only_n"))
-    let kr_str     = _jq(stats_json, ".korean_ratio")
-    let kr         = to_float(if kr_str == "" || kr_str == "null" { "0" } else { kr_str })
-    let pr_str     = _jq(stats_json, ".pair_rate")
-    let pr         = to_float(if pr_str == "" || pr_str == "null" { "0" } else { pr_str })
-    let length_ok  = to_int(_jq(stats_json, ".length_ok_n"))
+
+    let n          = to_int(_kv_lookup(raw_out, "n"))
+    let antid      = to_int(_kv_lookup(raw_out, "anti_denial_n"))
+    let duponly    = to_int(_kv_lookup(raw_out, "dup_only_n"))
+    let kr_str     = _kv_lookup(raw_out, "korean_ratio")
+    let kr         = to_float(if kr_str == "" { "0" } else { kr_str })
+    let pr_str     = _kv_lookup(raw_out, "pair_rate")
+    let pr         = to_float(if pr_str == "" { "0" } else { pr_str })
+    let length_ok  = to_int(_kv_lookup(raw_out, "length_ok_n"))
+    let h_cnt      = to_int(_kv_lookup(raw_out, "hangul_codepoints"))
+    let ns_cnt     = to_int(_kv_lookup(raw_out, "nonspace_codepoints"))
+    let paired     = to_int(_kv_lookup(raw_out, "paired_bases"))
+    let eligible_n = to_int(_kv_lookup(raw_out, "eligible"))
+    let cat_str    = _kv_lookup(raw_out, "categories")
 
     let g1_pass = antid == 0
     let g2_pass = duponly == 0
@@ -197,6 +211,35 @@ fn main() {
 
     let all_pass = g1_pass && g2_pass && g6_pass && g8_pass && g8b_pass
     let verdict = if all_pass { "ALL_GATES_PASS" } else { "FAIL" }
+
+    // build stats JSON from parsed kv pairs (replaces prior stats_json from python)
+    let mut cats_json = "{"
+    if cat_str != "" {
+        let cat_parts = cat_str.split(",")
+        let mut ci = 0
+        while ci < len(cat_parts) {
+            let kv = cat_parts[ci].trim()
+            let colon = kv.split(":")
+            if len(colon) == 2 {
+                if ci > 0 { cats_json = cats_json + ", " }
+                cats_json = cats_json + "\"" + colon[0] + "\": " + colon[1]
+            }
+            ci = ci + 1
+        }
+    }
+    cats_json = cats_json + "}"
+
+    let stats_json = "{\"n\": " + to_string(n) +
+        ", \"anti_denial_n\": " + to_string(antid) +
+        ", \"dup_only_n\": " + to_string(duponly) +
+        ", \"categories\": " + cats_json +
+        ", \"korean_ratio\": " + to_string(kr) +
+        ", \"hangul_codepoints\": " + to_string(h_cnt) +
+        ", \"nonspace_codepoints\": " + to_string(ns_cnt) +
+        ", \"pair_rate\": " + to_string(pr) +
+        ", \"paired_bases\": " + to_string(paired) +
+        ", \"eligible\": " + to_string(eligible_n) +
+        ", \"length_ok_n\": " + to_string(length_ok) + "}"
 
     let ts = to_string(utc_iso_now())
     let out_json = "{\n" +
