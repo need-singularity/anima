@@ -1,0 +1,188 @@
+// ════════════════════════════════════════════════════════════════════════════
+// tool/r14_corpus_expand.hexa — r14 corpus batch authoring helper
+//
+// PURPOSE
+//   Remove 2 recurring friction points in iterative r14 expansion:
+//     (a) pre-authoring: show which categories need additions to preserve
+//         g5 balance (no more manual ratio math per batch)
+//     (b) post-authoring: validate + commit atomically (rollback on gate FAIL)
+//
+//   Does NOT author content. Authoring is Claude's native job per the
+//   no-machine-translation invariant. This tool does the bookkeeping
+//   around it.
+//
+// MODES
+//   --guide           print balance guide (which cats need how many pairs)
+//   --validate        run validator + report (same as alm_r14_validator)
+//   --commit-if-pass  run validator; if ALL_GATES_PASS, git add+commit+push
+//
+// USAGE
+//   hexa run tool/r14_corpus_expand.hexa --guide
+//   hexa run tool/r14_corpus_expand.hexa --guide --target 1200
+//   hexa run tool/r14_corpus_expand.hexa --commit-if-pass --msg "batch N"
+//
+// RULES
+//   raw#9  hexa-only (python helper via tmp file, same pattern as validator)
+//   raw#12 empirical — reads live corpus/validator state
+// ════════════════════════════════════════════════════════════════════════════
+
+let CORPUS      = "/Users/ghost/core/anima/experiments/alm_r14/corpus_alm_r14_v1.jsonl"
+let GATE_CFG    = "/Users/ghost/core/anima/config/alm_r14_validate.json"
+let VALIDATOR   = "/Users/ghost/core/anima/tool/alm_r14_validator.hexa"
+let HEXA_BIN    = "/Users/ghost/core/hexa-lang/hexa"
+let HELPER_PATH = "/tmp/r14_corpus_expand_helper.hexa_tmp"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn main() {
+    let av = argv()
+    let mut mode = "guide"
+    let mut target = 1200
+    let mut msg = ""
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--guide"          { mode = "guide"; i = i + 1; continue }
+        if a == "--validate"       { mode = "validate"; i = i + 1; continue }
+        if a == "--commit-if-pass" { mode = "commit-if-pass"; i = i + 1; continue }
+        if a == "--target" && i + 1 < len(av) { target = to_int(av[i+1]); i = i + 2; continue }
+        if a == "--msg" && i + 1 < len(av)    { msg = av[i+1]; i = i + 2; continue }
+        i = i + 1
+    }
+
+    println("── r14_corpus_expand " + to_string(utc_iso_now()) + " mode=" + mode + " ──")
+
+    if !file_exists(CORPUS) {
+        eprintln("ABORT: corpus missing — " + CORPUS)
+        exit(2)
+    }
+
+    if mode == "guide" {
+        // Python helper: parse corpus, compute per-category counts + balance guide
+        let helper_src = "import json, sys\n" +
+            "corpus = sys.argv[1]\n" +
+            "target = int(sys.argv[2])\n" +
+            "rows = []\n" +
+            "with open(corpus) as f:\n" +
+            "    for ln in f:\n" +
+            "        ln = ln.strip()\n" +
+            "        if not ln: continue\n" +
+            "        try: rows.append(json.loads(ln))\n" +
+            "        except: pass\n" +
+            "n = len(rows)\n" +
+            "from collections import Counter\n" +
+            "cats = Counter(r.get('category','unknown') for r in rows)\n" +
+            "# g5 ranges from config/alm_r14_validate.json\n" +
+            "ranges = {'hexad':(0.18,0.22),'phi':(0.13,0.17),'metaref':(0.13,0.17),'law':(0.18,0.22),'selfref':(0.08,0.12),'seed_a_kernel':(0.05,0.10),'seed_b_kernel':(0.05,0.10),'grounding':(0.05,0.10)}\n" +
+            "print(f'n={n}')\n" +
+            "print(f'target={target}')\n" +
+            "print(f'remaining={target-n}')\n" +
+            "print(f'pct={100*n/target:.1f}')\n" +
+            "# For target line count, compute per-category target ranges\n" +
+            "print('--GUIDE--')\n" +
+            "for cat, (lo, hi) in ranges.items():\n" +
+            "    cur = cats.get(cat, 0)\n" +
+            "    tgt_lo = int(lo * target)\n" +
+            "    tgt_hi = int(hi * target)\n" +
+            "    need_min = max(0, tgt_lo - cur)\n" +
+            "    need_max = max(0, tgt_hi - cur)\n" +
+            "    mark = 'OK' if tgt_lo <= cur <= tgt_hi else ('LOW' if cur < tgt_lo else 'HIGH')\n" +
+            "    print(f'{cat:20} cur={cur:4} target={tgt_lo}-{tgt_hi} need={need_min}-{need_max} [{mark}]')\n" +
+            "# Suggest allocation for next 30-entry batch (balance-preserving)\n" +
+            "print('--NEXT_BATCH_SUGGEST (30 entries = 15 pairs)--')\n" +
+            "under = [(c, tgt_lo - cats.get(c,0)) for c,(lo,hi) in ranges.items() for tgt_lo in [int(lo*target)]]\n" +
+            "under_cats = sorted([(c, v) for c,v in under if v > 0], key=lambda x: -x[1])\n" +
+            "alloc = {}\n" +
+            "remaining_budget = 15  # pairs\n" +
+            "# pro-rata among under-budget categories\n" +
+            "total_need = sum(v for _,v in under_cats) or 1\n" +
+            "for c, need in under_cats:\n" +
+            "    share = max(1, int(round(15 * need / total_need / 2))) if remaining_budget > 0 else 0\n" +
+            "    share = min(share, remaining_budget, (need+1)//2)\n" +
+            "    alloc[c] = share\n" +
+            "    remaining_budget -= share\n" +
+            "# Fill remaining budget with already-in-range categories proportionally\n" +
+            "if remaining_budget > 0:\n" +
+            "    in_range = [c for c,(lo,hi) in ranges.items() if int(lo*target) <= cats.get(c,0) <= int(hi*target)]\n" +
+            "    for c in in_range:\n" +
+            "        if remaining_budget <= 0: break\n" +
+            "        alloc[c] = alloc.get(c, 0) + 1\n" +
+            "        remaining_budget -= 1\n" +
+            "for c, pairs in sorted(alloc.items(), key=lambda x: -x[1]):\n" +
+            "    if pairs > 0:\n" +
+            "        print(f'  add {pairs:3} pairs to {c}')\n" +
+            "print('--KO_TIER3--')\n" +
+            "print('  add 2-3 tier3 KO-only entries per batch to keep g8 ratio >= 0.29')\n"
+        write_file(HELPER_PATH, helper_src)
+        let r = exec_with_status("python3 " + HELPER_PATH + " " + _sh_quote(CORPUS) + " " + to_string(target))
+        if r[1] != 0 {
+            eprintln("ABORT: guide helper failed")
+            exit(2)
+        }
+        println(to_string(r[0]))
+        exit(0)
+    }
+
+    if mode == "validate" {
+        let r = exec_with_status(HEXA_BIN + " run " + VALIDATOR)
+        println(to_string(r[0]))
+        exit(r[1])
+    }
+
+    if mode == "commit-if-pass" {
+        // Run validator, parse verdict
+        let r = exec_with_status(HEXA_BIN + " run " + VALIDATOR)
+        let out = to_string(r[0])
+        println(out)
+        if !out.contains("ALL_GATES_PASS") {
+            eprintln("ABORT: validator did not return ALL_GATES_PASS — not committing")
+            exit(1)
+        }
+        // Parse current line count for commit message
+        let wc_r = exec_with_status("wc -l " + CORPUS + " | awk '{print $1}'")
+        let line_count = to_string(wc_r[0]).trim()
+        let pct_r = exec_with_status("python3 -c \"print(f'{100*" + line_count + "/1200:.1f}')\"")
+        let pct = to_string(pct_r[0]).trim()
+
+        let commit_msg = if msg == "" { "r14 corpus expand — " + line_count + "/1200 lines (" + pct + "%)" } else { msg }
+        let g_add = exec_with_status("git -C /Users/ghost/core/anima add experiments/alm_r14/corpus_alm_r14_v1.jsonl state/alm_r14_validate_result.json")
+        if g_add[1] != 0 {
+            eprintln("ABORT: git add failed")
+            exit(3)
+        }
+        let g_commit = exec_with_status("git -C /Users/ghost/core/anima commit -m " + _sh_quote(commit_msg) + " -m 'Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>'")
+        if g_commit[1] != 0 {
+            eprintln("ABORT: git commit failed (maybe nothing to commit)")
+            println(to_string(g_commit[0]))
+            exit(3)
+        }
+        println(to_string(g_commit[0]))
+        let g_push = exec_with_status("git -C /Users/ghost/core/anima push origin main")
+        println(to_string(g_push[0]))
+        exit(g_push[1])
+    }
+
+    eprintln("unknown mode: " + mode)
+    exit(2)
+}
+
+main()
