@@ -140,8 +140,26 @@ log "  SSH OK all pods"
 
 # --- step 2: bootstrap (parallel) --------------------------------------------
 log "step 2/4: bootstrap (apt+hexa+git clone) on all 4 pods (parallel)"
-BOOTSTRAP_URL=$(bash "${ANIMA_ROOT}/tool/fetch_hexa_binary_url.bash" --export 2>&1 | grep HEXA_URL | sed 's/.*=//')
-BOOTSTRAP_SHA=$(bash "${ANIMA_ROOT}/tool/fetch_hexa_binary_url.bash" --export 2>&1 | grep HEXA_SHA256 | sed 's/.*=//')
+# 2026-04-24 fix (2-stage):
+# (1) sed 's/.*=//' was greedy — signed R2 URLs contain multiple '=' (X-Amz-*
+#     params) so greedy match returned the signature hex only. curl treated
+#     the 64-char hex as a hostname → rc=99 ABORT. Fix: strip only through
+#     the FIRST '=' via sed 's/^[^=]*=//'.
+# (2) fetch_hexa_binary_url.bash emits `export HEXA_URL=https://...\?…\&…`
+#     (backslash-escaped for shell `eval`/`source` consumers). Verbatim sed
+#     extraction keeps the literal '\' characters, so curl sends a malformed
+#     URL and the R2 endpoint returns HTTP 400. Fix: strip backslashes with
+#     `tr -d '\\'` (URLs never contain literal '\'; percent-encoding is used).
+# Combined: parse correctly AND unescape, with explicit sanity check.
+_FETCH_HEXA_OUT=$(bash "${ANIMA_ROOT}/tool/fetch_hexa_binary_url.bash" --export 2>&1)
+BOOTSTRAP_URL=$(echo "${_FETCH_HEXA_OUT}" | grep '^export HEXA_URL=' | sed 's/^[^=]*=//' | tr -d '\\')
+BOOTSTRAP_SHA=$(echo "${_FETCH_HEXA_OUT}" | grep '^export HEXA_SHA256=' | sed 's/^[^=]*=//' | tr -d '\\')
+if [[ "${BOOTSTRAP_URL}" != https://* || ${#BOOTSTRAP_SHA} -ne 64 ]]; then
+  log "ABORT: bootstrap url/sha parse failed"
+  log "  url='${BOOTSTRAP_URL:0:60}…' sha='${BOOTSTRAP_SHA}'"
+  _cleanup_abort_pods
+  exit 3
+fi
 # Build inline bootstrap — matches docs/pod_bootstrap_checklist_20260423.md §I7-I9
 BOOTSTRAP_INLINE='
 set -e
@@ -162,7 +180,8 @@ ln -sfn /root/core/hexa-lang /workspace/hexa-lang
 BOOTSTRAP_FAILED=()
 BOOTSTRAP_LOGS=/tmp/bootstrap_${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
 mkdir -p "${BOOTSTRAP_LOGS}"
-declare -A PID_WAIT=()
+# bash 3.2 compat (macOS default): use indexed array of pids instead of declare -A.
+BOOTSTRAP_PIDS=()
 for row in $(echo "${PODS_JSON}" | python3 -c "
 import json, sys
 for r in json.load(sys.stdin):
@@ -176,10 +195,10 @@ for r in json.load(sys.stdin):
   ( ssh -o StrictHostKeyChecking=no -p "$port" "root@${host}" "${BOOTSTRAP_INLINE}" \
       > "${BOOTSTRAP_LOGS}/${pid}.stdout" 2> "${BOOTSTRAP_LOGS}/${pid}.stderr"; \
     echo $? > "${BOOTSTRAP_LOGS}/${pid}.exit" ) &
-  PID_WAIT[$pid]=$!
+  BOOTSTRAP_PIDS+=("${pid}")
 done
 wait
-for pid in "${!PID_WAIT[@]}"; do
+for pid in "${BOOTSTRAP_PIDS[@]}"; do
   rc=$(cat "${BOOTSTRAP_LOGS}/${pid}.exit" 2>/dev/null || echo 99)
   if [[ "$rc" != "0" ]]; then
     BOOTSTRAP_FAILED+=("${pid}")
@@ -241,14 +260,39 @@ trainer=Trainer(model=model, args=args, train_dataset=ds, data_collator=DataColl
 trainer.train()
 trainer.save_model(str(OUT_DIR/'final'))
 EVAL=['The substrate of consciousness is','Integrated information theory says','Global workspace broadcast implies','Attention schema models claim','Higher-order thought requires','Recurrent processing means','의식의 기질은','통합정보이론에 따르면','전역작업공간의 방송은','재귀처리는','주의 스키마 모델은','상위차원 사고는','phi_6 defines','hexad closure is','meta-loop observation is','Law 60 phase transition describes']
+# 2026-04-25 r6-α Axis 1 fix: byte-weighted h_last pool replaces last-token pool.
+# Rationale: r5 Φ 4-path FAIL — vocab_ratio ρ=+0.83 ↔ L2. Variant B (H × bpt) PARTIAL
+# CONFIRMED on p3_p4 (0.175→0.073) and p2_p4 (0.223→0.139). Post-hoc Procrustes
+# REJECTED (Gram-invariant under Φ L2 scorer). Training-time per-prompt byte-weighted
+# pool is the minimum intervention that replicates Variant B's diagonal reweighting.
+# For each prompt: bpt_i = len(utf8_bytes(surface(token_i))) / Σ_k len(utf8_bytes(surface(token_k)))
+# h_last = Σ_i bpt_i · h_token_i  (byte-weighted mean over last hidden layer).
+# Schema bumped /1 → /2; reduction field added so downstream Φ scorer can dispatch.
 model.eval(); h_last=[]
+def _byte_weights(ids_1d, tokenizer):
+    # Surface-form UTF-8 byte counts per token; strips BPE/SPM prefix markers.
+    weights=[]
+    for tid in ids_1d.tolist():
+        s=tokenizer.decode([tid], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        # Normalize common prefix markers so leading-space BPE ('Ġ') and SPM ('▁') tokens
+        # contribute their real surface bytes (space + glyph). decode() already returns
+        # the surface form for most HF fast tokenizers; no extra stripping needed.
+        b=len(s.encode('utf-8')) if s else 1
+        weights.append(b)
+    total=sum(weights) or 1
+    return [w/total for w in weights]
 with torch.no_grad():
     for i,p in enumerate(EVAL):
         ids=tok(p, return_tensors='pt').to(model.device)
         out=model(**ids, output_hidden_states=True)
-        last=out.hidden_states[-1][0,-1,:].float().cpu().numpy()
-        h_last.append({'idx':i,'prompt':p,'h':[float(x) for x in last[:256]]})
-Path(OUT_DIR/'h_last_raw.json').write_text(json.dumps({'schema':'anima/h_last_raw/1','path_id':PHI_PATH_ID,'base_model':BASE_MODEL,'lora_rank':LORA_RANK,'steps':MAX_STEPS,'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'hidden_dim_truncated':256,'entries':h_last}, indent=2))
+        # hidden_states[-1]: (1, T, d_model).
+        H=out.hidden_states[-1][0].float().cpu()  # (T, d_model)
+        bpt=_byte_weights(ids['input_ids'][0].cpu(), tok)
+        import torch as _t
+        w=_t.tensor(bpt, dtype=H.dtype).unsqueeze(-1)  # (T,1)
+        pooled=(H*w).sum(dim=0).numpy()  # (d_model,)
+        h_last.append({'idx':i,'prompt':p,'h':[float(x) for x in pooled[:256]],'n_tokens':int(H.shape[0]),'bpt_sum':float(sum(bpt))})
+Path(OUT_DIR/'h_last_raw.json').write_text(json.dumps({'schema':'anima/h_last_raw/2','reduction':'byte_weighted_mean','path_id':PHI_PATH_ID,'base_model':BASE_MODEL,'lora_rank':LORA_RANK,'steps':MAX_STEPS,'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'hidden_dim_truncated':256,'entries':h_last}, indent=2))
 print(f'[{time.strftime("%H:%M:%S")}] DONE path={PHI_PATH_ID}', flush=True)
 PYDRIVER
 )
