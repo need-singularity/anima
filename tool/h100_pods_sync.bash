@@ -58,20 +58,38 @@ readonly TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 ids=$(runpodctl pod list 2>/dev/null | jq -r '.[].id // empty')
 
 pods_json='[]'
+# 2026-04-24: RACE FIX — wait up to RUNTIME_WAIT_SEC per pod for runtime.ports to
+# populate. Prior behavior captured empty ssh_host/port when runtime wasn't ready,
+# breaking downstream SSH chain with no way to recover (2 failed launches burning
+# ~$16 of H100 time, feedback_h100_ssh_timeout.md). Env override:
+# ANIMA_PODS_SYNC_RUNTIME_WAIT_SEC (default 180s per pod).
+readonly RUNTIME_WAIT_SEC="${ANIMA_PODS_SYNC_RUNTIME_WAIT_SEC:-180}"
 if [[ -n "$ids" ]]; then
   rows=()
   while IFS= read -r pid; do
     [[ -z "$pid" ]] && continue
-    # Query runtime for public TCP port + ip
-    payload=$(curl -s -X POST "https://api.runpod.io/graphql" \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $API_KEY" \
-      -d "{\"query\":\"query { pod(input:{podId:\\\"$pid\\\"}){ id name runtime { ports { ip isIpPublic privatePort publicPort type } } } }\"}")
-    # Pick first public tcp port mapped to private 22
-    host=$(echo "$payload" | jq -r '.data.pod.runtime.ports[]? | select(.type=="tcp" and .isIpPublic==true and .privatePort==22) | .ip' | head -1)
-    port=$(echo "$payload" | jq -r '.data.pod.runtime.ports[]? | select(.type=="tcp" and .isIpPublic==true and .privatePort==22) | .publicPort' | head -1)
+    # Query runtime for public TCP port + ip; retry until populated or timeout.
+    host=""
+    port=""
+    elapsed=0
+    while [[ $elapsed -lt $RUNTIME_WAIT_SEC ]]; do
+      payload=$(curl -s -X POST "https://api.runpod.io/graphql" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $API_KEY" \
+        -d "{\"query\":\"query { pod(input:{podId:\\\"$pid\\\"}){ id name runtime { ports { ip isIpPublic privatePort publicPort type } } } }\"}")
+      host=$(echo "$payload" | jq -r '.data.pod.runtime.ports[]? | select(.type=="tcp" and .isIpPublic==true and .privatePort==22) | .ip' | head -1)
+      port=$(echo "$payload" | jq -r '.data.pod.runtime.ports[]? | select(.type=="tcp" and .isIpPublic==true and .privatePort==22) | .publicPort' | head -1)
+      if [[ -n "$host" && -n "$port" ]]; then
+        break
+      fi
+      sleep 5
+      elapsed=$((elapsed + 5))
+    done
     [[ -z "$host" ]] && host=""
     [[ -z "$port" ]] && port=22
+    if [[ "$host" == "" ]]; then
+      echo "  [WARN] $pid: runtime ports not populated within ${RUNTIME_WAIT_SEC}s — writing empty host" >&2
+    fi
     rows+=("$(jq -n --arg id "$pid" --arg host "$host" --argjson port "$port" --arg ts "$TS" '{
       pod_id: $id, provider: "runpod", ssh_host: $host, ssh_port: $port,
       ssh_user: "root", last_activity_source: "nvidia_smi",
