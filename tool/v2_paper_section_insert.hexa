@@ -1,0 +1,697 @@
+// ════════════════════════════════════════════════════════════════════════════
+// tool/v2_paper_section_insert.hexa
+// Scripted §10.N append/update for v2 paper
+//   docs/papers/phi_paradigm_paper_v1_preliminary.md
+//
+// PURPOSE
+//   Every r-round / chorus-extension update to the v2 paper has been a
+//   hand-edit taking ~30 min: compose prose, find the closing `---` + `*v1.x*`
+//   footer, splice new §heading + body before the footer, bump the version
+//   stamp. This tool does that mechanically so round updates (r5+) become
+//   minutes, not half-hours.
+//
+// MODES
+//   A. prose generation from verdict artifact
+//        --verdict-source state/phi_4path_cross_result_v3_TRAINED_<tag>.json
+//      Composes a draft section body (summary + Δ-table + falsifiable
+//      prediction check + artifact anchors). If any required field is
+//      missing from the artifact, emits "TODO(operator): ..." markers
+//      instead of inventing content.
+//
+//   B. pre-written body insert
+//        --body-file <path>
+//      Inserts that markdown verbatim under the new §heading.
+//
+//   Both modes:
+//     - Detect insertion point: the last `---` + `*v<ver> ...*` footer pair
+//     - Append `### <section> <title>` + body + trailing `---` before footer
+//     - Bump the last version stamp (v1.7 → v1.8, etc.)
+//     - Preserve every other section untouched
+//
+// OTHER MODES
+//   --list      enumerate existing §10.N sections (for inspection)
+//   --selftest  dry-run against r4 artifact with §10.99; verify diff non-empty
+//               and the paper file is NOT modified; verify --list output
+//               enumerates §10.1..§10.10
+//
+// SAFETY
+//   - --dry-run (default) prints unified diff, no write
+//   - --apply --yes required for actual write
+//   - Backup paper → paper.bak before write
+//   - Refuse insertion if --section already exists, unless --force
+//
+// USAGE
+//   hexa run tool/v2_paper_section_insert.hexa \
+//     --section 10.11 --title "..." \
+//     --verdict-source state/phi_4path_cross_result_v3_TRAINED_r5.json \
+//     --round r5 --dry-run
+//
+//   hexa run tool/v2_paper_section_insert.hexa \
+//     --section 10.11 --title "..." --body-file /tmp/body.md --apply --yes
+//
+//   hexa run tool/v2_paper_section_insert.hexa --list
+//   hexa run tool/v2_paper_section_insert.hexa --selftest
+//
+// IMPLEMENTATION
+//   Python tmp-file helper (avoids hexa exec_with_status quoting friction);
+//   helper written to /tmp/v2_paper_section_insert_helper.hexa_tmp each run.
+//
+// RULES
+//   raw#9  hexa-only (python helper via tmp file, no .py in repo)
+//   raw#12 empirical — reads live paper file + verdict JSON
+// ════════════════════════════════════════════════════════════════════════════
+
+let REPO_ROOT   = "/Users/ghost/core/anima"
+let PAPER_PATH  = REPO_ROOT + "/docs/papers/phi_paradigm_paper_v1_preliminary.md"
+let HELPER_PATH = "/tmp/v2_paper_section_insert_helper.hexa_tmp"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _file_exists_sh(p: string) -> bool {
+    let r = exec_with_status("test -f " + _sh_quote(p) + " && echo 1 || echo 0")
+    return to_string(r[0]).trim() == "1"
+}
+
+fn _utc_now() -> string {
+    let r = exec_with_status("date -u +%FT%TZ")
+    return to_string(r[0]).trim()
+}
+
+fn _die(msg: string, code: int) {
+    eprintln(msg)
+    exit(code)
+}
+
+// The single python helper. Shared across all modes; dispatch via first arg.
+//
+// Subcommands (argv[1]):
+//   list       <paper>
+//   preview    <paper> <section> <title> <body_file> <footer_bump_hint>
+//   apply      <paper> <section> <title> <body_file> <footer_bump_hint> <backup_path>
+//   compose    <verdict_json> <round> <section> <prev_section> <compare_prior>
+//              <prev_verdict_json_or_empty> → writes composed body to stdout
+//
+// All errors -> stderr + exit != 0. Stdout = structured payload.
+fn _write_helper() {
+    let src =
+        "import json, os, re, sys, difflib, shutil\n" +
+        "\n" +
+        "PAPER_FOOTER_RE = re.compile(r'^\\*v([0-9]+)\\.([0-9]+)\\b', re.M)\n" +
+        "SECTION_RE      = re.compile(r'^### (10\\.[0-9]+)\\s+(.*)$', re.M)\n" +
+        "\n" +
+        "def read_paper(path):\n" +
+        "    with open(path, 'r', encoding='utf-8') as f:\n" +
+        "        return f.read()\n" +
+        "\n" +
+        "def list_sections(text):\n" +
+        "    return [(m.group(1), m.group(2).strip(), m.start()) for m in SECTION_RE.finditer(text)]\n" +
+        "\n" +
+        "def find_last_footer(text):\n" +
+        "    \"\"\"Return (start, end_line_end, major, minor, full_footer_text) for last version footer.\n" +
+        "    Footer pattern: `*v<major>.<minor> ... *` possibly spanning multiple lines until next blank/EOF.\n" +
+        "    We match the `---` delimiter immediately above it too.\n" +
+        "    Returns (dash_start, footer_text_end, major, minor, footer_text) or None.\n" +
+        "    \"\"\"\n" +
+        "    matches = list(PAPER_FOOTER_RE.finditer(text))\n" +
+        "    if not matches:\n" +
+        "        return None\n" +
+        "    m = matches[-1]\n" +
+        "    # footer starts at m.start(); find its enclosing block end = end of its paragraph\n" +
+        "    # heuristic: footer block ends at next blank line OR EOF\n" +
+        "    foot_start = m.start()\n" +
+        "    # find preceding --- on its own line (immediately before footer, possibly after blank)\n" +
+        "    pre = text[:foot_start]\n" +
+        "    dash_match = None\n" +
+        "    for dm in re.finditer(r'(?m)^---\\s*$', pre):\n" +
+        "        dash_match = dm\n" +
+        "    if dash_match is None:\n" +
+        "        return None\n" +
+        "    dash_start = dash_match.start()\n" +
+        "    # find end of footer text: next blank line or EOF\n" +
+        "    tail = text[foot_start:]\n" +
+        "    end_rel = len(tail)\n" +
+        "    bm = re.search(r'\\n\\s*\\n', tail)\n" +
+        "    if bm:\n" +
+        "        end_rel = bm.start()\n" +
+        "    foot_end = foot_start + end_rel\n" +
+        "    footer_text = text[foot_start:foot_end]\n" +
+        "    return (dash_start, foot_end, int(m.group(1)), int(m.group(2)), footer_text)\n" +
+        "\n" +
+        "def bump_footer(footer_text, new_section, title, round_tag):\n" +
+        "    \"\"\"Bump *v1.X to *v1.(X+1) and replace the §-added line wording.\n" +
+        "    Preserve existing 'Supersedes' / 'Superseded by' tail if present.\n" +
+        "    \"\"\"\n" +
+        "    m = PAPER_FOOTER_RE.search(footer_text)\n" +
+        "    if not m:\n" +
+        "        return footer_text  # caller's problem\n" +
+        "    major, minor = int(m.group(1)), int(m.group(2))\n" +
+        "    new_stamp = f'*v{major}.{minor+1}'\n" +
+        "    today = os.environ.get('V2_TODAY') or ''\n" +
+        "    summary = f'§{new_section} added'\n" +
+        "    if today:\n" +
+        "        summary += f' {today}'\n" +
+        "    if round_tag:\n" +
+        "        summary += f' ({round_tag})'\n" +
+        "    summary += '.'\n" +
+        "    # Keep the Supersedes/Superseded-by tail from the previous footer verbatim.\n" +
+        "    tail = ''\n" +
+        "    sm = re.search(r'Supersedes.*', footer_text, re.S)\n" +
+        "    if sm:\n" +
+        "        tail = sm.group(0)\n" +
+        "        # Ensure tail ends with the closing '*' — strip any, then re-add.\n" +
+        "        tail = tail.rstrip()\n" +
+        "        if tail.endswith('*'):\n" +
+        "            tail = tail[:-1].rstrip()\n" +
+        "    new_footer = f'{new_stamp} — {summary}\\n'\n" +
+        "    if tail:\n" +
+        "        new_footer += tail + '*'\n" +
+        "    else:\n" +
+        "        new_footer = new_footer.rstrip() + '*'\n" +
+        "    return new_footer\n" +
+        "\n" +
+        "def insert_section(text, section, title, body, round_tag):\n" +
+        "    existing = {s for s, _, _ in list_sections(text)}\n" +
+        "    if section in existing:\n" +
+        "        raise SystemExit(f'ERR_SECTION_EXISTS: {section}')\n" +
+        "    foot = find_last_footer(text)\n" +
+        "    if foot is None:\n" +
+        "        raise SystemExit('ERR_NO_FOOTER: cannot locate trailing *vX.Y footer')\n" +
+        "    dash_start, foot_end, major, minor, footer_text = foot\n" +
+        "    # splice:\n" +
+        "    #   text[:dash_start] = everything before closing ---\n" +
+        "    #   then NEW: '### <section> <title>\\n\\n<body>\\n\\n---\\n\\n'\n" +
+        "    #   then text[dash_start:foot_end] but with bumped footer\n" +
+        "    new_heading = f'### {section} {title}\\n\\n'\n" +
+        "    # body: strip trailing whitespace, ensure single trailing newline\n" +
+        "    body_clean = body.rstrip() + '\\n'\n" +
+        "    # Note: we do NOT add a trailing `---` here; the preserved `lead` below\n" +
+        "    # (the existing closing-divider) serves as the separator between this\n" +
+        "    # new section and the bumped footer.\n" +
+        "    new_block = new_heading + body_clean + '\\n'\n" +
+        "    # keep the existing --- line, but replace footer_text with bumped version\n" +
+        "    original_between = text[dash_start:foot_end]\n" +
+        "    # original_between looks like: '---\\n\\n*v1.7 ... *'\n" +
+        "    # we want to keep the leading --- + blank, then replace the footer.\n" +
+        "    lead_m = re.match(r'(---\\s*\\n\\s*\\n)', original_between)\n" +
+        "    if lead_m:\n" +
+        "        lead = lead_m.group(1)\n" +
+        "        old_foot = original_between[lead_m.end():]\n" +
+        "    else:\n" +
+        "        lead = '---\\n\\n'\n" +
+        "        old_foot = footer_text\n" +
+        "    bumped = bump_footer(old_foot, section, title, round_tag)\n" +
+        "    new_between = lead + bumped\n" +
+        "    # remaining text after old footer\n" +
+        "    tail_text = text[foot_end:]\n" +
+        "    return text[:dash_start] + new_block + new_between + tail_text\n" +
+        "\n" +
+        "def compose_body(verdict_path, round_tag, section, prev_section, prev_verdict_path):\n" +
+        "    \"\"\"Assemble a draft section body from verdict artifact. Emit TODO markers\n" +
+        "    where source JSON is missing expected fields.\n" +
+        "    \"\"\"\n" +
+        "    try:\n" +
+        "        with open(verdict_path, 'r', encoding='utf-8') as f:\n" +
+        "            d = json.load(f)\n" +
+        "    except Exception as e:\n" +
+        "        raise SystemExit(f'ERR_VERDICT_LOAD: {e}')\n" +
+        "\n" +
+        "    gates = d.get('gates', {}) or {}\n" +
+        "    L2c = gates.get('L2_pass_count')\n" +
+        "    KLc = gates.get('KL_pass_count')\n" +
+        "    PRmm = gates.get('PR_max_over_min')\n" +
+        "    verdict = d.get('verdict', 'TODO(operator): verdict field missing')\n" +
+        "    real_L2 = d.get('real_L2', {}) or {}\n" +
+        "    real_KL = d.get('real_KL', {}) or {}\n" +
+        "    nb = d.get('null_bootstrap', {}) or {}\n" +
+        "    L2_p95 = nb.get('L2_p95')\n" +
+        "    KL_p95 = nb.get('KL_p95')\n" +
+        "    L2pass = d.get('L2_pass', {}) or {}\n" +
+        "    KLpass = d.get('KL_pass', {}) or {}\n" +
+        "    corpus = d.get('corpus', 'TODO(operator): corpus field missing')\n" +
+        "    method = d.get('method', 'TODO(operator): method field missing')\n" +
+        "    cmp_tbl = d.get('comparison_same_method', {}) or {}\n" +
+        "\n" +
+        "    def fmt_or_todo(v, fmt='{:.4f}'):\n" +
+        "        if v is None: return 'TODO'\n" +
+        "        try: return fmt.format(v)\n" +
+        "        except: return str(v)\n" +
+        "\n" +
+        "    p3p4L2 = real_L2.get('p3_p4')\n" +
+        "    p3p4KL = real_KL.get('p3_p4')\n" +
+        "\n" +
+        "    lines = []\n" +
+        "    lines.append(f'**Status**: TODO(operator): fill hypothesis status + prior prediction verdict (refs §{prev_section}).')\n" +
+        "    lines.append('')\n" +
+        "    lines.append('**Setup**')\n" +
+        "    lines.append(f'- Corpus: {corpus}')\n" +
+        "    lines.append(f'- Null method: {method}')\n" +
+        "    lines.append(f'- SSOT artifact: `{verdict_path}`')\n" +
+        "    lines.append(f'- Round tag: {round_tag or \"TODO(operator)\"}')\n" +
+        "    lines.append('')\n" +
+        "    lines.append('**Pair-wise gate result**')\n" +
+        "    lines.append('')\n" +
+        "    lines.append('| pair | L2 real | L2 p95 | L2 pass | KL real | KL p95 | KL pass |')\n" +
+        "    lines.append('|---|---|---|---|---|---|---|')\n" +
+        "    pairs = ['p1_p2','p1_p3','p1_p4','p2_p3','p2_p4','p3_p4']\n" +
+        "    for p in pairs:\n" +
+        "        l2r = real_L2.get(p); klr = real_KL.get(p)\n" +
+        "        lp = L2pass.get(p); kp = KLpass.get(p)\n" +
+        "        lmark = 'TODO' if lp is None else ('\\u2713' if lp else '\\u2717')\n" +
+        "        kmark = 'TODO' if kp is None else ('\\u2713' if kp else '\\u2717')\n" +
+        "        bolded = (p == 'p3_p4' and (lp is False))\n" +
+        "        pair_cell = f'**{p}**' if bolded else p\n" +
+        "        l2r_cell  = f'**{fmt_or_todo(l2r)}**' if bolded else fmt_or_todo(l2r)\n" +
+        "        l2p_cell  = f'**{fmt_or_todo(L2_p95)}**' if bolded else fmt_or_todo(L2_p95)\n" +
+        "        lmark_cell= f'**{lmark}**' if bolded else lmark\n" +
+        "        lines.append(f'| {pair_cell} | {l2r_cell} | {l2p_cell} | {lmark_cell} | {fmt_or_todo(klr)} | {fmt_or_todo(KL_p95)} | {kmark} |')\n" +
+        "    lines.append('')\n" +
+        "    lines.append(f'- L2 pass: **{L2c if L2c is not None else \"TODO\"}/6**')\n" +
+        "    lines.append(f'- KL pass: **{KLc if KLc is not None else \"TODO\"}/6**')\n" +
+        "    lines.append(f'- Participation ratio max/min: **{fmt_or_todo(PRmm, \"{:.3f}\")}**')\n" +
+        "    lines.append(f'- Verdict: **{verdict}**')\n" +
+        "    lines.append('')\n" +
+        "    # delta table\n" +
+        "    if cmp_tbl:\n" +
+        "        lines.append('**\\u0394 vs prior rounds (same method, same pipeline)**')\n" +
+        "        lines.append('')\n" +
+        "        keys = sorted(cmp_tbl.keys())\n" +
+        "        header = '| metric |' + ''.join(f' {k} |' for k in keys)\n" +
+        "        sep    = '|---|' + '|'.join(['---'] * len(keys)) + '|'\n" +
+        "        lines.append(header)\n" +
+        "        lines.append(sep)\n" +
+        "        row_specs = [\n" +
+        "            ('L2 pass', 'L2_pass', '{}/6'),\n" +
+        "            ('KL pass', 'KL_pass', '{}/6'),\n" +
+        "            ('p3_p4 L2', 'p3_p4_L2', '{:.4f}'),\n" +
+        "            ('PR max/min', 'PR_mm', '{:.3f}'),\n" +
+        "        ]\n" +
+        "        for label, key, fmt in row_specs:\n" +
+        "            row = f'| {label} |'\n" +
+        "            for k in keys:\n" +
+        "                v = (cmp_tbl.get(k) or {}).get(key)\n" +
+        "                row += f' {fmt_or_todo(v, fmt)} |'\n" +
+        "            lines.append(row)\n" +
+        "        lines.append('')\n" +
+        "    else:\n" +
+        "        lines.append('TODO(operator): no `comparison_same_method` block in verdict artifact — add \\u0394-vs-prior table manually.')\n" +
+        "        lines.append('')\n" +
+        "    # Falsifiable prediction check\n" +
+        "    lines.append(f'**Falsifiable prediction check (vs §{prev_section})**')\n" +
+        "    lines.append('')\n" +
+        "    lines.append(f'TODO(operator): reconcile §{prev_section}-N predictions against this round.')\n" +
+        "    lines.append('- Prior prediction: TODO')\n" +
+        "    lines.append('- This round observation: TODO (use table values above)')\n" +
+        "    lines.append('- Verdict: TODO (PASS / partial PASS / FAIL)')\n" +
+        "    lines.append('')\n" +
+        "    # Artifact anchors\n" +
+        "    lines.append(f'*§{section} anchors:*')\n" +
+        "    srcs = d.get('source_files', []) or []\n" +
+        "    for s in srcs:\n" +
+        "        lines.append(f'- `{s}`')\n" +
+        "    lines.append(f'- `{verdict_path}` — verdict artifact (schema {d.get(\"schema\", \"TODO\")})')\n" +
+        "    lines.append('- TODO(operator): add any round-specific convergence / corpus / adapter paths')\n" +
+        "    return '\\n'.join(lines) + '\\n'\n" +
+        "\n" +
+        "def main():\n" +
+        "    sub = sys.argv[1] if len(sys.argv) > 1 else ''\n" +
+        "    if sub == 'list':\n" +
+        "        paper = sys.argv[2]\n" +
+        "        text = read_paper(paper)\n" +
+        "        for sec, title, _off in list_sections(text):\n" +
+        "            print(f'{sec}\\t{title}')\n" +
+        "        return\n" +
+        "    if sub == 'preview':\n" +
+        "        paper, section, title, body_file, round_tag = sys.argv[2:7]\n" +
+        "        with open(body_file, 'r', encoding='utf-8') as f:\n" +
+        "            body = f.read()\n" +
+        "        text = read_paper(paper)\n" +
+        "        new_text = insert_section(text, section, title, body, round_tag)\n" +
+        "        diff = difflib.unified_diff(\n" +
+        "            text.splitlines(keepends=True),\n" +
+        "            new_text.splitlines(keepends=True),\n" +
+        "            fromfile=paper, tofile=paper + ' (after insert)',\n" +
+        "            n=3,\n" +
+        "        )\n" +
+        "        sys.stdout.write(''.join(diff))\n" +
+        "        return\n" +
+        "    if sub == 'apply':\n" +
+        "        paper, section, title, body_file, round_tag, backup = sys.argv[2:8]\n" +
+        "        with open(body_file, 'r', encoding='utf-8') as f:\n" +
+        "            body = f.read()\n" +
+        "        text = read_paper(paper)\n" +
+        "        new_text = insert_section(text, section, title, body, round_tag)\n" +
+        "        shutil.copy2(paper, backup)\n" +
+        "        with open(paper, 'w', encoding='utf-8') as f:\n" +
+        "            f.write(new_text)\n" +
+        "        print(f'WROTE {paper}')\n" +
+        "        print(f'BACKUP {backup}')\n" +
+        "        return\n" +
+        "    if sub == 'compose':\n" +
+        "        verdict_path, round_tag, section, prev_section, _compare_prior, prev_verdict = sys.argv[2:8]\n" +
+        "        body = compose_body(verdict_path, round_tag, section, prev_section, prev_verdict or None)\n" +
+        "        sys.stdout.write(body)\n" +
+        "        return\n" +
+        "    raise SystemExit(f'ERR_UNKNOWN_SUB: {sub}')\n" +
+        "\n" +
+        "main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+// Return the section number of the highest §10.N currently in the paper,
+// used as the default prev_section when user doesn't override.
+fn _highest_existing_section() -> string {
+    let r = exec_with_status("python3 " + HELPER_PATH + " list " + _sh_quote(PAPER_PATH))
+    if r[1] != 0 { return "10.1" }
+    let out = to_string(r[0]).trim()
+    if out == "" { return "10.1" }
+    let lines = out.split("\n")
+    // last non-empty first column
+    let mut last = "10.1"
+    let mut i = 0
+    while i < len(lines) {
+        let parts = lines[i].split("\t")
+        if len(parts) >= 1 && parts[0].trim() != "" { last = parts[0].trim() }
+        i = i + 1
+    }
+    return last
+}
+
+fn _auto_detect_prior_tag(verdict_source: string) -> string {
+    // Expect pattern .../phi_4path_cross_result_v3_TRAINED_rN.json
+    // Return r(N-1) if detectable, else empty.
+    let fname = verdict_source
+    let parts = fname.split("TRAINED_")
+    if len(parts) < 2 { return "" }
+    let tail = parts[1]  // e.g. r4.json
+    let stub = tail.replace(".json", "")
+    if stub.len() < 2 || stub.substring(0, 1) != "r" { return "" }
+    let num_s = stub.substring(1, stub.len())
+    let mut is_num = num_s.len() > 0
+    let mut ci = 0
+    while ci < num_s.len() && is_num {
+        let c = num_s.substring(ci, ci + 1)
+        if c < "0" || c > "9" { is_num = false }
+        ci = ci + 1
+    }
+    if !is_num { return "" }
+    let n = to_int(num_s)
+    if n <= 1 { return "" }
+    return "r" + to_string(n - 1)
+}
+
+fn _prior_verdict_path(verdict_source: string, prior_tag: string) -> string {
+    if prior_tag == "" { return "" }
+    let parts = verdict_source.split("TRAINED_")
+    if len(parts) < 2 { return "" }
+    let head = parts[0] + "TRAINED_"
+    let guess = head + prior_tag + ".json"
+    if _file_exists_sh(guess) { return guess }
+    return ""
+}
+
+// ─── modes ──────────────────────────────────────────────────────────────────
+
+fn _mode_list() {
+    _write_helper()
+    let r = exec_with_status("python3 " + HELPER_PATH + " list " + _sh_quote(PAPER_PATH))
+    if r[1] != 0 {
+        eprintln(to_string(r[0]))
+        _die("ABORT: list failed", 2)
+    }
+    let out = to_string(r[0])
+    let lines = out.split("\n")
+    println("── v2_paper_section_insert --list ──")
+    println("paper: " + PAPER_PATH)
+    println("")
+    println("section\ttitle")
+    let mut i = 0
+    let mut n = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln != "" {
+            println(ln)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    println("")
+    println("total: " + to_string(n) + " section(s)")
+    exit(0)
+}
+
+fn _mode_selftest() {
+    _write_helper()
+    println("── v2_paper_section_insert --selftest ──")
+
+    // Capture paper mtime BEFORE
+    let before_cmd = "stat -f %m " + _sh_quote(PAPER_PATH) + " 2>/dev/null || stat -c %Y " + _sh_quote(PAPER_PATH)
+    let mtime_before_r = exec_with_status(before_cmd)
+    let mtime_before = to_string(mtime_before_r[0]).trim()
+
+    // 1) --list must include 10.1 through 10.10
+    let lr = exec_with_status("python3 " + HELPER_PATH + " list " + _sh_quote(PAPER_PATH))
+    if lr[1] != 0 { _die("SELFTEST FAIL: list helper errored", 3) }
+    let list_out = to_string(lr[0])
+    let mut k = 1
+    while k <= 10 {
+        let needle = "10." + to_string(k) + "\t"
+        if !list_out.contains(needle) {
+            _die("SELFTEST FAIL: --list missing §10." + to_string(k), 3)
+        }
+        k = k + 1
+    }
+    println("  [PASS] --list enumerates §10.1..§10.10")
+
+    // 2) compose body for r4 verdict
+    let verdict = REPO_ROOT + "/state/phi_4path_cross_result_v3_TRAINED_r4.json"
+    if !_file_exists_sh(verdict) { _die("SELFTEST FAIL: missing r4 verdict artifact", 3) }
+    let body_path = "/tmp/v2_paper_section_insert_selftest_body.md"
+    let prev_sec = _highest_existing_section()
+    let compose_cmd = "python3 " + HELPER_PATH + " compose " +
+        _sh_quote(verdict) + " " + _sh_quote("r4") + " " + _sh_quote("10.99") +
+        " " + _sh_quote(prev_sec) + " " + _sh_quote("auto") + " " + _sh_quote("")
+    let cr = exec_with_status(compose_cmd + " > " + _sh_quote(body_path))
+    if cr[1] != 0 {
+        eprintln(to_string(cr[0]))
+        _die("SELFTEST FAIL: compose failed", 3)
+    }
+    if !_file_exists_sh(body_path) { _die("SELFTEST FAIL: composed body missing", 3) }
+    println("  [PASS] compose produced body file")
+
+    // 3) preview (dry-run) unified diff, non-empty
+    let pv = exec_with_status(
+        "python3 " + HELPER_PATH + " preview " +
+        _sh_quote(PAPER_PATH) + " " + _sh_quote("10.99") + " " +
+        _sh_quote("selftest section (DO NOT MERGE)") + " " +
+        _sh_quote(body_path) + " " + _sh_quote("r4")
+    )
+    if pv[1] != 0 {
+        eprintln(to_string(pv[0]))
+        _die("SELFTEST FAIL: preview failed", 3)
+    }
+    let diff_out = to_string(pv[0])
+    if diff_out.len() < 100 { _die("SELFTEST FAIL: diff too small (" + to_string(diff_out.len()) + " bytes)", 3) }
+    if !diff_out.contains("### 10.99") {
+        _die("SELFTEST FAIL: diff does not contain §10.99 heading", 3)
+    }
+    println("  [PASS] dry-run diff non-empty (" + to_string(diff_out.len()) + " bytes, contains §10.99)")
+
+    // 4) paper mtime must be unchanged
+    let mtime_after_r = exec_with_status(before_cmd)
+    let mtime_after = to_string(mtime_after_r[0]).trim()
+    if mtime_before != mtime_after {
+        _die("SELFTEST FAIL: paper mtime changed (" + mtime_before + " → " + mtime_after + ") — selftest must be read-only!", 3)
+    }
+    println("  [PASS] paper file unmodified (mtime stable)")
+
+    // cleanup
+    exec_with_status("rm -f " + _sh_quote(body_path))
+    println("selftest: OK")
+    exit(0)
+}
+
+fn _mode_insert(
+    section: string,
+    title: string,
+    body_file: string,
+    verdict_source: string,
+    round_tag: string,
+    compare_prior: string,
+    apply: bool,
+    yes: bool,
+    force: bool
+) {
+    _write_helper()
+
+    if section == "" { _die("ABORT: --section required (e.g. 10.11)", 2) }
+    if title == ""   { _die("ABORT: --title required", 2) }
+
+    // Validate section format
+    if !section.starts_with("10.") { _die("ABORT: --section must start with '10.' (got '" + section + "')", 2) }
+
+    // Force-check: does section already exist?
+    let lr = exec_with_status("python3 " + HELPER_PATH + " list " + _sh_quote(PAPER_PATH))
+    if lr[1] != 0 { _die("ABORT: list helper errored — " + to_string(lr[0]), 2) }
+    let list_out = to_string(lr[0])
+    if list_out.contains(section + "\t") && !force {
+        _die("ABORT: §" + section + " already exists — use --force to re-insert", 2)
+    }
+
+    // Resolve body
+    let mut effective_body_file = body_file
+    let mut composed_tmp = ""
+
+    if body_file == "" {
+        // Mode A: compose from verdict-source
+        if verdict_source == "" {
+            _die("ABORT: either --body-file or --verdict-source required", 2)
+        }
+        if !_file_exists_sh(verdict_source) {
+            _die("ABORT: --verdict-source not found: " + verdict_source, 2)
+        }
+        // auto-detect prior tag & prior verdict path if compare_prior=='auto' or unset
+        let mut prior_tag = ""
+        if compare_prior == "" || compare_prior == "auto" {
+            prior_tag = _auto_detect_prior_tag(verdict_source)
+        } else {
+            prior_tag = compare_prior
+        }
+        let prev_verdict = _prior_verdict_path(verdict_source, prior_tag)
+        let prev_sec = _highest_existing_section()
+
+        composed_tmp = "/tmp/v2_paper_section_insert_compose_" + _utc_now().replace(":","").replace("-","") + ".md"
+        let cmd = "python3 " + HELPER_PATH + " compose " +
+            _sh_quote(verdict_source) + " " + _sh_quote(round_tag) + " " +
+            _sh_quote(section) + " " + _sh_quote(prev_sec) + " " +
+            _sh_quote(compare_prior) + " " + _sh_quote(prev_verdict) +
+            " > " + _sh_quote(composed_tmp)
+        let cr = exec_with_status(cmd)
+        if cr[1] != 0 {
+            eprintln(to_string(cr[0]))
+            _die("ABORT: compose failed", 2)
+        }
+        effective_body_file = composed_tmp
+        println("── compose summary ──")
+        println("  verdict_source: " + verdict_source)
+        println("  round_tag:      " + round_tag)
+        println("  prev_section:   " + prev_sec)
+        println("  prior_tag:      " + (if prior_tag == "" { "(none detected)" } else { prior_tag }))
+        println("  prior_verdict:  " + (if prev_verdict == "" { "(none)" } else { prev_verdict }))
+        println("  composed_body:  " + composed_tmp)
+        println("")
+    } else {
+        if !_file_exists_sh(body_file) { _die("ABORT: --body-file not found: " + body_file, 2) }
+    }
+
+    // Preview (always — it's our validation that the splice works)
+    let pv = exec_with_status(
+        "python3 " + HELPER_PATH + " preview " +
+        _sh_quote(PAPER_PATH) + " " + _sh_quote(section) + " " +
+        _sh_quote(title) + " " + _sh_quote(effective_body_file) + " " +
+        _sh_quote(round_tag)
+    )
+    if pv[1] != 0 {
+        eprintln(to_string(pv[0]))
+        _die("ABORT: preview (splice) failed", 2)
+    }
+    let diff_out = to_string(pv[0])
+
+    if !apply {
+        println("── unified diff (dry-run) ──")
+        print(diff_out)
+        println("── end diff ──")
+        println("")
+        println("[dry-run] no write. Pass --apply --yes to commit the change.")
+        if composed_tmp != "" {
+            println("[dry-run] composed body retained at: " + composed_tmp)
+        }
+        exit(0)
+    }
+
+    // --apply path
+    if !yes {
+        _die("ABORT: --apply requires --yes for confirmation (safety gate)", 2)
+    }
+
+    let backup = PAPER_PATH + ".bak"
+    let ar = exec_with_status(
+        "python3 " + HELPER_PATH + " apply " +
+        _sh_quote(PAPER_PATH) + " " + _sh_quote(section) + " " +
+        _sh_quote(title) + " " + _sh_quote(effective_body_file) + " " +
+        _sh_quote(round_tag) + " " + _sh_quote(backup)
+    )
+    if ar[1] != 0 {
+        eprintln(to_string(ar[0]))
+        _die("ABORT: apply failed", 2)
+    }
+    println(to_string(ar[0]))
+    println("── applied ──")
+    println("  paper:  " + PAPER_PATH)
+    println("  backup: " + backup)
+    println("  section: §" + section + " — " + title)
+    exit(0)
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut section = ""
+    let mut title = ""
+    let mut body_file = ""
+    let mut verdict_source = ""
+    let mut round_tag = ""
+    let mut compare_prior = "auto"
+    let mut dry_run_flag = false
+    let mut apply = false
+    let mut yes = false
+    let mut force = false
+    let mut do_list = false
+    let mut do_selftest = false
+
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--section"        && i + 1 < len(av) { section = av[i+1];        i = i + 2; continue }
+        if a == "--title"          && i + 1 < len(av) { title = av[i+1];          i = i + 2; continue }
+        if a == "--body-file"      && i + 1 < len(av) { body_file = av[i+1];      i = i + 2; continue }
+        if a == "--verdict-source" && i + 1 < len(av) { verdict_source = av[i+1]; i = i + 2; continue }
+        if a == "--round"          && i + 1 < len(av) { round_tag = av[i+1];      i = i + 2; continue }
+        if a == "--compare-prior"  && i + 1 < len(av) { compare_prior = av[i+1];  i = i + 2; continue }
+        if a == "--dry-run"  { dry_run_flag = true; i = i + 1; continue }
+        if a == "--apply"    { apply = true; i = i + 1; continue }
+        if a == "--yes"      { yes = true; i = i + 1; continue }
+        if a == "--force"    { force = true; i = i + 1; continue }
+        if a == "--list"     { do_list = true; i = i + 1; continue }
+        if a == "--selftest" { do_selftest = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/v2_paper_section_insert.hexa [flags]")
+            println("  --list                         enumerate existing §10.N sections")
+            println("  --selftest                     read-only self-verification")
+            println("  --section 10.N --title \"...\"")
+            println("    + either --verdict-source <json> [--round r5] [--compare-prior r4|auto]")
+            println("    +     or --body-file <md>")
+            println("  --dry-run (default)            print unified diff, no write")
+            println("  --apply --yes                  actually splice + bump footer (backup → .bak)")
+            println("  --force                        allow re-insert of existing section")
+            exit(0)
+        }
+        i = i + 1
+    }
+
+    if do_list && do_selftest { _die("ABORT: --list and --selftest are mutually exclusive", 2) }
+    if do_list { _mode_list(); return }
+    if do_selftest { _mode_selftest(); return }
+
+    // default is dry-run if neither --apply nor --dry-run provided
+    if !apply && !dry_run_flag { dry_run_flag = true }
+
+    _mode_insert(section, title, body_file, verdict_source, round_tag, compare_prior, apply, yes, force)
+}
+
+main()
