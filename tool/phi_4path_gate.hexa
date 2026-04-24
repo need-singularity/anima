@@ -1,0 +1,522 @@
+// tool/phi_4path_gate.hexa — parameterized Φ 4-path cross-substrate gate (r5+)
+//
+// PURPOSE
+//   Reusable hexa-wrapped tool for the cross-substrate spectrum alignment
+//   gate that was implemented ad-hoc via inline Python heredocs in r2/r3/r4.
+//   Method parity with prior rounds is MANDATORY:
+//     • Gram top-16 eigvalsh spectra
+//     • col-perm null bootstrap, n=10000
+//     • pair L2 / KL gated against p95 of the null
+//     • PR max/min reported, no new gates beyond L2 + KL + PR
+//
+// USAGE
+//   hexa run tool/phi_4path_gate.hexa --tag r5
+//   hexa run tool/phi_4path_gate.hexa --tag r4 --compare r3,r2
+//   hexa run tool/phi_4path_gate.hexa --selftest
+//
+// INPUTS  (--tag <T>)
+//   state/h_last_raw_p{1,2,3,4}_TRAINED_<T>.json
+//     except T=="r2" (the original) which uses state/h_last_raw_p{1..4}_TRAINED.json
+//   Each file: {entries:[{idx, prompt, h:[...n_feat]}, ...n_prompts]}.
+//
+// OUTPUTS
+//   state/phi_4path_cross_result_v3_TRAINED_<T>.json   (T=="r2" → …_TRAINED.json)
+//   state/phi_4path_gate_last_verdict.json
+//
+// METHOD (must match r2/r3/r4 exactly)
+//   per path p:
+//     H = stack(entries[].h)          # n_prompts × n_feat
+//     G = H @ H.T                      # n_prompts × n_prompts
+//     eig = eigvalsh(G), top n_prompts, desc, normalize sum=1 → spectrum
+//     PR  = 1 / sum(spectrum^2)
+//   per pair (6):
+//     L2  = ||spec_i - spec_j||_2
+//     KL  = sum(p * log(p / q))        # eps=1e-12 clip
+//   null (n=10000, col-perm):
+//     for each iter, for each path, for each column k of H, permute rows
+//     independently. Recompute spectra + pair L2/KL. p95 over all iters.
+//   pass(pair) := (L2 < L2_p95) && (KL < KL_p95)
+//
+// IMPLEMENTATION NOTE
+//   Uses the tmp-file python helper pattern (tool/alm_r14_validator.hexa
+//   ~L114). Inline `python3 -c "..."` heredocs collide with hexa's
+//   exec_with_status quoting wrapper, so all heavy work is delegated to
+//   /tmp/phi_4path_gate_helper.hexa_tmp.
+
+let STATE_DIR       = "/Users/ghost/core/anima/state"
+let HELPER_PATH     = "/tmp/phi_4path_gate_helper.hexa_tmp"
+let VERDICT_OUT     = "/Users/ghost/core/anima/state/phi_4path_gate_last_verdict.json"
+let SCHEMA          = "anima/phi_4path_cross_result/3"
+let REVISION_DATE   = "2026-04-24"
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _input_path(tag: string, p: string) -> string {
+    // r2 (original round) used no tag suffix.
+    if tag == "r2" {
+        return STATE_DIR + "/h_last_raw_" + p + "_TRAINED.json"
+    }
+    return STATE_DIR + "/h_last_raw_" + p + "_TRAINED_" + tag + ".json"
+}
+
+fn _result_path(tag: string) -> string {
+    if tag == "r2" {
+        return STATE_DIR + "/phi_4path_cross_result_v3_TRAINED.json"
+    }
+    return STATE_DIR + "/phi_4path_cross_result_v3_TRAINED_" + tag + ".json"
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, math\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "# phi_4path_gate_helper — invoked by tool/phi_4path_gate.hexa.\n" +
+        "# Dispatch modes:\n" +
+        "#   run   <tag> <result_path> <schema> <rev_date>  -> compute + write\n" +
+        "#   stats <result_path>                            -> kv summary\n" +
+        "#   selftest                                       -> synthetic fixture\n" +
+        "\n" +
+        "EPS = 1e-12\n" +
+        "PAIRS = [('p1','p2'),('p1','p3'),('p1','p4'),\n" +
+        "         ('p2','p3'),('p2','p4'),('p3','p4')]\n" +
+        "\n" +
+        "MODELS = {\n" +
+        "    'p1': {'model': 'Qwen/Qwen3-8B',                   'lora_rank': 64,  'steps': 300},\n" +
+        "    'p2': {'model': 'unsloth/Meta-Llama-3.1-8B',        'lora_rank': 64,  'steps': 300},\n" +
+        "    'p3': {'model': 'mistralai/Mistral-Nemo-Base-2407', 'lora_rank': 96,  'steps': 300},\n" +
+        "    'p4': {'model': 'google/gemma-3-12b-pt',            'lora_rank': 128, 'steps': 300},\n" +
+        "}\n" +
+        "\n" +
+        "def spectrum_of(H):\n" +
+        "    # H: n_prompts x n_feat → gram n_prompts x n_prompts → top-n_prompts eigvalsh desc, sum=1\n" +
+        "    G = H @ H.T\n" +
+        "    w = np.linalg.eigvalsh(G)            # ascending\n" +
+        "    w = np.sort(w)[::-1]                  # descending\n" +
+        "    s = w.sum()\n" +
+        "    if s <= 0:\n" +
+        "        return np.ones_like(w) / len(w)\n" +
+        "    return w / s\n" +
+        "\n" +
+        "def pr_of(spec):\n" +
+        "    return float(1.0 / float((spec * spec).sum()))\n" +
+        "\n" +
+        "def pair_l2(a, b):\n" +
+        "    return float(np.linalg.norm(a - b))\n" +
+        "\n" +
+        "def pair_kl(a, b):\n" +
+        "    p = np.clip(a, EPS, None)\n" +
+        "    q = np.clip(b, EPS, None)\n" +
+        "    return float((p * np.log(p / q)).sum())\n" +
+        "\n" +
+        "def load_H(path):\n" +
+        "    with open(path) as f:\n" +
+        "        d = json.load(f)\n" +
+        "    rows = [e['h'] for e in d['entries']]\n" +
+        "    H = np.asarray(rows, dtype=np.float64)\n" +
+        "    meta = {k: d.get(k) for k in ('path_id','base_model','lora_rank','steps','hidden_dim_truncated')}\n" +
+        "    return H, meta\n" +
+        "\n" +
+        "def compute(Hs, n_null=10000, seed=42):\n" +
+        "    # real spectra\n" +
+        "    specs = {p: spectrum_of(Hs[p]) for p in ('p1','p2','p3','p4')}\n" +
+        "    prs   = {p: pr_of(specs[p])   for p in ('p1','p2','p3','p4')}\n" +
+        "    real_L2 = {}\n" +
+        "    real_KL = {}\n" +
+        "    for (i,j) in PAIRS:\n" +
+        "        real_L2[f'{i}_{j}'] = pair_l2(specs[i], specs[j])\n" +
+        "        real_KL[f'{i}_{j}'] = pair_kl(specs[i], specs[j])\n" +
+        "\n" +
+        "    # col-perm null, n_null iters. Per iter: for each path, permute each column\n" +
+        "    # of H independently (different permutation per column). Recompute specs,\n" +
+        "    # then 6 pair L2/KL feed one flat pool → p95 is cross-pair.\n" +
+        "    rng = np.random.default_rng(seed)\n" +
+        "    null_L2 = []\n" +
+        "    null_KL = []\n" +
+        "    n_prompts = next(iter(Hs.values())).shape[0]\n" +
+        "    for it in range(n_null):\n" +
+        "        perm_specs = {}\n" +
+        "        for p, H in Hs.items():\n" +
+        "            n_feat = H.shape[1]\n" +
+        "            Hp = np.empty_like(H)\n" +
+        "            for k in range(n_feat):\n" +
+        "                idx = rng.permutation(n_prompts)\n" +
+        "                Hp[:, k] = H[idx, k]\n" +
+        "            perm_specs[p] = spectrum_of(Hp)\n" +
+        "        for (i,j) in PAIRS:\n" +
+        "            null_L2.append(pair_l2(perm_specs[i], perm_specs[j]))\n" +
+        "            null_KL.append(pair_kl(perm_specs[i], perm_specs[j]))\n" +
+        "    L2_p95 = float(np.percentile(null_L2, 95))\n" +
+        "    KL_p95 = float(np.percentile(null_KL, 95))\n" +
+        "\n" +
+        "    L2_pass = {k: (v < L2_p95) for k,v in real_L2.items()}\n" +
+        "    KL_pass = {k: (v < KL_p95) for k,v in real_KL.items()}\n" +
+        "    L2_n = sum(1 for v in L2_pass.values() if v)\n" +
+        "    KL_n = sum(1 for v in KL_pass.values() if v)\n" +
+        "    pr_vals = list(prs.values())\n" +
+        "    pr_mm   = max(pr_vals) / min(pr_vals) if min(pr_vals) > 0 else float('inf')\n" +
+        "    verdict = 'PASS' if (L2_n == 6 and KL_n == 6) else f'FAIL ({L2_n}/6 L2, {KL_n}/6 KL)'\n" +
+        "    return {\n" +
+        "        'specs': {p: specs[p].tolist() for p in specs},\n" +
+        "        'prs': prs,\n" +
+        "        'real_L2': real_L2, 'real_KL': real_KL,\n" +
+        "        'L2_pass': L2_pass, 'KL_pass': KL_pass,\n" +
+        "        'L2_p95': L2_p95, 'KL_p95': KL_p95,\n" +
+        "        'L2_n': L2_n, 'KL_n': KL_n,\n" +
+        "        'pr_mm': pr_mm, 'verdict': verdict,\n" +
+        "    }\n" +
+        "\n" +
+        "def cmd_run(tag, result_path, schema, rev_date):\n" +
+        "    state_dir = os.path.dirname(result_path) or '.'\n" +
+        "    repo_root = os.path.dirname(state_dir) or '.'\n" +
+        "    def input_path(p):\n" +
+        "        if tag == 'r2':\n" +
+        "            return os.path.join(state_dir, f'h_last_raw_{p}_TRAINED.json')\n" +
+        "        return os.path.join(state_dir, f'h_last_raw_{p}_TRAINED_{tag}.json')\n" +
+        "    paths = {p: input_path(p) for p in ('p1','p2','p3','p4')}\n" +
+        "    for p, pth in paths.items():\n" +
+        "        if not os.path.exists(pth):\n" +
+        "            print(f'ERR: missing input {pth}', file=sys.stderr)\n" +
+        "            sys.exit(2)\n" +
+        "    Hs = {}\n" +
+        "    metas = {}\n" +
+        "    for p, pth in paths.items():\n" +
+        "        H, m = load_H(pth)\n" +
+        "        Hs[p] = H\n" +
+        "        metas[p] = m\n" +
+        "    R = compute(Hs)\n" +
+        "\n" +
+        "    import datetime as _dt\n" +
+        "    ts = _dt.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    short_src = [os.path.relpath(paths[p], repo_root) for p in ('p1','p2','p3','p4')]\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'variant': f'TRAINED_WEIGHT_{tag}',\n" +
+        "        'revision': f'v3.3 ({rev_date}) — {tag} gate via tool/phi_4path_gate.hexa, col-perm null n=10000',\n" +
+        "        'generated_at': ts,\n" +
+        "        'method': 'Gram top-16 eigvalsh + col-perm null (n=10000)',\n" +
+        "        'source_files': short_src,\n" +
+        "        'models': MODELS,\n" +
+        "        'spectra': R['specs'],\n" +
+        "        'participation_ratio': R['prs'],\n" +
+        "        'null_bootstrap': {\n" +
+        "            'n': 10000, 'method': 'col-perm',\n" +
+        "            'L2_p95': R['L2_p95'], 'KL_p95': R['KL_p95'],\n" +
+        "        },\n" +
+        "        'real_L2': R['real_L2'],\n" +
+        "        'real_KL': R['real_KL'],\n" +
+        "        'L2_pass': R['L2_pass'],\n" +
+        "        'KL_pass': R['KL_pass'],\n" +
+        "        'gates': {\n" +
+        "            'L2_pass_count': R['L2_n'],\n" +
+        "            'KL_pass_count': R['KL_n'],\n" +
+        "            'L2_pass_all': R['L2_n'] == 6,\n" +
+        "            'KL_pass_all': R['KL_n'] == 6,\n" +
+        "            'PR_max_over_min': R['pr_mm'],\n" +
+        "        },\n" +
+        "        'verdict': R['verdict'],\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f:\n" +
+        "        json.dump(out, f, indent=2)\n" +
+        "\n" +
+        "    # KV summary for hexa parent.\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'L2_p95={R[\"L2_p95\"]:.10f}')\n" +
+        "    print(f'KL_p95={R[\"KL_p95\"]:.10f}')\n" +
+        "    for k,v in R['real_L2'].items(): print(f'L2_{k}={v:.10f}')\n" +
+        "    for k,v in R['real_KL'].items(): print(f'KL_{k}={v:.10f}')\n" +
+        "    for k,v in R['L2_pass'].items(): print(f'L2pass_{k}={int(v)}')\n" +
+        "    for k,v in R['KL_pass'].items(): print(f'KLpass_{k}={int(v)}')\n" +
+        "    print(f'L2_n={R[\"L2_n\"]}')\n" +
+        "    print(f'KL_n={R[\"KL_n\"]}')\n" +
+        "    print(f'pr_mm={R[\"pr_mm\"]:.10f}')\n" +
+        "    print(f'verdict={R[\"verdict\"]}')\n" +
+        "    print(f'generated_at={ts}')\n" +
+        "\n" +
+        "def cmd_stats(result_path):\n" +
+        "    # Read an existing result JSON and emit kv summary.\n" +
+        "    if not os.path.exists(result_path):\n" +
+        "        print(f'missing={result_path}')\n" +
+        "        return\n" +
+        "    with open(result_path) as f:\n" +
+        "        d = json.load(f)\n" +
+        "    g = d.get('gates', {})\n" +
+        "    nb = d.get('null_bootstrap', {})\n" +
+        "    rl = d.get('real_L2', {})\n" +
+        "    print(f'exists=1')\n" +
+        "    print(f'verdict={d.get(\"verdict\",\"?\")}')\n" +
+        "    print(f'L2_n={g.get(\"L2_pass_count\",-1)}')\n" +
+        "    print(f'KL_n={g.get(\"KL_pass_count\",-1)}')\n" +
+        "    print(f'L2_p95={nb.get(\"L2_p95\",0.0):.10f}')\n" +
+        "    print(f'KL_p95={nb.get(\"KL_p95\",0.0):.10f}')\n" +
+        "    print(f'pr_mm={g.get(\"PR_max_over_min\",0.0):.10f}')\n" +
+        "    print(f'p3_p4_L2={rl.get(\"p3_p4\",0.0):.10f}')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    # Tiny synthetic fixture: 4 paths × 4 prompts × 8 feat, fixed seed.\n" +
+        "    # Does NOT touch state/. Only asserts the computation runs end-to-end.\n" +
+        "    rng = np.random.default_rng(1337)\n" +
+        "    Hs = {}\n" +
+        "    for i, p in enumerate(('p1','p2','p3','p4')):\n" +
+        "        Hs[p] = rng.standard_normal((4, 8)) + 0.05 * i\n" +
+        "    R = compute(Hs, n_null=200, seed=1337)\n" +
+        "    assert all(len(s) == 4 for s in R['specs'].values()), 'spectrum length mismatch'\n" +
+        "    assert R['L2_p95'] > 0 and R['KL_p95'] > 0, 'null p95 non-positive'\n" +
+        "    assert 0 <= R['L2_n'] <= 6, 'L2_n out of range'\n" +
+        "    assert 0 <= R['KL_n'] <= 6, 'KL_n out of range'\n" +
+        "    # all spectra sum to ~1\n" +
+        "    for p,s in R['specs'].items():\n" +
+        "        assert abs(sum(s) - 1.0) < 1e-9, f'{p} spectrum not normalized'\n" +
+        "    print('selftest=ok')\n" +
+        "    print(f'L2_n={R[\"L2_n\"]}')\n" +
+        "    print(f'KL_n={R[\"KL_n\"]}')\n" +
+        "    print(f'L2_p95={R[\"L2_p95\"]:.10f}')\n" +
+        "    print(f'KL_p95={R[\"KL_p95\"]:.10f}')\n" +
+        "    print(f'pr_mm={R[\"pr_mm\"]:.10f}')\n" +
+        "    print(f'verdict={R[\"verdict\"]}')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|stats|selftest> ...', file=sys.stderr)\n" +
+        "        sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'run':\n" +
+        "        tag, result_path, schema, rev_date = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]\n" +
+        "        cmd_run(tag, result_path, schema, rev_date)\n" +
+        "    elif mode == 'stats':\n" +
+        "        cmd_stats(sys.argv[2])\n" +
+        "    elif mode == 'selftest':\n" +
+        "        cmd_selftest()\n" +
+        "    else:\n" +
+        "        print(f'unknown mode: {mode}', file=sys.stderr)\n" +
+        "        sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__':\n" +
+        "    main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _fmt_float(s: string, digits: int) -> string {
+    // Truncate/pad a decimal string to `digits` fractional places for table display.
+    if s == "" { return "" }
+    let dot = s.index_of(".")
+    if dot < 0 { return s + "." + "0".repeat(digits) }
+    let head = s.substring(0, dot)
+    let tail = s.substring(dot + 1, s.len())
+    let mut t = tail
+    while t.len() < digits { t = t + "0" }
+    if t.len() > digits { t = t.substring(0, digits) }
+    return head + "." + t
+}
+
+fn _check_mark(ok: bool) -> string {
+    if ok { return "y" }
+    return "n"
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn _print_pair_table(kv: string) {
+    // Pretty-print the 6 pairs.
+    let l2p95_s = _kv_lookup(kv, "L2_p95")
+    let klp95_s = _kv_lookup(kv, "KL_p95")
+    println("pair   L2 real   L2 p95    L2?  KL real   KL p95    KL?")
+    let pairs = ["p1_p2", "p1_p3", "p1_p4", "p2_p3", "p2_p4", "p3_p4"]
+    let mut i = 0
+    while i < len(pairs) {
+        let pk = pairs[i]
+        let l2 = _fmt_float(_kv_lookup(kv, "L2_" + pk), 4)
+        let kl = _fmt_float(_kv_lookup(kv, "KL_" + pk), 4)
+        let l2p = _check_mark(_kv_lookup(kv, "L2pass_" + pk) == "1")
+        let klp = _check_mark(_kv_lookup(kv, "KLpass_" + pk) == "1")
+        let l2p95 = _fmt_float(l2p95_s, 4)
+        let klp95 = _fmt_float(klp95_s, 4)
+        println(pk + "  " + l2 + "   " + l2p95 + "    " + l2p + "    " + kl + "   " + klp95 + "    " + klp)
+        i = i + 1
+    }
+}
+
+fn _print_summary(kv: string) {
+    let l2n  = _kv_lookup(kv, "L2_n")
+    let kln  = _kv_lookup(kv, "KL_n")
+    let prmm = _fmt_float(_kv_lookup(kv, "pr_mm"), 3)
+    let v    = _kv_lookup(kv, "verdict")
+    println("L2 pass: " + l2n + "/6, KL pass: " + kln + "/6, PR max/min: " + prmm)
+    println("Verdict: " + v)
+}
+
+fn _compare_row(tag: string, kv: string) -> string {
+    if _kv_lookup(kv, "missing") != "" {
+        return tag + "  (missing: " + _kv_lookup(kv, "missing") + ")"
+    }
+    if _kv_lookup(kv, "exists") != "1" {
+        return tag + "  (no stats available)"
+    }
+    let l2n  = _kv_lookup(kv, "L2_n")
+    let kln  = _kv_lookup(kv, "KL_n")
+    let l2p  = _fmt_float(_kv_lookup(kv, "L2_p95"), 4)
+    let klp  = _fmt_float(_kv_lookup(kv, "KL_p95"), 4)
+    let prmm = _fmt_float(_kv_lookup(kv, "pr_mm"), 3)
+    let p34  = _fmt_float(_kv_lookup(kv, "p3_p4_L2"), 4)
+    let v    = _kv_lookup(kv, "verdict")
+    return tag + "  L2=" + l2n + "/6  KL=" + kln + "/6  L2p95=" + l2p + "  KLp95=" + klp + "  PR_mm=" + prmm + "  p3p4_L2=" + p34 + "  " + v
+}
+
+fn _write_verdict_ssot(tag: string, kv: string) {
+    let ts = to_string(utc_iso_now())
+    let p34 = _kv_lookup(kv, "L2_p3_p4")
+    let p34s = if p34 == "" { "0.0" } else { p34 }
+    let body = "{\n" +
+        "  \"schema\": \"anima/phi_4path_gate_last_verdict/1\",\n" +
+        "  \"tag\": \"" + tag + "\",\n" +
+        "  \"ts\": \"" + ts + "\",\n" +
+        "  \"verdict\": \"" + _kv_lookup(kv, "verdict") + "\",\n" +
+        "  \"L2_pass_count\": " + _kv_lookup(kv, "L2_n") + ",\n" +
+        "  \"KL_pass_count\": " + _kv_lookup(kv, "KL_n") + ",\n" +
+        "  \"p3_p4_L2\": " + p34s + ",\n" +
+        "  \"source\": \"tool/phi_4path_gate.hexa\"\n" +
+        "}\n"
+    write_file(VERDICT_OUT, body)
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut tag = ""
+    let mut compare_csv = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--tag" && i + 1 < len(av) {
+            tag = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--compare" && i + 1 < len(av) {
+            compare_csv = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── phi_4path_gate selftest ──")
+        let r = _run_helper("selftest")
+        let out = r[0]
+        let st = r[1]
+        println(out)
+        if st != 0 {
+            eprintln("selftest FAILED (exit " + to_string(st) + ")")
+            exit(1)
+        }
+        if _kv_lookup(out, "selftest") != "ok" {
+            eprintln("selftest marker missing")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if tag == "" {
+        eprintln("ABORT: --tag <T> required (or --selftest).")
+        eprintln("  usage: hexa run tool/phi_4path_gate.hexa --tag r5 [--compare r4,r3,r2]")
+        exit(2)
+    }
+
+    // Run the main computation for `tag`.
+    let result_path = _result_path(tag)
+    println("── phi_4path_gate --tag " + tag + " ──")
+    println("result: " + result_path)
+
+    // Input existence check (fail fast, clear error).
+    let paths = ["p1", "p2", "p3", "p4"]
+    let mut missing = []
+    let mut pi = 0
+    while pi < len(paths) {
+        let ip = _input_path(tag, paths[pi])
+        if !file_exists(ip) {
+            missing = missing.push(ip)
+        }
+        pi = pi + 1
+    }
+    if len(missing) > 0 {
+        eprintln("ABORT: missing input h_last_raw files for tag=" + tag + ":")
+        let mut mi = 0
+        while mi < len(missing) {
+            eprintln("  " + missing[mi])
+            mi = mi + 1
+        }
+        exit(2)
+    }
+
+    let args = "run " + _sh_quote(tag) + " " + _sh_quote(result_path) + " " + _sh_quote(SCHEMA) + " " + _sh_quote(REVISION_DATE)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 {
+        eprintln("ABORT: helper run exited " + to_string(st))
+        eprintln(out)
+        exit(2)
+    }
+
+    println("")
+    _print_pair_table(out)
+    println("")
+    _print_summary(out)
+    println("")
+    println("wrote " + result_path)
+
+    _write_verdict_ssot(tag, out)
+    println("wrote " + VERDICT_OUT)
+
+    // --compare: print side-by-side table for earlier tags (read their stats).
+    if compare_csv != "" {
+        println("")
+        println("── side-by-side comparison (same method) ──")
+        println(_compare_row(tag, out))
+        let tags = compare_csv.split(",")
+        let mut ti = 0
+        while ti < len(tags) {
+            let t2 = tags[ti].trim()
+            if t2 != "" {
+                let rp = _result_path(t2)
+                let r2 = _run_helper("stats " + _sh_quote(rp))
+                println(_compare_row(t2, r2[0]))
+            }
+            ti = ti + 1
+        }
+    }
+
+    // Exit 0 regardless of PASS/FAIL — the gate outcome is data, not a CI signal.
+    // (Selftest is separately a hard exit condition.)
+    exit(0)
+}
+
+main()
