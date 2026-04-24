@@ -1,14 +1,54 @@
-# ALM r6-α 런치 종결 — 중단 (RunPod spend_limit 강제종료)
+# ALM r6-α 런치 종결 — **attempt_5 FAIL-but-progress** (L2 6/6 ✓, KL 5/6)
 
-> **종결일**: 2026-04-25 UTC (2026-04-24T18:47Z 중단)
-> **Verdict**: **ABORTED** — Φ 4-path gate r6 미실행 (아티팩트 없음).
-> **근본원인**: RunPod 계정 `spendLimit=$80` 지연-enforcement 가 런치 약 4분 뒤 4 pods 전부 종료.
-> **코드결함**: 없음. 사용자 계정 측 soft-limit 설정에 의한 외부 terminatinon.
-> **H-DIAG3**: 동일 파라미터 재시도 금지 — spendLimit 상향/해제 전까지.
+> **최종 종결일**: 2026-04-25 20:25:37Z (attempt_5 Φ 4-path gate 실행 완료)
+> **Final Verdict (r6)**: **FAIL (6/6 L2, 5/6 KL)** — L2 gate 완전 달성, KL gate는 단일 pair(p2_p4) 잔존.
+> **Axis 1 (byte-weighted pool) 예측**: **VALIDATED** — p3_p4 L2 0.175→0.044 (Variant B 재현).
+> **Axis 2 (p2 RoPE Qwen2.5-7B swap) 예측**: **VALIDATED** — p1_p2 L2 0.152→0.097 돌파.
+> **잔존 이슈**: p2_p4 KL 0.189 (p95=0.178, 여유 6%) — r7 후보 (독립 제3 축 혹은 Gemma 고유성).
+> **CP1 serve**: 아티팩트 존재하나 Φ gate FAIL로 BLOCKED (r7 전제).
+> **Cost 총합 (attempts 1–5)**: $26.61 (attempt_1 $3.55 + attempt_5 $23.06 생산적).
 
 ---
 
-## 1. Verdict
+## 0. Attempt History (1→5)
+
+| # | UTC | Pre-flight | Launch | 결과 | Cost |
+|---|---|---|---|---|---|
+| 1 | 2026-04-24T18:41Z | PASS | 4 pods RUNNING | spendLimit async kill @ 4m27s | $3.55 |
+| 2 | 2026-04-25 (pre) | **ABORT** (bal $105) | — | H-DIAG3 same-signal hold | $0 |
+| 3 | 2026-04-25 (post cleanup) | **ABORT** (bal $105 identical) | — | H-DIAG3 firm hold | $0 |
+| 4 | 2026-04-25T19:45Z | 0/7 PASS, **pre-flight 8 NEW (git sync)** FAIL | — | 9 commits ahead, git push required | $0 |
+| **5** | **2026-04-25T19:54Z** | **0/7/8 PASS** (731e844c==origin/main) | 4 pods RUNNING+TRAINED | **FAIL (6/6 L2, 5/6 KL)** | **$23.06** |
+
+attempt_4의 pre-flight 8 추가는 origin/main=731e844c 동기 후 attempt_5에서 정상 통과.
+
+---
+
+## 1. attempt_5 최종 Verdict
+
+| pair | L2 r5 | L2 r6 | ΔL2 | r6 PASS? | KL r5 | KL r6 | ΔKL | r6 PASS? |
+|------|:-----:|:-----:|:---:|:--------:|:-----:|:-----:|:---:|:--------:|
+| p1_p2 | 0.1522 | **0.0968** | −0.055 | **✓ 돌파** | 0.0354 | 0.1376 | +0.102 | ✓ |
+| p1_p3 | 0.1066 | 0.0721 | −0.035 | ✓ | 0.0199 | 0.0135 | −0.006 | ✓ |
+| p1_p4 | 0.0900 | 0.0860 | −0.004 | ✓ | 0.0459 | 0.0262 | −0.020 | ✓ |
+| p2_p3 | 0.0486 | 0.1046 | +0.056 | ✓ | 0.0055 | 0.1033 | +0.098 | ✓ |
+| p2_p4 | 0.2231 | **0.1440** | −0.079 | **✓ 돌파** | 0.1520 | **0.1891** | +0.037 | **✗ 잔존** |
+| p3_p4 | 0.1753 | **0.0436** | **−0.132** | **✓ 돌파** | 0.1032 | **0.0205** | −0.083 | ✓ |
+| **Σ** | 3/6 | **6/6** |  |  | 4/6 | **5/6** |  |  |
+
+- L2 p95 null = 0.2002 / KL p95 null = 0.1782 / PR max/min = 1.300
+- Axis 1 핵심 타깃 **p3_p4 L2**: r5 0.175 → r6 0.044 (−0.132) — Variant B (H×bpt) Post-hoc 재현 ✓
+- Axis 2 핵심 타깃 **p1_p2 L2**: r5 0.152 → r6 0.097 (−0.055) — RoPE Llama3.1 → Qwen2.5 swap 효과 ✓
+- 잔존 단일 FAIL **p2_p4 KL**: 0.189 vs p95 0.178 (marginal 6% 초과) — 제3 축 후보 (Gemma 고유성 또는 독립 축)
+
+### CP1 closure 영향
+
+- **AN11(a) weight_emergent**: L2 substrate-independence 완전 달성 (6/6) → 이론 증거로 상당한 진전. KL 5/6 잔존으로 **gate FAIL** 상태 유지.
+- **CP1 serve 전제조건**: `state/trained_adapters_r6/p1/final/` 등 artifact 충족. 하지만 Φ gate FAIL로 CP1 serve **BLOCKED** (r7 예정: p2_p4 KL 해소).
+
+---
+
+## 1a. 이전 attempt_1 (2026-04-24 ABORTED) Verdict 원본
 
 | 항목 | 값 |
 |---|---|
@@ -16,6 +56,30 @@
 | r6 `state/h_last_raw_p{1..4}_TRAINED_r6.json` | **없음** (학습이 `save_model`/`eval` 단계 도달 전 종료) |
 | 런치 패키지 (commit `a4e65c6d`) 기능결함 | **없음** — chain bootstrap/driver/kickoff 전부 성공 |
 | 재시도 전제조건 | **사용자: RunPod spendLimit 해제/상향** |
+
+---
+
+## 1b. attempt_5 타임라인 (2026-04-25)
+
+| UTC | 이벤트 |
+|:---:|---|
+| 19:54:32 | `tool/h100_stage2_unified_launch.bash --apply` (screen -dmS anima_r6_attempt5) |
+| 19:54:35 | pre-flight 1-7 ALL PASS (7/7 포함 git sync 731e844c==origin/main) |
+| 19:54:39 | 4 pods 생성 ($47.88/hr) |
+| 19:55:01-53 | chain bootstrap + driver ship + nohup kickoff |
+| 19:56:58 | **Axis 3 발견**: ANIMA_STAGE2_CORPUS_PATH 상대경로 → 4/4 pods FileNotFoundError |
+| 19:58:32 | p1 training 재시작 (절대경로 `/root/core/anima/experiments/alm_r14/...`) |
+| 19:59:43 | p2/p3/p4 training 전부 재시작 완료 |
+| 20:05:39 | p2 훈련 완료 (300/300, loss 2.018) + h_last_raw.json 생성 |
+| 20:06:35 | p1 훈련 완료 (loss 1.992) |
+| 20:08:04 | p3 훈련 완료 (loss 2.149) |
+| 20:09:31 | p4 훈련 완료 (loss 2.008) |
+| 20:09:41 | adapter_pull 데몬 "all 4 pods have h_last_raw.json" |
+| 20:11:40-20:24:32 | 4 pods 순차 scp (p1 683M → p2 635M → p3 1.3G → p4 2.1G) |
+| 20:24:35 | 4 pods all kill (auto by --kill-after) |
+| 20:25:37 | Φ 4-path gate r6 실행 → **FAIL (6/6 L2, 5/6 KL)** |
+
+**Wall clock (launch→kill)**: 29분 56초. **Cost**: $455.03 → $431.97 = **$23.06 소진**.
 
 ---
 
