@@ -309,6 +309,8 @@ log "  driver shipped all 4 pods"
 
 # --- step 4: kickoff training (nohup, parallel) ------------------------------
 log "step 4/4: kickoff training nohup — NO IDLE"
+# 2026-04-25 r6-α attempt_5 recurrence prevention: coerce relative corpus path to absolute (pod cwd=/root → FileNotFoundError)
+[[ -n "${ANIMA_STAGE2_CORPUS_PATH:-}" && "${ANIMA_STAGE2_CORPUS_PATH}" != /* ]] && ANIMA_STAGE2_CORPUS_PATH=/root/core/anima/${ANIMA_STAGE2_CORPUS_PATH}
 for row in $(echo "${PODS_JSON}" | python3 -c "
 import json, sys
 for r in json.load(sys.stdin):
