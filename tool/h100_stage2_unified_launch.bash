@@ -106,7 +106,7 @@ log "V1 spot_bid_lock: cloud_tier=${CLOUD_TIER} bid_usd_per_hr=${BID_USD_PER_HR}
 FAIL_N=0
 
 # --- pre-flight 1: substrates config ------------------------------------------
-log "pre-flight 1/6: phi_4path_substrates.json"
+log "pre-flight 1/7: phi_4path_substrates.json"
 MODEL_P1=""; MODEL_P2=""; MODEL_P3=""; MODEL_P4=""
 if [[ -f "${SUBSTRATES_CFG}" ]]; then
   pass "substrates config exists"
@@ -218,7 +218,7 @@ else
 fi
 
 # --- pre-flight 2: lora rank config -------------------------------------------
-log "pre-flight 2/6: lora_rank_per_path.json (P2.1 Agent output)"
+log "pre-flight 2/7: lora_rank_per_path.json (P2.1 Agent output)"
 if [[ -f "${LORA_RANK_CFG}" ]]; then
   pass "lora rank config exists"
 else
@@ -226,7 +226,7 @@ else
 fi
 
 # --- pre-flight 3: launch manifest stage2 verdict -----------------------------
-log "pre-flight 3/6: h100_launch_manifest.json stage2 verdict"
+log "pre-flight 3/7: h100_launch_manifest.json stage2 verdict"
 if [[ -f "${LAUNCH_MANIFEST}" ]]; then
   stage2_verdict=$(python3 -c 'import json,sys
 m=json.load(open(sys.argv[1]))
@@ -244,7 +244,7 @@ else
 fi
 
 # --- pre-flight 4: runpodctl auth ---------------------------------------------
-log "pre-flight 4/6: runpodctl auth"
+log "pre-flight 4/7: runpodctl auth"
 if [[ -x "${RUNPODCTL}" ]]; then
   pass "runpodctl binary: ${RUNPODCTL}"
   if "${RUNPODCTL}" pod list >/dev/null 2>&1; then
@@ -257,7 +257,7 @@ else
 fi
 
 # --- pre-flight 5: huggingface auth -------------------------------------------
-log "pre-flight 5/6: huggingface auth"
+log "pre-flight 5/7: huggingface auth"
 if [[ -x "${HF_CLI}" ]]; then
   pass "hf binary: ${HF_CLI}"
   hf_out="$("${HF_CLI}" auth whoami 2>&1 || true)"
@@ -272,16 +272,42 @@ else
 fi
 
 # --- pre-flight 6: auto_kill registry writable --------------------------------
-log "pre-flight 6/6: h100_auto_kill pod registry writable"
+log "pre-flight 6/7: h100_auto_kill pod registry writable"
 if [[ -f "${AUTO_KILL_PODS}" && -w "${AUTO_KILL_PODS}" ]]; then
   pass "auto_kill registry present + writable: ${AUTO_KILL_PODS}"
 else
   mark_fail "auto_kill registry missing or read-only: ${AUTO_KILL_PODS}"
 fi
 
+# --- pre-flight 7: git sync origin/main ---------------------------------------
+# 2026-04-25 attempt_4 (r6-α) discovery: tool/h100_stage2_post_launch_chain.bash
+# bootstraps pods via `git clone --depth 1 https://github.com/need-singularity/anima.git`
+# which fetches ONLY origin/main tip. If local HEAD is ahead of origin/main, the
+# pods will train with STALE code and any fix commits (pool/RoPE/model-swap) are
+# silently ignored → guaranteed hypothesis-negating FAIL + full cost burn.
+# See state/convergence/h100_stage2_r6_20260425.json attempt_4 for full
+# diagnostic. This is a zero-cost pre-flight that must PASS before pod creation.
+log "pre-flight 7/7: git sync (local HEAD == origin/main)"
+if (cd "${ANIMA_ROOT}" && git rev-parse --git-dir >/dev/null 2>&1); then
+  ahead=$(cd "${ANIMA_ROOT}" && git rev-list --count origin/main..HEAD 2>/dev/null || echo -1)
+  behind=$(cd "${ANIMA_ROOT}" && git rev-list --count HEAD..origin/main 2>/dev/null || echo -1)
+  head_sha=$(cd "${ANIMA_ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo unknown)
+  origin_sha=$(cd "${ANIMA_ROOT}" && git rev-parse --short origin/main 2>/dev/null || echo unknown)
+  if [[ "${ahead}" == "0" ]]; then
+    pass "git sync OK (HEAD=${head_sha} == origin/main=${origin_sha}, ahead=0)"
+    if [[ "${behind}" != "0" && "${behind}" != "-1" ]]; then
+      warn "local is ${behind} commits behind origin/main — informational"
+    fi
+  else
+    mark_fail "git NOT synced: HEAD=${head_sha} ahead=${ahead} of origin/main=${origin_sha}. Pods shallow-clone origin/main and would train with STALE code. Run: git push origin main"
+  fi
+else
+  warn "not a git repo — skipping pre-flight 7 (post_launch_chain clones may fail)"
+fi
+
 # --- summary ------------------------------------------------------------------
 log ""
-log "pre-flight summary: fail_n=${FAIL_N} / 6 checks"
+log "pre-flight summary: fail_n=${FAIL_N} / 7 checks"
 log "policy: auto-charge ENABLED · balance/budget 언급 및 gate 완전 무시 (config/runpod_auto_charge.json + config/h100_max_parallelism_policy.json)"
 log "abort_thresholds:"
 log "  numerical_drift_bound  = ${NUMERICAL_DRIFT_BOUND}"
