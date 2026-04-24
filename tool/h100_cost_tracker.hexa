@@ -1,0 +1,603 @@
+// tool/h100_cost_tracker.hexa — per-round H100 / RunPod cost aggregator (SSOT)
+//
+// PURPOSE
+//   Cumulative cost tracker per round (r2, r3, r4, r5+) and per option across
+//   state/h100_stage2_launch_state.json + state/h100_stage2_adapter_pull_state.json
+//   + state/convergence/h100_stage2_*.json.
+//
+//   Emits state/h100_cost_tracker_result.json (SSOT for cost decisions) and
+//   prints a summary table to stdout.
+//
+// USAGE
+//   hexa run tool/h100_cost_tracker.hexa              # scan all + print summary table
+//   hexa run tool/h100_cost_tracker.hexa --round r4   # single-round detail
+//   hexa run tool/h100_cost_tracker.hexa --json       # JSON-only stdout (no table)
+//   hexa run tool/h100_cost_tracker.hexa --selftest   # run against repo state, sanity-check
+//
+// DATA SOURCES (first non-empty wins per field)
+//   1. state/convergence/h100_stage2_*.json
+//        launch.attempts[] + launch.attempt_N → per-attempt (pod_ids[], cost_burned_usd, ts)
+//        launch.policy.bid_usd_per_hr_per_pod (default bid if attempt lacks one)
+//        round_2_relaunch.pods_launched[] (legacy r2 relaunch)
+//        scientific_result.gates_summary (round hints: r2_*, r3_*, r4_*)
+//   2. state/h100_stage2_launch_state.json (current/last live launch snapshot)
+//   3. state/h100_stage2_adapter_pull_state.json (implicit billing-window close)
+//
+// COMPUTATION
+//   For each launch attempt:
+//     attempt_cost = cost_burned_usd  (authoritative if present)
+//                 OR pods_count × bid_usd_per_hr_per_pod × wall_hours  (estimate)
+//   Wall hours: start=attempt.ts, end=next_attempt.ts (early abort) or
+//   session_closed_round1.ts / adapter_pull.generated_at (final attempt).
+//
+//   Aggregate by round. Round id derived from session_id
+//   ("h100_stage2_r4_..." → r4). r2 and r3 historically share a single
+//   convergence file; r3 is inferred from gates_summary when present.
+//
+// DON'T
+//   - Don't call RunPod API (too slow, needs auth, MVP scope)
+//   - Don't modify existing launch/pull state files
+//   - Don't commit state/h100_cost_tracker_result.json (only the tool)
+//
+// raw#9  hexa-only loader · raw#11 snake_case · raw#15 no magic constants
+
+let STATE_LAUNCH     = "/Users/ghost/core/anima/state/h100_stage2_launch_state.json"
+let STATE_PULL       = "/Users/ghost/core/anima/state/h100_stage2_adapter_pull_state.json"
+let STATE_CONV_DIR   = "/Users/ghost/core/anima/state/convergence"
+let OUT_SSOT         = "/Users/ghost/core/anima/state/h100_cost_tracker_result.json"
+let HELPER_PATH      = "/tmp/h100_cost_tracker_helper.hexa_tmp"
+
+// Fallback bid when convergence record lacks one (sanity only).
+let DEFAULT_BID_USD_PER_HR_PER_POD = 14.0
+let DEFAULT_POD_COUNT              = 4
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa — kept inline (stage0 loader)
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _argv() -> array {
+    let a = args()
+    let mut o = []
+    let mut i = 2
+    while i < len(a) { o.push(a[i]); i = i + 1 }
+    return o
+}
+
+fn _has(av, k) -> bool {
+    let mut i = 0
+    while i < len(av) { if to_string(av[i]) == k { return true }; i = i + 1 }
+    return false
+}
+
+fn _arg_val(av, k) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == k && i + 1 < len(av) { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _pad(s: string, w: int) -> string {
+    let mut out = s
+    let mut i = len(s)
+    while i < w { out = out + " "; i = i + 1 }
+    return out
+}
+
+// Python helper does all JSON parse + aggregation + JSON serialization.
+// Returns kv-line format (for summary table) AND writes the SSOT JSON file.
+// tmp-file pattern avoids hexa exec_with_status quoting bug.
+fn _build_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, os, sys, glob, datetime as dt\n" +
+        "\n" +
+        "CONV_DIR   = sys.argv[1]\n" +
+        "LAUNCH_JS  = sys.argv[2]\n" +
+        "PULL_JS    = sys.argv[3]\n" +
+        "OUT_SSOT   = sys.argv[4]\n" +
+        "DEF_BID    = float(sys.argv[5])\n" +
+        "DEF_PODS   = int(sys.argv[6])\n" +
+        "MODE       = sys.argv[7]        # 'table' | 'json' | 'round:<id>'\n" +
+        "\n" +
+        "def _iso_to_sec(s):\n" +
+        "    if not s: return None\n" +
+        "    try:\n" +
+        "        s2 = s.replace('Z', '+00:00')\n" +
+        "        return dt.datetime.fromisoformat(s2).timestamp()\n" +
+        "    except Exception:\n" +
+        "        return None\n" +
+        "\n" +
+        "def _load(p):\n" +
+        "    if not os.path.exists(p): return None\n" +
+        "    try: return json.load(open(p))\n" +
+        "    except Exception: return None\n" +
+        "\n" +
+        "def _round_from_session(sid):\n" +
+        "    if not sid: return None\n" +
+        "    low = sid.lower()\n" +
+        "    for tok in ['r2','r3','r4','r5','r6','r7','r8','r9']:\n" +
+        "        if f'_{tok}_' in low or low.endswith(f'_{tok}') or f'stage2_{tok}' in low:\n" +
+        "            return tok\n" +
+        "    # r2/r3 historical: file sans round marker contains round_2_relaunch\n" +
+        "    return None\n" +
+        "\n" +
+        "def _infer_options(roadmap_entries, purpose):\n" +
+        "    opts = set()\n" +
+        "    re = roadmap_entries or []\n" +
+        "    txt = (purpose or '').lower()\n" +
+        "    blob = ' '.join(str(e) for e in re)\n" +
+        "    if '#10' in blob or '#91' in blob or '#83' in blob or 'stage-2' in txt or 'lora' in txt:\n" +
+        "        opts.add('A_h100_training')\n" +
+        "    if '#77' in blob or 'cp1' in txt or 'serve' in txt:\n" +
+        "        opts.add('B_cp1_serve')\n" +
+        "    if '#86' in blob or 'r14' in txt:\n" +
+        "        opts.add('C_r14_retrain')\n" +
+        "    return sorted(opts) if opts else ['A_h100_training']\n" +
+        "\n" +
+        "def _wall_hours(a, b):\n" +
+        "    ta = _iso_to_sec(a); tb = _iso_to_sec(b)\n" +
+        "    if ta is None or tb is None or tb <= ta: return None\n" +
+        "    return (tb - ta) / 3600.0\n" +
+        "\n" +
+        "pull = _load(PULL_JS)\n" +
+        "pull_ts = (pull or {}).get('generated_at')\n" +
+        "launch_snap = _load(LAUNCH_JS)\n" +
+        "\n" +
+        "records = []\n" +
+        "for path in sorted(glob.glob(os.path.join(CONV_DIR, 'h100_stage2*.json'))):\n" +
+        "    doc = _load(path)\n" +
+        "    if not doc: continue\n" +
+        "    sid = doc.get('session_id', os.path.basename(path))\n" +
+        "    round_id = _round_from_session(sid)\n" +
+        "    options  = _infer_options(doc.get('roadmap_entries'), doc.get('purpose',''))\n" +
+        "\n" +
+        "    launch = doc.get('launch', {}) or {}\n" +
+        "    policy = launch.get('policy', {}) or {}\n" +
+        "    bid    = float(policy.get('bid_usd_per_hr_per_pod') or DEF_BID)\n" +
+        "    gpus_per_pod = int(policy.get('gpu_count_per_pod') or 4)\n" +
+        "\n" +
+        "    attempts = []\n" +
+        "    # launch.attempt_N (r4 pattern)\n" +
+        "    for k in ['attempt_1','attempt_2','attempt_3','attempt_4','attempt_5']:\n" +
+        "        if k in launch and isinstance(launch[k], dict):\n" +
+        "            a = launch[k]\n" +
+        "            pids = a.get('pod_ids', []) or []\n" +
+        "            cost = a.get('cost_burned_usd')\n" +
+        "            attempts.append({\n" +
+        "                'attempt_key': k,\n" +
+        "                'ts': a.get('ts'),\n" +
+        "                'pod_ids': pids,\n" +
+        "                'pods_count': len(pids) if pids else DEF_PODS,\n" +
+        "                'cost_recorded_usd': float(cost) if cost is not None else None,\n" +
+        "                'result': a.get('result') or a.get('chain_result') or '',\n" +
+        "                'pods_cleaned': bool(a.get('pods_cleaned')),\n" +
+        "                'bid_usd_per_hr_per_pod': bid,\n" +
+        "                'gpus_per_pod': gpus_per_pod,\n" +
+        "            })\n" +
+        "    # top-level launch.pods[] (r2 first-round pattern — single attempt)\n" +
+        "    if not any(x['attempt_key'].startswith('attempt_') for x in attempts) and launch.get('pods'):\n" +
+        "        pods = launch.get('pods') or []\n" +
+        "        attempts.append({\n" +
+        "            'attempt_key': 'launch.pods',\n" +
+        "            'ts': launch.get('ts') or doc.get('started_at'),\n" +
+        "            'pod_ids': [p.get('pod_id') for p in pods if isinstance(p, dict)],\n" +
+        "            'pods_count': len(pods) if pods else DEF_PODS,\n" +
+        "            'cost_recorded_usd': None,\n" +
+        "            'result': 'complete' if doc.get('session_closed_round1') else 'unknown',\n" +
+        "            'pods_cleaned': True,\n" +
+        "            'bid_usd_per_hr_per_pod': bid,\n" +
+        "            'gpus_per_pod': gpus_per_pod,\n" +
+        "        })\n" +
+        "    # round_2_relaunch (legacy r3 session — same file but 2nd launch cycle)\n" +
+        "    r2r = doc.get('round_2_relaunch')\n" +
+        "    if r2r:\n" +
+        "        pods = r2r.get('pods_launched', []) or []\n" +
+        "        # End-of-round hint from expected_completion if real close missing\n" +
+        "        r2r_end = None\n" +
+        "        ec = r2r.get('expected_completion') or {}\n" +
+        "        if isinstance(ec, dict):\n" +
+        "            # daemon_kill_all: '~18:17Z' → on same date as ts_launch\n" +
+        "            launch_iso = r2r.get('ts_launch') or ''\n" +
+        "            if launch_iso and ec.get('daemon_kill_all'):\n" +
+        "                date_part = launch_iso.split('T')[0]\n" +
+        "                import re as _re\n" +
+        "                m = _re.search(r'(\\d{1,2}):(\\d{2})', str(ec['daemon_kill_all']))\n" +
+        "                if m:\n" +
+        "                    r2r_end = f'{date_part}T{int(m.group(1)):02d}:{m.group(2)}:00Z'\n" +
+        "        attempts.append({\n" +
+        "            'attempt_key': 'round_2_relaunch',\n" +
+        "            'ts': r2r.get('ts_launch'),\n" +
+        "            'end_ts_hint': r2r_end,\n" +
+        "            'pod_ids': [p.get('pod_id') for p in pods if isinstance(p, dict)],\n" +
+        "            'pods_count': len(pods) if pods else DEF_PODS,\n" +
+        "            'cost_recorded_usd': None,\n" +
+        "            'result': 'relaunch_recovery',\n" +
+        "            'pods_cleaned': True,\n" +
+        "            'bid_usd_per_hr_per_pod': bid,\n" +
+        "            'gpus_per_pod': gpus_per_pod,\n" +
+        "        })\n" +
+        "\n" +
+        "    session_close = doc.get('closed_at') or (doc.get('session_closed_round1') or {}).get('ts')\n" +
+        "    # Max plausible wall duration per attempt (prevents cross-session pull_ts bleed)\n" +
+        "    MAX_WALL_H_PER_ATTEMPT = 3.0\n" +
+        "    for i, a in enumerate(attempts):\n" +
+        "        start = a.get('ts')\n" +
+        "        end = a.get('end_ts_hint')\n" +
+        "        if end is None and i + 1 < len(attempts):\n" +
+        "            # For r2-style first launch, bound end by session_closed_round1\n" +
+        "            if a.get('attempt_key') == 'launch.pods' and session_close:\n" +
+        "                end = session_close\n" +
+        "            else:\n" +
+        "                end = attempts[i+1].get('ts')\n" +
+        "        if end is None:\n" +
+        "            end = session_close or pull_ts\n" +
+        "        wall_h = _wall_hours(start, end)\n" +
+        "        # Clamp pathological walls (e.g. pull_ts from a different session)\n" +
+        "        if wall_h is not None and wall_h > MAX_WALL_H_PER_ATTEMPT:\n" +
+        "            wall_h = MAX_WALL_H_PER_ATTEMPT\n" +
+        "        a['wall_hours'] = wall_h\n" +
+        "        est = (a['pods_count'] * bid * wall_h) if (wall_h is not None) else None\n" +
+        "        a['cost_estimate_usd'] = est\n" +
+        "        rec = a['cost_recorded_usd']\n" +
+        "        a['cost_usd'] = rec if rec is not None else est\n" +
+        "        a['cost_source'] = 'recorded' if rec is not None else ('estimate' if est is not None else 'unknown')\n" +
+        "        a['gpu_hours'] = (wall_h * a['pods_count'] * gpus_per_pod) if (wall_h is not None) else None\n" +
+        "\n" +
+        "    # r3 inference: if this file has r2_r13+r3_r13 gates and round_2_relaunch,\n" +
+        "    # the 2nd relaunch is typically r3 (not another r2). Reclassify if so.\n" +
+        "    gates = (doc.get('phi_gate_result') or {}).get('v3_1') or {}\n" +
+        "    sr = doc.get('scientific_result') or {}\n" +
+        "    gs = sr.get('gates_summary') or {}\n" +
+        "    # Heuristic: if file is flat h100_stage2_YYYYMMDD (no _rN suffix) and has\n" +
+        "    # both launch.pods and round_2_relaunch → treat first as r2, second as r3.\n" +
+        "    is_flat = ('_r' not in sid.lower().replace('stage2_', '', 1).split('_',1)[0]) if 'stage2_' in sid.lower() else False\n" +
+        "    # simpler: session_id startswith 'h100_stage2_2026' (pure date) and has two attempts\n" +
+        "    base_is_r2r3 = (sid.startswith('h100_stage2_') and not any(c in sid[len('h100_stage2_'):len('h100_stage2_')+3] for c in ['r2','r3','r4','r5']))\n" +
+        "    if base_is_r2r3 and len(attempts) >= 2:\n" +
+        "        records.append({\n" +
+        "            'path': path, 'session_id': sid, 'round_id': 'r2',\n" +
+        "            'options': options, 'bid_usd_per_hr_per_pod': bid,\n" +
+        "            'gpus_per_pod': gpus_per_pod,\n" +
+        "            'attempts': [attempts[0]],\n" +
+        "        })\n" +
+        "        records.append({\n" +
+        "            'path': path, 'session_id': sid + ' (r3)', 'round_id': 'r3',\n" +
+        "            'options': options, 'bid_usd_per_hr_per_pod': bid,\n" +
+        "            'gpus_per_pod': gpus_per_pod,\n" +
+        "            'attempts': attempts[1:],\n" +
+        "        })\n" +
+        "        continue\n" +
+        "    records.append({\n" +
+        "        'path': path, 'session_id': sid,\n" +
+        "        'round_id': round_id or ('r2' if attempts else 'unknown'),\n" +
+        "        'options': options, 'bid_usd_per_hr_per_pod': bid,\n" +
+        "        'gpus_per_pod': gpus_per_pod,\n" +
+        "        'attempts': attempts,\n" +
+        "    })\n" +
+        "\n" +
+        "rounds = {}\n" +
+        "for rec in records:\n" +
+        "    rid = rec['round_id']\n" +
+        "    r = rounds.setdefault(rid, {\n" +
+        "        'round_id': rid,\n" +
+        "        'attempts': 0, 'pods': 0,\n" +
+        "        'gpu_hours': 0.0, 'cost_usd': 0.0,\n" +
+        "        'attempts_detail': [], 'options': set(), 'sessions': [],\n" +
+        "        'status': 'unknown',\n" +
+        "    })\n" +
+        "    r['sessions'].append(rec['session_id'])\n" +
+        "    for o in rec['options']: r['options'].add(o)\n" +
+        "    for a in rec['attempts']:\n" +
+        "        r['attempts'] += 1\n" +
+        "        r['pods'] += a['pods_count']\n" +
+        "        if a['gpu_hours'] is not None: r['gpu_hours'] += a['gpu_hours']\n" +
+        "        if a['cost_usd'] is not None: r['cost_usd'] += a['cost_usd']\n" +
+        "        r['attempts_detail'].append({\n" +
+        "            'session_id': rec['session_id'],\n" +
+        "            'attempt_key': a['attempt_key'],\n" +
+        "            'ts': a.get('ts'),\n" +
+        "            'pod_ids': a.get('pod_ids'),\n" +
+        "            'pods_count': a.get('pods_count'),\n" +
+        "            'wall_hours': round(a['wall_hours'], 3) if a.get('wall_hours') is not None else None,\n" +
+        "            'gpu_hours': round(a['gpu_hours'], 3) if a.get('gpu_hours') is not None else None,\n" +
+        "            'cost_usd': round(a['cost_usd'], 2) if a.get('cost_usd') is not None else None,\n" +
+        "            'cost_source': a.get('cost_source'),\n" +
+        "            'result': a.get('result'),\n" +
+        "            'bid_usd_per_hr_per_pod': a.get('bid_usd_per_hr_per_pod'),\n" +
+        "        })\n" +
+        "\n" +
+        "for rid, r in rounds.items():\n" +
+        "    ok = sum(1 for a in r['attempts_detail']\n" +
+        "             if ('abort' not in (a.get('result') or '').lower()\n" +
+        "                 and 'fail' not in (a.get('result') or '').lower()))\n" +
+        "    fail = sum(1 for a in r['attempts_detail']\n" +
+        "               if ('abort' in (a.get('result') or '').lower()\n" +
+        "                   or 'fail' in (a.get('result') or '').lower()))\n" +
+        "    if ok > 0 and fail == 0: r['status'] = 'complete'\n" +
+        "    elif ok > 0 and fail > 0: r['status'] = 'partial_success'\n" +
+        "    elif fail > 0 and ok == 0: r['status'] = 'failed'\n" +
+        "    else: r['status'] = 'unknown'\n" +
+        "    r['options'] = sorted(r['options'])\n" +
+        "    r['gpu_hours'] = round(r['gpu_hours'], 3)\n" +
+        "    r['cost_usd'] = round(r['cost_usd'], 2)\n" +
+        "\n" +
+        "total_cost = round(sum(r['cost_usd'] for r in rounds.values()), 2)\n" +
+        "total_gpuh = round(sum(r['gpu_hours'] for r in rounds.values()), 3)\n" +
+        "\n" +
+        "ssot = {\n" +
+        "    'schema': 'anima/h100_cost_tracker/1',\n" +
+        "    'generated_at': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),\n" +
+        "    'rounds': rounds,\n" +
+        "    'total_cost_usd': total_cost,\n" +
+        "    'total_gpu_hours': total_gpuh,\n" +
+        "    'data_source': 'state/convergence/h100_stage2_*.json + launch_state.json + adapter_pull_state.json (runpodctl history not queried)',\n" +
+        "    'estimate_notes': 'costs use cost_burned_usd when recorded; otherwise pods_count x bid_usd_per_hr_per_pod x wall_hours. May differ from RunPod invoice by spot-market variance.',\n" +
+        "}\n" +
+        "with open(OUT_SSOT, 'w') as f:\n" +
+        "    json.dump(ssot, f, indent=2, default=str)\n" +
+        "    f.write('\\n')\n" +
+        "\n" +
+        "# kv lines for hexa to render summary/detail without JSON parsing\n" +
+        "def _emit_table():\n" +
+        "    keys = sorted(rounds.keys())\n" +
+        "    print(f'ROWS={len(keys)}')\n" +
+        "    for k in keys:\n" +
+        "        r = rounds[k]\n" +
+        "        print(f'ROW|{k}|{r[\"attempts\"]}|{r[\"pods\"]}|{r[\"gpu_hours\"]:.1f}|{r[\"cost_usd\"]:.2f}|{r[\"status\"]}|{\",\".join(r[\"options\"])}')\n" +
+        "    print(f'TOTAL|{total_gpuh:.1f}|{total_cost:.2f}')\n" +
+        "    print(f'SSOT={OUT_SSOT}')\n" +
+        "\n" +
+        "def _emit_round(rid):\n" +
+        "    if rid not in rounds:\n" +
+        "        print(f'ROUND_MISSING={rid}'); return\n" +
+        "    r = rounds[rid]\n" +
+        "    print(f'ROUND={rid}')\n" +
+        "    print(f'ATTEMPTS={r[\"attempts\"]}')\n" +
+        "    print(f'PODS={r[\"pods\"]}')\n" +
+        "    print(f'GPU_HOURS={r[\"gpu_hours\"]:.3f}')\n" +
+        "    print(f'COST_USD={r[\"cost_usd\"]:.2f}')\n" +
+        "    print(f'STATUS={r[\"status\"]}')\n" +
+        "    print(f'OPTIONS={\",\".join(r[\"options\"])}')\n" +
+        "    for d in r['attempts_detail']:\n" +
+        "        c = f\"${d['cost_usd']:.2f}\" if d['cost_usd'] is not None else '-'\n" +
+        "        w = f\"{d['wall_hours']:.3f}h\" if d['wall_hours'] is not None else '-'\n" +
+        "        print(f'DETAIL|{d[\"attempt_key\"]}|{d[\"ts\"]}|pods={d[\"pods_count\"]}|wall={w}|{c}|{d[\"cost_source\"]}|{d[\"result\"]}')\n" +
+        "\n" +
+        "if MODE == 'json':\n" +
+        "    print(json.dumps(ssot, indent=2, default=str))\n" +
+        "elif MODE.startswith('round:'):\n" +
+        "    _emit_round(MODE.split(':',1)[1])\n" +
+        "else:\n" +
+        "    _emit_table()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(mode: string) -> string {
+    let cmd = "python3 " + HELPER_PATH + " " +
+        _sh_quote(STATE_CONV_DIR) + " " +
+        _sh_quote(STATE_LAUNCH)   + " " +
+        _sh_quote(STATE_PULL)     + " " +
+        _sh_quote(OUT_SSOT)       + " " +
+        to_string(DEFAULT_BID_USD_PER_HR_PER_POD) + " " +
+        to_string(DEFAULT_POD_COUNT) + " " +
+        _sh_quote(mode)
+    let r = exec_with_status(cmd)
+    if r[1] != 0 {
+        eprintln("ABORT: helper failed (exit " + to_string(r[1]) + ")")
+        eprintln(to_string(r[0]))
+        exit(2)
+    }
+    return to_string(r[0]).trim()
+}
+
+fn _print_summary_table(raw: string) {
+    let lines = raw.split("\n")
+    let ts = to_string(utc_iso_now())
+    println("── H100 / RunPod cost tracker " + ts + " ──")
+    println("  " + _pad("round", 8) + _pad("attempts", 10) + _pad("pods", 6) + _pad("gpu_hrs", 10) + _pad("cost_usd", 11) + _pad("status", 18) + "options")
+    let mut i = 0
+    let mut total_line = ""
+    let mut ssot_line = ""
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with("ROW|") {
+            let rest = ln.substring(4, len(ln))
+            let parts = rest.split("|")
+            if len(parts) >= 7 {
+                let rid = parts[0]
+                let att = parts[1]
+                let pds = parts[2]
+                let gph = parts[3]
+                let cst = parts[4]
+                let stt = parts[5]
+                let opt = parts[6]
+                println("  " + _pad(rid, 8) + _pad(att, 10) + _pad(pds, 6) + _pad("~" + gph, 10) + _pad("$" + cst, 11) + _pad(stt, 18) + opt)
+            }
+        } else if ln.starts_with("TOTAL|") {
+            let parts = ln.substring(6, len(ln)).split("|")
+            if len(parts) >= 2 {
+                total_line = "  " + _pad("TOTAL", 8) + _pad("", 10) + _pad("", 6) + _pad("~" + parts[0], 10) + _pad("$" + parts[1], 11)
+            }
+        } else if ln.starts_with("SSOT=") {
+            ssot_line = ln.substring(5, len(ln))
+        }
+        i = i + 1
+    }
+    if total_line != "" { println(total_line) }
+    println("")
+    println("  ssot: " + ssot_line)
+}
+
+fn _print_round_detail(raw: string, rid: string) {
+    let lines = raw.split("\n")
+    println("── round " + rid + " detail ──")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with("ROUND_MISSING=") {
+            println("  (no data for round " + rid + ")")
+            return
+        } else if ln.starts_with("ATTEMPTS=") {
+            println("  attempts:   " + ln.substring(9, len(ln)))
+        } else if ln.starts_with("PODS=") {
+            println("  pods total: " + ln.substring(5, len(ln)))
+        } else if ln.starts_with("GPU_HOURS=") {
+            println("  gpu_hours:  ~" + ln.substring(10, len(ln)))
+        } else if ln.starts_with("COST_USD=") {
+            println("  cost_usd:   $" + ln.substring(9, len(ln)))
+        } else if ln.starts_with("STATUS=") {
+            println("  status:     " + ln.substring(7, len(ln)))
+        } else if ln.starts_with("OPTIONS=") {
+            println("  options:    " + ln.substring(8, len(ln)))
+        } else if ln.starts_with("DETAIL|") {
+            let rest = ln.substring(7, len(ln))
+            let parts = rest.split("|")
+            if len(parts) >= 7 {
+                println("  - " + parts[0] + " @" + parts[1] + "  " + parts[2] + "  " + parts[3] + "  cost=" + parts[4] + "  [" + parts[5] + "]  " + parts[6])
+            }
+        }
+        i = i + 1
+    }
+    println("  ssot: " + OUT_SSOT)
+}
+
+fn _selftest() {
+    println("── h100_cost_tracker --selftest ──")
+    _build_helper()
+    let raw = _run_helper("table")
+    if len(raw) < 10 {
+        eprintln("SELFTEST FAIL: helper output empty")
+        exit(1)
+    }
+    // Parse TOTAL + ROW lines for assertions.
+    let lines = raw.split("\n")
+    let mut total_cost = 0.0
+    let mut total_gpuh = 0.0
+    let mut rounds_seen = []
+    let mut r4_attempts = 0
+    let mut r4_cost = 0.0
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with("ROW|") {
+            let parts = ln.substring(4, len(ln)).split("|")
+            if len(parts) >= 6 {
+                rounds_seen.push(parts[0])
+                if parts[0] == "r4" {
+                    r4_attempts = to_int(parts[1])
+                    r4_cost = to_float(parts[4])
+                }
+            }
+        } else if ln.starts_with("TOTAL|") {
+            let parts = ln.substring(6, len(ln)).split("|")
+            if len(parts) >= 2 {
+                total_gpuh = to_float(parts[0])
+                total_cost = to_float(parts[1])
+            }
+        }
+        i = i + 1
+    }
+
+    let mut pass = true
+
+    // 1. non-empty
+    if len(rounds_seen) == 0 {
+        eprintln("SELFTEST FAIL: no rounds detected")
+        pass = false
+    } else {
+        println("  rounds detected: " + to_string(len(rounds_seen)))
+    }
+
+    // 2. r2 + r4 present; r3 warn-only
+    let mut has_r2 = false
+    let mut has_r3 = false
+    let mut has_r4 = false
+    let mut j = 0
+    while j < len(rounds_seen) {
+        if rounds_seen[j] == "r2" { has_r2 = true }
+        if rounds_seen[j] == "r3" { has_r3 = true }
+        if rounds_seen[j] == "r4" { has_r4 = true }
+        j = j + 1
+    }
+    if !has_r2 {
+        eprintln("SELFTEST FAIL: r2 missing")
+        pass = false
+    } else {
+        println("  r2: present")
+    }
+    if !has_r4 {
+        eprintln("SELFTEST FAIL: r4 missing")
+        pass = false
+    } else {
+        println("  r4: present")
+    }
+    if !has_r3 {
+        println("  r3: warn — not surfaced as standalone round (known: historically shares session w/ r2)")
+    } else {
+        println("  r3: present")
+    }
+
+    // 3. total_cost_usd ∈ [50, 300]
+    if total_cost < 50.0 || total_cost > 300.0 {
+        eprintln("SELFTEST FAIL: total_cost_usd=$" + to_string(total_cost) + " out of sanity range [50, 300]")
+        pass = false
+    } else {
+        println("  total_cost_usd = $" + to_string(total_cost) + " (sanity range [50, 300] OK)")
+    }
+    println("  total_gpu_hours = " + to_string(total_gpuh))
+
+    // 4. r4 has >=3 attempts
+    if has_r4 {
+        if r4_attempts < 3 {
+            eprintln("SELFTEST FAIL: r4 attempts=" + to_string(r4_attempts) + ", expected >=3")
+            pass = false
+        } else {
+            println("  r4 attempts = " + to_string(r4_attempts) + " (>=3 OK)")
+        }
+        if r4_cost < 50.0 || r4_cost > 100.0 {
+            println("  r4 cost = $" + to_string(r4_cost) + " (WARN: expected ~$68)")
+        } else {
+            println("  r4 cost = $" + to_string(r4_cost) + " (expected ~$68 OK)")
+        }
+    }
+
+    if pass {
+        println("  selftest: PASS")
+        println("")
+        _print_summary_table(raw)
+        exit(0)
+    } else {
+        println("  selftest: FAIL")
+        exit(1)
+    }
+}
+
+fn main() {
+    let av = _argv()
+    if _has(av, "--selftest") { _selftest(); return }
+    let want_json  = _has(av, "--json")
+    let round_f    = _arg_val(av, "--round")
+
+    _build_helper()
+
+    if want_json {
+        let raw = _run_helper("json")
+        println(raw)
+        exit(0)
+    }
+    if round_f != "" {
+        let raw = _run_helper("round:" + round_f)
+        _print_round_detail(raw, round_f)
+        exit(0)
+    }
+    let raw = _run_helper("table")
+    _print_summary_table(raw)
+    exit(0)
+}
+
+main()
