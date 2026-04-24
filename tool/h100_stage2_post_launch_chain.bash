@@ -159,16 +159,39 @@ ln -sfn /root/core/anima /workspace/anima
 ln -sfn /root/core/hexa-lang /workspace/hexa-lang
 '
 
+BOOTSTRAP_FAILED=()
+BOOTSTRAP_LOGS=/tmp/bootstrap_${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
+mkdir -p "${BOOTSTRAP_LOGS}"
+declare -A PID_WAIT=()
 for row in $(echo "${PODS_JSON}" | python3 -c "
 import json, sys
 for r in json.load(sys.stdin):
     print(f\"{r['pid']}:{r['host']}:{r['port']}\")
 "); do
   IFS=':' read -r pid host port <<< "$row"
-  ssh -o StrictHostKeyChecking=no -p "$port" "root@${host}" "${BOOTSTRAP_INLINE}" >/dev/null 2>&1 &
+  # 2026-04-24 fix: capture each pod's bootstrap output + exit status. Prior
+  # behavior piped all SSH output to /dev/null and logged 'bootstrap DONE'
+  # unconditionally, silently swallowing clone/download failures and leaving
+  # /root/core/anima missing → training driver FileNotFoundError on corpus.
+  ( ssh -o StrictHostKeyChecking=no -p "$port" "root@${host}" "${BOOTSTRAP_INLINE}" \
+      > "${BOOTSTRAP_LOGS}/${pid}.stdout" 2> "${BOOTSTRAP_LOGS}/${pid}.stderr"; \
+    echo $? > "${BOOTSTRAP_LOGS}/${pid}.exit" ) &
+  PID_WAIT[$pid]=$!
 done
 wait
-log "  bootstrap DONE all 4 pods"
+for pid in "${!PID_WAIT[@]}"; do
+  rc=$(cat "${BOOTSTRAP_LOGS}/${pid}.exit" 2>/dev/null || echo 99)
+  if [[ "$rc" != "0" ]]; then
+    BOOTSTRAP_FAILED+=("${pid}")
+    log "  [FAIL] ${pid} bootstrap rc=${rc} — see ${BOOTSTRAP_LOGS}/${pid}.stderr"
+  fi
+done
+if (( ${#BOOTSTRAP_FAILED[@]} > 0 )); then
+  log "ABORT: bootstrap failed on ${#BOOTSTRAP_FAILED[@]} pod(s): ${BOOTSTRAP_FAILED[*]}"
+  _cleanup_abort_pods
+  exit 3
+fi
+log "  bootstrap DONE all 4 pods (exit status verified, logs: ${BOOTSTRAP_LOGS}/)"
 
 # --- step 3: ship training driver --------------------------------------------
 log "step 3/4: ship pod-side training driver /workspace/train_pN.py"
