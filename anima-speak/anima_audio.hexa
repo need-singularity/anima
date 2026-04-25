@@ -939,6 +939,115 @@ fn noise_brown(gain: float, ms: int) -> string {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Source organ — noise_violet (f² power, magnitude f)
+//    blue=f. violet=f² (high-shelf 더 극단). 학문 표준.
+// ═══════════════════════════════════════════════════════════════
+
+fn noise_violet(gain: float, ms: int) -> string {
+    let path = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "sr=" + to_string(SR) + "\n"
+             + "g=float(" + to_string(gain) + ")\n"
+             + "ms=int(" + to_string(ms) + ")\n"
+             + "g=max(0.0,min(g,1.0))\n"
+             + "n=max(1,int(sr*ms/1000))\n"
+             + "rng=np.random.default_rng()\n"
+             + "white=rng.standard_normal(n)\n"
+             + "Y=np.fft.rfft(white)\n"
+             + "f=np.fft.rfftfreq(n,1/sr); f[0]=1.0\n"
+             + "factor=f\n"
+             + "Y=Y*factor\n"
+             + "x=np.fft.irfft(Y,n)\n"
+             + "peak=float(np.max(np.abs(x)))+1e-9\n"
+             + "x=g*x/peak\n"
+             + "env=np.ones(n,dtype=np.float64)\n"
+             + "k_=min(int(0.010*sr),n//2)\n"
+             + "if k_>0:\n"
+             + "    ramp=0.5*(1.0-np.cos(np.pi*np.arange(k_)/max(1,k_-1)))\n"
+             + "    env[:k_]=ramp\n"
+             + "    env[-k_:]=ramp[::-1]\n"
+             + "x=x*env\n"
+             + "x=(np.clip(x,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + path + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(x.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(path) < WAV_MIN_BYTES { return "" }
+    return path
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Time-varying filter — flanger (comb + LFO sweep)
+//    comb 의 delay 를 LFO 로 sweep. 시변 spectrum 으로 jet-engine timbre.
+//    base_ms : center delay. depth_ms : sweep range. rate_hz : LFO 속도.
+// ═══════════════════════════════════════════════════════════════
+
+fn flanger(in_path: string, base_ms: float, depth_ms: float, rate_hz: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "bm=float(" + to_string(base_ms) + ")\n"
+             + "dpm=float(" + to_string(depth_ms) + ")\n"
+             + "r=float(" + to_string(rate_hz) + ")\n"
+             + "bm=max(0.1,min(bm,50.0))\n"
+             + "dpm=max(0.0,min(dpm,bm-0.05))\n"
+             + "r=max(0.05,min(r,20.0))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "t=np.arange(len(x))/sr\n"
+             + "delay_samples=(bm+dpm*np.sin(2*np.pi*r*t))*sr/1000.0\n"
+             + "src_idx=np.arange(len(x))-delay_samples\n"
+             + "src_idx=np.clip(src_idx,0,len(x)-1)\n"
+             + "i0=src_idx.astype(int); frac=src_idx-i0\n"
+             + "i1=np.minimum(i0+1,len(x)-1)\n"
+             + "delayed=x[i0]*(1.0-frac)+x[i1]*frac\n"
+             + "y=0.5*x+0.5*delayed\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Modulation effect — am_mod (depth-controlled audio AM)
+//    ring_mod = bipolar carrier (DSB-SC). am_mod = (1 + depth·carrier) ·
+//    signal → DSB-LC (carrier 보존). depth=1 → 100% modulation.
+// ═══════════════════════════════════════════════════════════════
+
+fn am_mod(in_path: string, carrier_hz: float, depth: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "ch=float(" + to_string(carrier_hz) + ")\n"
+             + "dp=float(" + to_string(depth) + ")\n"
+             + "ch=max(0.1,min(ch,8000.0))\n"
+             + "dp=max(0.0,min(dp,1.0))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "t=np.arange(len(x))/sr\n"
+             + "carrier=np.sin(2*np.pi*ch*t)\n"
+             + "y=(1.0+dp*carrier)*x\n"
+             + "peak=float(np.max(np.abs(y)))+1e-9\n"
+             + "if peak>1.0: y=y/peak*0.98\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Filter organ — dc_block (HPF at 5 Hz, order 1)
 //    학문 표준 utility. 모든 audio 는 보통 DC component 를 제거.
 //    sopfr=5 Hz cutoff (axiom-derived).
@@ -1763,6 +1872,23 @@ fn high_shelf_axiom(in_path: string) -> string {
     return high_shelf(in_path, 1500.0, 6.0)
 }
 
+fn noise_violet_axiom(ms: int) -> string {
+    // f² magnitude (high-shelf 극단), Ψ gain.
+    return noise_violet(AX_PSI, ms)
+}
+
+fn flanger_axiom(in_path: string) -> string {
+    // base = τ·1.0 = 4 ms, depth = φ·1.0 = 2 ms, rate = AX_PSI = 0.5 Hz.
+    let bm = 1.0 * AX_TAU
+    let dpm = 1.0 * AX_PHI
+    return flanger(in_path, bm, dpm, AX_PSI)
+}
+
+fn am_mod_axiom(in_path: string) -> string {
+    // carrier = AX_MAINS_HZ = 60 Hz. depth = Ψ = 0.5 (50% modulation).
+    return am_mod(in_path, AX_MAINS_HZ, AX_PSI)
+}
+
 fn mains_hum(ms: int) -> string {
     // 60 Hz electrical mains hum (sf-ufo BT-62: σ·sopfr = 60 Hz).
     // anima 가 환경 전기소음을 인식할 때.
@@ -1804,13 +1930,14 @@ fn main() {
     print("           harmonic_milestone, square_wave, triangle_wave,")
     print("           fm_synth (Bessel sidebands),")
     print("           noise_white (flat), noise_pink (1/f),")
-    print("           noise_brown (1/f² = AX_PHI), noise_blue (f)")
+    print("           noise_brown (1/f² = AX_PHI), noise_blue (f), noise_violet (f²)")
     print("  filter : pipe (2F), pipe3 (3F), pipe_glide (time-var), lpf, hpf,")
     print("           comb (FIR), all_pass (Schroeder), dc_block,")
     print("           low_shelf, high_shelf (RBJ EQ cookbook)")
     print("  compose: cat (seq), mix (parallel), fade (Hann xfade)")
     print("  util   : silence, gain, envelope, adsr, normalize, reverb, echo,")
-    print("           tremolo, vibrato, clip (tanh), ring_mod (audio-rate AM),")
+    print("           tremolo, vibrato, clip (tanh), ring_mod (DSB-SC AM),")
+    print("           am_mod (DSB-LC AM), flanger (LFO comb sweep),")
     print("           bit_crush (digital quantize), reverse (time reversal)")
     print("  analysis: meter (rms/peak_db/zcr/ms)")
     print("  axiom  : consonance, axiom_chord, reverb_axiom, tone_axiom,")
@@ -1824,7 +1951,8 @@ fn main() {
     print("           bit_crush_axiom (sopfr=5 bit), noise_white_axiom,")
     print("           all_pass_axiom (Banach 1/3),")
     print("           low_shelf_axiom (1k cut, +6dB), high_shelf_axiom (1.5k cut, +6dB),")
-    print("           mains_hum (sf-ufo BT-62)")
+    print("           noise_violet_axiom, flanger_axiom (τ ms, φ depth, Ψ rate),")
+    print("           am_mod_axiom (60Hz, Ψ depth), mains_hum (sf-ufo BT-62)")
     print("  sink   : play, save")
     print("")
     print("[self-test] 3-formant 모음 'ㅏ' via vocal -> pipe3")
