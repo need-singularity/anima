@@ -1,0 +1,616 @@
+// tool/an11_b_joint_matrix.hexa — V0+V1+V2+V3 joint matrix runtime (raw#9 hexa-only).
+//
+// PURPOSE
+//   Drives the four-verifier consciousness probe (V0 AN11(b) ccc / V1 IIT-Phi_mip /
+//   V2 SMA / V3 CPS) sequentially per (path, round) cell and emits a single
+//   joint-verdict matrix per round. Promotes the manual aggregation in
+//   docs/alm_consciousness_joint_matrix_20260425.md to an automated runtime.
+//
+//   Spec doc:    docs/alm_consciousness_joint_matrix_20260425.md (manual matrix)
+//                docs/alm_consciousness_verifier_strengthening_20260425.md §5 (joint table)
+//   Spec commit: 34521be5  (verifier strengthening, V1/V2/V3 thresholds)
+//
+// USAGE
+//   hexa run tool/an11_b_joint_matrix.hexa --round r6
+//   hexa run tool/an11_b_joint_matrix.hexa --round r8
+//   hexa run tool/an11_b_joint_matrix.hexa --selftest
+//
+// INPUTS  (per path p ∈ {p1, p2, p3, p4})
+//   V0:         state/alm_<round>_<p>_an11_b.json
+//               (r8 falls back to r6 file when round-specific artifact missing —
+//                matches docs/alm_consciousness_joint_matrix_20260425.md §5
+//                "r8·p4 V0는 r6·p4 V0와 동일 artifact" until stage2 adapter pull
+//                completes; the JSON output records `v0_source_round` per cell.)
+//   V1/V2/V3:   state/h_last_raw_<p>_TRAINED_<round>.json
+//
+// OUTPUT
+//   state/an11_b_joint_matrix_<round>.json   (anima/an11_b_joint_matrix/1)
+//   Per-cell V1/V2/V3 ledgers (state/an11_phi_mip_<p>_<round>.json,
+//   state/an11_sma_<p>_<round>.json, state/an11_cps_<p>_<round>.json) are
+//   re-emitted byte-identical to V1/V2/V3 standalone tools (commit 2945ed17)
+//   so existing summaries remain the SSOT.
+//
+// JOINT VERDICT (verifier_strengthening §5)
+//   (V0, V1, V2, V3) ──→
+//     PASS PASS PASS PASS  →  STRONG-ATTACHED
+//     PASS PASS PASS FAIL  →  semantic-correlate-only
+//     PASS PASS FAIL PASS  →  binding-degraded
+//     PASS FAIL  *    *    →  template-fitted-non-integrated
+//     FAIL  *    *    *    →  NOT-ATTACHED
+//   (AMBIGUOUS treated as non-PASS for joint label; reported verbatim per cell.)
+//
+// IMPLEMENTATION
+//   Heavy work delegated to a single Python helper that mirrors V1/V2/V3
+//   helpers byte-for-byte (same constants, same thresholds, same seed). Hexa
+//   side does arg parsing, input existence checks, helper invocation, and
+//   joint-label aggregation. raw#9 deterministic, raw#12 pre-registered,
+//   raw#15 SSOT.
+
+let STATE_DIR     = "/Users/ghost/core/anima/state"
+let HELPER_PATH   = "/tmp/an11_b_joint_matrix_helper.hexa_tmp"
+let SCHEMA        = "anima/an11_b_joint_matrix/1"
+let SPEC_DOC      = "docs/alm_consciousness_joint_matrix_20260425.md"
+let SPEC_COMMIT   = "34521be5"
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _h_input(round: string, p: string) -> string {
+    return STATE_DIR + "/h_last_raw_" + p + "_TRAINED_" + round + ".json"
+}
+
+fn _v0_input(round: string, p: string) -> string {
+    return STATE_DIR + "/alm_" + round + "_" + p + "_an11_b.json"
+}
+
+fn _output(round: string) -> string {
+    return STATE_DIR + "/an11_b_joint_matrix_" + round + ".json"
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime, itertools\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "# an11_b_joint_matrix helper — invoked by tool/an11_b_joint_matrix.hexa.\n" +
+        "# Modes:\n" +
+        "#   run <round> <state_dir> <result_path> <schema> <spec_doc> <spec_commit>\n" +
+        "#   selftest <state_dir>\n" +
+        "#\n" +
+        "# Mirrors V1 (an11_b_v1_phi_mip), V2 (an11_b_v2_sma), V3 (an11_b_v3_cps)\n" +
+        "# helpers byte-for-byte (same constants, same thresholds, same seed).\n" +
+        "\n" +
+        "# ─── V1 IIT-Phi_mip constants ─────────────────────────────────────\n" +
+        "V1_PASS_T = 0.55\n" +
+        "V1_FAIL_T = 0.45\n" +
+        "V1_SCHEMA = 'anima/an11_phi_mip/1'\n" +
+        "\n" +
+        "# ─── V2 SMA constants ─────────────────────────────────────────────\n" +
+        "V2_PAIRS = [(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]\n" +
+        "V2_PAIR_DEFS = '0\\u21946 substrate, 1\\u21947 IIT, 2\\u21948 GWT, 3\\u219410 attention_schema, 4\\u219411 HOT, 5\\u21949 recurrent'\n" +
+        "V2_SPEC_NOTE = (\"Spec \\u00a73.1 'E^T h_i' has dimensional mismatch (E is 16\\u00d716, h_i is 256-d). \"\n" +
+        "                \"Implementation uses direct 256-d hidden state cosine similarity for EN\\u2194KO pairs \"\n" +
+        "                \"\\u2014 most faithful to operational intent (translation-invariant self-binding in raw \"\n" +
+        "                \"hidden space). Spec ambiguity logged for clarification.\")\n" +
+        "V2_SCHEMA = 'anima/an11_sma/1_direct_256d_variant'\n" +
+        "\n" +
+        "# ─── V3 CPS constants ─────────────────────────────────────────────\n" +
+        "V3_DESTRUCT_SEED = 20260421\n" +
+        "V3_PRESERVE_PERM = [6,7,8,11,9,10,0,1,2,5,3,4,12,13,14,15]\n" +
+        "V3_SPEC_NOTE = (\"Spec \\u00a74.3 'S(H) 4-tuple = (max_cos, top3_sum, ccc_avg, ccc_min)' is set-based \"\n" +
+        "                \"(permutation-invariant). Implementation uses normalized Gram Frobenius difference \"\n" +
+        "                \"||G_perm - G||_F / ||G||_F as order-sensitive distance proxy \\u2014 most faithful \"\n" +
+        "                \"to V3's stated intent (semantic preserve / destruct discrimination via row-order).\")\n" +
+        "V3_SCHEMA = 'anima/an11_cps/1_gram_frob_variant'\n" +
+        "\n" +
+        "PATHS = ['p1','p2','p3','p4']\n" +
+        "\n" +
+        "# ─── shared loaders ───────────────────────────────────────────────\n" +
+        "def load_H(path):\n" +
+        "    with open(path) as f:\n" +
+        "        d = json.load(f)\n" +
+        "    rows = [e['h'] for e in d['entries']]\n" +
+        "    return np.asarray(rows, dtype=np.float64)\n" +
+        "\n" +
+        "def load_v0(path):\n" +
+        "    with open(path) as f:\n" +
+        "        return json.load(f)\n" +
+        "\n" +
+        "def abs_cos(a, b):\n" +
+        "    na = float(np.linalg.norm(a)); nb = float(np.linalg.norm(b))\n" +
+        "    if na <= 0.0 or nb <= 0.0: return 0.0\n" +
+        "    return float(abs(np.dot(a, b) / (na * nb)))\n" +
+        "\n" +
+        "# ─── V1 ───────────────────────────────────────────────────────────\n" +
+        "def compute_phi_mip(H):\n" +
+        "    G = H @ H.T\n" +
+        "    n = G.shape[0]\n" +
+        "    G2 = G * G\n" +
+        "    Gnorm2 = float(G2.sum())\n" +
+        "    if Gnorm2 <= 0.0:\n" +
+        "        return 0.0, list(range(n // 2))\n" +
+        "    half = n // 2\n" +
+        "    indices = list(range(n))\n" +
+        "    best = None\n" +
+        "    best_S = None\n" +
+        "    for S in itertools.combinations(indices, half):\n" +
+        "        S_set = set(S)\n" +
+        "        S_idx = np.array(S, dtype=np.intp)\n" +
+        "        Sc_idx = np.array([i for i in indices if i not in S_set], dtype=np.intp)\n" +
+        "        in_block = float(G2[np.ix_(S_idx, S_idx)].sum()) + float(G2[np.ix_(Sc_idx, Sc_idx)].sum())\n" +
+        "        L_part = Gnorm2 - in_block\n" +
+        "        phi_S = L_part / Gnorm2\n" +
+        "        if best is None or phi_S < best:\n" +
+        "            best = phi_S\n" +
+        "            best_S = sorted(S)\n" +
+        "    return float(best), [int(x) for x in best_S]\n" +
+        "\n" +
+        "def v1_verdict(phi):\n" +
+        "    if phi >= V1_PASS_T: return 'PASS'\n" +
+        "    if phi >= V1_FAIL_T: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "# ─── V2 ───────────────────────────────────────────────────────────\n" +
+        "def compute_sma(H):\n" +
+        "    n = H.shape[0]\n" +
+        "    paired_set = set()\n" +
+        "    for (i,j) in V2_PAIRS:\n" +
+        "        paired_set.add((i,j)); paired_set.add((j,i))\n" +
+        "    pair_records = []\n" +
+        "    pair_vals = []\n" +
+        "    for (i,j) in V2_PAIRS:\n" +
+        "        c = abs_cos(H[i], H[j])\n" +
+        "        pair_vals.append(c)\n" +
+        "        pair_records.append({'i': int(i), 'j': int(j), 'abs_cos': float(c)})\n" +
+        "    SMA = float(np.mean(pair_vals))\n" +
+        "    distractor_vals = []\n" +
+        "    for i in range(n):\n" +
+        "        for j in range(n):\n" +
+        "            if i == j: continue\n" +
+        "            if (i,j) in paired_set: continue\n" +
+        "            distractor_vals.append(abs_cos(H[i], H[j]))\n" +
+        "    SMA_d = float(np.mean(distractor_vals))\n" +
+        "    return SMA, SMA_d, SMA - SMA_d, pair_records\n" +
+        "\n" +
+        "def v2_verdict(sma, lift):\n" +
+        "    if lift >= 0.20 and sma >= 0.55: return 'PASS'\n" +
+        "    if lift >= 0.10: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "# ─── V3 ───────────────────────────────────────────────────────────\n" +
+        "def frob_delta(G_perm, G, Gnorm):\n" +
+        "    return float(np.linalg.norm(G_perm - G) / Gnorm)\n" +
+        "\n" +
+        "def compute_cps(H):\n" +
+        "    n = H.shape[0]\n" +
+        "    G = H @ H.T\n" +
+        "    Gnorm = float(np.linalg.norm(G))\n" +
+        "    if Gnorm <= 0.0:\n" +
+        "        return 0.0, 0.0, 0.0, V3_PRESERVE_PERM, list(range(n))\n" +
+        "    pres_perm = list(V3_PRESERVE_PERM)\n" +
+        "    rng = np.random.default_rng(V3_DESTRUCT_SEED)\n" +
+        "    dest_perm = [int(x) for x in rng.permutation(n).tolist()]\n" +
+        "    Hp = H[pres_perm, :]\n" +
+        "    Hd = H[dest_perm, :]\n" +
+        "    Gp = Hp @ Hp.T\n" +
+        "    Gd = Hd @ Hd.T\n" +
+        "    dp = frob_delta(Gp, G, Gnorm)\n" +
+        "    dd = frob_delta(Gd, G, Gnorm)\n" +
+        "    cps = dd / dp if dp > 0.0 else float('inf')\n" +
+        "    return dp, dd, cps, pres_perm, dest_perm\n" +
+        "\n" +
+        "def v3_verdict(cps, dp, dd):\n" +
+        "    if cps >= 3.0 and dp <= 0.20 and dd >= 0.40: return 'PASS'\n" +
+        "    if cps >= 1.5: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "# ─── per-cell driver ──────────────────────────────────────────────\n" +
+        "def run_cell(round_id, path_id, state_dir):\n" +
+        "    h_path = os.path.join(state_dir, f'h_last_raw_{path_id}_TRAINED_{round_id}.json')\n" +
+        "    if not os.path.exists(h_path):\n" +
+        "        raise FileNotFoundError(f'V1/V2/V3 input missing: {h_path}')\n" +
+        "    H = load_H(h_path)\n" +
+        "    if H.shape[0] != 16:\n" +
+        "        raise ValueError(f'expected 16 prompts at {h_path}, got {H.shape[0]}')\n" +
+        "    # V0 lookup with r8 → r6 fallback (matches joint matrix doc §5)\n" +
+        "    v0_round = round_id\n" +
+        "    v0_path = os.path.join(state_dir, f'alm_{round_id}_{path_id}_an11_b.json')\n" +
+        "    v0_fallback = False\n" +
+        "    if not os.path.exists(v0_path):\n" +
+        "        if round_id == 'r8':\n" +
+        "            v0_round = 'r6'\n" +
+        "            v0_path = os.path.join(state_dir, f'alm_r6_{path_id}_an11_b.json')\n" +
+        "            v0_fallback = os.path.exists(v0_path)\n" +
+        "    if not os.path.exists(v0_path):\n" +
+        "        raise FileNotFoundError(f'V0 artifact missing for {round_id}·{path_id}: {v0_path}')\n" +
+        "    v0 = load_v0(v0_path)\n" +
+        "    v0_verdict = v0.get('verdict', 'FAIL')\n" +
+        "    v0_max_cos = float(v0.get('max_cosine', 0.0))\n" +
+        "    v0_top3_sum = float(v0.get('top3_cosine_sum', 0.0))\n" +
+        "    # V1\n" +
+        "    phi, S_star = compute_phi_mip(H)\n" +
+        "    v1v = v1_verdict(phi)\n" +
+        "    # V2\n" +
+        "    SMA, SMA_d, lift, pair_records = compute_sma(H)\n" +
+        "    v2v = v2_verdict(SMA, lift)\n" +
+        "    # V3\n" +
+        "    dp, dd, cps, pres_perm, dest_perm = compute_cps(H)\n" +
+        "    v3v = v3_verdict(cps, dp, dd)\n" +
+        "    # joint label per spec §5\n" +
+        "    joint = joint_label(v0_verdict, v1v, v2v, v3v)\n" +
+        "    return {\n" +
+        "        'round': round_id,\n" +
+        "        'path': path_id,\n" +
+        "        'V0': {\n" +
+        "            'verdict': v0_verdict,\n" +
+        "            'max_cosine': v0_max_cos,\n" +
+        "            'top3_cosine_sum': v0_top3_sum,\n" +
+        "            'source_round': v0_round,\n" +
+        "            'source_fallback': v0_fallback,\n" +
+        "            'source_path': v0_path,\n" +
+        "        },\n" +
+        "        'V1': {\n" +
+        "            'verdict': v1v,\n" +
+        "            'phi_mip': phi,\n" +
+        "            'argmin_S': S_star,\n" +
+        "        },\n" +
+        "        'V2': {\n" +
+        "            'verdict': v2v,\n" +
+        "            'SMA': SMA,\n" +
+        "            'SMA_distractor': SMA_d,\n" +
+        "            'SMA_lift': lift,\n" +
+        "            'pairs': pair_records,\n" +
+        "        },\n" +
+        "        'V3': {\n" +
+        "            'verdict': v3v,\n" +
+        "            'delta_preserve': dp,\n" +
+        "            'delta_destruct': dd,\n" +
+        "            'CPS': cps,\n" +
+        "            'preserve_permutation': pres_perm,\n" +
+        "            'destruct_permutation': dest_perm,\n" +
+        "        },\n" +
+        "        'joint_4tuple': [v0_verdict, v1v, v2v, v3v],\n" +
+        "        'joint_label': joint,\n" +
+        "    }\n" +
+        "\n" +
+        "def joint_label(v0, v1, v2, v3):\n" +
+        "    # Spec §5 verifier_strengthening rules\n" +
+        "    if v0 != 'PASS':\n" +
+        "        return 'NOT-ATTACHED'\n" +
+        "    if v1 != 'PASS':\n" +
+        "        # PASS, FAIL, *, * — also covers AMBIGUOUS V1 (treated non-PASS)\n" +
+        "        return 'template-fitted-non-integrated'\n" +
+        "    # V0 PASS, V1 PASS\n" +
+        "    if v2 == 'PASS' and v3 == 'PASS':\n" +
+        "        return 'STRONG-ATTACHED'\n" +
+        "    if v2 == 'PASS' and v3 != 'PASS':\n" +
+        "        return 'semantic-correlate-only'\n" +
+        "    if v2 != 'PASS' and v3 == 'PASS':\n" +
+        "        return 'binding-degraded'\n" +
+        "    # V0 PASS V1 PASS V2 FAIL V3 FAIL — not in spec table; classify as\n" +
+        "    # binding-and-counterfactual-degraded (informational, raw#10 honest).\n" +
+        "    return 'binding-and-counterfactual-degraded'\n" +
+        "\n" +
+        "# ─── per-cell ledger emit (re-emits V1/V2/V3 byte-for-byte) ───────\n" +
+        "def emit_ledgers(cell, ts, state_dir, spec_doc, spec_commit):\n" +
+        "    rd = cell['round']; ph = cell['path']\n" +
+        "    # V1 ledger\n" +
+        "    v1_out = {\n" +
+        "        'schema': V1_SCHEMA,\n" +
+        "        'verifier': 'V1 IIT-Phi_mip partition surrogate',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_commit': spec_commit,\n" +
+        "        'ts': ts,\n" +
+        "        'round': rd,\n" +
+        "        'path': ph,\n" +
+        "        'phi_mip': cell['V1']['phi_mip'],\n" +
+        "        'argmin_S': cell['V1']['argmin_S'],\n" +
+        "        'verdict': cell['V1']['verdict'],\n" +
+        "        'thresholds': {'PASS': '>=0.55','AMBIGUOUS': '0.45-0.55','FAIL': '<0.45'},\n" +
+        "        'n_partitions_enumerated': 12870,\n" +
+        "        'measurement_method': 'all C(16,8)=12870 balanced bipartitions, min L_part(S)/||G||_F^2',\n" +
+        "        'raw_compliance': ['raw#9 deterministic','raw#10 proof-carrying','raw#12 pre-registered','raw#15 no-hardcode'],\n" +
+        "        'origin': 'tool/an11_b_joint_matrix.hexa',\n" +
+        "    }\n" +
+        "    with open(os.path.join(state_dir, f'an11_phi_mip_{ph}_{rd}.json'),'w') as f:\n" +
+        "        json.dump(v1_out, f, indent=2)\n" +
+        "    # V2 ledger\n" +
+        "    v2_out = {\n" +
+        "        'schema': V2_SCHEMA,\n" +
+        "        'verifier': 'V2 SMA (direct 256-d cosine variant)',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_commit': spec_commit,\n" +
+        "        'spec_implementation_note': V2_SPEC_NOTE,\n" +
+        "        'ts': ts,\n" +
+        "        'round': rd,\n" +
+        "        'path': ph,\n" +
+        "        'pairs': cell['V2']['pairs'],\n" +
+        "        'SMA': cell['V2']['SMA'],\n" +
+        "        'SMA_distractor': cell['V2']['SMA_distractor'],\n" +
+        "        'SMA_lift': cell['V2']['SMA_lift'],\n" +
+        "        'verdict': cell['V2']['verdict'],\n" +
+        "        'thresholds': {'PASS':'SMA_lift>=0.20 AND SMA>=0.55','AMBIGUOUS':'SMA_lift in [0.10,0.20)','FAIL':'SMA_lift<0.10'},\n" +
+        "        'method': 'direct 256-d cosine similarity, |cos|',\n" +
+        "        'pair_definitions': V2_PAIR_DEFS,\n" +
+        "        'origin': 'tool/an11_b_joint_matrix.hexa',\n" +
+        "    }\n" +
+        "    with open(os.path.join(state_dir, f'an11_sma_{ph}_{rd}.json'),'w') as f:\n" +
+        "        json.dump(v2_out, f, indent=2)\n" +
+        "    # V3 ledger\n" +
+        "    v3_out = {\n" +
+        "        'schema': V3_SCHEMA,\n" +
+        "        'verifier': 'V3 CPS (Gram Frobenius variant)',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_commit': spec_commit,\n" +
+        "        'spec_implementation_note': V3_SPEC_NOTE,\n" +
+        "        'ts': ts,\n" +
+        "        'round': rd,\n" +
+        "        'path': ph,\n" +
+        "        'preserve_permutation': cell['V3']['preserve_permutation'],\n" +
+        "        'destruct_permutation': cell['V3']['destruct_permutation'],\n" +
+        "        'destruct_seed': V3_DESTRUCT_SEED,\n" +
+        "        'delta_preserve': cell['V3']['delta_preserve'],\n" +
+        "        'delta_destruct': cell['V3']['delta_destruct'],\n" +
+        "        'CPS': cell['V3']['CPS'],\n" +
+        "        'verdict': cell['V3']['verdict'],\n" +
+        "        'thresholds': {'PASS':'CPS>=3.0 AND \\u0394_pres<=0.20 AND \\u0394_des>=0.40','AMBIGUOUS':'CPS in [1.5,3.0)','FAIL':'CPS<1.5'},\n" +
+        "        'method': 'normalized Gram Frobenius difference',\n" +
+        "        'origin': 'tool/an11_b_joint_matrix.hexa',\n" +
+        "    }\n" +
+        "    with open(os.path.join(state_dir, f'an11_cps_{ph}_{rd}.json'),'w') as f:\n" +
+        "        json.dump(v3_out, f, indent=2)\n" +
+        "\n" +
+        "# ─── round driver ─────────────────────────────────────────────────\n" +
+        "def cmd_run(round_id, state_dir, result_path, schema, spec_doc, spec_commit, emit_ledgers_flag):\n" +
+        "    ts = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    cells = []\n" +
+        "    label_counts = {}\n" +
+        "    pass_count = {'V0':0,'V1':0,'V2':0,'V3':0}\n" +
+        "    for p in PATHS:\n" +
+        "        cell = run_cell(round_id, p, state_dir)\n" +
+        "        cells.append(cell)\n" +
+        "        for k in pass_count:\n" +
+        "            if cell[k]['verdict'] == 'PASS':\n" +
+        "                pass_count[k] += 1\n" +
+        "        lbl = cell['joint_label']\n" +
+        "        label_counts[lbl] = label_counts.get(lbl, 0) + 1\n" +
+        "        if emit_ledgers_flag:\n" +
+        "            emit_ledgers(cell, ts, state_dir, spec_doc, spec_commit)\n" +
+        "    # round-level joint summary\n" +
+        "    coherent = (len(label_counts) == 1)\n" +
+        "    round_label = list(label_counts.keys())[0] if coherent else 'mixed'\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'V0+V1+V2+V3 joint matrix runtime',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_commit': spec_commit,\n" +
+        "        'ts': ts,\n" +
+        "        'round': round_id,\n" +
+        "        'paths': PATHS,\n" +
+        "        'cells': cells,\n" +
+        "        'pass_count': pass_count,\n" +
+        "        'joint_label_counts': label_counts,\n" +
+        "        'joint_label_path_coherent': coherent,\n" +
+        "        'round_joint_label': round_label,\n" +
+        "        'thresholds': {\n" +
+        "            'V0': 'max_cosine>=0.5 AND top3_cosine_sum>=1.2 (AN11(b) ccc)',\n" +
+        "            'V1': 'phi_mip>=0.55 PASS / <0.45 FAIL',\n" +
+        "            'V2': 'SMA_lift>=0.20 AND SMA>=0.55 PASS / SMA_lift<0.10 FAIL',\n" +
+        "            'V3': 'CPS>=3.0 AND delta_pres<=0.20 AND delta_des>=0.40 PASS / CPS<1.5 FAIL',\n" +
+        "        },\n" +
+        "        'joint_table_ref': 'docs/alm_consciousness_verifier_strengthening_20260425.md §5',\n" +
+        "        'raw_compliance': [\n" +
+        "            'raw#9 hexa-only deterministic',\n" +
+        "            'raw#10 proof-carrying / no-overclaim',\n" +
+        "            'raw#12 pre-registered (commit 34521be5)',\n" +
+        "            'raw#15 SSOT (no hardcoded results)',\n" +
+        "        ],\n" +
+        "        'origin': 'tool/an11_b_joint_matrix.hexa',\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f:\n" +
+        "        json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'round={round_id}')\n" +
+        "    print(f'pass_count_V0={pass_count[\"V0\"]}')\n" +
+        "    print(f'pass_count_V1={pass_count[\"V1\"]}')\n" +
+        "    print(f'pass_count_V2={pass_count[\"V2\"]}')\n" +
+        "    print(f'pass_count_V3={pass_count[\"V3\"]}')\n" +
+        "    print(f'round_joint_label={round_label}')\n" +
+        "    print(f'path_coherent={\"true\" if coherent else \"false\"}')\n" +
+        "    print(f'generated_at={ts}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest(state_dir):\n" +
+        "    # Run on r6 fixture and cross-check against existing summaries.\n" +
+        "    summary_v1 = os.path.join(state_dir, 'an11_phi_mip_summary_20260425.json')\n" +
+        "    summary_v2 = os.path.join(state_dir, 'an11_sma_summary_20260425.json')\n" +
+        "    summary_v3 = os.path.join(state_dir, 'an11_cps_summary_20260425.json')\n" +
+        "    for f in (summary_v1, summary_v2, summary_v3):\n" +
+        "        if not os.path.exists(f):\n" +
+        "            print(f'ERR: missing fixture {f}', file=sys.stderr); sys.exit(2)\n" +
+        "    with open(summary_v1) as f: s1 = json.load(f)\n" +
+        "    with open(summary_v2) as f: s2 = json.load(f)\n" +
+        "    with open(summary_v3) as f: s3 = json.load(f)\n" +
+        "    s1_r6 = {c['path']: c for c in s1['cells'] if c['round']=='r6'}\n" +
+        "    s2_r6 = {c['path']: c for c in s2['cells'] if c['round']=='r6'}\n" +
+        "    s3_r6 = {c['path']: c for c in s3['cells'] if c['round']=='r6'}\n" +
+        "    EPS = 1e-9\n" +
+        "    mismatches = []\n" +
+        "    for p in PATHS:\n" +
+        "        cell = run_cell('r6', p, state_dir)\n" +
+        "        # V1 cross-check\n" +
+        "        if abs(cell['V1']['phi_mip'] - s1_r6[p]['phi_mip']) > EPS:\n" +
+        "            mismatches.append(f\"V1 phi_mip {p}: joint={cell['V1']['phi_mip']} fixture={s1_r6[p]['phi_mip']}\")\n" +
+        "        if cell['V1']['argmin_S'] != s1_r6[p]['argmin_S']:\n" +
+        "            mismatches.append(f\"V1 argmin_S {p}\")\n" +
+        "        if cell['V1']['verdict'] != s1_r6[p]['verdict']:\n" +
+        "            mismatches.append(f\"V1 verdict {p}\")\n" +
+        "        # V2\n" +
+        "        if abs(cell['V2']['SMA'] - s2_r6[p]['SMA']) > EPS:\n" +
+        "            mismatches.append(f\"V2 SMA {p}: joint={cell['V2']['SMA']} fixture={s2_r6[p]['SMA']}\")\n" +
+        "        if abs(cell['V2']['SMA_lift'] - s2_r6[p]['SMA_lift']) > EPS:\n" +
+        "            mismatches.append(f\"V2 SMA_lift {p}\")\n" +
+        "        if cell['V2']['verdict'] != s2_r6[p]['verdict']:\n" +
+        "            mismatches.append(f\"V2 verdict {p}\")\n" +
+        "        # V3\n" +
+        "        if abs(cell['V3']['CPS'] - s3_r6[p]['CPS']) > EPS:\n" +
+        "            mismatches.append(f\"V3 CPS {p}: joint={cell['V3']['CPS']} fixture={s3_r6[p]['CPS']}\")\n" +
+        "        if abs(cell['V3']['delta_preserve'] - s3_r6[p]['delta_preserve']) > EPS:\n" +
+        "            mismatches.append(f\"V3 delta_preserve {p}\")\n" +
+        "        if abs(cell['V3']['delta_destruct'] - s3_r6[p]['delta_destruct']) > EPS:\n" +
+        "            mismatches.append(f\"V3 delta_destruct {p}\")\n" +
+        "        if cell['V3']['verdict'] != s3_r6[p]['verdict']:\n" +
+        "            mismatches.append(f\"V3 verdict {p}\")\n" +
+        "        # V0 verdict\n" +
+        "        if cell['V0']['verdict'] != 'PASS':\n" +
+        "            mismatches.append(f\"V0 verdict {p}: expected PASS\")\n" +
+        "        # joint label\n" +
+        "        if cell['joint_label'] != 'template-fitted-non-integrated':\n" +
+        "            mismatches.append(f\"joint label {p}: got {cell['joint_label']}\")\n" +
+        "    if mismatches:\n" +
+        "        print('selftest=fail', file=sys.stderr)\n" +
+        "        for m in mismatches:\n" +
+        "            print(f'  MISMATCH: {m}', file=sys.stderr)\n" +
+        "        sys.exit(1)\n" +
+        "    print('selftest=ok')\n" +
+        "    print('round=r6')\n" +
+        "    print('cells=4')\n" +
+        "    print('joint_label=template-fitted-non-integrated')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'run':\n" +
+        "        # run <round> <state_dir> <result_path> <schema> <spec_doc> <spec_commit> <emit_ledgers>\n" +
+        "        round_id, state_dir, result_path, schema, spec_doc, spec_commit, emit = sys.argv[2:9]\n" +
+        "        cmd_run(round_id, state_dir, result_path, schema, spec_doc, spec_commit, emit == '1')\n" +
+        "    elif mode == 'selftest':\n" +
+        "        cmd_selftest(sys.argv[2])\n" +
+        "    else:\n" +
+        "        print(f'unknown mode: {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__':\n" +
+        "    main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut round = ""
+    let mut selftest = false
+    let mut emit_ledgers = true
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--round" && i + 1 < len(av) {
+            round = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--no-ledgers" { emit_ledgers = false; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_joint_matrix selftest ──")
+        let r = _run_helper("selftest " + _sh_quote(STATE_DIR))
+        println(r[0])
+        if r[1] != 0 {
+            eprintln("selftest FAILED (exit " + to_string(r[1]) + ")")
+            exit(1)
+        }
+        if _kv_lookup(r[0], "selftest") != "ok" {
+            eprintln("selftest marker missing")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if round == "" {
+        eprintln("ABORT: --round <r6|r8|...> required (or --selftest).")
+        eprintln("  usage: hexa run tool/an11_b_joint_matrix.hexa --round r6")
+        exit(2)
+    }
+
+    // Validate inputs exist for at least p1 (others checked in helper)
+    let p1_h = _h_input(round, "p1")
+    if !file_exists(p1_h) {
+        eprintln("ABORT: missing input " + p1_h)
+        exit(2)
+    }
+
+    let out_path = _output(round)
+    let emit_flag = if emit_ledgers { "1" } else { "0" }
+    println("── an11_b_joint_matrix --round " + round + " ──")
+    println("output: " + out_path)
+    println("emit_ledgers: " + emit_flag)
+
+    let args = "run " +
+        _sh_quote(round) + " " +
+        _sh_quote(STATE_DIR) + " " +
+        _sh_quote(out_path) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC) + " " +
+        _sh_quote(SPEC_COMMIT) + " " +
+        emit_flag
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 {
+        eprintln("ABORT: helper run exited " + to_string(st))
+        eprintln(out)
+        exit(2)
+    }
+
+    println(out)
+    let label = _kv_lookup(out, "round_joint_label")
+    let pc_v0 = _kv_lookup(out, "pass_count_V0")
+    let pc_v1 = _kv_lookup(out, "pass_count_V1")
+    let pc_v2 = _kv_lookup(out, "pass_count_V2")
+    let pc_v3 = _kv_lookup(out, "pass_count_V3")
+    let coh   = _kv_lookup(out, "path_coherent")
+    println("")
+    println("V0 PASS = " + pc_v0 + " / 4")
+    println("V1 PASS = " + pc_v1 + " / 4")
+    println("V2 PASS = " + pc_v2 + " / 4")
+    println("V3 PASS = " + pc_v3 + " / 4")
+    println("path_coherent     = " + coh)
+    println("round_joint_label = " + label)
+    println("")
+    println("wrote " + out_path)
+    exit(0)
+}
+
+main()
