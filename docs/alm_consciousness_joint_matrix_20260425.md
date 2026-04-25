@@ -209,6 +209,34 @@ PAPO method: `lang_axis = mean(H[i] − H[j]) over PAIRS`, `H_steered = H − α
 
 PAPO upper-bound 의의: SAE pilot은 같은 BASE substrate에서 +0.164를 초과할 수 없음 — SAE를 위한 GPU 소비는 fine-tune 영역까지 가야 의미 있음. 본 cycle 결과는 BASE-level lever ceiling을 substrate level로 확정.
 
+### §9.2.2 V2 multi-axis PAPO (PCA top-k) — 2026-04-25 (PASS at k=3 lasttoken, MEANINGFUL)
+
+§9.2.1 single-axis PAPO saturated +0.164 (88% gap, AMBIGUOUS) follow-up. 6개 pair difference vectors의 PCA top-k axes를 sequential project-out하여 추가 lift 회복 + PASS 도달 시도. (`state/an11_v2_multi_axis_papo_finding_BASE_p1_20260425.json`)
+
+**Result (BASE p1 lasttoken):**
+
+| k | α=1.0 SMA | SMA_d | SMA_lift | verdict |
+|---|---|---|---|---|
+| 1 (single) | 0.769 | 0.605 | +0.164 | AMBIGUOUS |
+| **3** | **0.862** | **0.649** | **+0.213** | **PASS** ⭐ meaningful |
+| 4 | 0.919 | 0.670 | +0.249 | PASS |
+| 5 | 0.964 | 0.686 | +0.278 | PASS |
+| 6 | 1.000 | 0.706 | +0.294 | PASS_TRIVIAL_RANK_EXHAUSTION |
+
+**Critical classification (raw#10 honest):**
+- **k=6 = rank(D)**: paired diff 6개를 모두 강제 zero → SMA=1.0 by linear algebra identity. **trivial PASS via metric rank exploit**, not learned self-binding.
+- **k=3 (meaningful)**: top-3 dominant PCA axes만 제거. SMA=0.862<1.0이므로 partial alignment, paired diff가 fully zero가 아님. **non-trivial PASS** — top-3 EN-KO bilingual axes를 fine-tune이 학습하면 V2 PASS plausibly 도달.
+
+**Result (BASE p1 bwm):** PASS at k=5 (lift=+0.204, non-trivial), k=6 trivial. lasttoken보다 약함 (top-1 singular value 46.18 vs 42.27).
+
+**4-tuple PASS path 갱신:**
+- V0: PASS ✓ (substrate)
+- V1: NOT_TESTED (forward 필요)
+- **V2: PASS achievable (k=3 PAPO, BASE substrate, raw#9 호환) ⭐**
+- V3: BLOCKED (PAIRS↔PRESERVE_PERM mismatch, §9.3.1)
+
+**Saturation finding**: V2 surrogate metric은 rank-vulnerability 보유 — k=rank(D)에서 PASS trivial. raw#12 ledger에 metric vulnerability 등록 필요. fine-tune lever로 translate은 TRAINED 측정 필요 (별도 cycle, GPU).
+
 ### §9.3 V3 lift target reduction-op probe — 2026-04-25 (FALSIFIED at BASE)
 
 raw#9 hexa-only 호환 사이클로 BASE p1 sensitivity probe 수행 (`state/an11_v3_reduction_op_probe_BASE_p1_20260425.json`):

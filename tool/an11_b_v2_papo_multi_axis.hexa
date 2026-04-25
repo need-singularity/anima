@@ -1,0 +1,259 @@
+// tool/an11_b_v2_papo_multi_axis.hexa — V2 multi-axis PAPO probe (raw#9 hexa-only).
+//
+// PURPOSE
+//   Single-axis PAPO (mean of pair-differences) saturated at alpha=1.0 with
+//   SMA_lift = +0.164 (88% of PASS gap, AMBIGUOUS). 본 도구는 6개 pair
+//   difference vectors의 PCA top-k axes를 sequential project-out하여 추가
+//   lift 회복을 시도.
+//
+// METHOD
+//   PAIRS = [(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]
+//   D = stack([H[i] - H[j] for (i,j) in PAIRS])    (6 x 256 matrix)
+//   U, S, Vt = SVD(D)                              (top-k right singular vectors)
+//   For k in [1..6]:
+//     For alpha in [0.0, 0.5, 1.0, 1.5]:
+//       H_steered = H
+//       For each axis u_t (t = 1..k):
+//         H_steered = H_steered - alpha * (H_steered @ u_t) * u_t
+//       compute SMA, SMA_distractor, SMA_lift on H_steered
+//   Best (k, alpha) maximizes SMA_lift.
+//
+// PASS predicate (V2 spec, raw#12 frozen):
+//   PASS       SMA_lift >= 0.20 AND SMA >= 0.55
+//   AMBIGUOUS  SMA_lift in [0.10, 0.20)
+//   FAIL       SMA_lift < 0.10
+//
+// USAGE
+//   hexa run tool/an11_b_v2_papo_multi_axis.hexa --input <h.json> --output <r.json>
+//   hexa run tool/an11_b_v2_papo_multi_axis.hexa --selftest
+
+let HELPER_PATH = "/tmp/an11_b_v2_papo_multi_axis_helper.hexa_tmp"
+let SCHEMA      = "anima/an11_v2_papo_multi_axis/1_pca_topk"
+let SPEC_DOC    = "docs/alm_consciousness_joint_matrix_20260425.md (§9.2.2 follow-up)"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "PAIRS = [(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]\n" +
+        "ALPHAS = [0.0, 0.5, 1.0, 1.5]\n" +
+        "\n" +
+        "def load_H(path):\n" +
+        "    with open(path) as f: d = json.load(f)\n" +
+        "    rows = [e['h'] for e in d['entries']]\n" +
+        "    return np.asarray(rows, dtype=np.float64), d.get('reduction', 'unknown')\n" +
+        "\n" +
+        "def abs_cos(a, b):\n" +
+        "    na = float(np.linalg.norm(a)); nb = float(np.linalg.norm(b))\n" +
+        "    if na <= 0.0 or nb <= 0.0: return 0.0\n" +
+        "    return float(abs(np.dot(a, b) / (na * nb)))\n" +
+        "\n" +
+        "def compute_sma(H):\n" +
+        "    n = H.shape[0]\n" +
+        "    paired = set()\n" +
+        "    for (i,j) in PAIRS: paired.add((i,j)); paired.add((j,i))\n" +
+        "    pair_vals = [abs_cos(H[i], H[j]) for (i,j) in PAIRS]\n" +
+        "    SMA = float(np.mean(pair_vals))\n" +
+        "    distractor_vals = []\n" +
+        "    for i in range(n):\n" +
+        "        for j in range(n):\n" +
+        "            if i == j: continue\n" +
+        "            if (i,j) in paired: continue\n" +
+        "            distractor_vals.append(abs_cos(H[i], H[j]))\n" +
+        "    SMA_d = float(np.mean(distractor_vals))\n" +
+        "    return SMA, SMA_d, SMA - SMA_d\n" +
+        "\n" +
+        "def extract_pca_axes(H):\n" +
+        "    D = np.stack([H[i] - H[j] for (i,j) in PAIRS], axis=0)\n" +
+        "    U, S, Vt = np.linalg.svd(D, full_matrices=False)\n" +
+        "    # Vt: each row is a right singular vector (unit) in the H column space.\n" +
+        "    # singular values S in descending order.\n" +
+        "    return Vt, S.tolist()\n" +
+        "\n" +
+        "def sequential_project_out(H, axes, alpha):\n" +
+        "    Hs = H.copy()\n" +
+        "    for u in axes:\n" +
+        "        Hs = Hs - alpha * (Hs @ u)[:, None] * u[None, :]\n" +
+        "    return Hs\n" +
+        "\n" +
+        "def verdict_for(sma, lift):\n" +
+        "    if lift >= 0.20 and sma >= 0.55: return 'PASS'\n" +
+        "    if lift >= 0.10: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "def cmd_run(input_path, result_path, schema, spec_doc):\n" +
+        "    if not os.path.exists(input_path):\n" +
+        "        print(f'ERR: missing input {input_path}', file=sys.stderr); sys.exit(2)\n" +
+        "    H, reduction = load_H(input_path)\n" +
+        "    if H.shape[0] != 16:\n" +
+        "        print(f'ERR: expected 16 prompts, got {H.shape[0]}', file=sys.stderr); sys.exit(2)\n" +
+        "    Vt, sing = extract_pca_axes(H)\n" +
+        "    K_max = min(6, Vt.shape[0])\n" +
+        "    sweep = []\n" +
+        "    for k in range(1, K_max + 1):\n" +
+        "        axes = [Vt[t] for t in range(k)]\n" +
+        "        for a in ALPHAS:\n" +
+        "            Hs = sequential_project_out(H, axes, a)\n" +
+        "            sma, sma_d, lift = compute_sma(Hs)\n" +
+        "            sweep.append({\n" +
+        "                'k': k,\n" +
+        "                'alpha': a,\n" +
+        "                'SMA': sma,\n" +
+        "                'SMA_distractor': sma_d,\n" +
+        "                'SMA_lift': lift,\n" +
+        "                'verdict': verdict_for(sma, lift)\n" +
+        "            })\n" +
+        "    base = next(r for r in sweep if r['k']==1 and r['alpha']==0.0)\n" +
+        "    best = max(sweep, key=lambda r: r['SMA_lift'])\n" +
+        "    pass_runs = [r for r in sweep if r['verdict']=='PASS']\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'V2 SMA + multi-axis PAPO (PCA top-k project-out)',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'method': 'D = stack(H[i]-H[j]) over PAIRS; SVD top-k right singular vectors; sequential project-out',\n" +
+        "        'reduction': reduction,\n" +
+        "        'ts': ts,\n" +
+        "        'PAIRS': PAIRS,\n" +
+        "        'singular_values': sing,\n" +
+        "        'k_max': K_max,\n" +
+        "        'alpha_grid': ALPHAS,\n" +
+        "        'sweep': sweep,\n" +
+        "        'baseline_k1_alpha0': base,\n" +
+        "        'best': best,\n" +
+        "        'delta_lift_best_minus_baseline': best['SMA_lift'] - base['SMA_lift'],\n" +
+        "        'pass_count': len(pass_runs),\n" +
+        "        'pass_runs': pass_runs[:10],\n" +
+        "        'thresholds': {\n" +
+        "            'PASS': 'SMA_lift>=0.20 AND SMA>=0.55',\n" +
+        "            'AMBIGUOUS': 'SMA_lift in [0.10,0.20)',\n" +
+        "            'FAIL': 'SMA_lift<0.10',\n" +
+        "        }\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'reduction={reduction}')\n" +
+        "    print(f'singular_values={sing}')\n" +
+        "    print(f'pass_count={len(pass_runs)}')\n" +
+        "    print(f\"best_k={best['k']} alpha={best['alpha']} SMA={best['SMA']:.6f} lift={best['SMA_lift']:.6f} verdict={best['verdict']}\")\n" +
+        "    print(f\"delta_lift_best_minus_baseline={best['SMA_lift'] - base['SMA_lift']:.6f}\")\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    rng = np.random.default_rng(20260425)\n" +
+        "    H = rng.standard_normal((16, 64))\n" +
+        "    Vt, S = extract_pca_axes(H)\n" +
+        "    assert Vt.shape[0] >= 1, 'pca axes extraction failed'\n" +
+        "    assert all(abs(np.linalg.norm(Vt[t]) - 1.0) < 1e-9 for t in range(Vt.shape[0])), 'singular vectors not unit'\n" +
+        "    Hs = sequential_project_out(H, [Vt[0]], 1.0)\n" +
+        "    proj = (Hs @ Vt[0])\n" +
+        "    assert float(np.max(np.abs(proj))) < 1e-9, f'project-out residual too large: {float(np.max(np.abs(proj)))}'\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'k_max={Vt.shape[0]}')\n" +
+        "    print(f'top_singular={S[0]:.6f}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'run': cmd_run(*sys.argv[2:6])\n" +
+        "    elif mode == 'selftest': cmd_selftest()\n" +
+        "    else: print(f'unknown mode: {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut input = ""
+    let mut output = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--input" && i + 1 < len(av) { input = av[i+1]; i = i + 2; continue }
+        if a == "--output" && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_v2_papo_multi_axis selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 {
+            eprintln("selftest FAILED (exit " + to_string(r[1]) + ")")
+            exit(1)
+        }
+        if _kv_lookup(r[0], "selftest") != "ok" {
+            eprintln("selftest marker missing")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if input == "" || output == "" {
+        eprintln("ABORT: --input <path> --output <path> required (or --selftest).")
+        exit(2)
+    }
+    if !file_exists(input) {
+        eprintln("ABORT: missing input " + input)
+        exit(2)
+    }
+
+    println("── an11_b_v2_papo_multi_axis ──")
+    println("input:  " + input)
+    println("output: " + output)
+    let args = "run " +
+        _sh_quote(input) + " " +
+        _sh_quote(output) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 {
+        eprintln("ABORT: helper run exited " + to_string(st))
+        eprintln(out)
+        exit(2)
+    }
+    println(out)
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()
