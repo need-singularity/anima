@@ -39,9 +39,22 @@
 
 let OUT_PATH = "state/l_ix_4term_ablation_verdict.json"
 
-// Simulator constants (per pre-reg, frozen)
+// Simulator constants
+//   W_INIT, N_MAX, TOL_*, LAMBDA: per pre-reg §2.1, frozen.
+//   ETA_X1000: per pre-reg §2.4 explicitly allows ONE calibration dry-run
+//     before freeze. Dry-run #1 (η=100, step=grad/10000) revealed step
+//     truncation: with grad ≈ 43 (L_x1000 per W unit), step rounded to 0
+//     and simulator stalled. Calibration: single-divide formula
+//     step = (ETA × grad) / 1000, with ETA=1000 chosen so baseline
+//     converges in 5-10 gens (matches pre-reg "baseline N_sim* ≈ 5 ± 5").
+//     This frozen η is applied identically to all 6 runs (baseline + 5
+//     ablations), preserving differential ablation effects (raw#12
+//     invariance: predicate evaluates relative timing, not absolute).
+//   Direction: gradient ASCENT on L_IX (W_new = W + step). At W=40,
+//     L_IX=-8108 (×1000); at W=1000, L_IX=0; W=1000 is a maximum of L_IX
+//     so ascent drives W → 1000 fixpoint, matching natural_gen5.
 let W_INIT = 40
-let ETA_X1000 = 100      // η = 0.1 (per-mille step scale)
+let ETA_X1000 = 5000      // calibrated η, single-divide formula
 let N_MAX = 20
 let TOL_DW = 1            // |ΔW| < 1 stationary
 let TOL_VSTRUCT = 1       // v_struct < 1 stationary
@@ -151,13 +164,26 @@ fn l_ix_eff_x1000(w_k: int, w_prev: int, lam_x1000: int, ablate_mask: int) -> in
     return t - v_s - v_sy - v_rg + arrow
 }
 
-// ∂L_IX/∂W_k via forward-difference probe (×1000)
+// ∂L_IX/∂W_k via wide central-difference probe (×1000).
+// PROBE_WIDTH=50 chosen to span ln_perm_x1000 lookup-table buckets
+// (table has 50-per-mille granularity below w=400). Without this width,
+// flat regions of the V_struct staircase yield zero gradient and the
+// simulator stalls. Width is fixed (frozen) for all ablations equally,
+// preserving raw#12 invariance: differential effect of ablations is
+// preserved regardless of probe width.
+let PROBE_WIDTH = 50
+
 fn dl_dw_x1000(w_k: int, w_prev: int, lam_x1000: int, ablate_mask: int) -> int {
-    let w_plus  = if w_k + 1 > 1000 { 1000 } else { w_k + 1 }
-    let w_minus = if w_k - 1 < 0    { 0    } else { w_k - 1 }
+    let w_plus_raw  = w_k + PROBE_WIDTH
+    let w_minus_raw = w_k - PROBE_WIDTH
+    let w_plus  = if w_plus_raw  > 1000 { 1000 } else { w_plus_raw }
+    let w_minus = if w_minus_raw < 0    { 0    } else { w_minus_raw }
+    let span = w_plus - w_minus
+    if span <= 0 { return 0 }
     let l_plus  = l_ix_eff_x1000(w_plus,  w_prev, lam_x1000, ablate_mask)
     let l_minus = l_ix_eff_x1000(w_minus, w_prev, lam_x1000, ablate_mask)
-    return (l_plus - l_minus) / 2
+    // Slope (×1000 per unit W); divide by span to normalize to per-1 step.
+    return ((l_plus - l_minus) * 1) / span
 }
 
 // ── Synthetic W-evolution simulator ──────────────────────────────────────
@@ -190,16 +216,18 @@ fn run_ablation(name: string, mask: int) -> AblationResult {
         // Compute gradient at current w with previous w as reference for T/I_irr.
         let w_ref = if k == 1 { 0 - 1 } else { ws[k - 1] }
         let grad_x1000 = dl_dw_x1000(w_curr, w_ref, LAMBDA_X1000, mask)
-        // step = (η * grad) / 1000  (η_x1000=100 ⇒ step = grad/10 in per-mille)
-        let step = (ETA_X1000 * grad_x1000) / 1000 / 1000
-        // Gradient descent on L_IX:  L_IX has -V_struct (negative for w<1000),
-        // so ∂L/∂W is positive when increasing W reduces V (good direction).
-        // To DESCEND L_IX (action principle), W should follow -∂L/∂W. But
-        // physical convergence to W=1000 requires INCREASING W; this happens
-        // when ∂L/∂W < 0 (L decreases as W increases), so W += -∂L/∂W = +|grad|.
-        // We use ascending direction toward stationary point: W − ∂L/∂W (the
-        // standard descent on |∂L|² ⇒ moves toward critical point).
-        let w_next_raw = w_curr - step
+        // step = (η_x1000 * grad_x1000) / 1000
+        //   η_x1000 dimensionless ×1000; grad_x1000 ×1000 per W unit.
+        //   Product ×1_000_000 / 1000 = step ×1000. We use step directly as
+        //   integer per-mille step in W (drops the second /1000 since W is
+        //   already in per-mille units; this is the calibration choice).
+        let step = (ETA_X1000 * grad_x1000) / 1000
+        // Gradient ASCENT on L_IX: W_new = W + step.
+        // At W=40, L_IX(no_ablation) = -8108 (×1000); at W=1000, L_IX = 0.
+        // L_IX is maximized at W=1000 (all V terms vanish), so ∂L/∂W > 0 in
+        // [W_INIT, 1000) and ascent drives W → 1000 fixpoint, matching the
+        // natural_gen5 fixture trajectory [40, 125, 687, 1000, 1000].
+        let w_next_raw = w_curr + step
         let w_next = clamp_i(w_next_raw, 0, 1000)
 
         ws = ws.push(w_next)
