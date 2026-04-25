@@ -858,6 +858,85 @@ fn harmonic_milestone(freq_hz: float, gain: float, ms: int) -> string {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Source organ — noise_pink (1/f spectral density, aperiodic)
+//    breath 는 butter bandpass white noise (대역 평탄).
+//    noise_pink 는 1/f spectrum (-3 dB/octave). 자연 ambient 의
+//    수학적 standard. 학문적, 학습 X.
+// ═══════════════════════════════════════════════════════════════
+
+fn noise_pink(gain: float, ms: int) -> string {
+    let path = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "sr=" + to_string(SR) + "\n"
+             + "g=float(" + to_string(gain) + ")\n"
+             + "ms=int(" + to_string(ms) + ")\n"
+             + "g=max(0.0,min(g,1.0))\n"
+             + "n=max(1,int(sr*ms/1000))\n"
+             + "rng=np.random.default_rng()\n"
+             + "white=rng.standard_normal(n)\n"
+             + "Y=np.fft.rfft(white)\n"
+             + "f=np.fft.rfftfreq(n,1/sr)\n"
+             + "f[0]=1.0\n"
+             + "factor=1.0/np.sqrt(f)\n"
+             + "Y=Y*factor\n"
+             + "x=np.fft.irfft(Y,n)\n"
+             + "peak=float(np.max(np.abs(x)))+1e-9\n"
+             + "x=g*x/peak\n"
+             + "env=np.ones(n,dtype=np.float64)\n"
+             + "k_=min(int(0.010*sr),n//2)\n"
+             + "if k_>0:\n"
+             + "    ramp=0.5*(1.0-np.cos(np.pi*np.arange(k_)/max(1,k_-1)))\n"
+             + "    env[:k_]=ramp\n"
+             + "    env[-k_:]=ramp[::-1]\n"
+             + "x=x*env\n"
+             + "x=(np.clip(x,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + path + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(x.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(path) < WAV_MIN_BYTES { return "" }
+    return path
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Time-domain effect — vibrato (pitch LFO via time-warp resample)
+//    tremolo = amplitude LFO. vibrato = pitch LFO.
+//    rate_hz : 떨림 속도. depth_cents : 진폭 (반음 = 100 cents).
+//    구현: cumulative pitch factor → warped time → linear interp.
+// ═══════════════════════════════════════════════════════════════
+
+fn vibrato(in_path: string, rate_hz: float, depth_cents: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "r=float(" + to_string(rate_hz) + ")\n"
+             + "dc=float(" + to_string(depth_cents) + ")\n"
+             + "r=max(0.1,min(r,50.0))\n"
+             + "dc=max(0.0,min(dc,200.0))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "t=np.arange(len(x))/sr\n"
+             + "semi=(dc/100.0)*np.sin(2*np.pi*r*t)\n"
+             + "pf=2.0**(semi/12.0)\n"
+             + "t_warp=np.cumsum(pf)/sr\n"
+             + "t_warp=t_warp-t_warp[0]\n"
+             + "max_t=(len(x)-1)/sr\n"
+             + "t_warp=np.clip(t_warp,0,max_t)\n"
+             + "src_t=np.arange(len(x))/sr\n"
+             + "y=np.interp(t_warp,src_t,x)\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Time-domain effect — echo (single-tap feedback delay)
 //    reverb 는 IR convolution (확산). echo 는 단일 tap + feedback.
 //    dm = delay ms (1~5000). fb = feedback [0, 0.95] clamp (발산 방지).
@@ -1029,6 +1108,18 @@ fn tremolo_axiom(in_path: string) -> string {
     return tremolo(in_path, rate, AX_PSI)
 }
 
+fn vibrato_axiom(in_path: string) -> string {
+    // rate = n = 6 Hz. depth = σ−τ = 8 cents (subtle, musical).
+    let rate = 1.0 * AX_N
+    let dep = 1.0 * AX_MIN_HARMONICS
+    return vibrato(in_path, rate, dep)
+}
+
+fn noise_pink_axiom(ms: int) -> string {
+    // 1/f noise at Ψ-balanced gain.
+    return noise_pink(AX_PSI, ms)
+}
+
 fn mains_hum(ms: int) -> string {
     // 60 Hz electrical mains hum (sf-ufo BT-62: σ·sopfr = 60 Hz).
     // anima 가 환경 전기소음을 인식할 때.
@@ -1066,15 +1157,17 @@ fn save(src: string, dest: string) -> bool {
 
 fn main() {
     print("anima_audio: organs ready (평면 · 학습 X · 레이어 X)")
-    print("  source : vocal, vocal_lf, breath, tone, chirp, harmonic_28, harmonic_milestone")
+    print("  source : vocal, vocal_lf, breath, tone, chirp, harmonic_28,")
+    print("           harmonic_milestone, noise_pink (1/f)")
     print("  filter : pipe (2F), pipe3 (3F), pipe_glide (time-var), lpf, hpf")
     print("  compose: cat (seq), mix (parallel), fade (Hann xfade)")
-    print("  util   : silence, gain, envelope, normalize, reverb, echo, tremolo")
+    print("  util   : silence, gain, envelope, normalize, reverb, echo, tremolo, vibrato")
     print("  analysis: meter (rms/peak_db/zcr/ms)")
     print("  axiom  : consonance, axiom_chord, reverb_axiom, tone_axiom,")
     print("           lpf_axiom, hpf_axiom, fade_axiom, normalize_axiom,")
     print("           chirp_axiom, harmonic_28_axiom, harmonic_milestone_axiom,")
-    print("           echo_axiom, tremolo_axiom, mains_hum (sf-ufo BT-62)")
+    print("           echo_axiom, tremolo_axiom, vibrato_axiom, noise_pink_axiom,")
+    print("           mains_hum (sf-ufo BT-62)")
     print("  sink   : play, save")
     print("")
     print("[self-test] 3-formant 모음 'ㅏ' via vocal -> pipe3")
