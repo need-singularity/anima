@@ -1,0 +1,265 @@
+// tool/alm_decode_hook_dryrun.hexa — L2 decode-time Φ-attach hook dry-run
+//
+// PURPOSE
+//   Prototype + verify the L2 decode-time hook contract that wires the
+//   Φ-eigenvec (16-d) into the per-token logit reweighting step. The
+//   production target is `tool/serve_alm_persona.hexa::backend_invoke`
+//   which currently stubs to BACKEND_PENDING. This dry-run does NOT
+//   touch live model weights; it loads the existing r6 h_last + Φ
+//   spectrum artifacts and synthesizes a deterministic decode trajectory
+//   to verify two safety predicates before any real wire-in:
+//
+//     P1 (top-1 preservation): for steering strength α ≤ α_max,
+//        the post-hook top-1 token MUST equal the pre-hook top-1 token
+//        on ≥ TOP1_KEEP_FRAC of decode steps.
+//     P2 (KL bounded): KL(p_post || p_pre) ≤ KL_MAX over all steps.
+//
+// CHECKPOINT
+//   L2 abstraction layer (docs/alm_inference_abstraction_layers_20260425.md
+//   §3). Closes the L1→L2 gap by freezing the hook contract + dry-run
+//   evidence under raw#12 pre-registered predicates.
+//
+// RAW POLICY
+//   raw#9   no .py in repo — python helper materialised to /tmp/ only
+//   raw#10  deterministic — fixed numpy seed 42, fixed thresholds
+//   raw#11  snake_case
+//   raw#12  실측 only — predicates pre-registered HERE before run
+//   raw#15  no-hardcode — paths from constants below
+//
+// USAGE
+//   hexa tool/alm_decode_hook_dryrun.hexa
+//   hexa tool/alm_decode_hook_dryrun.hexa --tag r6
+//   hexa tool/alm_decode_hook_dryrun.hexa --selftest
+//
+// INPUTS
+//   state/h_last_raw_p{1..4}_TRAINED_<tag>.json   (entries[].h: 256-d)
+//   state/phi_4path_cross_result_v3_TRAINED_<tag>.json  (spectra[p].16-d)
+//
+// OUTPUTS
+//   state/alm_decode_hook_dryrun_<tag>.json
+//
+// HOOK CONTRACT (frozen here)
+//   input:  (current_logits: float[V], hidden_state: float[H], step: int)
+//   output: adjusted_logits: float[V]
+//   method: project hidden_state onto top-K Φ-eigenvecs (proxy: per-path
+//           spectrum × random-but-seeded readout matrix), produce a
+//           steering bias of dim V, scale by α, add to logits:
+//             adj = logits + α * (W_steer @ phi_proj(hidden_state))
+//   safety: α clamped to α_max = 0.20 (logit-space). Empirical α_max is
+//           re-derived from the predicate sweep below.
+
+let STATE_DIR        = "/Users/ghost/core/anima/state"
+let DOCS_DIR         = "/Users/ghost/core/anima/docs"
+let HELPER_PATH      = "/tmp/alm_decode_hook_dryrun_helper.py"
+let SCHEMA           = "anima/alm_decode_hook_dryrun/1"
+let DEFAULT_TAG      = "r6"
+let DEFAULT_VOCAB    = 4096      // proxy V (real Qwen3 ≈ 152K, irrelevant for predicate)
+let DEFAULT_STEPS    = 64        // simulated decode steps
+let DEFAULT_ALPHA    = 0.10
+let DEFAULT_ALPHA_MAX = 0.20
+let DEFAULT_PHI_DIMS = 16
+let DEFAULT_HIDDEN   = 256
+let TOP1_KEEP_FRAC   = 0.95      // P1 threshold (re-verified empirically)
+let KL_MAX           = 0.05      // P2 threshold (logit-space KL bound)
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _arg_flag(av: array, f: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if to_string(av[i]) == f { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _arg_val(av: array, f: string, dflt: string) -> string {
+    let mut i = 0
+    let n = len(av)
+    while i < n - 1 {
+        if to_string(av[i]) == f { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "# alm_decode_hook_dryrun_helper — invoked by tool/alm_decode_hook_dryrun.hexa\n" +
+        "# Stage-0 (pre-H100) prototype: simulates per-token Φ-attach decode hook\n" +
+        "# on existing r6 h_last data. raw#12 — predicates pre-registered in caller.\n" +
+        "import json, sys, os, math\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "STATE_DIR = sys.argv[1]\n" +
+        "TAG       = sys.argv[2]\n" +
+        "OUT       = sys.argv[3]\n" +
+        "VOCAB     = int(sys.argv[4])\n" +
+        "STEPS     = int(sys.argv[5])\n" +
+        "ALPHA     = float(sys.argv[6])\n" +
+        "ALPHA_MAX = float(sys.argv[7])\n" +
+        "PHI_DIMS  = int(sys.argv[8])\n" +
+        "TOP1_KEEP = float(sys.argv[9])\n" +
+        "KL_MAX    = float(sys.argv[10])\n" +
+        "\n" +
+        "PATHS = ['p1','p2','p3','p4']\n" +
+        "\n" +
+        "def load_h_last(p, tag):\n" +
+        "    fn = f'{STATE_DIR}/h_last_raw_{p}_TRAINED_{tag}.json'\n" +
+        "    with open(fn) as f:\n" +
+        "        d = json.load(f)\n" +
+        "    H = np.asarray([e['h'] for e in d['entries']], dtype=np.float64)\n" +
+        "    return H, d['hidden_dim_truncated']\n" +
+        "\n" +
+        "def load_phi_spectra(tag):\n" +
+        "    fn = f'{STATE_DIR}/phi_4path_cross_result_v3_TRAINED_{tag}.json'\n" +
+        "    with open(fn) as f:\n" +
+        "        d = json.load(f)\n" +
+        "    return {p: np.asarray(d['spectra'][p], dtype=np.float64) for p in PATHS}\n" +
+        "\n" +
+        "def kl_logit_space(p_logits, q_logits):\n" +
+        "    # softmax both, KL(p||q)\n" +
+        "    def sm(x):\n" +
+        "        x = x - x.max()\n" +
+        "        e = np.exp(x); return e / e.sum()\n" +
+        "    p = sm(p_logits); q = sm(q_logits)\n" +
+        "    eps = 1e-12\n" +
+        "    return float((p * (np.log(p + eps) - np.log(q + eps))).sum())\n" +
+        "\n" +
+        "def phi_attach_hook(logits, hidden, phi_eigvec, W_steer, alpha):\n" +
+        "    # Hook contract: adj = logits + alpha * (W_steer @ proj)\n" +
+        "    # proj = (hidden · phi_eigvec) * phi_eigvec  (rank-1 projection)\n" +
+        "    # phi_eigvec is normalised to unit L2.\n" +
+        "    coef = float(np.dot(hidden[:PHI_DIMS], phi_eigvec))\n" +
+        "    proj = coef * phi_eigvec                # PHI_DIMS\n" +
+        "    bias = W_steer @ proj                   # VOCAB\n" +
+        "    return logits + alpha * bias\n" +
+        "\n" +
+        "def main():\n" +
+        "    rng = np.random.default_rng(42)\n" +
+        "    # Load real artifacts.\n" +
+        "    Hs = {p: load_h_last(p, TAG)[0] for p in PATHS}\n" +
+        "    spectra = load_phi_spectra(TAG)\n" +
+        "    # The Φ-eigenvec for steering: use the spectrum vector itself as a 16-d\n" +
+        "    # signature (deterministic, sourced from the gated artifact). Normalise.\n" +
+        "    phi_eig = {}\n" +
+        "    for p in PATHS:\n" +
+        "        v = spectra[p].copy()\n" +
+        "        n = np.linalg.norm(v)\n" +
+        "        phi_eig[p] = v / (n if n > 0 else 1.0)\n" +
+        "    # W_steer: deterministic readout (PHI_DIMS → VOCAB), seeded.\n" +
+        "    W_steer = rng.normal(0.0, 1.0/math.sqrt(PHI_DIMS), size=(VOCAB, PHI_DIMS))\n" +
+        "    # Synthesize a base-LM logit stream: deterministic seeded normal\n" +
+        "    # plus a slowly varying mean (mimics a coherent decoder).\n" +
+        "    base_logits = rng.normal(0.0, 1.0, size=(STEPS, VOCAB))\n" +
+        "    drift = np.linspace(0, 0.5, STEPS).reshape(-1,1) * rng.normal(0,0.5,size=(1,VOCAB))\n" +
+        "    base_logits = base_logits + drift\n" +
+        "    # Use real h_t: cycle through the 16-entry h_last per path; here use p1.\n" +
+        "    H = Hs['p1']  # 16 x 256\n" +
+        "    eig = phi_eig['p1']\n" +
+        "    # Sweep alphas to find empirical α_max satisfying P1 + P2.\n" +
+        "    alphas = np.linspace(0.0, ALPHA_MAX, 9)  # 0.0,0.025,...,0.20\n" +
+        "    sweep = []\n" +
+        "    for a in alphas:\n" +
+        "        kept = 0; kls = []\n" +
+        "        for t in range(STEPS):\n" +
+        "            ht = H[t % H.shape[0]]\n" +
+        "            pre = base_logits[t]\n" +
+        "            post = phi_attach_hook(pre, ht, eig, W_steer, a)\n" +
+        "            if int(np.argmax(post)) == int(np.argmax(pre)):\n" +
+        "                kept += 1\n" +
+        "            kls.append(kl_logit_space(pre, post))\n" +
+        "        keep_frac = kept / STEPS\n" +
+        "        kl_max_obs = float(max(kls))\n" +
+        "        kl_mean_obs = float(np.mean(kls))\n" +
+        "        sweep.append({\n" +
+        "            'alpha': float(a),\n" +
+        "            'top1_keep_frac': keep_frac,\n" +
+        "            'kl_max_obs': kl_max_obs,\n" +
+        "            'kl_mean_obs': kl_mean_obs,\n" +
+        "            'p1_pass': bool(keep_frac >= TOP1_KEEP),\n" +
+        "            'p2_pass': bool(kl_max_obs <= KL_MAX),\n" +
+        "        })\n" +
+        "    # Largest α with both predicates satisfied.\n" +
+        "    feasible = [s for s in sweep if s['p1_pass'] and s['p2_pass']]\n" +
+        "    alpha_emp = max([s['alpha'] for s in feasible], default=0.0)\n" +
+        "    primary = next((s for s in sweep if abs(s['alpha'] - ALPHA) < 1e-9), sweep[0])\n" +
+        "    p1_pass_primary = primary['p1_pass']\n" +
+        "    p2_pass_primary = primary['p2_pass']\n" +
+        "    verdict = 'PASS' if (p1_pass_primary and p2_pass_primary) else 'FAIL'\n" +
+        "    out = {\n" +
+        "        'schema': 'anima/alm_decode_hook_dryrun/1',\n" +
+        "        'tag': TAG,\n" +
+        "        'predicates_pre_registered': {\n" +
+        "            'p1_top1_preservation': {'threshold_keep_frac': TOP1_KEEP, 'description': 'argmax(post) == argmax(pre) on >= threshold of steps'},\n" +
+        "            'p2_kl_bounded':        {'threshold_kl_max': KL_MAX,    'description': 'KL(softmax(pre) || softmax(post)) <= threshold over all steps'},\n" +
+        "        },\n" +
+        "        'hook_contract': {\n" +
+        "            'input':  '(current_logits[V], hidden_state[H_dim], step:int)',\n" +
+        "            'output': 'adjusted_logits[V]',\n" +
+        "            'formula': 'adj = logits + alpha * (W_steer @ ((h[:phi_dims]·phi_eigvec) * phi_eigvec))',\n" +
+        "            'phi_dims': PHI_DIMS,\n" +
+        "            'phi_eigvec_source': f'state/phi_4path_cross_result_v3_TRAINED_{TAG}.json::spectra (L2-normalised)',\n" +
+        "            'alpha_default': ALPHA,\n" +
+        "            'alpha_max_declared': ALPHA_MAX,\n" +
+        "        },\n" +
+        "        'sim': {\n" +
+        "            'vocab_proxy': VOCAB,\n" +
+        "            'steps': STEPS,\n" +
+        "            'hidden_dim': int(H.shape[1]),\n" +
+        "            'h_last_path': 'p1',\n" +
+        "            'rng_seed': 42,\n" +
+        "        },\n" +
+        "        'sweep': sweep,\n" +
+        "        'alpha_emp_max_satisfying_p1_p2': alpha_emp,\n" +
+        "        'primary_alpha_eval': primary,\n" +
+        "        'p1_pass': p1_pass_primary,\n" +
+        "        'p2_pass': p2_pass_primary,\n" +
+        "        'verdict': verdict,\n" +
+        "    }\n" +
+        "    os.makedirs(os.path.dirname(OUT), exist_ok=True)\n" +
+        "    with open(OUT, 'w') as f:\n" +
+        "        json.dump(out, f, indent=2)\n" +
+        "    print(f'verdict={verdict} alpha_emp_max={alpha_emp:.4f} primary_alpha={ALPHA} keep_frac={primary[\"top1_keep_frac\"]:.4f} kl_max={primary[\"kl_max_obs\"]:.6f}')\n" +
+        "\n" +
+        "if __name__ == '__main__':\n" +
+        "    main()\n"
+    write_file(HELPER_PATH, src)
+    exec_capture("chmod +x " + _sh_quote(HELPER_PATH))
+}
+
+fn main() {
+    let av = args()
+    let tag = _arg_val(av, "--tag", DEFAULT_TAG)
+    let out = STATE_DIR + "/alm_decode_hook_dryrun_" + tag + ".json"
+
+    _write_helper()
+
+    let cmd = "python3 " + _sh_quote(HELPER_PATH) + " " +
+              _sh_quote(STATE_DIR) + " " +
+              _sh_quote(tag) + " " +
+              _sh_quote(out) + " " +
+              to_string(DEFAULT_VOCAB) + " " +
+              to_string(DEFAULT_STEPS) + " " +
+              to_string(DEFAULT_ALPHA) + " " +
+              to_string(DEFAULT_ALPHA_MAX) + " " +
+              to_string(DEFAULT_PHI_DIMS) + " " +
+              to_string(TOP1_KEEP_FRAC) + " " +
+              to_string(KL_MAX)
+    let r = exec_capture(cmd)
+    let stdout_s = to_string(r[0])
+    let rc = to_int(to_string(r[2]))
+    let summary_path = STATE_DIR + "/alm_decode_hook_dryrun_last.txt"
+    write_file(summary_path, "tag=" + tag + "\nrc=" + to_string(rc) + "\n" + stdout_s + "\n")
+    if rc != 0 {
+        exit(1)
+    }
+    exit(0)
+}
+
+main()
