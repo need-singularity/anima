@@ -1,0 +1,358 @@
+// tool/alm_decode_hook_w_steer_train.hexa — train W_steer readout for L2 Φ-attach hook
+//
+// PURPOSE
+//   docs/alm_inference_decode_hook_spec_20260425.md §5.2 records that the
+//   dry-run prototype uses a NULL (seeded-Gaussian) W_steer readout, which
+//   bounds the safety predicates (P1, P2) but provides no semantic steering.
+//   This tool replaces that null readout with a CLOSED-FORM ridge-regression
+//   fit on the real r6 h_last data (16 templates × 4 paths = 64 examples).
+//
+//   Production target (deferred): tool/serve_alm_persona.hexa::backend_invoke
+//   loads `state/alm_decode_hook_w_steer_r6.json` instead of seeded null.
+//
+// PRE-REGISTERED OBJECTIVE (raw#12)
+//   Given:
+//     - h_t ∈ R^{H_dim=256}      (real h_last, per (template_idx, path))
+//     - phi_eigvec_p ∈ R^{phi_dims=16}, p ∈ {p1..p4}, L2-normalised
+//     - target y_i ∈ {0..15}     (template index — what the prompt is "about")
+//   Pre-image (training-time proxy for V-space):
+//     proj_i = (h_i[:phi_dims] · phi_eigvec_path(i)) * phi_eigvec_path(i)
+//     proj_i ∈ R^{phi_dims}
+//   Readout dimension at training: K=16 = num templates (NOT VOCAB).
+//   Production V-space embedding is a FIXED downstream linear map T_emb:
+//     R^K → R^V, applied at wire-in time. This decouples training (K=16,
+//     tractable, n=64) from V-space inference (V≈152K, intractable from 64).
+//   Closed-form objective:
+//     W_steer^* = argmin_W || X W^T − Y ||_F^2 + λ ||W||_F^2
+//     X ∈ R^{n × phi_dims}, Y ∈ R^{n × K} (one-hot targets), W ∈ R^{K × phi_dims}
+//   Solution: W^T = (X^T X + λ I)^{-1} X^T Y, so W = Y^T X (X^T X + λ I)^{-1}
+//
+// WHY CROSS-ENTROPY IS NOT THE FORMAL OBJECTIVE HERE (raw#12 정직성)
+//   The user request mentioned "minimize cross-entropy of softmax(logits +
+//   α·proj)". That objective is NOT closed-form in W (softmax is non-linear).
+//   Two honest options:
+//     (a) iterate (gradient descent on W) — violates the closed-form ask;
+//     (b) substitute a SURROGATE that IS closed-form and dominates CE on
+//         well-separated targets — namely ridge regression on one-hot Y.
+//   We pick (b). The cert below records BOTH the closed-form MSE and the
+//   resulting CE evaluated POST-HOC (not optimised, but reported honestly).
+//
+// HELD-OUT EVAL
+//   5-fold cross-validation by (template_idx mod 5). For each fold:
+//     - train on 4 paths × 13 templates ≈ 52 examples
+//     - eval on 4 paths × 3 templates ≈ 12 examples
+//   Metrics:
+//     - top-1 template accuracy on held-out (chance = 1/16 = 6.25%)
+//     - top-3 template accuracy
+//     - cross-entropy vs uniform (lower is better)
+//   PASS criterion (pre-registered): top-1 ≥ 12.5% (= 2× chance).
+//
+// STOP CONDITIONS (from goal)
+//   1. W_steer trained AND held-out top-1 ≥ 2× chance     → save + cert PASS
+//   2. data insufficient (held-out top-1 < 2× chance)     → save + cert FAIL,
+//                                                            document reason
+//   3. closed-form ill-conditioned (cond > 1e12)          → escalate
+//
+// RAW POLICY
+//   raw#9   no .py in repo — python helper materialised to /tmp/ only
+//   raw#10  deterministic — fixed numpy seed 42, fixed λ
+//   raw#11  snake_case
+//   raw#12  실측 only — objective + pass criterion declared HERE before run
+//   raw#15  no-hardcode — paths from constants
+//
+// USAGE
+//   hexa tool/alm_decode_hook_w_steer_train.hexa
+//   hexa tool/alm_decode_hook_w_steer_train.hexa --tag r6
+//   hexa tool/alm_decode_hook_w_steer_train.hexa --lambda 0.1
+//
+// INPUTS
+//   state/h_last_raw_p{1..4}_TRAINED_<tag>.json  (entries[].h:256, .idx:0..15)
+//   state/phi_4path_cross_result_v3_TRAINED_<tag>.json::spectra
+//
+// OUTPUTS
+//   state/alm_decode_hook_w_steer_<tag>.json           — weights + cert
+//   state/alm_decode_hook_w_steer_<tag>_summary.txt    — short summary
+//
+// EXIT CODES
+//   0  trained, cert PASS or documented FAIL (insufficient data path)
+//   1  inputs missing / malformed
+//   2  closed-form ill-conditioned (escalation)
+
+let STATE_DIR        = "/Users/ghost/core/anima/state"
+let HELPER_PATH      = "/tmp/alm_decode_hook_w_steer_train_helper.py"
+let SCHEMA           = "anima/alm_decode_hook_w_steer/1"
+let DEFAULT_TAG      = "r6"
+let DEFAULT_PHI_DIMS = 16
+let DEFAULT_LAMBDA   = 0.1
+let DEFAULT_K        = 16          // number of template classes
+let CHANCE           = 0.0625      // 1/16
+let PASS_THRESH      = 0.125       // 2× chance (pre-registered)
+let COND_LIMIT       = 1e12        // closed-form well-conditioned bound
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _arg_val(av: array, f: string, dflt: string) -> string {
+    let mut i = 0
+    let n = len(av)
+    while i < n - 1 {
+        if to_string(av[i]) == f { return to_string(av[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "# alm_decode_hook_w_steer_train_helper — closed-form ridge fit for W_steer.\n" +
+        "# raw#12 — objective + pass criterion declared in caller hexa.\n" +
+        "import json, sys, os, math\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "STATE_DIR = sys.argv[1]\n" +
+        "TAG       = sys.argv[2]\n" +
+        "OUT       = sys.argv[3]\n" +
+        "PHI_DIMS  = int(sys.argv[4])\n" +
+        "LAMBDA    = float(sys.argv[5])\n" +
+        "K         = int(sys.argv[6])\n" +
+        "PASS_TH   = float(sys.argv[7])\n" +
+        "COND_LIM  = float(sys.argv[8])\n" +
+        "\n" +
+        "PATHS = ['p1','p2','p3','p4']\n" +
+        "RNG_SEED = 42\n" +
+        "\n" +
+        "def load_h_last(p, tag):\n" +
+        "    fn = f'{STATE_DIR}/h_last_raw_{p}_TRAINED_{tag}.json'\n" +
+        "    with open(fn) as f:\n" +
+        "        d = json.load(f)\n" +
+        "    H = np.asarray([e['h'] for e in d['entries']], dtype=np.float64)\n" +
+        "    idx = np.asarray([e['idx'] for e in d['entries']], dtype=np.int64)\n" +
+        "    return H, idx\n" +
+        "\n" +
+        "def load_phi(tag):\n" +
+        "    fn = f'{STATE_DIR}/phi_4path_cross_result_v3_TRAINED_{tag}.json'\n" +
+        "    with open(fn) as f:\n" +
+        "        d = json.load(f)\n" +
+        "    eigs = {}\n" +
+        "    for p in PATHS:\n" +
+        "        v = np.asarray(d['spectra'][p], dtype=np.float64)\n" +
+        "        n = np.linalg.norm(v)\n" +
+        "        eigs[p] = v / (n if n > 0 else 1.0)\n" +
+        "    return eigs\n" +
+        "\n" +
+        "def softmax(x, axis=-1):\n" +
+        "    x = x - x.max(axis=axis, keepdims=True)\n" +
+        "    e = np.exp(x)\n" +
+        "    return e / e.sum(axis=axis, keepdims=True)\n" +
+        "\n" +
+        "def ridge_fit(X, Y, lam):\n" +
+        "    # W^T = (X^T X + lam I)^{-1} X^T Y\n" +
+        "    XtX = X.T @ X\n" +
+        "    A = XtX + lam * np.eye(X.shape[1])\n" +
+        "    cond = float(np.linalg.cond(A))\n" +
+        "    Wt = np.linalg.solve(A, X.T @ Y)\n" +
+        "    W = Wt.T  # K x phi_dims\n" +
+        "    return W, cond\n" +
+        "\n" +
+        "def build_features(Hs, idxs, eigs):\n" +
+        "    # Build X (n x phi_dims), Y (n x K), template_idx (n,), path_id (n,)\n" +
+        "    Xs = []\n" +
+        "    Ys = []\n" +
+        "    Ts = []\n" +
+        "    Ps = []\n" +
+        "    for pi, p in enumerate(PATHS):\n" +
+        "        H = Hs[p]; idx = idxs[p]; eig = eigs[p]\n" +
+        "        # rank-1 projection in 16-d\n" +
+        "        h_head = H[:, :PHI_DIMS]              # n x phi_dims\n" +
+        "        coef = h_head @ eig                   # n\n" +
+        "        proj = coef[:, None] * eig[None, :]   # n x phi_dims\n" +
+        "        for r in range(H.shape[0]):\n" +
+        "            Xs.append(proj[r])\n" +
+        "            y = np.zeros(K); y[int(idx[r])] = 1.0\n" +
+        "            Ys.append(y)\n" +
+        "            Ts.append(int(idx[r]))\n" +
+        "            Ps.append(pi)\n" +
+        "    return (np.asarray(Xs), np.asarray(Ys),\n" +
+        "            np.asarray(Ts), np.asarray(Ps))\n" +
+        "\n" +
+        "def evaluate(W, X, T):\n" +
+        "    # logits = X W^T  (n x K). predict argmax.\n" +
+        "    logits = X @ W.T\n" +
+        "    pred = np.argmax(logits, axis=1)\n" +
+        "    top1 = float((pred == T).mean())\n" +
+        "    # top-3\n" +
+        "    top3_count = 0\n" +
+        "    for i in range(len(T)):\n" +
+        "        order = np.argsort(-logits[i])\n" +
+        "        if T[i] in order[:3]:\n" +
+        "            top3_count += 1\n" +
+        "    top3 = top3_count / len(T) if len(T) > 0 else 0.0\n" +
+        "    # cross-entropy (post-hoc, not optimised)\n" +
+        "    p = softmax(logits, axis=1)\n" +
+        "    eps = 1e-12\n" +
+        "    ce = float(-np.log(p[np.arange(len(T)), T] + eps).mean())\n" +
+        "    return {'top1': top1, 'top3': top3, 'ce': ce, 'n': int(len(T))}\n" +
+        "\n" +
+        "def evaluate_null(X, T, K, seed=42):\n" +
+        "    # baseline: seeded Gaussian W_steer (the current null readout)\n" +
+        "    rng = np.random.default_rng(seed)\n" +
+        "    W_null = rng.normal(0.0, 1.0/math.sqrt(X.shape[1]), size=(K, X.shape[1]))\n" +
+        "    return evaluate(W_null, X, T)\n" +
+        "\n" +
+        "def main():\n" +
+        "    Hs = {}; idxs = {}\n" +
+        "    for p in PATHS:\n" +
+        "        H, idx = load_h_last(p, TAG)\n" +
+        "        Hs[p] = H; idxs[p] = idx\n" +
+        "    eigs = load_phi(TAG)\n" +
+        "    X, Y, T, P = build_features(Hs, idxs, eigs)\n" +
+        "    n, d = X.shape\n" +
+        "    # Full-data fit (production weights).\n" +
+        "    W_full, cond_full = ridge_fit(X, Y, LAMBDA)\n" +
+        "    train_metrics = evaluate(W_full, X, T)\n" +
+        "    null_train = evaluate_null(X, T, K)\n" +
+        "    # 5-fold CV by template_idx mod 5 (so held-out templates are unseen).\n" +
+        "    folds = []\n" +
+        "    for f in range(5):\n" +
+        "        test_mask = (T % 5) == f\n" +
+        "        train_mask = ~test_mask\n" +
+        "        Xt = X[train_mask]; Yt = Y[train_mask]\n" +
+        "        Xv = X[test_mask];  Tv = T[test_mask]\n" +
+        "        if Xt.shape[0] == 0 or Xv.shape[0] == 0:\n" +
+        "            continue\n" +
+        "        Wf, condf = ridge_fit(Xt, Yt, LAMBDA)\n" +
+        "        m = evaluate(Wf, Xv, Tv)\n" +
+        "        m_null = evaluate_null(Xv, Tv, K)\n" +
+        "        folds.append({\n" +
+        "            'fold': f,\n" +
+        "            'n_train': int(Xt.shape[0]),\n" +
+        "            'n_test':  int(Xv.shape[0]),\n" +
+        "            'cond':    float(condf),\n" +
+        "            'trained': m,\n" +
+        "            'null':    m_null,\n" +
+        "        })\n" +
+        "    held_top1 = float(np.mean([f['trained']['top1'] for f in folds])) if folds else 0.0\n" +
+        "    held_top3 = float(np.mean([f['trained']['top3'] for f in folds])) if folds else 0.0\n" +
+        "    held_ce   = float(np.mean([f['trained']['ce']   for f in folds])) if folds else float('inf')\n" +
+        "    null_top1 = float(np.mean([f['null']['top1']    for f in folds])) if folds else 0.0\n" +
+        "    null_top3 = float(np.mean([f['null']['top3']    for f in folds])) if folds else 0.0\n" +
+        "    null_ce   = float(np.mean([f['null']['ce']      for f in folds])) if folds else float('inf')\n" +
+        "    # Verdict\n" +
+        "    if cond_full > COND_LIM:\n" +
+        "        verdict = 'ESCALATE_ILL_CONDITIONED'\n" +
+        "        rc = 2\n" +
+        "    elif held_top1 >= PASS_TH:\n" +
+        "        verdict = 'PASS'\n" +
+        "        rc = 0\n" +
+        "    else:\n" +
+        "        verdict = 'FAIL_INSUFFICIENT_DATA'\n" +
+        "        rc = 0\n" +
+        "    out = {\n" +
+        "        'schema': 'anima/alm_decode_hook_w_steer/1',\n" +
+        "        'tag': TAG,\n" +
+        "        'objective_pre_registered': {\n" +
+        "            'kind': 'ridge_regression_one_hot_template_index',\n" +
+        "            'closed_form': 'W^T = (X^T X + lambda I)^{-1} X^T Y',\n" +
+        "            'X_dim': PHI_DIMS,\n" +
+        "            'Y_dim_K': K,\n" +
+        "            'lambda': LAMBDA,\n" +
+        "            'rng_seed': RNG_SEED,\n" +
+        "            'pass_threshold_held_out_top1': PASS_TH,\n" +
+        "            'chance_baseline': 1.0/K,\n" +
+        "            'eval': '5-fold CV by template_idx mod 5 (held-out templates unseen)',\n" +
+        "        },\n" +
+        "        'data': {\n" +
+        "            'n_total': int(n),\n" +
+        "            'phi_dims': int(d),\n" +
+        "            'K_classes': int(K),\n" +
+        "            'paths': PATHS,\n" +
+        "            'sources': {\n" +
+        "                'h_last': [f'state/h_last_raw_{p}_TRAINED_{TAG}.json' for p in PATHS],\n" +
+        "                'phi':    f'state/phi_4path_cross_result_v3_TRAINED_{TAG}.json',\n" +
+        "            },\n" +
+        "        },\n" +
+        "        'full_fit': {\n" +
+        "            'cond': float(cond_full),\n" +
+        "            'train_metrics': train_metrics,\n" +
+        "            'train_metrics_null_baseline': null_train,\n" +
+        "            'W_steer_K_by_phi_dims': W_full.tolist(),\n" +
+        "        },\n" +
+        "        'cv_folds': folds,\n" +
+        "        'cv_summary': {\n" +
+        "            'held_out_top1_trained': held_top1,\n" +
+        "            'held_out_top3_trained': held_top3,\n" +
+        "            'held_out_ce_trained':   held_ce,\n" +
+        "            'held_out_top1_null':    null_top1,\n" +
+        "            'held_out_top3_null':    null_top3,\n" +
+        "            'held_out_ce_null':      null_ce,\n" +
+        "            'top1_lift_over_null':   held_top1 - null_top1,\n" +
+        "            'top1_lift_over_chance': held_top1 - (1.0/K),\n" +
+        "        },\n" +
+        "        'verdict': verdict,\n" +
+        "        'production_wire_in_note': (\n" +
+        "            'W_steer here maps phi_dims->K=16 (template space). To embed '\n" +
+        "            'in V-space (Qwen3 vocab) at decode time, compose with a fixed '\n" +
+        "            'template->token-distribution map T_emb in R^{V x K}; this map '\n" +
+        "            'is out of scope for this 0-cost training round.'\n" +
+        "        ),\n" +
+        "    }\n" +
+        "    os.makedirs(os.path.dirname(OUT), exist_ok=True)\n" +
+        "    with open(OUT, 'w') as f:\n" +
+        "        json.dump(out, f, indent=2)\n" +
+        "    summary = (\n" +
+        "        f'verdict={verdict}\\n'\n" +
+        "        f'n_total={n} phi_dims={d} K={K}\\n'\n" +
+        "        f'cond_full={cond_full:.3e}\\n'\n" +
+        "        f'held_out top1: trained={held_top1:.4f} null={null_top1:.4f} '\n" +
+        "        f'chance={1.0/K:.4f}\\n'\n" +
+        "        f'held_out top3: trained={held_top3:.4f} null={null_top3:.4f}\\n'\n" +
+        "        f'held_out ce:   trained={held_ce:.4f} null={null_ce:.4f}\\n'\n" +
+        "        f'pass_threshold={PASS_TH:.4f}\\n'\n" +
+        "    )\n" +
+        "    print(summary)\n" +
+        "    sys.exit(rc)\n" +
+        "\n" +
+        "if __name__ == '__main__':\n" +
+        "    main()\n"
+    write_file(HELPER_PATH, src)
+    exec_capture("chmod +x " + _sh_quote(HELPER_PATH))
+}
+
+fn main() {
+    let av = args()
+    let tag = _arg_val(av, "--tag", DEFAULT_TAG)
+    let lam_s = _arg_val(av, "--lambda", to_string(DEFAULT_LAMBDA))
+    let out = STATE_DIR + "/alm_decode_hook_w_steer_" + tag + ".json"
+
+    _write_helper()
+
+    let cmd = "python3 " + _sh_quote(HELPER_PATH) + " " +
+              _sh_quote(STATE_DIR) + " " +
+              _sh_quote(tag) + " " +
+              _sh_quote(out) + " " +
+              to_string(DEFAULT_PHI_DIMS) + " " +
+              lam_s + " " +
+              to_string(DEFAULT_K) + " " +
+              to_string(PASS_THRESH) + " " +
+              to_string(COND_LIMIT)
+    let r = exec_capture(cmd)
+    let stdout_s = to_string(r[0])
+    let stderr_s = to_string(r[1])
+    let rc = to_int(to_string(r[2]))
+    let summary_path = STATE_DIR + "/alm_decode_hook_w_steer_" + tag + "_summary.txt"
+    write_file(summary_path,
+        "tag=" + tag + "\nlambda=" + lam_s + "\nrc=" + to_string(rc) + "\n" +
+        stdout_s + "\n" + (if rc != 0 { "STDERR:\n" + stderr_s } else { "" }))
+    print(stdout_s)
+    if rc == 2 {
+        // ill-conditioned escalation
+        exit(2)
+    }
+    exit(0)
+}
+
+main()

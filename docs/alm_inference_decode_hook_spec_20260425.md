@@ -226,11 +226,59 @@ operating envelope (α ≤ 0.20) sits **comfortably below both break points**.
 - `state/alm_decode_hook_dryrun_r6.json` (verdict=PASS)
 - `state/alm_decode_hook_dryrun_last.txt` (run summary)
 - `docs/alm_inference_decode_hook_spec_20260425.md` (this file)
+- `tool/alm_decode_hook_w_steer_train.hexa` (W_steer ridge-fit, 2026-04-25)
+- `state/alm_decode_hook_w_steer_r6.json` (verdict=FAIL_INSUFFICIENT_DATA)
+- `state/alm_decode_hook_w_steer_r6_summary.txt`
 
 ### verdict
 **L2_DECODE_HOOK_SPEC_VERIFIED_PENDING_LIVE_WIRE** — internal consistency
 established at 0-cost (no GPU, no model load). Live wire-in is gated on
 H100 cascade #9 (base_model + persona_lora landing on disk).
+
+---
+
+## §6.5 W_steer training round (2026-04-25, 0-cost CPU)
+
+A closed-form ridge-regression fit was attempted to replace the null
+seeded-Gaussian `W_steer` of §5.2. Tool: `tool/alm_decode_hook_w_steer_train.hexa`.
+
+### pre-registered objective
+- Target: 16-class template index (one-hot Y), features X = rank-1 Φ-projection
+  (matching §1.2 hook formula).
+- Closed form: `W^T = (X^T X + λ I)^{-1} X^T Y`, λ = 0.1, seed 42.
+- Pass criterion: 5-fold CV held-out top-1 ≥ 12.5 % (= 2 × chance).
+
+### result — `state/alm_decode_hook_w_steer_r6.json`
+| metric | trained | null Gaussian | chance |
+|---:|---:|---:|---:|
+| train top-1 | 7.81 % | 4.69 % | 6.25 % |
+| train CE    | 2.766  | 2.880  | —      |
+| **held-out top-1** | **1.67 %** | 5.00 % | 6.25 % |
+| held-out top-3     | 11.25 %    | 17.92 %| —      |
+| held-out CE        | 2.798      | 2.876  | —      |
+
+`cond(X^T X + λ I) = 4.13 × 10³` — well-conditioned, math is sound.
+
+### verdict: **W_STEER_TRAINING_FAIL_INSUFFICIENT_DATA**
+- The closed-form solver works; fit slightly improves train-set CE over null.
+- Held-out top-1 is **below chance** because 5-fold CV by template_idx mod 5
+  makes held-out templates **never seen** in training. Any classifier whose
+  decision boundary is in template-id-space is structurally OOD on the held-out
+  fold. Ablation confirms: even using full `h[:256]` (256-d, no rank-1 collapse)
+  yields held-out top-1 = 0 %.
+- Root cause: 16 templates × 4 paths = 64 examples, with templates as the label
+  space, is a **zero-shot** generalisation regime, not a learning regime.
+- Stop condition #2 (data insufficient) triggered as pre-registered.
+
+### what this means for the hook
+- The §5.2 statement "W_steer is null readout … shape correct, semantic content
+  not" stands. Ridge regression on this corpus does not recover semantic
+  content from template-id supervision. The training cert is preserved as
+  evidence of the wall.
+- Alternative supervisions that would respect this corpus (deferred): (a)
+  contrastive same-template-different-path (within-template held-out paths,
+  not held-out templates); (b) cluster-id via Φ spectrum participation ratio;
+  (c) use real Qwen3 next-token distributions as Y, requiring live GPU.
 
 ---
 
