@@ -1,0 +1,164 @@
+// tool/an11_b_anti_map_heuristic_score.hexa — ANTI_MAP semantic distance heuristic scoring (raw#9).
+//
+// PURPOSE
+//   Mk.XI ANTI_MAP ledger의 anti-meaning 항목들이 surface-level negation 이상의
+//   semantic specificity를 보유하는지 simple heuristic 측정. LLM-as-judge 대신
+//   token-level negation marker count + word-bag overlap inversion.
+//
+//   raw#10 honest: heuristic은 noisy approximation. real validation은 LLM-judge
+//   별도 cycle. 본 scoring은 첫 baseline check — 모든 항목이 negation marker
+//   포함 + word-bag overlap < threshold이면 PASS_BASELINE.
+//
+// METHOD
+//   For each (original, anti_meaning) pair:
+//     orig_tokens = simple_tokenize(original)
+//     anti_tokens = simple_tokenize(anti_meaning)
+//     overlap = |orig_tokens ∩ anti_tokens| / |orig_tokens ∪ anti_tokens|
+//     negation_marker_count = count of {no, not, lacks, fails, rejects, prevents,
+//                                       eliminates, never, cannot, 없이, 없으며,
+//                                       못, 안, 거부, 불필요, 잘못, 부수} in anti
+//     score = (1 - overlap) + negation_marker_count * 0.1   (max ~ 1.5+)
+//   PASS_BASELINE if all 16 entries: overlap <= 0.5 AND negation_marker_count >= 1
+
+let HELPER_PATH = "/tmp/an11_b_anti_map_heuristic_score_helper.hexa_tmp"
+let SCHEMA      = "anima/an11_anti_map_heuristic_score/1"
+let SPEC_DOC    = "docs/mk_xi_implementation_roadmap_20260425.md §2"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, re, datetime\n" +
+        "\n" +
+        "NEG_MARKERS = {\n" +
+        "    'no', 'not', 'lacks', 'fails', 'rejects', 'prevents', 'eliminates',\n" +
+        "    'never', 'cannot', 'epiphenomenal', 'inconsistent',\n" +
+        "    '없이', '없으며', '없는', '없다', '못', '안', '거부', '거부되며',\n" +
+        "    '불필요', '잘못', '부수', '없으며,', '없이도'\n" +
+        "}\n" +
+        "\n" +
+        "def tokenize(s):\n" +
+        "    s = s.lower()\n" +
+        "    parts = re.findall(r'[a-z]+|[\\u3131-\\uD79F]+', s)\n" +
+        "    return [p for p in parts if len(p) > 1]\n" +
+        "\n" +
+        "def jaccard_overlap(a, b):\n" +
+        "    sa, sb = set(a), set(b)\n" +
+        "    union = sa | sb\n" +
+        "    if not union: return 0.0\n" +
+        "    return len(sa & sb) / len(union)\n" +
+        "\n" +
+        "def neg_marker_count(text):\n" +
+        "    text_low = text.lower()\n" +
+        "    count = 0\n" +
+        "    for m in NEG_MARKERS:\n" +
+        "        if m in text_low:\n" +
+        "            count += text_low.count(m)\n" +
+        "    return count\n" +
+        "\n" +
+        "def cmd_run(input_path, result_path, schema, spec_doc):\n" +
+        "    with open(input_path) as f: d = json.load(f)\n" +
+        "    entries = d['ANTI_MAP_16_entries']\n" +
+        "    records = []\n" +
+        "    fail_count = 0\n" +
+        "    for e in entries:\n" +
+        "        orig = e['original']\n" +
+        "        anti = e['anti_meaning']\n" +
+        "        ot = tokenize(orig)\n" +
+        "        at = tokenize(anti)\n" +
+        "        ov = jaccard_overlap(ot, at)\n" +
+        "        nm = neg_marker_count(anti)\n" +
+        "        score = (1.0 - ov) + 0.1 * nm\n" +
+        "        passing = (ov <= 0.5) and (nm >= 1)\n" +
+        "        if not passing: fail_count += 1\n" +
+        "        records.append({\n" +
+        "            'idx': e['idx'],\n" +
+        "            'original': orig,\n" +
+        "            'anti': anti,\n" +
+        "            'overlap_jaccard': ov,\n" +
+        "            'neg_marker_count': nm,\n" +
+        "            'heuristic_score': score,\n" +
+        "            'pass_baseline': passing\n" +
+        "        })\n" +
+        "    overall = 'PASS_BASELINE' if fail_count == 0 else f'FAIL_{fail_count}_entries'\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'ANTI_MAP heuristic semantic distance scoring',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'method': 'jaccard overlap + negation marker count heuristic; baseline-level only, NOT replacement for LLM-as-judge',\n" +
+        "        'ts': ts,\n" +
+        "        'PASS_baseline_predicate': 'overlap_jaccard <= 0.5 AND neg_marker_count >= 1 for all entries',\n" +
+        "        'records': records,\n" +
+        "        'fail_count': fail_count,\n" +
+        "        'overall_verdict': overall\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    print(f'overall_verdict={overall}')\n" +
+        "    print(f'fail_count={fail_count}')\n" +
+        "    for r in records:\n" +
+        "        print(f\"idx={r['idx']} overlap={r['overlap_jaccard']:.3f} neg={r['neg_marker_count']} score={r['heuristic_score']:.3f} pass={r['pass_baseline']}\")\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper run <input> <output> <schema> <spec_doc>', file=sys.stderr); sys.exit(2)\n" +
+        "    if sys.argv[1] == 'run':\n" +
+        "        cmd_run(*sys.argv[2:6])\n" +
+        "    else:\n" +
+        "        sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut input = "/Users/ghost/core/anima/state/mk_xi_anti_map_ledger_20260425.json"
+    let mut output = "/Users/ghost/core/anima/state/mk_xi_anti_map_heuristic_score_20260425.json"
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--input" && i + 1 < len(av) { input = av[i+1]; i = i + 2; continue }
+        if a == "--output" && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        i = i + 1
+    }
+    _write_helper()
+    println("── an11_b_anti_map_heuristic_score ──")
+    println("input:  " + input)
+    println("output: " + output)
+    let args = "run " + _sh_quote(input) + " " + _sh_quote(output) + " " + _sh_quote(SCHEMA) + " " + _sh_quote(SPEC_DOC)
+    let r = _run_helper(args)
+    if r[1] != 0 { eprintln("ABORT: helper exit " + to_string(r[1])); eprintln(r[0]); exit(2) }
+    println(r[0])
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()

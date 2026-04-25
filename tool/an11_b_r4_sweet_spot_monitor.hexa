@@ -1,0 +1,180 @@
+// tool/an11_b_r4_sweet_spot_monitor.hexa — r4 trajectory monitor STUB (raw#9 hexa-only).
+//
+// PURPOSE
+//   Mk.XI r4-equivalent epoch sweet spot detection. 본 stub은 algorithm
+//   skeleton + spec validation만 제공 — 실제 training trajectory monitoring은
+//   training infra (PyTorch/JAX wrapper) 통합 필요로 deferred.
+//
+//   spec: state/mk_xi_r4_monitor_spec_20260425.json (frozen 2026-04-25)
+//
+// STUB BEHAVIOR
+//   --selftest          : algorithm skeleton 검증 (input/output spec 일치)
+//   --simulate <jsonl>  : trajectory log JSONL 입력 받아 sweet spot detection 실행
+//                         (real measurement이 아닌 simulation — 외부 도구가 trajectory
+//                          기록 후 본 도구로 post-hoc analysis 가능)
+//
+//   real-time monitoring 미구현 (training infra 통합 필요).
+
+let HELPER_PATH = "/tmp/an11_b_r4_sweet_spot_monitor_helper.hexa_tmp"
+let SCHEMA      = "anima/an11_r4_sweet_spot_monitor/1_stub"
+let SPEC_DOC    = "state/mk_xi_r4_monitor_spec_20260425.json"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime\n" +
+        "\n" +
+        "# Frozen hyperparameters per state/mk_xi_r4_monitor_spec_20260425.json\n" +
+        "N_LOOKBACK = 3\n" +
+        "V2_PASS_COUNT_THRESHOLD = 1\n" +
+        "V_PAIRRANK_TOP3_THRESHOLD = 0.10\n" +
+        "MIN_TRAIN_STEPS = 100  # avoid false positive at step 0\n" +
+        "\n" +
+        "def is_sweet_spot(record):\n" +
+        "    return (record.get('v2_pass_count_k_le_5', 0) >= V2_PASS_COUNT_THRESHOLD and\n" +
+        "            record.get('v_pairrank_top3_hit', 0.0) >= V_PAIRRANK_TOP3_THRESHOLD and\n" +
+        "            record.get('train_step', 0) >= MIN_TRAIN_STEPS)\n" +
+        "\n" +
+        "def detect_r4_star(trajectory):\n" +
+        "    r4_star = None\n" +
+        "    consecutive_false_after = 0\n" +
+        "    for rec in trajectory:\n" +
+        "        sweet = is_sweet_spot(rec)\n" +
+        "        if r4_star is None:\n" +
+        "            if sweet:\n" +
+        "                r4_star = rec\n" +
+        "                consecutive_false_after = 0\n" +
+        "        else:\n" +
+        "            if not sweet:\n" +
+        "                consecutive_false_after += 1\n" +
+        "                if consecutive_false_after >= N_LOOKBACK:\n" +
+        "                    return r4_star, 'EARLY_STOP_TRIGGERED', rec\n" +
+        "            else:\n" +
+        "                consecutive_false_after = 0\n" +
+        "                # update r4_star to highest score so far\n" +
+        "                cur_score = (rec.get('v2_pass_count_k_le_5', 0) +\n" +
+        "                             rec.get('v_pairrank_top3_hit', 0.0))\n" +
+        "                star_score = (r4_star.get('v2_pass_count_k_le_5', 0) +\n" +
+        "                              r4_star.get('v_pairrank_top3_hit', 0.0))\n" +
+        "                if cur_score > star_score:\n" +
+        "                    r4_star = rec\n" +
+        "    if r4_star is None:\n" +
+        "        return None, 'NO_SWEET_SPOT_REACHED', None\n" +
+        "    return r4_star, 'SWEET_SPOT_FOUND_NO_DEGRADATION', None\n" +
+        "\n" +
+        "def cmd_simulate(traj_path, result_path, schema, spec_doc):\n" +
+        "    if not os.path.exists(traj_path):\n" +
+        "        print(f'ERR: missing trajectory {traj_path}', file=sys.stderr); sys.exit(2)\n" +
+        "    trajectory = []\n" +
+        "    with open(traj_path) as f:\n" +
+        "        for line in f:\n" +
+        "            line = line.strip()\n" +
+        "            if not line: continue\n" +
+        "            trajectory.append(json.loads(line))\n" +
+        "    r4_star, verdict, last_rec = detect_r4_star(trajectory)\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema, 'verifier': 'r4 sweet spot monitor (stub simulation)',\n" +
+        "        'spec_doc': spec_doc, 'ts': ts,\n" +
+        "        'thresholds': {'V2_PASS_COUNT': V2_PASS_COUNT_THRESHOLD,\n" +
+        "                       'V_PAIRRANK_TOP3': V_PAIRRANK_TOP3_THRESHOLD,\n" +
+        "                       'N_LOOKBACK': N_LOOKBACK, 'MIN_TRAIN_STEPS': MIN_TRAIN_STEPS},\n" +
+        "        'trajectory_length': len(trajectory),\n" +
+        "        'verdict': verdict,\n" +
+        "        'r4_star': r4_star,\n" +
+        "        'last_evaluated': last_rec\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    print(f'verdict={verdict}')\n" +
+        "    print(f'trajectory_length={len(trajectory)}')\n" +
+        "    print(f\"r4_star_step={r4_star['train_step'] if r4_star else 'none'}\")\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    fake = [\n" +
+        "        {'train_step': 50, 'v2_pass_count_k_le_5': 0, 'v_pairrank_top3_hit': 0.0},\n" +
+        "        {'train_step': 150, 'v2_pass_count_k_le_5': 1, 'v_pairrank_top3_hit': 0.15},\n" +
+        "        {'train_step': 250, 'v2_pass_count_k_le_5': 2, 'v_pairrank_top3_hit': 0.20},\n" +
+        "        {'train_step': 350, 'v2_pass_count_k_le_5': 0, 'v_pairrank_top3_hit': 0.05},\n" +
+        "        {'train_step': 450, 'v2_pass_count_k_le_5': 0, 'v_pairrank_top3_hit': 0.0},\n" +
+        "        {'train_step': 550, 'v2_pass_count_k_le_5': 0, 'v_pairrank_top3_hit': 0.0}\n" +
+        "    ]\n" +
+        "    r4, verdict, _ = detect_r4_star(fake)\n" +
+        "    assert verdict == 'EARLY_STOP_TRIGGERED', f'expected early stop, got {verdict}'\n" +
+        "    assert r4 is not None and r4['train_step'] == 250, f'expected step 250, got {r4}'\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f\"r4_star_step={r4['train_step']}\")\n" +
+        "    print(f'verdict={verdict}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2: sys.exit(2)\n" +
+        "    if sys.argv[1] == 'simulate': cmd_simulate(*sys.argv[2:6])\n" +
+        "    elif sys.argv[1] == 'selftest': cmd_selftest()\n" +
+        "    else: sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut traj = ""
+    let mut output = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--simulate" && i + 1 < len(av) { traj = av[i+1]; i = i + 2; continue }
+        if a == "--output" && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    _write_helper()
+    if selftest {
+        println("── an11_b_r4_sweet_spot_monitor selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("selftest FAILED"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { eprintln("marker missing"); exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+    if traj == "" || output == "" { eprintln("ABORT: --simulate <jsonl> --output <json> required (or --selftest)"); exit(2) }
+    println("── an11_b_r4_sweet_spot_monitor simulate ──")
+    println("trajectory: " + traj)
+    println("output:     " + output)
+    let args = "simulate " + _sh_quote(traj) + " " + _sh_quote(output) + " " + _sh_quote(SCHEMA) + " " + _sh_quote(SPEC_DOC)
+    let r = _run_helper(args)
+    if r[1] != 0 { eprintln("ABORT: helper exit " + to_string(r[1])); eprintln(r[0]); exit(2) }
+    println(r[0])
+    exit(0)
+}
+
+main()
