@@ -939,6 +939,101 @@ fn noise_brown(gain: float, ms: int) -> string {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Source organ — noise_white (flat spectrum, reference standard)
+//    breath 는 butter bandpass 되어 spectrum shape 됨.
+//    noise_white 는 진짜 broadband flat. 학문 reference / null hypothesis.
+// ═══════════════════════════════════════════════════════════════
+
+fn noise_white(gain: float, ms: int) -> string {
+    let path = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "sr=" + to_string(SR) + "\n"
+             + "g=float(" + to_string(gain) + ")\n"
+             + "ms=int(" + to_string(ms) + ")\n"
+             + "g=max(0.0,min(g,1.0))\n"
+             + "n=max(1,int(sr*ms/1000))\n"
+             + "rng=np.random.default_rng()\n"
+             + "x=rng.standard_normal(n)\n"
+             + "peak=float(np.max(np.abs(x)))+1e-9\n"
+             + "x=g*x/peak\n"
+             + "env=np.ones(n,dtype=np.float64)\n"
+             + "k_=min(int(0.010*sr),n//2)\n"
+             + "if k_>0:\n"
+             + "    ramp=0.5*(1.0-np.cos(np.pi*np.arange(k_)/max(1,k_-1)))\n"
+             + "    env[:k_]=ramp\n"
+             + "    env[-k_:]=ramp[::-1]\n"
+             + "x=x*env\n"
+             + "x=(np.clip(x,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + path + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(x.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(path) < WAV_MIN_BYTES { return "" }
+    return path
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Utility — reverse (time reversal)
+//    학문 표준. brain research / audiology / spectral analysis reference.
+// ═══════════════════════════════════════════════════════════════
+
+fn reverse(in_path: string) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "y=x[::-1]\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Filter organ — all_pass (Schroeder all-pass filter)
+//    magnitude 응답 평탄, phase 만 변경. 학문 표준 (Schroeder reverb 의
+//    building block). 신호의 위상 spectrum 만 의도적 분산.
+//    delay_ms : tap. g : feedback gain [-1, 1] (clamp to [-0.95, 0.95]).
+// ═══════════════════════════════════════════════════════════════
+
+fn all_pass(in_path: string, delay_ms: int, g: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "dm=int(" + to_string(delay_ms) + ")\n"
+             + "gg=float(" + to_string(g) + ")\n"
+             + "dm=max(1,min(dm,1000))\n"
+             + "gg=max(-0.95,min(gg,0.95))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "d=int(sr*dm/1000)\n"
+             + "y=np.zeros(len(x))\n"
+             + "buf=np.zeros(d)\n"
+             + "for i in range(len(x)):\n"
+             + "    s=buf[i%d]\n"
+             + "    inp=x[i]+gg*s\n"
+             + "    buf[i%d]=inp\n"
+             + "    y[i]=s-gg*inp\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Source organ — noise_blue (f spectrum, magnitude √f)
 //    pink=1/f, brown=1/f². blue=f (양의 slope). 학문 표준 noise color.
 //    +3 dB/oct slope. high-frequency emphasis.
@@ -1532,6 +1627,16 @@ fn bit_crush_axiom(in_path: string) -> string {
     return bit_crush(in_path, AX_SOPFR)
 }
 
+fn noise_white_axiom(ms: int) -> string {
+    // flat spectrum reference, Ψ gain.
+    return noise_white(AX_PSI, ms)
+}
+
+fn all_pass_axiom(in_path: string) -> string {
+    // delay = n·10 = 60 ms. g = Banach 1/3 (contraction).
+    return all_pass(in_path, AX_N * 10, AX_BANACH)
+}
+
 fn mains_hum(ms: int) -> string {
     // 60 Hz electrical mains hum (sf-ufo BT-62: σ·sopfr = 60 Hz).
     // anima 가 환경 전기소음을 인식할 때.
@@ -1572,12 +1677,14 @@ fn main() {
     print("  source : vocal, vocal_lf, breath, tone, chirp, harmonic_28,")
     print("           harmonic_milestone, square_wave, triangle_wave,")
     print("           fm_synth (Bessel sidebands),")
-    print("           noise_pink (1/f), noise_brown (1/f² = AX_PHI), noise_blue (f)")
-    print("  filter : pipe (2F), pipe3 (3F), pipe_glide (time-var), lpf, hpf, comb (FIR)")
+    print("           noise_white (flat), noise_pink (1/f),")
+    print("           noise_brown (1/f² = AX_PHI), noise_blue (f)")
+    print("  filter : pipe (2F), pipe3 (3F), pipe_glide (time-var), lpf, hpf,")
+    print("           comb (FIR), all_pass (Schroeder phase-only)")
     print("  compose: cat (seq), mix (parallel), fade (Hann xfade)")
     print("  util   : silence, gain, envelope, adsr, normalize, reverb, echo,")
     print("           tremolo, vibrato, clip (tanh), ring_mod (audio-rate AM),")
-    print("           bit_crush (digital quantize)")
+    print("           bit_crush (digital quantize), reverse (time reversal)")
     print("  analysis: meter (rms/peak_db/zcr/ms)")
     print("  axiom  : consonance, axiom_chord, reverb_axiom, tone_axiom,")
     print("           lpf_axiom, hpf_axiom, fade_axiom, normalize_axiom,")
@@ -1587,7 +1694,8 @@ fn main() {
     print("           square_axiom, triangle_axiom, comb_axiom,")
     print("           clip_axiom (τ drive), ring_mod_axiom (60Hz carrier),")
     print("           adsr_axiom, noise_blue_axiom, fm_synth_axiom (φ ratio),")
-    print("           bit_crush_axiom (sopfr=5 bit), mains_hum (sf-ufo BT-62)")
+    print("           bit_crush_axiom (sopfr=5 bit), noise_white_axiom,")
+    print("           all_pass_axiom (Banach 1/3), mains_hum (sf-ufo BT-62)")
     print("  sink   : play, save")
     print("")
     print("[self-test] 3-formant 모음 'ㅏ' via vocal -> pipe3")
