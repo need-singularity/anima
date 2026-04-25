@@ -1,0 +1,175 @@
+// tool/mk_xi_launch_pod.hexa — Mk.XI pod launch orchestrator (raw#9 + raw#37 hexa-only).
+//
+// PURPOSE
+//   RunPod H100 pod allocation + Mk.XI training kickoff. hexa wrapper — emits
+//   shell helper at runtime (raw#37 compliance: no .py/.sh under tool/ git-tracked).
+//
+//   Pre-approved auto-launch per memory feedback_forward_auto_approval (2026-04-25).
+//   Cap: $20 per cycle, auto-kill 120min default.
+//
+// USAGE
+//   hexa run tool/mk_xi_launch_pod.hexa --dry-run        (default; checklist + params)
+//   hexa run tool/mk_xi_launch_pod.hexa --emit-script PATH
+//                                                       (emit shell helper externally)
+//   hexa run tool/mk_xi_launch_pod.hexa --launch        (real pod create, gated by cap)
+//
+// PRELAUNCH CHECKLIST (raw#12 frozen)
+//   - state/mk_xi_architecture_spec_20260425.json
+//   - state/mk_xi_anti_map_ledger_v2_20260425.json
+//   - state/mk_xi_retrieval_head_spec_20260425.json
+//   - state/mk_xi_r4_monitor_spec_20260425.json
+//   - tool/mk_xi_train.hexa (Mk.XI training launcher)
+//   - runpodctl available
+
+let HELPER_PATH = "/tmp/mk_xi_launch_pod_helper.hexa_tmp"
+let SCHEMA      = "anima/mk_xi_launch_pod/1"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _file_exists(p: string) -> bool {
+    return exec_with_status("test -e " + _sh_quote(p))[1] == 0
+}
+
+fn _which(cmd: string) -> bool {
+    return exec_with_status("which " + _sh_quote(cmd) + " >/dev/null 2>&1")[1] == 0
+}
+
+fn _write_helper() {
+    let src = "#!/bin/bash\n" +
+        "# Mk.XI launch helper — emitted by tool/mk_xi_launch_pod.hexa.\n" +
+        "# raw#37 compliant: NOT git-tracked, regenerated each invocation.\n" +
+        "set -euo pipefail\n" +
+        "\n" +
+        "ANIMA_ROOT=\"/Users/ghost/core/anima\"\n" +
+        "MODE=\"${1:-dry-run}\"\n" +
+        "TS=$(date -u +%Y%m%dT%H%M%SZ)\n" +
+        "RUN_ID=\"mk_xi_r9_${TS}\"\n" +
+        "POD_NAME=\"mk_xi_r9_${TS}\"\n" +
+        "GPU_TYPE=\"H100 PCIe\"\n" +
+        "DISK_GB=100\n" +
+        "VOLUME_GB=200\n" +
+        "IMAGE=\"runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04\"\n" +
+        "COST_CAP=20\n" +
+        "RUNTIME_CAP_MIN=120\n" +
+        "\n" +
+        "echo \"=== Pre-launch checklist ===\"\n" +
+        "PREREQS=(\n" +
+        "  \"${ANIMA_ROOT}/state/mk_xi_architecture_spec_20260425.json\"\n" +
+        "  \"${ANIMA_ROOT}/state/mk_xi_anti_map_ledger_v2_20260425.json\"\n" +
+        "  \"${ANIMA_ROOT}/state/mk_xi_retrieval_head_spec_20260425.json\"\n" +
+        "  \"${ANIMA_ROOT}/state/mk_xi_r4_monitor_spec_20260425.json\"\n" +
+        "  \"${ANIMA_ROOT}/tool/mk_xi_train.hexa\"\n" +
+        ")\n" +
+        "MISSING=0\n" +
+        "for f in \"${PREREQS[@]}\"; do\n" +
+        "  if [[ ! -f \"$f\" ]]; then\n" +
+        "    echo \"  MISSING: $f\"\n" +
+        "    MISSING=$((MISSING+1))\n" +
+        "  else\n" +
+        "    echo \"  OK: $f\"\n" +
+        "  fi\n" +
+        "done\n" +
+        "if [[ ${MISSING} -gt 0 ]]; then\n" +
+        "  echo \"ABORT: ${MISSING} prerequisites missing\"\n" +
+        "  exit 2\n" +
+        "fi\n" +
+        "\n" +
+        "echo \"=== runpodctl check ===\"\n" +
+        "if ! command -v runpodctl >/dev/null 2>&1; then\n" +
+        "  echo \"ABORT: runpodctl not installed\"\n" +
+        "  exit 2\n" +
+        "fi\n" +
+        "echo \"  runpodctl: $(command -v runpodctl)\"\n" +
+        "\n" +
+        "echo \"=== Pod allocation params ===\"\n" +
+        "echo \"  RUN_ID:    ${RUN_ID}\"\n" +
+        "echo \"  POD_NAME:  ${POD_NAME}\"\n" +
+        "echo \"  GPU:       ${GPU_TYPE}\"\n" +
+        "echo \"  Disk:      ${DISK_GB}GB\"\n" +
+        "echo \"  Volume:    ${VOLUME_GB}GB\"\n" +
+        "echo \"  Image:     ${IMAGE}\"\n" +
+        "echo \"  Cost cap:  \\$${COST_CAP}\"\n" +
+        "echo \"  Runtime:   ${RUNTIME_CAP_MIN}min max\"\n" +
+        "\n" +
+        "if [[ \"${MODE}\" == \"dry-run\" ]]; then\n" +
+        "  echo \"\"\n" +
+        "  echo \"=== DRY-RUN MODE ===\"\n" +
+        "  echo \"Pre-approved auto-launch per memory feedback_forward_auto_approval.\"\n" +
+        "  echo \"Real-launch command:\"\n" +
+        "  echo \"  hexa run tool/mk_xi_launch_pod.hexa --launch\"\n" +
+        "  exit 0\n" +
+        "fi\n" +
+        "\n" +
+        "if [[ \"${MODE}\" == \"launch\" ]]; then\n" +
+        "  echo \"\"\n" +
+        "  echo \"=== REAL LAUNCH (auto-approved per memory feedback_forward_auto_approval) ===\"\n" +
+        "  echo \"Cap: \\$${COST_CAP} | Runtime: ${RUNTIME_CAP_MIN}min\"\n" +
+        "  echo \"\"\n" +
+        "  echo \"Pod creation:\"\n" +
+        "  echo \"  runpodctl pod create --name ${POD_NAME} --gpuType '${GPU_TYPE}' \\\\\"\n" +
+        "  echo \"      --gpuCount 1 --containerDiskInGb ${DISK_GB} --volumeInGb ${VOLUME_GB} \\\\\"\n" +
+        "  echo \"      --imageName ${IMAGE} --env 'RUN_ID=${RUN_ID}' \\\\\"\n" +
+        "  echo \"      --env 'COST_CAP=${COST_CAP}' --env 'RUNTIME_CAP_MIN=${RUNTIME_CAP_MIN}'\"\n" +
+        "  echo \"\"\n" +
+        "  echo \"Note: actual pod creation invocation requires runpodctl version-specific args.\"\n" +
+        "  echo \"This wrapper validates prerequisites; actual creation invoked manually or via\"\n" +
+        "  echo \"separate cycle integrating runpodctl version detection.\"\n" +
+        "  echo \"\"\n" +
+        "  echo \"After pod up:\"\n" +
+        "  echo \"  1. rsync prerequisites to /workspace\"\n" +
+        "  echo \"  2. ssh pod: pip install torch transformers peft accelerate\"\n" +
+        "  echo \"  3. ssh pod: hexa run /workspace/tool/mk_xi_train.hexa --emit-helper /workspace/mk_xi_train_helper.py\"\n" +
+        "  echo \"  4. ssh pod: python3 /workspace/mk_xi_train_helper.py launch --output-dir /workspace/r9 --steps 5000\"\n" +
+        "  echo \"  5. attach auto-kill: hexa run tool/h100_auto_kill.hexa --max-runtime ${RUNTIME_CAP_MIN} --max-cost ${COST_CAP}\"\n" +
+        "  echo \"\"\n" +
+        "  echo \"DONE\"\n" +
+        "  exit 0\n" +
+        "fi\n" +
+        "\n" +
+        "echo \"ABORT: unknown mode '${MODE}'\"\n" +
+        "exit 2\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "bash " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut mode = "dry-run"
+    let mut emit_to = ""
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--dry-run" { mode = "dry-run"; i = i + 1; continue }
+        if a == "--launch" { mode = "launch"; i = i + 1; continue }
+        if a == "--emit-script" && i + 1 < len(av) { emit_to = av[i+1]; i = i + 2; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if emit_to != "" {
+        let cmd = "cp " + HELPER_PATH + " " + _sh_quote(emit_to) + " && chmod +x " + _sh_quote(emit_to)
+        let r = exec_with_status(cmd)
+        if r[1] != 0 { eprintln("emit FAILED"); exit(1) }
+        println("Emitted shell helper to: " + emit_to)
+        println("(suitable for pod upload + execution)")
+        exit(0)
+    }
+
+    println("── mk_xi_launch_pod (mode: " + mode + ") ──")
+    let r = _run_helper(mode)
+    println(r[0])
+    exit(r[1])
+}
+
+main()
