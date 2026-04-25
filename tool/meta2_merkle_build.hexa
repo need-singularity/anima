@@ -1,0 +1,543 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/meta2_merkle_build.hexa — L2 Merkle tree builder for .meta2-cert
+//
+//  CLUSTER   adjacent to cluster #34 (cert hash-chain auto-verifier)
+//  RAW       raw#9  hexa-only       raw#10 proof-carrying
+//            raw#11 snake_case      raw#15 no-hardcode
+//            V8 SAFE_COMMIT · LLM=none · deterministic
+//
+//  PURPOSE
+//    Lift the `.meta2-cert/index.json` `prev_index_sha` *linked-list* chain
+//    (O(N) inclusion proof) to a balanced binary *Merkle tree* with
+//    O(log N) inclusion proofs and a single-root commitment.
+//
+//  CANONICALIZATION (matches tool/meta2_hashchain_verify.hexa)
+//    leaf_hash(entry) = sha256( jq -S -c 'del(.current_hash)' <entry-file> )
+//
+//  TREE
+//    - leaves ordered as in index.json.entries[]
+//    - pad to next power of 2 by duplicating last leaf (Bitcoin / RFC6962-lite)
+//    - parent = sha256( left_hex || right_hex )           (ASCII concat)
+//    - root   = top-level single hash committing the epoch
+//
+//  PROOF (per leaf)
+//    [ {sibling_hash, side:"L"|"R"}, ... ]    length == tree_depth
+//
+//  OUTPUTS
+//    state/meta2_merkle_root.json     (anima.meta2.merkle.root.v1)
+//    state/meta2_merkle_proofs.json   (anima.meta2.merkle.proofs.v1)
+//
+//  SELFTEST (--selftest)
+//    T1 4-leaf perfect tree, depth=2
+//    T2 13-leaf padded tree, depth=4 (pad=3)
+//    T3 tamper detection (mutated leaf rejected against original root)
+//    T4 real .meta2-cert round-trip
+//    PASS gate: 4/4
+//
+//  USAGE
+//    hexa tool/meta2_merkle_build.hexa
+//    hexa tool/meta2_merkle_build.hexa --root .meta2-cert \
+//         --out-root state/meta2_merkle_root.json \
+//         --out-proofs state/meta2_merkle_proofs.json
+//    hexa tool/meta2_merkle_build.hexa --selftest
+// ════════════════════════════════════════════════════════════════════════════
+
+let SCHEMA_ROOT   = "anima.meta2.merkle.root.v1"
+let SCHEMA_PROOFS = "anima.meta2.merkle.proofs.v1"
+let RAW_STRICT    = "raw#9 raw#10 raw#11 raw#15 deterministic LLM=none V8"
+let ROOT_DEFAULT       = ".meta2-cert"
+let OUT_ROOT_DEFAULT   = "state/meta2_merkle_root.json"
+let OUT_PROOFS_DEFAULT = "state/meta2_merkle_proofs.json"
+
+// ─── string helpers ────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -e " + _sh_quote(p) + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn now_stamp() -> string { return _str(exec("date -u +%FT%TZ")).trim() }
+
+// ─── sha256 helpers ────────────────────────────────────────────────────────
+
+fn sha256_of_bytes(s: string) -> string {
+    let tmp = "/tmp/meta2_merkle_buf_" + str(len(s)) + "_" + _str(exec("date +%s%N")).trim() + ".bin"
+    write_file(tmp, s)
+    let r = _str(exec("shasum -a 256 " + _sh_quote(tmp) + " 2>/dev/null | awk '{print $1}'")).trim()
+    let _ = exec("rm -f " + _sh_quote(tmp))
+    return r
+}
+
+// canonical bytes for a cert entry: jq -S -c 'del(.current_hash)' <file> (no trailing newline)
+fn canonical_minus_current_hash(path: string) -> string {
+    let cmd = "jq -S -c 'del(.current_hash)' " + _sh_quote(path) + " 2>/dev/null | tr -d '\\n'"
+    return _str(exec(cmd))
+}
+
+fn leaf_hash_for_entry(cert_root: string, file_name: string) -> string {
+    let full = cert_root + "/" + file_name
+    if !fexists(full) {
+        // missing file → leaf = sha256("MISSING:<name>") so absence is committed
+        return sha256_of_bytes("MISSING:" + file_name)
+    }
+    let canon = canonical_minus_current_hash(full)
+    return sha256_of_bytes(canon)
+}
+
+// parent = sha256( left_hex || right_hex )    (ASCII concatenation)
+fn parent_hash(left_hex: string, right_hex: string) -> string {
+    return sha256_of_bytes(left_hex + right_hex)
+}
+
+// ─── pow2 helper ───────────────────────────────────────────────────────────
+
+fn next_pow2(n: int) -> int {
+    if n <= 1 { return 1 }
+    let mut p = 1
+    while p < n { p = p * 2 }
+    return p
+}
+
+// ─── tree build ────────────────────────────────────────────────────────────
+//
+// Returns positional triple: [root, levels, padded_count]
+// where levels is a list of lists (level 0 = padded leaves, last = [root]).
+
+fn build_merkle(leaves: list) -> list {
+    let n = len(leaves)
+    if n == 0 {
+        let empty = sha256_of_bytes("")
+        let mut lvls = []
+        let mut top = []
+        top = top.push(empty)
+        lvls = lvls.push(top)
+        let mut r = []
+        r = r.push(empty)
+        r = r.push(lvls)
+        r = r.push(1)
+        return r
+    }
+
+    let target = next_pow2(n)
+    let mut padded = []
+    let mut i = 0
+    while i < n { padded = padded.push(leaves[i]); i = i + 1 }
+    let last = leaves[n - 1]
+    while len(padded) < target { padded = padded.push(last) }
+    let pad_count = len(padded) - n
+
+    let mut levels = []
+    levels = levels.push(padded)
+    let mut cur = padded
+    while len(cur) > 1 {
+        let mut nxt = []
+        let mut j = 0
+        while j < len(cur) {
+            let l = _str(cur[j])
+            let r = _str(cur[j + 1])
+            nxt = nxt.push(parent_hash(l, r))
+            j = j + 2
+        }
+        levels = levels.push(nxt)
+        cur = nxt
+    }
+    let root = _str(cur[0])
+    let mut out = []
+    out = out.push(root)
+    out = out.push(levels)
+    out = out.push(pad_count)
+    return out
+}
+
+// ─── inclusion proof ───────────────────────────────────────────────────────
+//
+// Proof entry = positional pair [sibling_hex, side]  where side ∈ {"L","R"}.
+// "R" means the sibling is on the right of the current node.
+
+fn inclusion_proof(levels: list, leaf_index: int) -> list {
+    let mut steps = []
+    let mut idx = leaf_index
+    let mut depth = 0
+    while depth < len(levels) - 1 {
+        let level = levels[depth]
+        let mut sibling = ""
+        let mut side = ""
+        if (idx % 2) == 0 {
+            sibling = _str(level[idx + 1])
+            side = "R"
+        } else {
+            sibling = _str(level[idx - 1])
+            side = "L"
+        }
+        let mut step = []
+        step = step.push(sibling)
+        step = step.push(side)
+        steps = steps.push(step)
+        idx = idx / 2
+        depth = depth + 1
+    }
+    return steps
+}
+
+fn verify_proof(leaf_hex: string, steps: list, root_hex: string) -> bool {
+    let mut h = leaf_hex
+    let mut i = 0
+    while i < len(steps) {
+        let step = steps[i]
+        let sib = _str(step[0])
+        let side = _str(step[1])
+        if side == "L" { h = parent_hash(sib, h) }
+        else { h = parent_hash(h, sib) }
+        i = i + 1
+    }
+    return h == root_hex
+}
+
+// ─── load index.json entries ──────────────────────────────────────────────
+//
+// Returns parallel lists [slugs, files] preserving entry order.
+
+fn load_entries(cert_root: string) -> list {
+    let idx = cert_root + "/index.json"
+    if !fexists(idx) {
+        let mut empty = []
+        empty = empty.push([])
+        empty = empty.push([])
+        return empty
+    }
+    let n_raw = _str(exec("jq -r '.entries | length' " + _sh_quote(idx) + " 2>/dev/null")).trim()
+    let n = if n_raw == "" { 0 } else { int(n_raw) }
+    let mut slugs = []
+    let mut files = []
+    let mut i = 0
+    while i < n {
+        let slug = _str(exec("jq -r '.entries[" + str(i) + "].slug // empty' " + _sh_quote(idx) + " 2>/dev/null")).trim()
+        let file = _str(exec("jq -r '.entries[" + str(i) + "].file // empty' " + _sh_quote(idx) + " 2>/dev/null")).trim()
+        let safe_slug = if slug == "" { "entry_" + str(i) } else { slug }
+        let safe_file = if file == "" { safe_slug + ".json" } else { file }
+        slugs = slugs.push(safe_slug)
+        files = files.push(safe_file)
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(slugs)
+    out = out.push(files)
+    return out
+}
+
+// ─── JSON emit ─────────────────────────────────────────────────────────────
+
+fn json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    return a.replace("\"", "\\\"")
+}
+
+fn emit_root_json(cert_root: string, leaf_count: int, padded_count: int,
+                  tree_depth: int, root_hex: string) -> string {
+    let stamp = now_stamp()
+    let mut s = "{\n"
+    s = s + "  \"schema\": \""           + SCHEMA_ROOT + "\",\n"
+    s = s + "  \"ts\": \""               + stamp + "\",\n"
+    s = s + "  \"cert_root\": \""        + json_escape(cert_root) + "\",\n"
+    s = s + "  \"leaf_count\": "         + str(leaf_count) + ",\n"
+    s = s + "  \"padded_count\": "       + str(padded_count) + ",\n"
+    s = s + "  \"tree_depth\": "         + str(tree_depth) + ",\n"
+    s = s + "  \"merkle_root\": \""      + root_hex + "\",\n"
+    s = s + "  \"leaf_hash_algo\": \"sha256(jq -S -c 'del(.current_hash)' <entry>)\",\n"
+    s = s + "  \"parent_hash_algo\": \"sha256(left_hex || right_hex)\",\n"
+    s = s + "  \"padding_rule\": \"duplicate-last-leaf to next power of two\",\n"
+    s = s + "  \"raw_strict\": \""       + RAW_STRICT + "\"\n"
+    s = s + "}\n"
+    return s
+}
+
+fn emit_proof_step(step: list) -> string {
+    let sib  = _str(step[0])
+    let side = _str(step[1])
+    return "{ \"sibling\": \"" + sib + "\", \"side\": \"" + side + "\" }"
+}
+
+fn emit_leaf_record(leaf_index: int, slug: string, file_name: string,
+                    leaf_hex: string, prev_index_sha: string, steps: list) -> string {
+    let mut s = "    {\n"
+    s = s + "      \"leaf_index\": "       + str(leaf_index) + ",\n"
+    s = s + "      \"slug\": \""           + json_escape(slug) + "\",\n"
+    s = s + "      \"file\": \""           + json_escape(file_name) + "\",\n"
+    s = s + "      \"leaf_hash\": \""      + leaf_hex + "\",\n"
+    s = s + "      \"prev_index_sha\": \"" + json_escape(prev_index_sha) + "\",\n"
+    s = s + "      \"proof\": ["
+    let mut i = 0
+    while i < len(steps) {
+        if i > 0 { s = s + "," }
+        s = s + " " + emit_proof_step(steps[i])
+        i = i + 1
+    }
+    s = s + " ]\n    }"
+    return s
+}
+
+fn emit_proofs_json(root_hex: string, tree_depth: int, leaf_records: list) -> string {
+    let stamp = now_stamp()
+    let mut s = "{\n"
+    s = s + "  \"schema\": \""      + SCHEMA_PROOFS + "\",\n"
+    s = s + "  \"ts\": \""          + stamp + "\",\n"
+    s = s + "  \"merkle_root\": \"" + root_hex + "\",\n"
+    s = s + "  \"tree_depth\": "    + str(tree_depth) + ",\n"
+    s = s + "  \"leaves\": [\n"
+    let mut i = 0
+    while i < len(leaf_records) {
+        s = s + _str(leaf_records[i])
+        if i + 1 < len(leaf_records) { s = s + "," }
+        s = s + "\n"
+        i = i + 1
+    }
+    s = s + "  ],\n"
+    s = s + "  \"raw_strict\": \"" + RAW_STRICT + "\"\n"
+    s = s + "}\n"
+    return s
+}
+
+// ─── high-level build ──────────────────────────────────────────────────────
+//
+// Returns positional [root_hex, leaf_count, padded_count, tree_depth,
+//                     leaves_list, levels_list, slugs, files, prev_shas].
+
+fn build_for_root(cert_root: string) -> list {
+    let pair = load_entries(cert_root)
+    let slugs = pair[0]
+    let files = pair[1]
+    let n = len(slugs)
+    let mut leaves = []
+    let mut prev_shas = []
+    let mut i = 0
+    while i < n {
+        let lh = leaf_hash_for_entry(cert_root, _str(files[i]))
+        leaves = leaves.push(lh)
+        // pull prev_index_sha for raw#10 cross-ref (informational only)
+        let idx = cert_root + "/index.json"
+        let prev = _str(exec("jq -r '.entries[" + str(i) + "].prev_index_sha // empty' " + _sh_quote(idx) + " 2>/dev/null")).trim()
+        prev_shas = prev_shas.push(prev)
+        i = i + 1
+    }
+    let triple = build_merkle(leaves)
+    let root_hex = _str(triple[0])
+    let levels = triple[1]
+    let pad = triple[2]
+    let depth = len(levels) - 1
+    let mut out = []
+    out = out.push(root_hex)
+    out = out.push(n)
+    out = out.push(pad)
+    out = out.push(depth)
+    out = out.push(leaves)
+    out = out.push(levels)
+    out = out.push(slugs)
+    out = out.push(files)
+    out = out.push(prev_shas)
+    return out
+}
+
+// ─── selftest harness ──────────────────────────────────────────────────────
+
+fn _selftest_t1() -> string {
+    // 4-leaf perfect tree, depth=2
+    let mut leaves = []
+    let mut i = 0
+    while i < 4 {
+        leaves = leaves.push(sha256_of_bytes("leaf_" + str(i)))
+        i = i + 1
+    }
+    let triple = build_merkle(leaves)
+    let root = _str(triple[0])
+    let levels = triple[1]
+    let pad = triple[2]
+    if pad != 0 { return "FAIL_t1_pad_" + str(pad) }
+    if (len(levels) - 1) != 2 { return "FAIL_t1_depth" }
+    let mut k = 0
+    while k < 4 {
+        let pp = inclusion_proof(levels, k)
+        if len(pp) != 2 { return "FAIL_t1_proof_len_" + str(k) }
+        if !verify_proof(_str(leaves[k]), pp, root) { return "FAIL_t1_verify_" + str(k) }
+        k = k + 1
+    }
+    return "PASS_t1_root_" + root.substring(0, 16)
+}
+
+fn _selftest_t2() -> string {
+    // 13-leaf padded tree, pad=3, depth=4
+    let mut leaves = []
+    let mut i = 0
+    while i < 13 {
+        leaves = leaves.push(sha256_of_bytes("leaf_" + str(i)))
+        i = i + 1
+    }
+    let triple = build_merkle(leaves)
+    let root = _str(triple[0])
+    let levels = triple[1]
+    let pad = triple[2]
+    if pad != 3 { return "FAIL_t2_pad_" + str(pad) }
+    if (len(levels) - 1) != 4 { return "FAIL_t2_depth" }
+    let mut k = 0
+    while k < 13 {
+        let pp = inclusion_proof(levels, k)
+        if len(pp) != 4 { return "FAIL_t2_proof_len_" + str(k) }
+        if !verify_proof(_str(leaves[k]), pp, root) { return "FAIL_t2_verify_" + str(k) }
+        k = k + 1
+    }
+    return "PASS_t2_root_" + root.substring(0, 16)
+}
+
+fn _selftest_t3() -> string {
+    // tamper detection
+    let mut leaves = []
+    let mut i = 0
+    while i < 13 {
+        leaves = leaves.push(sha256_of_bytes("leaf_" + str(i)))
+        i = i + 1
+    }
+    let triple = build_merkle(leaves)
+    let root = _str(triple[0])
+    let levels = triple[1]
+    let proof_for_7 = inclusion_proof(levels, 7)
+    let tampered = sha256_of_bytes("TAMPERED")
+    let still_ok = verify_proof(tampered, proof_for_7, root)
+    if still_ok { return "FAIL_t3_false_negative" }
+    return "PASS_t3_tamper_rejected"
+}
+
+fn _selftest_t4() -> string {
+    let root_default = env("ANIMA_ROOT")
+    let cert_root = if root_default == "" { ROOT_DEFAULT } else { root_default + "/" + ROOT_DEFAULT }
+    if !fexists(cert_root) { return "SKIP_t4_no_meta2cert" }
+    let pkg = build_for_root(cert_root)
+    let root_hex = _str(pkg[0])
+    let n = pkg[1]
+    let levels = pkg[5]
+    let leaves = pkg[4]
+    let mut k = 0
+    while k < n {
+        let pp = inclusion_proof(levels, k)
+        if !verify_proof(_str(leaves[k]), pp, root_hex) {
+            return "FAIL_t4_verify_" + str(k)
+        }
+        k = k + 1
+    }
+    return "PASS_t4_n_" + str(n) + "_root_" + root_hex.substring(0, 16)
+}
+
+fn run_selftest() -> int {
+    println("meta2_merkle_build v1 — selftest")
+    let r1 = _selftest_t1()
+    let r2 = _selftest_t2()
+    let r3 = _selftest_t3()
+    let r4 = _selftest_t4()
+    println("  T1: " + r1)
+    println("  T2: " + r2)
+    println("  T3: " + r3)
+    println("  T4: " + r4)
+    let mut passed = 0
+    if r1.substring(0, 4) == "PASS" { passed = passed + 1 }
+    if r2.substring(0, 4) == "PASS" { passed = passed + 1 }
+    if r3.substring(0, 4) == "PASS" { passed = passed + 1 }
+    // T4 may be SKIP — count PASS or SKIP as non-failure.  We require strictly
+    // PASS for total tally, but bypass T4 when meta2-cert is absent.
+    if r4.substring(0, 4) == "PASS" { passed = passed + 1 }
+    let total = if r4.substring(0, 4) == "SKIP" { 3 } else { 4 }
+    println("selftest result: " + str(passed) + "/" + str(total) + " PASS")
+    if passed == total { return 0 }
+    return 1
+}
+
+// ─── arg helpers ───────────────────────────────────────────────────────────
+
+fn arg_present(av, key: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn arg_value(av, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == key && i + 1 < len(av) { return _str(av[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = argv()
+
+    if arg_present(av, "--help") {
+        println("usage: hexa tool/meta2_merkle_build.hexa [--root <dir>] [--out-root <json>] [--out-proofs <json>] [--selftest]")
+        exit(0)
+    }
+
+    if arg_present(av, "--selftest") {
+        let rc = run_selftest()
+        exit(rc)
+    }
+
+    let cert_root  = arg_value(av, "--root",       ROOT_DEFAULT)
+    let out_root   = arg_value(av, "--out-root",   OUT_ROOT_DEFAULT)
+    let out_proofs = arg_value(av, "--out-proofs", OUT_PROOFS_DEFAULT)
+
+    println("meta2_merkle_build v1 — walking " + cert_root)
+    let pkg = build_for_root(cert_root)
+    let root_hex = _str(pkg[0])
+    let n = pkg[1]
+    let pad = pkg[2]
+    let depth = pkg[3]
+    let leaves = pkg[4]
+    let levels = pkg[5]
+    let slugs = pkg[6]
+    let files = pkg[7]
+    let prevs = pkg[8]
+
+    // emit root document
+    let root_json = emit_root_json(cert_root, n, pad, depth, root_hex)
+    write_file(out_root, root_json)
+
+    // emit proofs document
+    let mut leaf_records = []
+    let mut i = 0
+    while i < n {
+        let steps = inclusion_proof(levels, i)
+        // self-verify before emitting (defense in depth)
+        if !verify_proof(_str(leaves[i]), steps, root_hex) {
+            println("FATAL: self-verify failed for leaf " + str(i) + " (" + _str(slugs[i]) + ")")
+            exit(2)
+        }
+        let rec = emit_leaf_record(i, _str(slugs[i]), _str(files[i]),
+                                   _str(leaves[i]), _str(prevs[i]), steps)
+        leaf_records = leaf_records.push(rec)
+        i = i + 1
+    }
+    let proofs_json = emit_proofs_json(root_hex, depth, leaf_records)
+    write_file(out_proofs, proofs_json)
+
+    println("  leaf_count   = " + str(n))
+    println("  padded_count = " + str(pad))
+    println("  tree_depth   = " + str(depth))
+    println("  merkle_root  = " + root_hex)
+    println("  wrote: " + out_root)
+    println("  wrote: " + out_proofs)
+    exit(0)
+}
+
+main()

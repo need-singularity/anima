@@ -31,7 +31,7 @@ raw#10 준수: each archive event carries `{ts, path, status, sha256, size}` —
 |---|---|:---:|---|
 | **L0** local + cloud archive + hash-chain | `state/*.json` + R2 4-bucket + JSONL ledger + `.meta2-cert` chain | **VERIFIED** r2-r8 모두 archived (158 events) | sha256 second-preimage (2¹²⁸) — practical OK |
 | **L1** multi-region replication | Cloudflare R2 글로벌 edge (S3-compatible) | **부분** (provider-side only; client-controlled replication 부재) | **CAP**: P 강제 → C/A trade-off; eventual consistency window 측정 안 됨 |
-| **L2** cryptographic provenance / Merkle tree | per-event Merkle root + signed manifests | **미구현** (chain 은 있으나 tree 아님) | 위조 탐지 가능 ↔ 키 관리 단일 실패점 (root 키 분실 = 전체 무효) |
+| **L2** cryptographic provenance / Merkle tree | per-event Merkle root + signed manifests | **prototype VERIFIED** (2026-04-25, N=10, depth=4, root `0fc3ba90…`; spec → `docs/anima_memory_merkle_tree_spec_20260425.md`) | 위조 탐지 가능 ↔ 키 관리 단일 실패점 (root 키 분실 = 전체 무효) |
 | **L3** zero-knowledge audit | content 노출 없이 history verify (zk-SNARK / zk-STARK) | **미구현** | proof generation O(n log n) ~ minutes; SRS trusted setup (SNARK) or transparent (STARK, larger proofs) |
 | **L4** quantum-secure memory | post-quantum signature (Dilithium / SPHINCS+) + lattice commitments | **미구현** | NIST PQC 표준화 진행 중; signature size ~수 KB (vs Ed25519 64 B) |
 | **L5** absolute physical / mathematical floor | (한계 자체) | (한계) | **Bekenstein bound** S ≤ 2πkRE/ℏc · **Landauer** ≥ kT ln 2 per bit erase · **no-cloning** (quantum state 복제 불가) · **Shannon source coding** H(X) lower bound · **Kolmogorov K(x)** incomputable (Chaitin) |
@@ -60,11 +60,18 @@ raw#10 준수: each archive event carries `{ts, path, status, sha256, size}` —
 - **개선 path**: dual-write to AWS S3 / Backblaze B2 — bandwidth × 2, but 다중-vendor durability
 - **bound**: PACELC (Abadi 2012) — partition 없을 때조차 latency vs consistency trade
 
-### L2 — cryptographic provenance / Merkle tree (미구현)
+### L2 — cryptographic provenance / Merkle tree (prototype VERIFIED 2026-04-25)
 
 - 현재 chain 은 *linked list* (each entry → prev hash) — Merkle tree (binary hash tree) 아님
 - Merkle 도입 이점: O(log n) inclusion proof (vs O(n) linear scan); Merkle Mountain Range (Bitcoin / Certificate Transparency 사용)
 - **요구**: `.meta2-cert/merkle_root_{epoch}.json` + per-entry inclusion proof
+- **prototype** (`tool/meta2_merkle_build.py`, `state/meta2_merkle_root.json`, `state/meta2_merkle_proofs.json`):
+  - N=10, padded=16, depth=4, root `0fc3ba903f63cbff4485267be6d1c4be755e4b07d451b624c54efca51d3d1edb`
+  - leaf hash: `sha256(jq -S -c 'del(.current_hash)' <entry>)` — matches existing hashchain verifier convention
+  - parent hash: `sha256(left_hex || right_hex)` (RFC 6962-lite)
+  - selftest 4/4 PASS (T1 4-leaf · T2 13-leaf · T3 tamper-detect · T4 real walk)
+  - spec: `docs/anima_memory_merkle_tree_spec_20260425.md`
+- **next**: hexa port + Ed25519 root signature + R2 publish (see spec §7)
 - **bound**: 위조 탐지 강화 ↔ root 키 분실 시 전체 epoch 무효 (key recovery → multisig / Shamir SSS)
 
 ### L3 — zero-knowledge audit (미구현)
@@ -111,7 +118,7 @@ raw#10 준수: each archive event carries `{ts, path, status, sha256, size}` —
 |---|:---:|---|
 | L0 local + R2 + hash-chain | **100%** | (achieved · maintain) |
 | L1 multi-region | **40%** (R2 provider-internal) | dual-write S3/B2 |
-| L2 Merkle tree | **0%** | per-epoch root + inclusion proof |
+| L2 Merkle tree | **prototype** (N=10, depth=4, root computed; selftest 4/4) | hexa port + sign root + publish to R2 |
 | L3 zk-audit | **0%** | corpus license circuit prototype |
 | L4 PQ-crypto | **0%** | Dilithium dual-sign migration |
 | L5 (한계) | (수학+물리 절대) | — |
