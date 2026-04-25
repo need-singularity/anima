@@ -32,143 +32,7 @@
 //   raw#1  does NOT alter chflags state (read-only probe); auto-fix tool 별도
 //   raw#10 writes state/integrity_drift_<ts>.json + summary SSOT
 //
-// AIRGENOME LONG-LENS CHAIN (rig_trend)
-//   program 시작 시 airgenome hook 기반으로 "rig_trend" 라는 단일 장기 lens
-//   chain 을 보장한다 (is-active 가드, 없으면 activate). 8 체크 완료 후
-//   1 회 touch 로 snapshot payload 를 findings.jsonl 에 append 한다. release
-//   하지 않는다 (장기 lens 유지). airgenome 바이너리 부재 또는 hook CLI
-//   미구현 환경에서는 graceful skip 하여 integrity_guard 본 실행은 영향받지
-//   않는다.
-
 let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/roadmap_integrity_config.json"
-
-// ─── airgenome hook long-lens chain (rig_trend) ─────────────────────
-//
-// CLI-only 경로. MCP / hexa wrapper 가 제공되지 않아도 동일 state root
-// (AIRGENOME_HOOK_ROOT > CLAUDE_PROJECT_DIR > pwd) 에 기록된다. 모든
-// 호출은 graceful — 실패 시 false 반환 후 호출부에서 silently skip.
-
-let RIG_TREND_CHAIN   = "rig_trend"
-let RIG_TREND_SEED    = "roadmap integrity trend"
-let RIG_TREND_COMMAND = "roadmap"
-
-fn _airgenome_bin() -> string {
-    let candidates = [
-        "/Users/ghost/Dev/airgenome/bin/airgenome",
-        "/Users/ghost/.hx/bin/airgenome"
-    ]
-    for c in candidates {
-        let p = to_string(c)
-        if _file_exists(p) { return p }
-    }
-    return ""
-}
-
-fn _airgenome_hook_is_active(bin: string, chain: string) -> int {
-    // exit 0 + stdout "1" → active; exit 0 + stdout "0" → inactive;
-    // any error (missing shim, non-zero exit) → -1 (unknown, skip).
-    let cmd = _sh_quote(bin) + " hook is-active " + _sh_quote(chain) + " 2>/dev/null"
-    let r = exec_with_status(cmd)
-    if r[1] != 0 { return -1 }
-    let out = to_string(r[0]).trim()
-    if out == "1" { return 1 }
-    if out == "0" { return 0 }
-    return -1
-}
-
-fn _airgenome_hook_activate(bin: string, chain: string, seed: string, command: string) -> bool {
-    let cmd = _sh_quote(bin) + " hook activate " +
-              _sh_quote(chain) + " " + _sh_quote(seed) + " " + _sh_quote(command) +
-              " >/dev/null 2>&1"
-    return _exec_code(cmd) == 0
-}
-
-fn _airgenome_hook_touch(bin: string, chain: string, kind: string, payload: string) -> bool {
-    let cmd = _sh_quote(bin) + " hook touch " +
-              _sh_quote(chain) + " " + _sh_quote(kind) + " " + _sh_quote(payload) +
-              " >/dev/null 2>&1"
-    return _exec_code(cmd) == 0
-}
-
-// Ensure rig_trend chain is active. Returns:
-//   "active"   — already active OR successfully activated (proceed with touch)
-//   "skip"     — airgenome missing / hook CLI unavailable / activate failed
-fn _rig_trend_ensure() -> string {
-    let bin = _airgenome_bin()
-    if bin == "" { return "skip" }
-    let st = _airgenome_hook_is_active(bin, RIG_TREND_CHAIN)
-    if st == 1 { return "active" }
-    if st < 0  { return "skip" }
-    // st == 0 → activate
-    if _airgenome_hook_activate(bin, RIG_TREND_CHAIN, RIG_TREND_SEED, RIG_TREND_COMMAND) {
-        return "active"
-    }
-    return "skip"
-}
-
-fn _rig_trend_snapshot_payload(results: array) -> string {
-    // Build deterministic JSON payload with per-check verdict + drift counts.
-    let mut check_pairs = []
-    let mut i = 0
-    while i < len(results) {
-        let r = results[i]
-        let name = to_string(r[0])
-        let verdict = to_string(r[1])
-        // name := "check_<N>_<slug>" → reduce to "check_<N>"
-        let mut short = name
-        let us1 = short.index_of("_")
-        if us1 >= 0 {
-            let rest = short.substring(us1 + 1, len(short))
-            let us2 = rest.index_of("_")
-            if us2 >= 0 {
-                short = short.substring(0, us1 + 1 + us2)
-            }
-        }
-        check_pairs.push("\"" + _json_escape(short) + "\":\"" + _json_escape(verdict) + "\"")
-        i = i + 1
-    }
-
-    // drift counters
-    let mut closure_debt = 0
-    let mut non_blocking_warn = 0
-    let mut total_drift = 0
-    let mut k = 0
-    while k < len(results) {
-        let r = results[k]
-        let name = to_string(r[0])
-        let verdict = to_string(r[1])
-        if verdict == "FAIL" || verdict == "WARN" { total_drift = total_drift + 1 }
-        if verdict == "WARN" { non_blocking_warn = non_blocking_warn + 1 }
-        if name == "check_8_closure_debt" && (verdict == "WARN" || verdict == "FAIL") {
-            closure_debt = 1
-        }
-        k = k + 1
-    }
-
-    let mut parts = []
-    parts.push("{\"ts\":\"" + _ts_iso() + "\"")
-    let mut j = 0
-    while j < len(check_pairs) {
-        parts.push("," + to_string(check_pairs[j]))
-        j = j + 1
-    }
-    parts.push(",\"closure_debt\":" + to_string(closure_debt))
-    parts.push(",\"non_blocking_warn\":" + to_string(non_blocking_warn))
-    parts.push(",\"total_drift\":" + to_string(total_drift))
-    parts.push("}")
-    return parts.join("")
-}
-
-// Emit single snapshot touch on rig_trend. No release (long-lens).
-// Caller passes the ensure-state string so we do not re-invoke
-// is-active. Returns true if touch was attempted + succeeded.
-fn _rig_trend_emit_snapshot(state: string, results: array) -> bool {
-    if state != "active" { return false }
-    let bin = _airgenome_bin()
-    if bin == "" { return false }
-    let payload = _rig_trend_snapshot_payload(results)
-    return _airgenome_hook_touch(bin, RIG_TREND_CHAIN, "snapshot", payload)
-}
 
 // ─── sys helpers ─────────────────────────────────────────────────────
 
@@ -988,11 +852,6 @@ fn main() -> int {
     let json_mode = _flag(av, "--json")
     let single = _opt(av, "--check", "")
 
-    // airgenome rig_trend long-lens: ensure active before running checks.
-    // is-active guard prevents duplicate activation; missing airgenome or
-    // hook CLI returns "skip" and downstream touch is suppressed.
-    let rig_state = _rig_trend_ensure()
-
     let mut results = []
     if single != "" {
         let n = to_int(single)
@@ -1021,21 +880,10 @@ fn main() -> int {
     if !json_mode { print_human(results, cfg) }
     let drift_log = emit_summary_ssot(cfg, results, exit_code)
 
-    // rig_trend snapshot touch — full run only (single-check mode skips).
-    // No release: long-lens chain remains active across invocations.
-    let mut rig_touched = false
-    if single == "" {
-        rig_touched = _rig_trend_emit_snapshot(rig_state, results)
-    }
-
     if !json_mode {
         println("")
         if drift_log != "" { println("drift_log: " + drift_log) }
         println("summary_ssot: " + to_string(cfg["output"]["summary_ssot"]))
-        let mut rig_msg = "skip (airgenome unavailable)"
-        if rig_state == "active" { rig_msg = "active (touch skipped)" }
-        if rig_touched { rig_msg = "active (snapshot appended)" }
-        println("rig_trend: " + rig_msg)
         println("exit_code=" + to_string(exit_code))
     }
     return exit_code

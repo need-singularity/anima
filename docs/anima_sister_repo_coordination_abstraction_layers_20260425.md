@@ -14,7 +14,7 @@
 | anima | hybrid framework home (cell+lora+ALM/CLM) | `/Users/ghost/core/anima` | (consumer) |
 | nexus | meta-engine + atlas convergence witness (R24-R32) | `/Users/ghost/core/nexus` | `nxs-` |
 | hexa-lang | language/SSOT substrate, raw_audit canonical, uchg-locked | `/Users/ghost/Dev/hexa-lang` | `hxa-` |
-| airgenome | mac-local resource manager + hooks (scope-reduced 2026-04-25) | `/Users/ghost/core/airgenome` | `agm-` |
+| airgenome | mac-local resource manager (hooks retired 2026-04-25) | `/Users/ghost/core/airgenome` | `agm-` |
 | hive | governance / cross-host enforcement (succeeded airgenome AG2-AG9) | `/Users/ghost/core/hive` | (host) |
 | n6-architecture | n=6 atlas primitives + foundation projection (R31 peer cousin) | `/Users/ghost/core/n6-architecture` | `n6a-` |
 
