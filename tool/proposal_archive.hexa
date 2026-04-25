@@ -4,8 +4,10 @@
 //   After USER has spawned a sub-agent that built the module per the
 //   proposed_implementation_<id>.md spec, USER explicitly archives via:
 //     hexa tool/proposal_archive.hexa --id <N> --module-path <path>
-//   We verify (a) module file exists, (b) `hexa <module> --selftest` exits 0,
-//   then move approved/<id>.json → archived/<id>.json + write
+//   We verify (a) module file exists, (b) extension is `.hexa`, (c)
+//   `hexa <module> --selftest` exits 0 AND prints a SELFTEST_PASS / DONE
+//   marker (and does NOT print "unknown subcommand"), then move
+//   approved/<id>.json → archived/<id>.json + write
 //   implementation_module_path. P4 (§5 + §8 transition gate).
 //
 // USAGE
@@ -18,8 +20,15 @@
 // HARD CONSTRAINTS
 //   - module-path is REQUIRED (no auto-discovery — user must name what was built).
 //   - Module file must exist on disk.
-//   - `hexa <module> --selftest` must exit 0.
+//   - Module file extension MUST be `.hexa` (rejects .md/.json/.py/etc.).
+//   - `hexa <module> --selftest` must exit 0 AND emit SELFTEST_PASS or DONE.
+//   - "unknown subcommand" output → reject (hexa CLI default-success leak).
 //   - Re-run on already-archived id → noop exit 0.
+//
+// LEAK FIX 2026-04-25
+//   Prior gate accepted any extant file because hexa CLI returns exit 0 on
+//   "unknown subcommand <path>" — making non-hexa files silently pass.
+//   See docs/anima_evolution_archive_gate_fix_20260425.md.
 
 let DEFAULT_ROOT     = "/Users/ghost/core/anima"
 let PROPOSALS_DIR    = DEFAULT_ROOT + "/state/proposals"
@@ -190,14 +199,24 @@ fn _resolve_proposal_file(dir: string, id: string) -> string {
 
 fn _load_inventory() {
     if !_fexists(INVENTORY_PATH) {
-        return json_parse("{\"schema\":\"anima.proposals.inventory.v1\",\"updated_at\":\"\",\"proposals\":[]}")
+        return json_parse("{\"schema\":\"anima.proposal_inventory.v1\",\"updated_at\":\"\",\"entries\":[]}")
     }
-    return json_parse(read_file(INVENTORY_PATH))
+    let inv = json_parse(read_file(INVENTORY_PATH))
+    // Legacy/migration: if "proposals" present without "entries", normalize.
+    // If both present, "entries" wins (canonical per anima.proposal_inventory.v1).
+    if !inv.contains_key("entries") {
+        if inv.contains_key("proposals") {
+            inv["entries"] = inv["proposals"]
+        } else {
+            inv["entries"] = []
+        }
+    }
+    return inv
 }
 
 fn _inv_find_idx(inv, id: string) -> int {
-    if !inv.contains_key("proposals") { return -1 }
-    let ps = inv["proposals"]
+    if !inv.contains_key("entries") { return -1 }
+    let ps = inv["entries"]
     let mut i = 0
     while i < len(ps) {
         let p = ps[i]
@@ -271,6 +290,9 @@ fn _save_inventory(inv) {
     let mut i = 0
     while i < len(ks) {
         let k = ks[i]
+        // "entries" is the canonical proposal list; emit last.
+        // Drop legacy "proposals" key on write (migration sink).
+        if k == "entries" { i = i + 1; continue }
         if k == "proposals" { i = i + 1; continue }
         let mut v = inv[k]
         if k == "updated_at" {
@@ -283,8 +305,8 @@ fn _save_inventory(inv) {
     if !emitted_updated {
         body = body + "  \"updated_at\": \"" + _now_iso() + "\",\n"
     }
-    let ps = if inv.contains_key("proposals") { inv["proposals"] } else { [] }
-    body = body + "  \"proposals\": [\n"
+    let ps = if inv.contains_key("entries") { inv["entries"] } else { [] }
+    body = body + "  \"entries\": [\n"
     let mut j = 0
     while j < len(ps) {
         body = body + "  " + _proposal_to_json(ps[j])
@@ -318,9 +340,35 @@ fn _resolve_module_abs(module_path: string) -> string {
     return DEFAULT_ROOT + "/" + module_path
 }
 
+fn _has_substring(hay: string, needle: string) -> bool {
+    let h = len(hay)
+    let n = len(needle)
+    if n == 0 { return true }
+    if h < n { return false }
+    let mut i = 0
+    while i + n <= h {
+        if hay.substring(i, i + n) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _ends_with(hay: string, suffix: string) -> bool {
+    let h = len(hay)
+    let n = len(suffix)
+    if n > h { return false }
+    return hay.substring(h - n, h) == suffix
+}
+
 fn _verify_module_selftest(module_abs: string) -> array {
     if !_fexists(module_abs) {
         return [false, "module file not found: " + module_abs]
+    }
+    // LEAK FIX (2026-04-25): enforce `.hexa` extension. hexa CLI returns
+    // exit 0 on "unknown subcommand <path>", which previously let any
+    // extant file (md/json/py) pass the gate.
+    if !_ends_with(module_abs, ".hexa") {
+        return [false, "module file extension must be .hexa (got: " + module_abs + ")"]
     }
     // Run hexa <module> --selftest, capture exit code via $?.
     // To avoid metachars in exec, write a tiny wrapper script.
@@ -329,11 +377,26 @@ fn _verify_module_selftest(module_abs: string) -> array {
     write_file(wrap, body)
     exec("chmod +x " + _sh_quote(wrap))
     let rc_str = to_string(exec(_sh_quote(wrap))).trim()
-    if rc_str == "0" {
-        return [true, "module selftest PASS"]
-    }
     let out = to_string(exec("cat /tmp/anima_proposal_archive_selftest.out"))
-    return [false, "module selftest exit=" + rc_str + " output:\n" + out]
+
+    // LEAK FIX: reject hexa CLI default-success leak (unknown subcommand
+    // → exit 0 with help text). If the CLI rejected the input, treat as
+    // FAIL even when rc==0.
+    if _has_substring(out, "unknown subcommand") {
+        return [false, "module selftest leak: hexa CLI rejected input as 'unknown subcommand' (rc=" + rc_str + "). Module is not a runnable .hexa script.\n" + out]
+    }
+
+    if rc_str != "0" {
+        return [false, "module selftest exit=" + rc_str + " output:\n" + out]
+    }
+
+    // LEAK FIX: require explicit SELFTEST_PASS or DONE marker. exit 0
+    // alone is insufficient — many no-op scripts trivially exit 0.
+    if !_has_substring(out, "SELFTEST_PASS") && !_has_substring(out, "DONE") {
+        return [false, "module selftest exit=0 but missing SELFTEST_PASS/DONE marker; output:\n" + out]
+    }
+
+    return [true, "module selftest PASS (marker present)"]
 }
 
 // ─── core action ─────────────────────────────────────────────────────
@@ -379,13 +442,13 @@ fn _do_archive(id: string, module_path: string) -> array {
     let inv = _load_inventory()
     let idx = _inv_find_idx(inv, id)
     if idx >= 0 {
-        let ps = inv["proposals"]
+        let ps = inv["entries"]
         let entry = ps[idx]
         _set_field(entry, "user_status", "archived")
         _set_field(entry, "implementation_module_path", module_path)
         _set_field(entry, "user_decision_at", _now_iso())
         ps[idx] = entry
-        inv["proposals"] = ps
+        inv["entries"] = ps
     }
     _save_inventory(inv)
 
@@ -398,13 +461,23 @@ fn _selftest() -> array {
     let id = "99999999-T04"
     let approved_path = APPROVED_DIR + "/" + id + ".json"
     let archived_path = ARCHIVED_DIR + "/" + id + ".json"
-    // Synthetic module that exits 0 on --selftest.
+    // Synthetic module that exits 0 on --selftest with SELFTEST_PASS marker.
     let module_path = "tool/proposal_" + id + "_synthetic.hexa"
     let module_abs = DEFAULT_ROOT + "/" + module_path
+    // Negative fixture (FAIL: selftest exits 1).
+    let fail_module_path = "tool/proposal_" + id + "_synthetic_fail.hexa"
+    let fail_module_abs = DEFAULT_ROOT + "/" + fail_module_path
+    // Leak fixture (non-hexa file: hexa CLI returns exit 0 with
+    // "unknown subcommand"; gate must REJECT).
+    let leak_module_path = "tool/proposal_" + id + "_synthetic_leak.md"
+    let leak_module_abs = DEFAULT_ROOT + "/" + leak_module_path
+    // Marker-missing fixture (PASS exit 0 but no SELFTEST_PASS/DONE marker).
+    let nomark_module_path = "tool/proposal_" + id + "_synthetic_nomark.hexa"
+    let nomark_module_abs = DEFAULT_ROOT + "/" + nomark_module_path
 
     _ensure_dir(APPROVED_DIR)
     _ensure_dir(ARCHIVED_DIR)
-    exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(archived_path) + " " + _sh_quote(module_abs))
+    exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(archived_path) + " " + _sh_quote(module_abs) + " " + _sh_quote(fail_module_abs) + " " + _sh_quote(leak_module_abs) + " " + _sh_quote(nomark_module_abs))
 
     // S0: missing module-path → exit 3
     _atomic_write(approved_path, "{\n  \"id\": \"" + id + "\",\n  \"title\": \"selftest archive\",\n  \"kind\": \"tool\",\n  \"user_status\": \"approved\"\n}\n")
@@ -421,8 +494,38 @@ fn _selftest() -> array {
         return [false, "S1: nonexistent module should exit 1, got " + _str(r1[0])]
     }
 
-    // S2: write a synthetic hexa module that --selftest exits 0
-    let synth_body = "// synthetic for proposal_archive selftest\nlet argv = args()\nlet mut has = false\nlet mut i = 0\nwhile i < len(argv) { if to_string(argv[i]) == \"--selftest\" { has = true }; i = i + 1 }\nif has { println(\"synthetic selftest PASS\"); exit(0) }\nprintln(\"synthetic noop\"); exit(0)\n"
+    // S1b: extant non-hexa file (.md) → exit 1 (extension reject + leak guard)
+    _atomic_write(leak_module_abs, "# leak fixture — not a hexa script\n")
+    let r1b = _do_archive(id, leak_module_path)
+    if r1b[0] != 1 {
+        exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(leak_module_abs))
+        return [false, "S1b: non-hexa (.md) module should exit 1 (leak guard), got " + _str(r1b[0])]
+    }
+    exec("rm -f " + _sh_quote(leak_module_abs))
+
+    // S1c: synthetic hexa with selftest exit 1 → exit 1 (negative fixture)
+    let fail_body = "// synthetic FAIL fixture\nlet argv = args()\nlet mut has = false\nlet mut i = 0\nwhile i < len(argv) { if to_string(argv[i]) == \"--selftest\" { has = true }; i = i + 1 }\nif has { println(\"synthetic selftest FAIL\"); exit(1) }\nexit(0)\n"
+    _atomic_write(fail_module_abs, fail_body)
+    let r1c = _do_archive(id, fail_module_path)
+    if r1c[0] != 1 {
+        exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(fail_module_abs))
+        return [false, "S1c: failing-selftest module should exit 1, got " + _str(r1c[0])]
+    }
+    exec("rm -f " + _sh_quote(fail_module_abs))
+
+    // S1d: synthetic hexa with selftest exit 0 BUT no SELFTEST_PASS/DONE
+    // marker → exit 1 (marker enforcement)
+    let nomark_body = "// synthetic no-marker fixture\nexit(0)\n"
+    _atomic_write(nomark_module_abs, nomark_body)
+    let r1d = _do_archive(id, nomark_module_path)
+    if r1d[0] != 1 {
+        exec("rm -f " + _sh_quote(approved_path) + " " + _sh_quote(nomark_module_abs))
+        return [false, "S1d: missing SELFTEST_PASS/DONE marker should exit 1, got " + _str(r1d[0])]
+    }
+    exec("rm -f " + _sh_quote(nomark_module_abs))
+
+    // S2: write a synthetic hexa module that --selftest exits 0 with marker
+    let synth_body = "// synthetic for proposal_archive selftest\nlet argv = args()\nlet mut has = false\nlet mut i = 0\nwhile i < len(argv) { if to_string(argv[i]) == \"--selftest\" { has = true }; i = i + 1 }\nif has { println(\"synthetic SELFTEST_PASS\"); exit(0) }\nprintln(\"synthetic noop\"); exit(0)\n"
     _atomic_write(module_abs, synth_body)
 
     let r2 = _do_archive(id, module_path)
@@ -445,7 +548,7 @@ fn _selftest() -> array {
     // Cleanup synthetic.
     exec("rm -f " + _sh_quote(archived_path) + " " + _sh_quote(module_abs))
 
-    return [true, "S0 missing-arg + S1 missing-module + S2 archive + S3 idempotent → 4/4 PASS"]
+    return [true, "S0 missing-arg + S1 missing-module + S1b leak-guard(.md) + S1c fail-selftest + S1d no-marker + S2 archive + S3 idempotent → 7/7 PASS"]
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────
@@ -456,7 +559,7 @@ if _arg_present(argv, "--selftest") {
     println("── proposal_archive selftest ──")
     let r = _selftest()
     println(_str(r[1]))
-    println("── selftest result: " + (if r[0] { "4/4 PASS" } else { "FAIL" }) + " ──")
+    println("── selftest result: " + (if r[0] { "7/7 PASS" } else { "FAIL" }) + " ──")
     if r[0] { exit(0) }
     exit(1)
 }
