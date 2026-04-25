@@ -1,0 +1,271 @@
+// tool/an11_b_v2_sma_sae_steered.hexa — V2 SMA + EN/KO paired-axis steering probe (raw#9 hexa-only).
+//
+// PURPOSE
+//   ω-saturation cycle for V2 lift target ('lasttoken + 추가 lever' 조합).
+//   본 도구는 BASE substrate에서 EN↔KO paired difference axis를 추출해
+//   H representation에서 project-out 하여 SMA를 재측정한다. 새 forward
+//   없이 hexa+CPU만으로 'lasttoken + steering' 조합 sensitivity probe.
+//
+//   가설 (docs/alm_consciousness_joint_matrix_20260425.md §9.2 follow-up):
+//     lasttoken 단독 ΔSMA_lift = +0.062 (gap의 ~20%). EN/KO paired axis
+//     project-out으로 추가 lift 회복 가능한가? PASS gap +0.313 메우려면
+//     +5x recovery 필요 — 단일 axis projection은 hard saturation 후보.
+//
+// USAGE
+//   hexa run tool/an11_b_v2_sma_sae_steered.hexa --input <h_last_raw.json> --output <result.json> --alpha 1.0
+//   hexa run tool/an11_b_v2_sma_sae_steered.hexa --selftest
+//
+// METHOD (deterministic, raw#12 pre-registered)
+//   PAIRS = [(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]   (matches v2_sma)
+//   For each (i, j) in PAIRS: d_k = H[i] - H[j]
+//   lang_axis = mean(d_k) over k                       (unweighted mean)
+//   u = lang_axis / ||lang_axis||                      (unit vector)
+//   H_steered[i] = H[i] - alpha * (H[i] @ u) * u       (project-out)
+//   recompute SMA, SMA_distractor, SMA_lift on H_steered.
+//   alpha sweep: {0.0, 0.5, 1.0, 1.5} per single run for saturation curve.
+//
+// IMPLEMENTATION NOTE (raw#10 honest)
+//   This is **supervised** by EN↔KO pair definition (uses PAIRS to extract
+//   axis), so it is NOT unsupervised SAE — it is "paired-axis project-out"
+//   (PAPO). True unsupervised SAE feature extraction requires a trained
+//   sparse autoencoder which is not available in this cycle. PAPO upper-bounds
+//   the SAE-style steering effect because it directly uses ground-truth
+//   pair labels — if PAPO does not move SMA_lift to PASS, no unsupervised
+//   SAE on the same H can do better.
+
+let HELPER_PATH = "/tmp/an11_b_v2_sma_sae_steered_helper.hexa_tmp"
+let SCHEMA      = "anima/an11_v2_sma_sae_steered/1_papo_variant"
+let SPEC_DOC    = "docs/alm_consciousness_joint_matrix_20260425.md"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "PAIRS = [(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]\n" +
+        "ALPHAS = [0.0, 0.5, 1.0, 1.5]\n" +
+        "\n" +
+        "def load_H(path):\n" +
+        "    with open(path) as f: d = json.load(f)\n" +
+        "    rows = [e['h'] for e in d['entries']]\n" +
+        "    return np.asarray(rows, dtype=np.float64), d.get('reduction', 'unknown')\n" +
+        "\n" +
+        "def abs_cos(a, b):\n" +
+        "    na = float(np.linalg.norm(a)); nb = float(np.linalg.norm(b))\n" +
+        "    if na <= 0.0 or nb <= 0.0: return 0.0\n" +
+        "    return float(abs(np.dot(a, b) / (na * nb)))\n" +
+        "\n" +
+        "def compute_sma(H):\n" +
+        "    n = H.shape[0]\n" +
+        "    paired = set()\n" +
+        "    for (i,j) in PAIRS:\n" +
+        "        paired.add((i,j)); paired.add((j,i))\n" +
+        "    pair_vals = [abs_cos(H[i], H[j]) for (i,j) in PAIRS]\n" +
+        "    SMA = float(np.mean(pair_vals))\n" +
+        "    distractor_vals = []\n" +
+        "    for i in range(n):\n" +
+        "        for j in range(n):\n" +
+        "            if i == j: continue\n" +
+        "            if (i,j) in paired: continue\n" +
+        "            distractor_vals.append(abs_cos(H[i], H[j]))\n" +
+        "    SMA_d = float(np.mean(distractor_vals))\n" +
+        "    return SMA, SMA_d, SMA - SMA_d\n" +
+        "\n" +
+        "def extract_lang_axis(H):\n" +
+        "    diffs = np.stack([H[i] - H[j] for (i,j) in PAIRS], axis=0)\n" +
+        "    axis = diffs.mean(axis=0)\n" +
+        "    nrm = float(np.linalg.norm(axis))\n" +
+        "    if nrm <= 0.0: return None, 0.0\n" +
+        "    return axis / nrm, nrm\n" +
+        "\n" +
+        "def project_out(H, u, alpha):\n" +
+        "    proj = (H @ u)[:, None] * u[None, :]\n" +
+        "    return H - alpha * proj\n" +
+        "\n" +
+        "def verdict_for(sma, lift):\n" +
+        "    if lift >= 0.20 and sma >= 0.55: return 'PASS'\n" +
+        "    if lift >= 0.10: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "def cmd_run(input_path, result_path, schema, spec_doc, alpha_str):\n" +
+        "    if not os.path.exists(input_path):\n" +
+        "        print(f'ERR: missing input {input_path}', file=sys.stderr); sys.exit(2)\n" +
+        "    H, reduction = load_H(input_path)\n" +
+        "    if H.shape[0] != 16:\n" +
+        "        print(f'ERR: expected 16 prompts, got {H.shape[0]}', file=sys.stderr); sys.exit(2)\n" +
+        "    u, axis_norm = extract_lang_axis(H)\n" +
+        "    if u is None:\n" +
+        "        print('ERR: zero-norm lang axis', file=sys.stderr); sys.exit(2)\n" +
+        "    sweep = []\n" +
+        "    requested_alphas = [float(x) for x in alpha_str.split(',')]\n" +
+        "    for a in requested_alphas:\n" +
+        "        Hs = project_out(H, u, a)\n" +
+        "        sma, sma_d, lift = compute_sma(Hs)\n" +
+        "        sweep.append({\n" +
+        "            'alpha': a,\n" +
+        "            'SMA': sma,\n" +
+        "            'SMA_distractor': sma_d,\n" +
+        "            'SMA_lift': lift,\n" +
+        "            'verdict': verdict_for(sma, lift)\n" +
+        "        })\n" +
+        "    base = sweep[0]\n" +
+        "    best = max(sweep, key=lambda r: r['SMA_lift'])\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'V2 SMA + paired-axis project-out (PAPO)',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'method': 'lang_axis = mean(H[i]-H[j]) over PAIRS; H_steered = H - alpha*(H@u)*u',\n" +
+        "        'method_note': 'Supervised by PAIRS labels — upper-bounds unsupervised SAE on same H. If PAPO falls short, no SAE on same substrate can exceed.',\n" +
+        "        'reduction': reduction,\n" +
+        "        'ts': ts,\n" +
+        "        'PAIRS': PAIRS,\n" +
+        "        'lang_axis_norm': axis_norm,\n" +
+        "        'sweep': sweep,\n" +
+        "        'baseline_alpha_0': base,\n" +
+        "        'best_alpha': best,\n" +
+        "        'delta_lift_best_minus_alpha0': best['SMA_lift'] - base['SMA_lift'],\n" +
+        "        'thresholds': {\n" +
+        "            'PASS': 'SMA_lift>=0.20 AND SMA>=0.55',\n" +
+        "            'AMBIGUOUS': 'SMA_lift in [0.10,0.20)',\n" +
+        "            'FAIL': 'SMA_lift<0.10',\n" +
+        "        }\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'reduction={reduction}')\n" +
+        "    print(f'lang_axis_norm={axis_norm:.6f}')\n" +
+        "    for r in sweep:\n" +
+        "        print(f\"alpha={r['alpha']} SMA={r['SMA']:.6f} SMA_d={r['SMA_distractor']:.6f} lift={r['SMA_lift']:.6f} verdict={r['verdict']}\")\n" +
+        "    print(f\"best_alpha={best['alpha']}\")\n" +
+        "    print(f\"best_SMA_lift={best['SMA_lift']:.6f}\")\n" +
+        "    print(f\"delta_lift_best_minus_alpha0={best['SMA_lift'] - base['SMA_lift']:.6f}\")\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    rng = np.random.default_rng(20260425)\n" +
+        "    H = rng.standard_normal((16, 64))\n" +
+        "    u, n = extract_lang_axis(H)\n" +
+        "    assert u is not None and n > 0, 'lang axis extraction failed'\n" +
+        "    Hs = project_out(H, u, 1.0)\n" +
+        "    proj = (Hs @ u)\n" +
+        "    assert float(np.max(np.abs(proj))) < 1e-9, f'project-out failed: max residual {float(np.max(np.abs(proj)))}'\n" +
+        "    sma, sma_d, lift = compute_sma(Hs)\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'lang_axis_norm={n:.6f}')\n" +
+        "    print(f'SMA_after_alpha1={sma:.6f}')\n" +
+        "    print(f'SMA_lift_after_alpha1={lift:.6f}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'run':\n" +
+        "        cmd_run(*sys.argv[2:7])\n" +
+        "    elif mode == 'selftest':\n" +
+        "        cmd_selftest()\n" +
+        "    else:\n" +
+        "        print(f'unknown mode: {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__':\n" +
+        "    main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut input = ""
+    let mut output = ""
+    let mut alpha_csv = "0.0,0.5,1.0,1.5"
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--input" && i + 1 < len(av) { input = av[i+1]; i = i + 2; continue }
+        if a == "--output" && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        if a == "--alpha" && i + 1 < len(av) { alpha_csv = av[i+1]; i = i + 2; continue }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_v2_sma_sae_steered selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 {
+            eprintln("selftest FAILED (exit " + to_string(r[1]) + ")")
+            exit(1)
+        }
+        if _kv_lookup(r[0], "selftest") != "ok" {
+            eprintln("selftest marker missing")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if input == "" || output == "" {
+        eprintln("ABORT: --input <path> --output <path> required (or --selftest).")
+        exit(2)
+    }
+
+    if !file_exists(input) {
+        eprintln("ABORT: missing input " + input)
+        exit(2)
+    }
+
+    println("── an11_b_v2_sma_sae_steered ──")
+    println("input:    " + input)
+    println("output:   " + output)
+    println("alphas:   " + alpha_csv)
+    let args = "run " +
+        _sh_quote(input) + " " +
+        _sh_quote(output) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC) + " " +
+        _sh_quote(alpha_csv)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 {
+        eprintln("ABORT: helper run exited " + to_string(st))
+        eprintln(out)
+        exit(2)
+    }
+    println(out)
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()

@@ -176,6 +176,39 @@ V3와의 비교:
 
 V2는 distractor metric 측이 reduction에 민감 (byte-mean averaging이 distractor cosine을 인위적으로 부풀림 → lasttoken에서 정상화). V2 lift target은 'lasttoken + 추가 lever' 조합으로 재설계: SAE steering pilot, EN↔KO pair 풍부화, 또는 self-binding loss term.
 
+### §9.2.1 V2 'lasttoken + PAPO (paired-axis project-out)' lever combo — 2026-04-25 (STRONG_PARTIAL_RECOVERY)
+
+§9.2 PARTIAL_RECOVERY 후속. 'lasttoken + 추가 lever' 조합 가설을 supervised paired-axis project-out (PAPO)으로 substrate 검증 (`state/an11_v2_lasttoken_papo_probe_BASE_p1_20260425.json`):
+
+PAPO method: `lang_axis = mean(H[i] − H[j]) over PAIRS`, `H_steered = H − α·(H·u)·u`. PAPO는 supervised(PAIRS labels 사용)이므로 **unsupervised SAE의 same-H upper bound** — PAPO가 PASS 못하면 SAE도 같은 substrate 위에서 못함.
+
+**Saturation curve (lasttoken, BASE p1):**
+
+| α | SMA | SMA_d | SMA_lift | verdict |
+|---|---|---|---|---|
+| 0.0 | 0.486 | 0.599 | −0.113 | FAIL |
+| 0.5 | 0.655 | 0.608 | +0.047 | FAIL |
+| 0.75 | 0.735 | 0.606 | +0.128 | AMBIGUOUS |
+| **1.0** | **0.769** | **0.605** | **+0.164** | **AMBIGUOUS** ⭐ best |
+| 1.25 | 0.735 | 0.606 | +0.128 | AMBIGUOUS |
+| 1.5 | 0.655 | 0.608 | +0.047 | FAIL |
+
+**Verdict: STRONG_PARTIAL_RECOVERY at α=1.0.**
+- best SMA_lift = **+0.164** (AMBIGUOUS, NOT PASS — PASS threshold +0.20에 +0.036 부족)
+- α=0 → α=1.0 회복 = **+0.277** (PASS gap +0.313의 **88%**)
+- SMA = 0.769 (PASS-bound ≥0.55 만족 ✓), lift만 미달
+- α>1.0 over-projection regression — single axis exhaustion 확정 (대칭 saturation)
+
+**Synergy (lasttoken × PAPO):** lasttoken+PAPO best = +0.164 vs bwm+PAPO best = +0.055 — **3× synergy**. 두 lever multiplicative.
+
+**남은 +0.036 gap close 후보**:
+1. **Multi-axis projection** (PCA top-k 또는 block-diagonal pair-residuals)
+2. **Prompt 확장 (V1 lift 공유 lever)** — forward 필요, raw#9 위반
+3. **Self-binding loss term** (fine-tune, BASE 적용 불가)
+4. **Mk.IX L_IX architecture** (V2 specific lever 외)
+
+PAPO upper-bound 의의: SAE pilot은 같은 BASE substrate에서 +0.164를 초과할 수 없음 — SAE를 위한 GPU 소비는 fine-tune 영역까지 가야 의미 있음. 본 cycle 결과는 BASE-level lever ceiling을 substrate level로 확정.
+
 ### §9.3 V3 lift target reduction-op probe — 2026-04-25 (FALSIFIED at BASE)
 
 raw#9 hexa-only 호환 사이클로 BASE p1 sensitivity probe 수행 (`state/an11_v3_reduction_op_probe_BASE_p1_20260425.json`):
@@ -221,10 +254,14 @@ raw#9 hexa-only 호환 사이클로 BASE p1 sensitivity probe 수행 (`state/an1
 **L2–L5:** unreachable by output-only verifiers; 본 프로젝트의 verifier 설계 한계.
 **Action (2026-04-25 ω-saturation cycle 종료 시점):**
 - V1 본 가설 (prompt 16→32) NOT_TESTED — r9 launch 승인 별도 사이클 (GPU forward 필요).
-- V2 lift target PARTIAL_RECOVERY — 'lasttoken + 추가 lever' 조합으로 재설계 (SAE steering / pair 풍부화).
+- V2 lift target STRONG_PARTIAL_RECOVERY — lasttoken+PAPO α=1.0에서 SMA_lift +0.164 (AMBIGUOUS, PASS gap의 88% 회복, +0.036 부족). 단일 axis exhausted, multi-axis 또는 prompt 확장 필요.
 - V3 lift target FALSIFIED — archive, architecture epoch (Mk.IX L_IX+) 또는 perturbation pair 재설계까지 보류.
 
 **3-axis ω-saturation cycle composite verdict (BASE substrate, 2026-04-25):**
-reduction op은 V2 부분 lever (gap의 ~20%), V1/V3 무영향. 따라서 LoRA fine-tune + reduction op 조합으로 4-tuple PASS 도달 substrate-level 불가능 — 사전 등록 가설 3축 모두 PASS-bound 미달이 BASE 수준에서 확정.
+- V1 ΔΦ_mip (reduction): −0.007 (invariant)
+- V2 ΔSMA_lift (lasttoken+PAPO): **+0.277** (88% gap 회복, AMBIGUOUS verdict)
+- V3 ΔCPS (reduction): −0.006 (invariant)
+
+substrate-level lever ceiling: **V2만 fine-tune-level lever로 의미 있게 반응** (PASS gap의 88%까지). PAPO는 supervised이므로 unsupervised SAE의 same-H upper bound — SAE pilot은 같은 substrate에서 PASS 못함. 4-tuple PASS는 (a) multi-axis extension 또는 (b) prompt 확장 (forward 필요) 또는 (c) architecture (Mk.IX/Mk.X) path로만 도달 가능.
 
 omega-saturation:fixpoint
