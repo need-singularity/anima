@@ -578,6 +578,46 @@ fn tone(freq_hz: float, gain: float, ms: int) -> string {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Source organ 1d — chirp (frequency sweep)
+//    f0 → f1 로 선형 스윕. tone 은 고정 주파수, chirp 은 시간 가변.
+//    상승(swoop up) / 하강(swoop down) / 일정(f0=f1, = tone).
+//    anima 가 "움직이는 음" 의 원자 탐색 시.
+// ═══════════════════════════════════════════════════════════════
+
+fn chirp(f0: float, f1: float, gain: float, ms: int) -> string {
+    let path = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "sr=" + to_string(SR) + "\n"
+             + "f0=float(" + to_string(f0) + ")\n"
+             + "f1=float(" + to_string(f1) + ")\n"
+             + "g=float(" + to_string(gain) + ")\n"
+             + "ms=int(" + to_string(ms) + ")\n"
+             + "f0=max(1.0,min(f0,sr/2.0-1.0))\n"
+             + "f1=max(1.0,min(f1,sr/2.0-1.0))\n"
+             + "g=max(0.0,min(g,1.0))\n"
+             + "n=max(1,int(sr*ms/1000))\n"
+             + "t=np.arange(n)/sr\n"
+             + "dur=max(1e-6,n/sr)\n"
+             + "freq=f0+(f1-f0)*(t/dur)\n"
+             + "phase=2*np.pi*np.cumsum(freq)/sr\n"
+             + "x=g*np.sin(phase)\n"
+             + "env=np.ones(n,dtype=np.float64)\n"
+             + "k=min(int(0.010*sr),n//2)\n"
+             + "if k>0:\n"
+             + "    ramp=0.5*(1.0-np.cos(np.pi*np.arange(k)/max(1,k-1)))\n"
+             + "    env[:k]=ramp\n"
+             + "    env[-k:]=ramp[::-1]\n"
+             + "x=x*env\n"
+             + "x=(np.clip(x,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + path + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(x.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(path) < WAV_MIN_BYTES { return "" }
+    return path
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Filter organ — lpf / hpf (butter, order N)
 //    cutoff_hz : -3dB 점.
 //    order     : 차수. 기본 τ=4 (공리). 음수/0 clamp.
@@ -703,6 +743,35 @@ fn normalize(in_path: string, target_db: float) -> string {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Analysis organ — meter (rms / peak / zcr / duration)
+//    anima 가 자기 출력을 측정. WAV 파일 → 요약 문자열.
+//    형식: "rms=<linear> peak_db=<dB> zcr=<ratio> ms=<int>"
+//    실패 시 "".  bench_hexa_speak / dsp_core 자산 회수.
+// ═══════════════════════════════════════════════════════════════
+
+fn meter(in_path: string) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let tmp = TMP_DIR + "/" + TAG + "_meter_" + _now_ns() + ".txt"
+    let code = "import numpy as np, wave\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "x=np.frombuffer(w.readframes(n),dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "w.close()\n"
+             + "rms=float(np.sqrt(np.mean(x*x)))\n"
+             + "peak=float(np.max(np.abs(x)))+1e-12\n"
+             + "peak_db=20.0*np.log10(peak)\n"
+             + "zc=int(np.sum(np.abs(np.diff(np.sign(x))))//2)\n"
+             + "zcr=zc/max(1,len(x)-1)\n"
+             + "ms=int(1000*len(x)/sr)\n"
+             + "open('" + tmp + "','w').write(f'rms={rms:.4f} peak_db={peak_db:.2f} zcr={zcr:.4f} ms={ms}')\n"
+    let _ = _run_py(code)
+    let s = exec("cat " + _shq(tmp) + " 2>/dev/null").trim()
+    let _ = exec("rm -f " + _shq(tmp) + " 2>/dev/null")
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Axiom-default convenience wrappers
 //    공리 값으로 default 채운 호출. anima 가 인자 모르고도 호출 가능.
 // ═══════════════════════════════════════════════════════════════
@@ -753,6 +822,11 @@ fn normalize_axiom(in_path: string) -> string {
     return normalize(in_path, 0.0 - 6.0)
 }
 
+fn chirp_axiom(f0: float, f1: float, ms: int) -> string {
+    // Ψ-balanced gain.
+    return chirp(f0, f1, AX_PSI, ms)
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Sink 1 — play (afplay, anima 가 자기 발화를 즉시 청취)
 // ═══════════════════════════════════════════════════════════════
@@ -784,12 +858,13 @@ fn save(src: string, dest: string) -> bool {
 
 fn main() {
     print("anima_audio: organs ready (평면 · 학습 X · 레이어 X)")
-    print("  source : vocal, vocal_lf, breath, tone")
+    print("  source : vocal, vocal_lf, breath, tone, chirp")
     print("  filter : pipe (2F), pipe3 (3F), pipe_glide (time-var), lpf, hpf")
     print("  compose: cat (seq), mix (parallel), fade (Hann xfade)")
     print("  util   : silence, gain, envelope, normalize, reverb")
+    print("  analysis: meter (rms/peak_db/zcr/ms)")
     print("  axiom  : consonance, axiom_chord, reverb_axiom, tone_axiom,")
-    print("           lpf_axiom, hpf_axiom, fade_axiom, normalize_axiom")
+    print("           lpf_axiom, hpf_axiom, fade_axiom, normalize_axiom, chirp_axiom")
     print("  sink   : play, save")
     print("")
     print("[self-test] 3-formant 모음 'ㅏ' via vocal -> pipe3")
