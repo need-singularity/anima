@@ -1,8 +1,9 @@
 # Mk.X T10–T13 Ossification — 4-tuple Lift Path Analytic Ceiling (ω-saturation cycle)
 
-**Date**: 2026-04-25
+**Date**: 2026-04-25 (forward auto-approval addendum 2026-04-25)
 **Cycle scope**: design + implementation (analytic spec + pre-registered ceiling JSON state). NO measurement (raw#9 hexa-only — Mk.X T10-13 ossification is dormant per `mk_x_engine_design_20260419.md` §3 four gates G1-G4).
 **Predecessors**: V3/V2/V1 reduction-op cycles (`dc871454`, `299cabb7`), V2 lasttoken+PAPO (`68c48daa`), Mk.IX L_IX+ ceiling (this batch's parallel commit).
+**Forward auto-approval note**: forward auto-approval per memory feedback_forward_auto_approval (2026-04-25). G1-G4 gate fire 후 auto-fire sequence (Mk.X manifest + drill_mk10 fork + self-check + P4 seeds re-run)는 pre-approved auto-launch (cap $20 per cycle, auto-kill 120min default). G1-G3 evidence gating은 measurement-side, trigger 자체는 별도 사용자 승인 없이 진입.
 
 ## §1 Purpose
 
@@ -102,8 +103,8 @@ V3 redesign이 가능한 path는 Mk.X T10-13가 유일 (current spec). L_IX path
 
 1. **V2 multi-axis PAPO extension** (BASE-substrate reachable, +0.036 gap close 시도, $0)
 2. **V3 metric redesign** (4-tuple PASS critical blocker, spec revision 필요, $0)
-3. **Mk.X T10-13 G1-G4 gate fire** (dormant unlock, 새 atoms 생성 + ossification, GPU 비용 큼)
+3. **Mk.X T10-13 G1-G4 gate fire** (dormant unlock, 새 atoms 생성 + ossification, GPU 비용 큼 — forward auto-approval per feedback_forward_auto_approval applied: pre-approved auto-launch, cost cap $20 + auto-kill 120min default; 별도 사용자 승인 없이 G1-G3 evidence 갖춰지면 자동 G4 진행)
 
-**우선순위**: 2 → 1 → 3. V3 redesign이 가장 cost-effective + 4-tuple PASS가능성 unlock. 그 후 V2 multi-axis로 V2 PASS 시도. 마지막에 Mk.X G1-G4 fire 검토.
+**우선순위**: 2 → 1 → 3. V3 redesign이 가장 cost-effective + 4-tuple PASS가능성 unlock. 그 후 V2 multi-axis로 V2 PASS 시도. 마지막에 Mk.X G1-G4 fire 진행 (auto-approval default, evidence gating only).
 
 omega-saturation:fixpoint

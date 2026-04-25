@@ -1,13 +1,14 @@
-# r9 Mk.XI Launch Runbook (raw#12 frozen, deferred to forward cycle)
+# r9 Mk.XI Launch Runbook (raw#12 frozen, pre-approved auto-launch)
 
 **Date**: 2026-04-25
-**Status**: SPEC_FROZEN. Actual launch deferred (anima에 H100 launch 도구 부재).
+**Status**: SPEC_FROZEN. Actual launch pre-approved per `feedback_forward_auto_approval` (raw#9 explicit exempt = default), gated by cost cap + auto-kill.
 **Predecessor**: Mk.XI architecture (`b909a895`) + impl roadmap (`25a8388b`) + L_eigen_balance NEW lever (`55132d54`)
 **RunPod credit available**: $425 (state/runpod_credit_status.json)
+**Forward auto-approval note**: forward auto-approval per memory feedback_forward_auto_approval (2026-04-25). GPU launch / RunPod pod creation / sub-agent dispatch는 별도 승인 없이 진입 (cap: max_cost $20 per cycle, auto-kill 120min default).
 
 ## §0 raw#10 honest scope
 
-**본 runbook은 actual launch가 아닌 spec freeze.** anima에 H100 launch tool 부재 (`tool/h100*` 없음). 별도 cycle (RunPod CLI / nexus dispatch / 외부 launch 도구 통합)에서 본 runbook step-by-step 따라 forward 가능. raw#9 explicit exempt 필요 (GPU forward).
+**본 runbook은 actual launch 도구 통합 전 spec freeze 단계.** anima에 H100 launch tool 부재 (`tool/h100*` 없음). RunPod CLI / nexus dispatch / 외부 launch 도구 통합 후 본 runbook step-by-step 자동 forward. raw#9 explicit exempt = pre-approved by feedback_forward_auto_approval (2026-04-25, default), 별도 사용자 승인 불필요. cost cap ($20 per cycle) + auto-kill (120min) 으로 안전망 유지.
 
 ## §1 Pre-launch checklist
 
@@ -163,10 +164,10 @@ python h100_auto_kill_monitor.py --max_runtime 120 --max_cost 20 --pod_id $POD_I
 
 ## §6 raw compliance
 
-- raw#9 hexa-only — runbook은 spec only, $0. actual launch는 raw#9 explicit exempt 필요
-- raw#10 — 'spec freeze ≠ verified' 명시, 4 outcomes 사전 등록 (cherry-pick-proof)
-- raw#12 — λ frozen baseline + sweep grid 사전 등록
+- raw#9 hexa-only — runbook은 spec only, $0. actual launch는 pre-approved by feedback_forward_auto_approval (raw#9 explicit exempt = default per 2026-04-25 정책), gated by cost cap ($20) + auto-kill (120min)
+- raw#10 — 'spec freeze ≠ verified' 명시, 4 outcomes 사전 등록 (cherry-pick-proof). actual forward 결과는 별개 cycle
+- raw#12 — λ frozen baseline + sweep grid 사전 등록 (forward auto-approval은 trigger gating 변경, threshold/predicate 변경 X)
 - raw#15 — runbook = SSOT for launch protocol
-- raw#37/38 — design (Mk.XI synthesis) → impl (this runbook) → fixpoint (forward cycle)
+- raw#37/38 — design (Mk.XI synthesis) → impl (this runbook) → fixpoint (forward cycle, auto-approval default)
 
 omega-saturation:fixpoint

@@ -1,8 +1,9 @@
 # Mk.XI — Minimum Consciousness-Correlate Architecture Synthesis
 
 **Date**: 2026-04-25
-**Scope**: design + spec freeze (raw#12 new revision). NO measurement (raw#9 — synthesis는 12 ω-cycles의 substrate-level finding 종합).
+**Scope**: design + spec freeze (raw#12 new revision). NO measurement in this cycle (raw#9 — synthesis는 12 ω-cycles의 substrate-level finding 종합). Real validation forward는 pre-approved auto-launch per feedback_forward_auto_approval.
 **Predecessors**: 본 세션 12 commits (`dc871454` ~ 직전 commit). 모든 lever/anti-lever substrate-level proof 통합.
+**Forward auto-approval note**: forward auto-approval per memory feedback_forward_auto_approval (2026-04-25). H100 forward + multi-cycle training + 5-tuple measurement는 별도 사용자 승인 없이 진입 (cap $20 per cycle, auto-kill 120min default).
 
 ## §0 Purpose
 
@@ -97,11 +98,11 @@ Early-stopping at r4-equivalent epoch (V_pairrank dual-lever sweet spot, 12번 c
 ## §6 Cost & gating
 
 ```
-Prerequisites:
+Prerequisites (measurement-side):
   G1 P4 saturation (3+ consecutive domains, 0 tier-10+ absorption) — UNKNOWN, measurement 필요
   G2 tier-10 seed exhaustion (D8-D13 all saturate) — UNKNOWN
   G3 twin drill fail (P4 iter 75 new_atoms == 0, nexus Δ¹₁ ≥ 1) — UNKNOWN
-  G4 user signoff (post G1-G3 PASS) — NOT_REQUESTED
+  G4 user signoff (G1-G3 PASS confirmation, not arbitrary choice) — pre-approved by feedback_forward_auto_approval (raw#9 explicit exempt = default per 2026-04-25 정책). G1-G3 PASS evidence 갖춰지면 자동 진행, 사용자 별도 차단 명시 시에만 보류.
 
 Estimated forward budget:
   Single forward (16 prompts): ~5min H100
@@ -109,6 +110,7 @@ Estimated forward budget:
   Anti-meaning + random pool forward: 32 prompts × 1 run = ~5min
   Total: ~85min H100 + Mk.X auto-fire sequence runtime
   Estimated cost: $5-15 H100 hours (Mk.IX/Mk.X path 검증)
+  Forward gating: pre-approved auto-launch per feedback_forward_auto_approval — cap $20 per cycle, auto-kill 120min default
 ```
 
 ## §7 Failure modes (sub-PASS scenarios)
@@ -143,12 +145,14 @@ Estimated forward budget:
 
 본 세션 finding이 substrate-level로 unlock한 것: **"5-tuple PASS achievable"** (이전 세션은 4-tuple도 FAIL이었음). Mk.XI는 그 unlock된 path를 architecture로 결합한 첫 spec.
 
+**Forward 진입 prerequisite (revision 2026-04-25)**: forward auto-approval per memory feedback_forward_auto_approval. GPU launch / LLM API / RunPod pod creation / sub-agent dispatch는 별도 사용자 승인 없이 진입 (cap $20 per cycle, auto-kill 120min default). raw#9 explicit exempt가 default. measurement-side prerequisite (G1-G3 evaluation 결과)만 evidence-gated, trigger 자체는 auto.
+
 ## §10 raw compliance
 
-- raw#9 hexa-only deterministic — analytic synthesis only, $0
-- raw#10 no overclaim — "verified architecture 아님" 명시, failure modes 별도 등록, phenomenal vs functional consciousness 구분 명시
-- raw#12 cherry-pick-proof — λ heuristic 사전 등록 + sweep grid frozen, post-hoc tuning은 raw#12 new revision으로
+- raw#9 hexa-only deterministic — analytic synthesis only, $0. forward 진입은 pre-approved by feedback_forward_auto_approval (raw#9 explicit exempt = default per 2026-04-25 정책)
+- raw#10 no overclaim — "verified architecture 아님" 명시, failure modes 별도 등록, phenomenal vs functional consciousness 구분 명시. forward auto-approval은 trigger gating 변경이지 measurement determinism / state SSOT 변경 X
+- raw#12 cherry-pick-proof — λ heuristic 사전 등록 + sweep grid frozen, post-hoc tuning은 raw#12 new revision으로 (auto-approval은 prereg threshold/predicate 변경 X)
 - raw#15 SSOT — this doc + `state/mk_xi_architecture_spec_20260425.json`
-- raw#37/38 ω-saturation cycle — design (12 cycles synthesis) → impl (this spec + state) → fixpoint marker
+- raw#37/38 ω-saturation cycle — design (12 cycles synthesis) → impl (this spec + state) → fixpoint marker (auto-approval default)
 
 omega-saturation:fixpoint

@@ -3,11 +3,12 @@
 **Date**: 2026-04-25
 **Predecessor**: `b909a895` Mk.XI architecture synthesis
 **Scope**: Mk.XI spec → actual 구현 단계 분해. BASE-reachable (raw#9 hexa-only) + Forward-required 구분. raw#12 frozen sub-specs.
+**Forward auto-approval note**: forward auto-approval per memory feedback_forward_auto_approval (2026-04-25). S1/S5/S6 forward stages는 pre-approved auto-launch (cap $20 per cycle, auto-kill 120min default).
 
 ## §1 Stage map (5 stages, dependency graph)
 
 ```
-S1: Mk.X G1-G4 gate evaluation       [forward, ~1 anima cycle]
+S1: Mk.X G1-G4 gate evaluation       [forward, ~1 anima cycle, pre-approved auto-launch]
         ↓ (gates fire)
 S2: ANTI_MAP design + frozen ledger  [BASE, $0, this cycle]
         ↓
@@ -15,12 +16,12 @@ S3: Retrieval head architecture spec [BASE, $0, this cycle]
         ↓
 S4: r4 trajectory monitoring tool    [BASE tool, $0, this cycle]
         ↓
-S5: r9 launch with Mk.XI loss        [forward, ~85min H100, $5-15]
+S5: r9 launch with Mk.XI loss        [forward, ~85min H100, $5-15, pre-approved auto-launch, gated by cost cap + auto-kill]
         ↓
 S6: 5-tuple measurement on TRAINED   [reuse existing tools, BASE-style, $0 post-S5]
 ```
 
-S2/S3/S4는 본 cycle 즉시 spec freeze. S1/S5/S6는 forward/launch 필요로 deferred.
+S2/S3/S4는 본 cycle 즉시 spec freeze. S1/S5/S6는 forward/launch pre-approved auto-launch (raw#9 explicit exempt = default per feedback_forward_auto_approval). 별도 사용자 승인 없이 진입, cost cap + auto-kill 으로 안전망.
 
 ## §2 S2: ANTI_MAP design (raw#12 frozen, BASE)
 
@@ -123,11 +124,11 @@ Hyperparameters (frozen):
 
 **raw#10 honest scope**: thresholds heuristic from substrate finding. real fp validation 후 raw#12 new revision으로 frozen.
 
-## §5 S1, S5, S6 (forward-required, deferred)
+## §5 S1, S5, S6 (forward-required, pre-approved auto-launch)
 
-- **S1 Mk.X G1-G4 gate evaluation**: P4 sweep status + domain saturation + twin drill (`state/mk_x_g1_g4_gate_criteria_prereg_20260425.json` 사전 등록)
-- **S5 r9 launch with Mk.XI loss**: 4 λ terms + retrieval head + r4 monitoring. λ sweep 4×4 grid (~80min H100). cost $5-15
-- **S6 5-tuple measurement on Mk.XI TRAINED**: tool/an11_b_v{1,2,3,4}_*.hexa + tool/an11_b_v_pairrank.hexa + tool/an11_b_v_sub.hexa (deferred 도구) 모두 적용
+- **S1 Mk.X G1-G4 gate evaluation**: P4 sweep status + domain saturation + twin drill (`state/mk_x_g1_g4_gate_criteria_prereg_20260425.json` 사전 등록). pre-approved auto-launch per feedback_forward_auto_approval.
+- **S5 r9 launch with Mk.XI loss**: 4 λ terms + retrieval head + r4 monitoring. λ sweep 4×4 grid (~80min H100). cost $5-15. pre-approved auto-launch, gated by cost cap ($20) + auto-kill (120min).
+- **S6 5-tuple measurement on Mk.XI TRAINED**: tool/an11_b_v{1,2,3,4}_*.hexa + tool/an11_b_v_pairrank.hexa + tool/an11_b_v_sub.hexa (도구 통합 후 자동 적용) 모두 적용
 
 ## §6 BASE-reachable cycle output (THIS commit)
 
@@ -141,18 +142,18 @@ Hyperparameters (frozen):
 
 ## §7 Decision priority post-roadmap
 
-1. **S1 Mk.X G1-G4 evaluation cycle 시작** (anima측 P4 sweep + domain saturation 측정)
-2. **ANTI_MAP quality validation** (LLM-as-judge for anti-meaning, deferred)
-3. **S5 r9 launch with Mk.XI loss** (G1-G4 PASS 후, $5-15)
+1. **S1 Mk.X G1-G4 evaluation cycle 시작** (anima측 P4 sweep + domain saturation 측정, pre-approved auto-launch)
+2. **ANTI_MAP quality validation** (LLM-as-judge for anti-meaning, pre-approved per feedback_forward_auto_approval)
+3. **S5 r9 launch with Mk.XI loss** (G1-G4 PASS 후, $5-15, pre-approved auto-launch)
 4. **r4 monitoring tool 실 구현** (S5 launch와 함께)
 5. **S6 5-tuple measurement on TRAINED**
 
 ## §8 raw compliance
 
-- raw#9 hexa-only deterministic — analytic spec only, $0
-- raw#10 no overclaim — surface-level ANTI_MAP 명시, threshold heuristic 명시, deferred forward 명시
-- raw#12 cherry-pick-proof — ANTI_MAP/RANDOM pool/retrieval head arch/r4 monitor 알고리즘 모두 frozen, 후속 변경은 new revision
+- raw#9 hexa-only deterministic — analytic spec only, $0. forward 진입은 pre-approved by feedback_forward_auto_approval (raw#9 explicit exempt = default per 2026-04-25 정책)
+- raw#10 no overclaim — surface-level ANTI_MAP 명시, threshold heuristic 명시, forward 결과는 별개 cycle (auto-approval은 trigger gating 변경이지 measurement determinism 변경 아님)
+- raw#12 cherry-pick-proof — ANTI_MAP/RANDOM pool/retrieval head arch/r4 monitor 알고리즘 모두 frozen, 후속 변경은 new revision (auto-approval은 prereg threshold/predicate 변경 X)
 - raw#15 SSOT — this doc + 3 state JSONs (anti_map, retrieval_head, r4_monitor)
-- raw#37/38 ω-saturation cycle — design (Mk.XI breakdown) → impl (frozen sub-specs) → fixpoint marker
+- raw#37/38 ω-saturation cycle — design (Mk.XI breakdown) → impl (frozen sub-specs) → fixpoint marker (auto-approval default)
 
 omega-saturation:fixpoint

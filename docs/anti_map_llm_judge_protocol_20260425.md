@@ -1,13 +1,14 @@
-# ANTI_MAP LLM-as-Judge Validation Protocol (raw#12 frozen)
+# ANTI_MAP LLM-as-Judge Validation Protocol (raw#12 frozen, pre-approved)
 
 **Date**: 2026-04-25
-**Status**: SPEC_FROZEN. Actual LLM API call deferred (anima에 LLM 호출 도구 부재).
+**Status**: SPEC_FROZEN. Actual LLM API call pre-approved per `feedback_forward_auto_approval` (raw#9 explicit exempt = default), gated by cost cap (~$5 per validation cycle).
 **Predecessor**: ANTI_MAP v2 (`066dfd2d`) — heuristic baseline PASS but semantic ground truth 별도 검증 필요
 **Reference**: state/mk_xi_anti_map_ledger_v2_20260425.json
+**Forward auto-approval note**: forward auto-approval per memory feedback_forward_auto_approval (2026-04-25). LLM API call (anthropic/openai/local LLM judge)은 별도 승인 없이 진입 (cap: $5 per validation cycle, 16 entries × 3 samples).
 
 ## §0 raw#10 honest scope
 
-**ANTI_MAP v2 heuristic PASS_BASELINE 도달했으나 실제 anti-meaning quality는 LLM-as-judge로만 검증 가능.** anima에 외부 LLM API 호출 도구 부재 (`tool/llm*` 없음). 본 protocol은 frozen spec — actual LLM call은 별도 cycle (외부 anthropic/openai API key 필요, 또는 local LLM forward 통합).
+**ANTI_MAP v2 heuristic PASS_BASELINE 도달했으나 실제 anti-meaning quality는 LLM-as-judge로만 검증 가능.** anima에 외부 LLM API 호출 도구 부재 (`tool/llm*` 없음). 본 protocol은 frozen spec — actual LLM call은 pre-approved per feedback_forward_auto_approval (외부 anthropic/openai API key 통합 또는 local LLM forward 통합 후 자동 진입). cost cap $5 per cycle 으로 안전망.
 
 ## §1 Validation goals
 
@@ -130,10 +131,10 @@ state/mk_xi_anti_map_llm_judge_validation_20260425.json
 
 ## §9 raw compliance
 
-- raw#9 — protocol spec only, $0. actual call은 raw#9 explicit exempt 필요
-- raw#10 — 'spec ≠ validated' 명시, failure modes 4개 사전 등록
-- raw#12 — judge prompt template + thresholds + cost budget 모두 frozen
+- raw#9 — protocol spec only, $0. actual call은 pre-approved by feedback_forward_auto_approval (raw#9 explicit exempt = default per 2026-04-25 정책), gated by cost cap ($5 per validation cycle)
+- raw#10 — 'spec ≠ validated' 명시, failure modes 4개 사전 등록. actual call 결과는 별개 cycle, forward auto-approval은 trigger gating 변경
+- raw#12 — judge prompt template + thresholds + cost budget 모두 frozen (auto-approval은 prereg threshold/predicate 변경 X)
 - raw#15 — protocol = SSOT for LLM-judge validation
-- raw#37/38 — design (ANTI_MAP v2 heuristic insufficient) → impl (this protocol) → fixpoint
+- raw#37/38 — design (ANTI_MAP v2 heuristic insufficient) → impl (this protocol) → fixpoint (auto-approval default)
 
 omega-saturation:fixpoint
