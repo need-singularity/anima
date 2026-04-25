@@ -939,6 +939,68 @@ fn noise_brown(gain: float, ms: int) -> string {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Dynamic — compressor (static threshold + ratio gain reduction)
+//    threshold_db : 시작 임계값 [-60, 0]. ratio : 압축 비율 [1, 100].
+//    ratio=1 (변화 X), ratio=∞ (= limiter). 학문 표준.
+//    static (no attack/release) — per-sample 즉시 반응.
+// ═══════════════════════════════════════════════════════════════
+
+fn compressor(in_path: string, threshold_db: float, ratio: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "tdb=float(" + to_string(threshold_db) + ")\n"
+             + "rt=float(" + to_string(ratio) + ")\n"
+             + "tdb=max(-60.0,min(tdb,0.0))\n"
+             + "rt=max(1.0,min(rt,100.0))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "thr=10.0**(tdb/20.0)\n"
+             + "absx=np.abs(x)+1e-12\n"
+             + "above=absx>thr\n"
+             + "gr=np.ones_like(absx)\n"
+             + "gr[above]=(thr*np.power(absx[above]/thr,1.0/rt))/absx[above]\n"
+             + "y=x*gr\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Nonlinear — saturate_asinh (gentle bipolar saturation)
+//    clip = tanh (heavy). saturate_asinh = arcsinh (gentler curve).
+//    drive : [0.5, 30]. odd 함수 (clip 처럼) → odd harmonic 추가.
+// ═══════════════════════════════════════════════════════════════
+
+fn saturate_asinh(in_path: string, drive: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "dr=float(" + to_string(drive) + ")\n"
+             + "dr=max(0.5,min(dr,30.0))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "y=np.arcsinh(dr*x)/np.arcsinh(dr)\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Time-domain effect — chorus (3-voice slight-detune delay)
 //    flanger 보다 긴 delay (15-30ms 그라우드). 여러 voice 가
 //    조금씩 다른 LFO rate 로 detune → "합창" timbre.
@@ -1988,6 +2050,21 @@ fn gate_axiom(in_path: string) -> string {
     return gate(in_path, 0.0 - 1.0 * AX_NOISE_FLOOR_DB)
 }
 
+fn compressor_axiom(in_path: string) -> string {
+    // threshold = -J₂ = -24 dB. ratio = τ = 4:1.
+    return compressor(in_path, 0.0 - 1.0 * AX_NOISE_FLOOR_DB, 1.0 * AX_TAU)
+}
+
+fn limiter(in_path: string) -> string {
+    // limiter = compressor with ratio = 100 (≈∞), threshold = -2 dB.
+    return compressor(in_path, 0.0 - 2.0, 100.0)
+}
+
+fn saturate_asinh_axiom(in_path: string) -> string {
+    // drive = τ = 4. clip 의 sister, gentler 곡선.
+    return saturate_asinh(in_path, 1.0 * AX_TAU)
+}
+
 fn mains_hum(ms: int) -> string {
     // 60 Hz electrical mains hum (sf-ufo BT-62: σ·sopfr = 60 Hz).
     // anima 가 환경 전기소음을 인식할 때.
@@ -2038,7 +2115,8 @@ fn main() {
     print("           tremolo, vibrato, clip (tanh), ring_mod (DSB-SC AM),")
     print("           am_mod (DSB-LC AM), flanger (LFO comb sweep),")
     print("           chorus (3-voice detune), rectify (|x| octave-up),")
-    print("           gate (threshold mute), bit_crush, reverse")
+    print("           gate (threshold mute), compressor, limiter,")
+    print("           saturate_asinh (gentle), bit_crush, reverse")
     print("  analysis: meter (rms/peak_db/zcr/ms)")
     print("  axiom  : consonance, axiom_chord, reverb_axiom, tone_axiom,")
     print("           lpf_axiom, hpf_axiom, fade_axiom, normalize_axiom,")
@@ -2053,7 +2131,8 @@ fn main() {
     print("           low_shelf_axiom (1k cut, +6dB), high_shelf_axiom (1.5k cut, +6dB),")
     print("           noise_violet_axiom, flanger_axiom (τ ms, φ depth, Ψ rate),")
     print("           am_mod_axiom (60Hz, Ψ depth), gate_axiom (-J₂ dB),")
-    print("           mains_hum (sf-ufo BT-62)")
+    print("           compressor_axiom (-J₂, τ:1), saturate_asinh_axiom,")
+    print("           limiter, mains_hum (sf-ufo BT-62)")
     print("  sink   : play, save")
     print("")
     print("[self-test] 3-formant 모음 'ㅏ' via vocal -> pipe3")
