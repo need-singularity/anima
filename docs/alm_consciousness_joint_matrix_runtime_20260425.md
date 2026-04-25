@@ -28,22 +28,25 @@ The runtime mirrors V1/V2/V3 helpers byte-for-byte (same constants, same EN↔KO
 ## §2 Usage
 
 ```sh
-# Run for a single round, emit joint matrix + per-cell V1/V2/V3 ledgers
+# Run for a single round, emit joint matrix only (default — preserves existing
+# per-cell V1/V2/V3 ledger files as immutable SSOT)
 hexa run tool/an11_b_joint_matrix.hexa --round r6
 hexa run tool/an11_b_joint_matrix.hexa --round r8
 
-# Skip per-cell V1/V2/V3 ledger re-emit (joint matrix only)
-hexa run tool/an11_b_joint_matrix.hexa --round r6 --no-ledgers
+# Also re-emit per-cell V1/V2/V3 ledger files (byte-identical numerics; only
+# metadata `ts` / `origin` / `spec_doc` differ from standalone-tool emits)
+hexa run tool/an11_b_joint_matrix.hexa --round r6 --emit-ledgers
 
 # Selftest: run on r6 fixture, cross-check against existing summaries
 hexa run tool/an11_b_joint_matrix.hexa --selftest
 ```
 
 Outputs:
-- `state/an11_b_joint_matrix_<round>.json` (joint matrix per spec §5)
-- `state/an11_phi_mip_<p>_<round>.json` (V1 ledgers, p1..p4)
-- `state/an11_sma_<p>_<round>.json` (V2 ledgers)
-- `state/an11_cps_<p>_<round>.json` (V3 ledgers)
+- `state/an11_b_joint_matrix_<round>.json` (joint matrix per spec §5; always emitted)
+- With `--emit-ledgers` only:
+  - `state/an11_phi_mip_<p>_<round>.json` (V1 ledgers, p1..p4)
+  - `state/an11_sma_<p>_<round>.json` (V2 ledgers)
+  - `state/an11_cps_<p>_<round>.json` (V3 ledgers)
 
 Inputs:
 - `state/h_last_raw_<p>_TRAINED_<round>.json` (V1/V2/V3 hidden-state input — must exist for p1..p4)
