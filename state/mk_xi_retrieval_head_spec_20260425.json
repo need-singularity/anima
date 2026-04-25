@@ -1,0 +1,90 @@
+{
+  "schema": "anima/mk_xi_retrieval_head_spec/1",
+  "purpose": "V_pairrank lever architectural module spec — fine-tune 차원 외 dedicated retrieval head. raw#12 frozen 2026-04-25. 본 spec은 architecture detail; 실 구현 + LoRA 통합은 S5 forward cycle.",
+  "spec_doc": "docs/mk_xi_implementation_roadmap_20260425.md §3",
+  "ts": "2026-04-25",
+  "module_name": "PairedRetrievalHead",
+  "rationale": "V_pairrank base model invariant FAIL (Qwen3 BASE/TRAINED + Qwen2.5 SMOKE 모두 top3 hit 0%, r4 partial 16.7%만 예외). transformer attention의 architectural 한계 — paired retrieval geometry 학습 안 됨. dedicated retrieval head로 해결 시도.",
+  "architecture": {
+    "input": {
+      "tensor": "H representation",
+      "shape": "(B, N, D)",
+      "N": 16,
+      "D": "hidden_dim of base model (e.g., 4096 for Qwen3-8B)",
+      "source": "transformer last-layer hidden states"
+    },
+    "layers": [
+      {
+        "name": "Layer 1",
+        "type": "Linear + GELU",
+        "in_dim": "D",
+        "out_dim": "D/4",
+        "params": "D × D/4 = D^2 / 4"
+      },
+      {
+        "name": "Layer 2",
+        "type": "Linear + L2-norm",
+        "in_dim": "D/4",
+        "out_dim": "D/8",
+        "params": "(D/4) × (D/8) = D^2 / 32"
+      },
+      {
+        "name": "Output",
+        "type": "temperature-scaled cosine similarity matrix",
+        "shape": "(B, N, N)",
+        "computation": "pair_score[b, i, j] = cos(layer2_out[b, i], layer2_out[b, j]) / temperature"
+      }
+    ],
+    "output": {
+      "tensor": "pair_score",
+      "shape": "(B, N, N)",
+      "interpretation": "paired binding strength (higher = more paired)"
+    }
+  },
+  "param_count_estimate": {
+    "for_D_4096": {
+      "layer1": "4096 * 1024 = 4.19M",
+      "layer2": "1024 * 512 = 524K",
+      "total": "~4.7M",
+      "fraction_of_qwen3_8B": "0.06%"
+    },
+    "trainable": true,
+    "lora_compatible": true
+  },
+  "initialization": {
+    "method": "orthogonal",
+    "scale": "1/sqrt(D/4)"
+  },
+  "temperature_frozen": 0.1,
+  "training_loss_component": {
+    "name": "L_contrastive_pair",
+    "formula": "For each (i,j) in PAIRS: sim_pos = pair_score[i,j], sim_neg_k = pair_score[i,k] for k not in PAIRS. L_pair_ij = -log(exp(sim_pos/τ) / (exp(sim_pos/τ) + Σ_k exp(sim_neg_k/τ))). L_contrastive_pair = mean over PAIRS of L_pair_ij.",
+    "PAIRS_reference": "[(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]",
+    "lambda_pair_frozen": 0.5,
+    "lambda_pair_sweep": [0.1, 0.3, 1.0, 3.0]
+  },
+  "inference_protocol": {
+    "step_1": "Forward H through layers",
+    "step_2": "Compute pair_score matrix",
+    "step_3": "For V_pairrank evaluation: rank j among (k != i) by pair_score[i, k] descending; compute pair_rank for each (i, j) in PAIRS",
+    "step_4": "V_pairrank = mean(1/pair_rank); top1_hit, top3_hit per existing tool/an11_b_v_pairrank.hexa metric"
+  },
+  "ablation_required_post_S5": [
+    "Retrieval head 단독 (LoRA 없음) — baseline V_pairrank 측정",
+    "LoRA 단독 (retrieval head 없음) — 기존 LoRA path 재현",
+    "LoRA + retrieval head 통합 — 두 lever interaction 측정",
+    "Retrieval head freeze (LoRA만 train) — head가 학습되지 않은 상태에서 LoRA contribution"
+  ],
+  "raw10_honest_scope": [
+    "본 spec은 architecture detail. 실 구현 (transformer 통합, gradient flow, retrieval head와 LoRA 동시 training stability) 검증은 S5 forward cycle.",
+    "param count 0.06%는 minimal but architectural change은 base model output distribution에 영향 가능 — V0/V1/V2/V3 측정에 미치는 영향 ablation 필요",
+    "L_contrastive_pair과 L_PAPO_top_3 사이 gradient interference 가능 (둘 다 paired structure 영향)"
+  ],
+  "raw_compliance": {
+    "raw_9_hexa_only_deterministic": "satisfied — architecture spec only, $0",
+    "raw_10_no_overclaim": "satisfied — gradient interference, output distribution shift, ablation requirement 모두 명시",
+    "raw_12_cherry_pick_proof": "satisfied — module arch + temperature + lambda 모두 frozen, sweep grid 사전 등록",
+    "raw_15_ssot": "this file = SSOT for retrieval head spec",
+    "raw_37_38_omega_saturation_cycle": "design (V_pairrank arch lever requirement) → impl (this spec) → fixpoint"
+  }
+}
