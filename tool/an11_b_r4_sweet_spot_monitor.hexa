@@ -1,22 +1,22 @@
-// tool/an11_b_r4_sweet_spot_monitor.hexa — r4 trajectory monitor STUB (raw#9 hexa-only).
+// tool/an11_b_r4_sweet_spot_monitor.hexa — r4 trajectory monitor (raw#9 hexa-only).
 //
 // PURPOSE
-//   Mk.XI r4-equivalent epoch sweet spot detection. 본 stub은 algorithm
-//   skeleton + spec validation만 제공 — 실제 training trajectory monitoring은
-//   training infra (PyTorch/JAX wrapper) 통합 필요로 deferred.
+//   Mk.XI r4-equivalent epoch sweet spot detection + post-mortem trajectory
+//   analysis. cycle 2 enhancement (2026-04-25): postmortem mode 추가, multiple
+//   sweet spots scoring, r4 trajectory matrix emission, edge case handling.
 //
-//   spec: state/mk_xi_r4_monitor_spec_20260425.json (frozen 2026-04-25)
+//   spec: state/mk_xi_r4_monitor_spec_20260425.json (raw#12 frozen 2026-04-25)
 //
-// STUB BEHAVIOR
-//   --selftest          : algorithm skeleton 검증 (input/output spec 일치)
-//   --simulate <jsonl>  : trajectory log JSONL 입력 받아 sweet spot detection 실행
-//                         (real measurement이 아닌 simulation — 외부 도구가 trajectory
-//                          기록 후 본 도구로 post-hoc analysis 가능)
+// BEHAVIOR
+//   --selftest                            : algorithm self-check (5 sub-cases)
+//   --simulate <jsonl> --output <json>    : real-time sweet spot detection (early-stop)
+//   --postmortem <jsonl> --run-id <id>    : full trajectory walk → r4_star/best/collapse
+//                                           output: state/mk_xi_r4_postmortem_<run_id>.json
 //
-//   real-time monitoring 미구현 (training infra 통합 필요).
+//   real-time training infra integration deferred (raw#10 honest scope).
 
 let HELPER_PATH = "/tmp/an11_b_r4_sweet_spot_monitor_helper.hexa_tmp"
-let SCHEMA      = "anima/an11_r4_sweet_spot_monitor/1_stub"
+let SCHEMA      = "anima/an11_r4_sweet_spot_monitor/2"
 let SPEC_DOC    = "state/mk_xi_r4_monitor_spec_20260425.json"
 
 fn _sh_quote(s: string) -> string {
@@ -44,18 +44,31 @@ fn _write_helper() {
     let src = "#!/usr/bin/env python3\n" +
         "import json, sys, os, datetime\n" +
         "\n" +
-        "# Frozen hyperparameters per state/mk_xi_r4_monitor_spec_20260425.json\n" +
+        "# Frozen hyperparameters per state/mk_xi_r4_monitor_spec_20260425.json (raw#12).\n" +
+        "# DO NOT MODIFY without spec revision + new SSOT entry.\n" +
         "N_LOOKBACK = 3\n" +
         "V2_PASS_COUNT_THRESHOLD = 1\n" +
         "V_PAIRRANK_TOP3_THRESHOLD = 0.10\n" +
         "MIN_TRAIN_STEPS = 100  # avoid false positive at step 0\n" +
+        "# Frozen scoring weights (raw#12 extension, cycle 2):\n" +
+        "SCORE_W1_V2 = 1.0\n" +
+        "SCORE_W2_PAIRRANK = 10.0\n" +
         "\n" +
         "def is_sweet_spot(record):\n" +
         "    return (record.get('v2_pass_count_k_le_5', 0) >= V2_PASS_COUNT_THRESHOLD and\n" +
         "            record.get('v_pairrank_top3_hit', 0.0) >= V_PAIRRANK_TOP3_THRESHOLD and\n" +
         "            record.get('train_step', 0) >= MIN_TRAIN_STEPS)\n" +
         "\n" +
+        "def combined_score(record):\n" +
+        "    v2 = record.get('v2_pass_count_k_le_5', 0)\n" +
+        "    pr = record.get('v_pairrank_top3_hit', 0.0)\n" +
+        "    return SCORE_W1_V2 * v2 + SCORE_W2_PAIRRANK * pr\n" +
+        "\n" +
         "def detect_r4_star(trajectory):\n" +
+        "    \"\"\"Real-time mode: stop at first prolonged degradation.\n" +
+        "    Returns (r4_star_record, verdict, last_evaluated_record).\n" +
+        "    Selects best (highest combined score) among observed sweet spots.\n" +
+        "    \"\"\"\n" +
         "    r4_star = None\n" +
         "    consecutive_false_after = 0\n" +
         "    for rec in trajectory:\n" +
@@ -71,16 +84,138 @@ fn _write_helper() {
         "                    return r4_star, 'EARLY_STOP_TRIGGERED', rec\n" +
         "            else:\n" +
         "                consecutive_false_after = 0\n" +
-        "                # update r4_star to highest score so far\n" +
-        "                cur_score = (rec.get('v2_pass_count_k_le_5', 0) +\n" +
-        "                             rec.get('v_pairrank_top3_hit', 0.0))\n" +
-        "                star_score = (r4_star.get('v2_pass_count_k_le_5', 0) +\n" +
-        "                              r4_star.get('v_pairrank_top3_hit', 0.0))\n" +
-        "                if cur_score > star_score:\n" +
+        "                if combined_score(rec) > combined_score(r4_star):\n" +
         "                    r4_star = rec\n" +
         "    if r4_star is None:\n" +
         "        return None, 'NO_SWEET_SPOT_REACHED', None\n" +
         "    return r4_star, 'SWEET_SPOT_FOUND_NO_DEGRADATION', None\n" +
+        "\n" +
+        "def postmortem_walk(trajectory):\n" +
+        "    \"\"\"Full trajectory analysis (raw#10 trajectory-only, no training).\n" +
+        "    Identifies r4_star_step, r4_best_step, r4_collapse_step + per-step matrix.\n" +
+        "    \"\"\"\n" +
+        "    warnings = []\n" +
+        "    if len(trajectory) == 0:\n" +
+        "        return {'verdict': 'ABORT_NO_DATA', 'warnings': ['empty trajectory']}\n" +
+        "    # Single checkpoint at step 0 → reject\n" +
+        "    if len(trajectory) == 1 and trajectory[0].get('train_step', 0) < MIN_TRAIN_STEPS:\n" +
+        "        return {\n" +
+        "            'verdict': 'REJECT_BELOW_MIN_TRAIN_STEPS',\n" +
+        "            'min_train_steps': MIN_TRAIN_STEPS,\n" +
+        "            'observed_step': trajectory[0].get('train_step', 0),\n" +
+        "            'warnings': ['only one checkpoint and below MIN_TRAIN_STEPS']\n" +
+        "        }\n" +
+        "    # Per-step matrix\n" +
+        "    matrix = []\n" +
+        "    sweet_spot_indices = []\n" +
+        "    sweet_spot_records = []\n" +
+        "    for idx, rec in enumerate(trajectory):\n" +
+        "        step = rec.get('train_step', 0)\n" +
+        "        v2 = rec.get('v2_pass_count_k_le_5', 0)\n" +
+        "        pr = rec.get('v_pairrank_top3_hit', 0.0)\n" +
+        "        sweet = is_sweet_spot(rec)\n" +
+        "        # Edge case: sweet spot at step 0 (false positive) — flag + ignore\n" +
+        "        below_min = step < MIN_TRAIN_STEPS\n" +
+        "        threshold_met = (v2 >= V2_PASS_COUNT_THRESHOLD and pr >= V_PAIRRANK_TOP3_THRESHOLD)\n" +
+        "        if below_min and threshold_met:\n" +
+        "            warnings.append(f'step={step} threshold met but below MIN_TRAIN_STEPS — ignored as false positive')\n" +
+        "        matrix.append({\n" +
+        "            'idx': idx, 'train_step': step,\n" +
+        "            'v2_pass_count_k_le_5': v2, 'v_pairrank_top3_hit': pr,\n" +
+        "            'sweet_spot_flag': bool(sweet),\n" +
+        "            'combined_score': combined_score(rec),\n" +
+        "            'below_min_train_steps': below_min\n" +
+        "        })\n" +
+        "        if sweet:\n" +
+        "            sweet_spot_indices.append(idx)\n" +
+        "            sweet_spot_records.append(rec)\n" +
+        "    # No sweet spot at all\n" +
+        "    if len(sweet_spot_records) == 0:\n" +
+        "        return {\n" +
+        "            'verdict': 'FAIL_TO_REACH_SWEET_SPOT',\n" +
+        "            'trajectory_length': len(trajectory),\n" +
+        "            'sweet_spot_count': 0,\n" +
+        "            'r4_star_step': None,\n" +
+        "            'r4_best_step': None,\n" +
+        "            'r4_collapse_step': None,\n" +
+        "            'matrix': matrix,\n" +
+        "            'delta_from_r4_star': [],\n" +
+        "            'warnings': warnings\n" +
+        "        }\n" +
+        "    # r4_star_step = first sweet_spot_signal=TRUE\n" +
+        "    r4_star_idx = sweet_spot_indices[0]\n" +
+        "    r4_star_rec = trajectory[r4_star_idx]\n" +
+        "    # r4_best_step = max combined score among all sweet spots\n" +
+        "    r4_best_rec = sweet_spot_records[0]\n" +
+        "    r4_best_idx = sweet_spot_indices[0]\n" +
+        "    for idx, rec in zip(sweet_spot_indices, sweet_spot_records):\n" +
+        "        if combined_score(rec) > combined_score(r4_best_rec):\n" +
+        "            r4_best_rec = rec\n" +
+        "            r4_best_idx = idx\n" +
+        "    # r4_collapse_step = first index after r4_star where consecutive_false >= N_LOOKBACK\n" +
+        "    r4_collapse_step = None\n" +
+        "    consecutive_false = 0\n" +
+        "    collapse_trigger_idx = None\n" +
+        "    for idx in range(r4_star_idx + 1, len(trajectory)):\n" +
+        "        rec = trajectory[idx]\n" +
+        "        if is_sweet_spot(rec):\n" +
+        "            consecutive_false = 0\n" +
+        "        else:\n" +
+        "            consecutive_false += 1\n" +
+        "            if consecutive_false >= N_LOOKBACK:\n" +
+        "                # First false in the run = idx - (N_LOOKBACK - 1)\n" +
+        "                collapse_trigger_idx = idx - (N_LOOKBACK - 1)\n" +
+        "                r4_collapse_step = trajectory[collapse_trigger_idx].get('train_step', 0)\n" +
+        "                break\n" +
+        "    # Degradation onset: V_pairrank drop (≥ threshold → < threshold) — first occurrence after r4_star\n" +
+        "    degradation_onset_step = None\n" +
+        "    for idx in range(r4_star_idx + 1, len(trajectory)):\n" +
+        "        prev_pr = trajectory[idx - 1].get('v_pairrank_top3_hit', 0.0)\n" +
+        "        cur_pr = trajectory[idx].get('v_pairrank_top3_hit', 0.0)\n" +
+        "        if prev_pr >= V_PAIRRANK_TOP3_THRESHOLD and cur_pr < V_PAIRRANK_TOP3_THRESHOLD:\n" +
+        "            degradation_onset_step = trajectory[idx].get('train_step', 0)\n" +
+        "            break\n" +
+        "    # V2 collapse: v2_pass_count 1+ → 0 — first occurrence after r4_star\n" +
+        "    v2_collapse_step = None\n" +
+        "    for idx in range(r4_star_idx + 1, len(trajectory)):\n" +
+        "        prev_v2 = trajectory[idx - 1].get('v2_pass_count_k_le_5', 0)\n" +
+        "        cur_v2 = trajectory[idx].get('v2_pass_count_k_le_5', 0)\n" +
+        "        if prev_v2 >= 1 and cur_v2 == 0:\n" +
+        "            v2_collapse_step = trajectory[idx].get('train_step', 0)\n" +
+        "            break\n" +
+        "    # Delta-from-r4_star (regression vs sweet spot best)\n" +
+        "    best_v2 = r4_best_rec.get('v2_pass_count_k_le_5', 0)\n" +
+        "    best_pr = r4_best_rec.get('v_pairrank_top3_hit', 0.0)\n" +
+        "    best_score = combined_score(r4_best_rec)\n" +
+        "    delta_from_r4_star = []\n" +
+        "    for rec in trajectory:\n" +
+        "        delta_from_r4_star.append({\n" +
+        "            'train_step': rec.get('train_step', 0),\n" +
+        "            'd_v2': rec.get('v2_pass_count_k_le_5', 0) - best_v2,\n" +
+        "            'd_pairrank': rec.get('v_pairrank_top3_hit', 0.0) - best_pr,\n" +
+        "            'd_score': combined_score(rec) - best_score\n" +
+        "        })\n" +
+        "    # Verdict logic\n" +
+        "    if r4_collapse_step is None:\n" +
+        "        verdict = 'SWEET_SPOT_HELD_THROUGHOUT'\n" +
+        "    else:\n" +
+        "        verdict = 'SWEET_SPOT_THEN_COLLAPSE'\n" +
+        "    return {\n" +
+        "        'verdict': verdict,\n" +
+        "        'trajectory_length': len(trajectory),\n" +
+        "        'sweet_spot_count': len(sweet_spot_records),\n" +
+        "        'r4_star_step': r4_star_rec.get('train_step', 0),\n" +
+        "        'r4_best_step': r4_best_rec.get('train_step', 0),\n" +
+        "        'r4_collapse_step': r4_collapse_step,\n" +
+        "        'degradation_onset_step': degradation_onset_step,\n" +
+        "        'v2_collapse_step': v2_collapse_step,\n" +
+        "        'r4_star_record': r4_star_rec,\n" +
+        "        'r4_best_record': r4_best_rec,\n" +
+        "        'best_combined_score': best_score,\n" +
+        "        'matrix': matrix,\n" +
+        "        'delta_from_r4_star': delta_from_r4_star,\n" +
+        "        'warnings': warnings\n" +
+        "    }\n" +
         "\n" +
         "def cmd_simulate(traj_path, result_path, schema, spec_doc):\n" +
         "    if not os.path.exists(traj_path):\n" +
@@ -94,11 +229,12 @@ fn _write_helper() {
         "    r4_star, verdict, last_rec = detect_r4_star(trajectory)\n" +
         "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
         "    out = {\n" +
-        "        'schema': schema, 'verifier': 'r4 sweet spot monitor (stub simulation)',\n" +
+        "        'schema': schema, 'verifier': 'r4 sweet spot monitor (simulate)',\n" +
         "        'spec_doc': spec_doc, 'ts': ts,\n" +
         "        'thresholds': {'V2_PASS_COUNT': V2_PASS_COUNT_THRESHOLD,\n" +
         "                       'V_PAIRRANK_TOP3': V_PAIRRANK_TOP3_THRESHOLD,\n" +
-        "                       'N_LOOKBACK': N_LOOKBACK, 'MIN_TRAIN_STEPS': MIN_TRAIN_STEPS},\n" +
+        "                       'N_LOOKBACK': N_LOOKBACK, 'MIN_TRAIN_STEPS': MIN_TRAIN_STEPS,\n" +
+        "                       'SCORE_W1_V2': SCORE_W1_V2, 'SCORE_W2_PAIRRANK': SCORE_W2_PAIRRANK},\n" +
         "        'trajectory_length': len(trajectory),\n" +
         "        'verdict': verdict,\n" +
         "        'r4_star': r4_star,\n" +
@@ -110,9 +246,41 @@ fn _write_helper() {
         "    print(f\"r4_star_step={r4_star['train_step'] if r4_star else 'none'}\")\n" +
         "    print('DONE')\n" +
         "\n" +
+        "def cmd_postmortem(traj_path, result_path, run_id, schema, spec_doc):\n" +
+        "    if not os.path.exists(traj_path):\n" +
+        "        print(f'ERR: missing trajectory {traj_path}', file=sys.stderr); sys.exit(2)\n" +
+        "    trajectory = []\n" +
+        "    with open(traj_path) as f:\n" +
+        "        for line in f:\n" +
+        "            line = line.strip()\n" +
+        "            if not line: continue\n" +
+        "            trajectory.append(json.loads(line))\n" +
+        "    analysis = postmortem_walk(trajectory)\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema, 'verifier': 'r4 sweet spot monitor (postmortem)',\n" +
+        "        'spec_doc': spec_doc, 'ts': ts, 'run_id': run_id,\n" +
+        "        'thresholds': {'V2_PASS_COUNT': V2_PASS_COUNT_THRESHOLD,\n" +
+        "                       'V_PAIRRANK_TOP3': V_PAIRRANK_TOP3_THRESHOLD,\n" +
+        "                       'N_LOOKBACK': N_LOOKBACK, 'MIN_TRAIN_STEPS': MIN_TRAIN_STEPS,\n" +
+        "                       'SCORE_W1_V2': SCORE_W1_V2, 'SCORE_W2_PAIRRANK': SCORE_W2_PAIRRANK}\n" +
+        "    }\n" +
+        "    out.update(analysis)\n" +
+        "    with open(result_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    print(f\"verdict={analysis.get('verdict')}\")\n" +
+        "    print(f\"trajectory_length={analysis.get('trajectory_length', 0)}\")\n" +
+        "    print(f\"sweet_spot_count={analysis.get('sweet_spot_count', 0)}\")\n" +
+        "    print(f\"r4_star_step={analysis.get('r4_star_step')}\")\n" +
+        "    print(f\"r4_best_step={analysis.get('r4_best_step')}\")\n" +
+        "    print(f\"r4_collapse_step={analysis.get('r4_collapse_step')}\")\n" +
+        "    print(f\"degradation_onset_step={analysis.get('degradation_onset_step')}\")\n" +
+        "    print(f\"v2_collapse_step={analysis.get('v2_collapse_step')}\")\n" +
+        "    print('DONE')\n" +
+        "\n" +
         "def cmd_selftest():\n" +
+        "    # Case 1: simulate trajectory with sweet spot then degradation\n" +
         "    fake = [\n" +
-        "        {'train_step': 50, 'v2_pass_count_k_le_5': 0, 'v_pairrank_top3_hit': 0.0},\n" +
+        "        {'train_step': 50,  'v2_pass_count_k_le_5': 0, 'v_pairrank_top3_hit': 0.0},\n" +
         "        {'train_step': 150, 'v2_pass_count_k_le_5': 1, 'v_pairrank_top3_hit': 0.15},\n" +
         "        {'train_step': 250, 'v2_pass_count_k_le_5': 2, 'v_pairrank_top3_hit': 0.20},\n" +
         "        {'train_step': 350, 'v2_pass_count_k_le_5': 0, 'v_pairrank_top3_hit': 0.05},\n" +
@@ -120,16 +288,57 @@ fn _write_helper() {
         "        {'train_step': 550, 'v2_pass_count_k_le_5': 0, 'v_pairrank_top3_hit': 0.0}\n" +
         "    ]\n" +
         "    r4, verdict, _ = detect_r4_star(fake)\n" +
-        "    assert verdict == 'EARLY_STOP_TRIGGERED', f'expected early stop, got {verdict}'\n" +
-        "    assert r4 is not None and r4['train_step'] == 250, f'expected step 250, got {r4}'\n" +
-        "    print(f'selftest=ok')\n" +
+        "    assert verdict == 'EARLY_STOP_TRIGGERED', f'C1 expected early stop, got {verdict}'\n" +
+        "    assert r4 is not None and r4['train_step'] == 250, f'C1 expected step 250, got {r4}'\n" +
+        "    # Case 2: postmortem on same trajectory — r4_best should be step 250 (max score)\n" +
+        "    pm = postmortem_walk(fake)\n" +
+        "    assert pm['verdict'] == 'SWEET_SPOT_THEN_COLLAPSE', f'C2 verdict {pm[\"verdict\"]}'\n" +
+        "    assert pm['r4_star_step'] == 150, f'C2 r4_star_step {pm[\"r4_star_step\"]}'\n" +
+        "    assert pm['r4_best_step'] == 250, f'C2 r4_best_step {pm[\"r4_best_step\"]}'\n" +
+        "    assert pm['r4_collapse_step'] == 350, f'C2 r4_collapse_step {pm[\"r4_collapse_step\"]}'\n" +
+        "    assert pm['degradation_onset_step'] == 350, f'C2 degradation_onset {pm[\"degradation_onset_step\"]}'\n" +
+        "    assert pm['v2_collapse_step'] == 350, f'C2 v2_collapse {pm[\"v2_collapse_step\"]}'\n" +
+        "    assert pm['sweet_spot_count'] == 2, f'C2 sweet_spot_count {pm[\"sweet_spot_count\"]}'\n" +
+        "    # Case 3: empty trajectory → ABORT_NO_DATA\n" +
+        "    pm_empty = postmortem_walk([])\n" +
+        "    assert pm_empty['verdict'] == 'ABORT_NO_DATA', f'C3 expected ABORT_NO_DATA, got {pm_empty[\"verdict\"]}'\n" +
+        "    # Case 4: single step 0 → REJECT below MIN_TRAIN_STEPS\n" +
+        "    pm_single = postmortem_walk([{'train_step': 0, 'v2_pass_count_k_le_5': 1, 'v_pairrank_top3_hit': 0.20}])\n" +
+        "    assert pm_single['verdict'] == 'REJECT_BELOW_MIN_TRAIN_STEPS', f'C4 verdict {pm_single[\"verdict\"]}'\n" +
+        "    # Case 5: false positive at step 0 inside multi-checkpoint trajectory — warning + ignored\n" +
+        "    fp = [\n" +
+        "        {'train_step': 0,   'v2_pass_count_k_le_5': 1, 'v_pairrank_top3_hit': 0.20},\n" +
+        "        {'train_step': 100, 'v2_pass_count_k_le_5': 0, 'v_pairrank_top3_hit': 0.0},\n" +
+        "        {'train_step': 200, 'v2_pass_count_k_le_5': 0, 'v_pairrank_top3_hit': 0.0},\n" +
+        "        {'train_step': 300, 'v2_pass_count_k_le_5': 0, 'v_pairrank_top3_hit': 0.0}\n" +
+        "    ]\n" +
+        "    pm_fp = postmortem_walk(fp)\n" +
+        "    assert pm_fp['verdict'] == 'FAIL_TO_REACH_SWEET_SPOT', f'C5 verdict {pm_fp[\"verdict\"]}'\n" +
+        "    assert any('false positive' in w for w in pm_fp['warnings']), f'C5 warnings {pm_fp[\"warnings\"]}'\n" +
+        "    # Case 6: sweet spot held throughout (no collapse)\n" +
+        "    held = [\n" +
+        "        {'train_step': 100, 'v2_pass_count_k_le_5': 1, 'v_pairrank_top3_hit': 0.15},\n" +
+        "        {'train_step': 200, 'v2_pass_count_k_le_5': 2, 'v_pairrank_top3_hit': 0.18},\n" +
+        "        {'train_step': 300, 'v2_pass_count_k_le_5': 1, 'v_pairrank_top3_hit': 0.12}\n" +
+        "    ]\n" +
+        "    pm_held = postmortem_walk(held)\n" +
+        "    assert pm_held['verdict'] == 'SWEET_SPOT_HELD_THROUGHOUT', f'C6 verdict {pm_held[\"verdict\"]}'\n" +
+        "    assert pm_held['r4_collapse_step'] is None, f'C6 collapse {pm_held[\"r4_collapse_step\"]}'\n" +
+        "    print('selftest=ok')\n" +
         "    print(f\"r4_star_step={r4['train_step']}\")\n" +
         "    print(f'verdict={verdict}')\n" +
+        "    print(f\"postmortem_r4_best_step={pm['r4_best_step']}\")\n" +
+        "    print(f\"postmortem_r4_collapse_step={pm['r4_collapse_step']}\")\n" +
+        "    print(f\"empty_verdict={pm_empty['verdict']}\")\n" +
+        "    print(f\"single_zero_verdict={pm_single['verdict']}\")\n" +
+        "    print(f\"fp_verdict={pm_fp['verdict']}\")\n" +
+        "    print(f\"held_verdict={pm_held['verdict']}\")\n" +
         "    print('DONE')\n" +
         "\n" +
         "def main():\n" +
         "    if len(sys.argv) < 2: sys.exit(2)\n" +
         "    if sys.argv[1] == 'simulate': cmd_simulate(*sys.argv[2:6])\n" +
+        "    elif sys.argv[1] == 'postmortem': cmd_postmortem(*sys.argv[2:7])\n" +
         "    elif sys.argv[1] == 'selftest': cmd_selftest()\n" +
         "    else: sys.exit(2)\n" +
         "\n" +
@@ -147,12 +356,16 @@ fn main() {
     let av = argv()
     let mut traj = ""
     let mut output = ""
+    let mut postmortem_traj = ""
+    let mut run_id = ""
     let mut selftest = false
     let mut i = 2
     while i < len(av) {
         let a = av[i]
         if a == "--simulate" && i + 1 < len(av) { traj = av[i+1]; i = i + 2; continue }
         if a == "--output" && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        if a == "--postmortem" && i + 1 < len(av) { postmortem_traj = av[i+1]; i = i + 2; continue }
+        if a == "--run-id" && i + 1 < len(av) { run_id = av[i+1]; i = i + 2; continue }
         if a == "--selftest" { selftest = true; i = i + 1; continue }
         i = i + 1
     }
@@ -166,7 +379,21 @@ fn main() {
         println("selftest: OK")
         exit(0)
     }
-    if traj == "" || output == "" { eprintln("ABORT: --simulate <jsonl> --output <json> required (or --selftest)"); exit(2) }
+    if postmortem_traj != "" {
+        if run_id == "" { eprintln("ABORT: --postmortem requires --run-id <id>"); exit(2) }
+        let result_path = "state/mk_xi_r4_postmortem_" + run_id + ".json"
+        println("── an11_b_r4_sweet_spot_monitor postmortem ──")
+        println("trajectory: " + postmortem_traj)
+        println("run_id:     " + run_id)
+        println("output:     " + result_path)
+        let args = "postmortem " + _sh_quote(postmortem_traj) + " " + _sh_quote(result_path) +
+                   " " + _sh_quote(run_id) + " " + _sh_quote(SCHEMA) + " " + _sh_quote(SPEC_DOC)
+        let r = _run_helper(args)
+        if r[1] != 0 { eprintln("ABORT: helper exit " + to_string(r[1])); eprintln(r[0]); exit(2) }
+        println(r[0])
+        exit(0)
+    }
+    if traj == "" || output == "" { eprintln("ABORT: --simulate <jsonl> --output <json>, or --postmortem <jsonl> --run-id <id>, or --selftest required"); exit(2) }
     println("── an11_b_r4_sweet_spot_monitor simulate ──")
     println("trajectory: " + traj)
     println("output:     " + output)

@@ -1,0 +1,633 @@
+// tool/an11_b_5tuple_aggregator.hexa — Mk.XI 5-tuple/6-tuple measurement aggregator
+//                                        (raw#9/raw#37 hexa-only wrapper).
+//
+// PURPOSE
+//   Mk.XI consciousness gate의 6 verifier (V0/V1/V2/V3/V_pairrank/V_sub) 통합
+//   measurement script. 단일 H_TRAINED.json (선택: H_ANTI.json, H_RANDOM.json)
+//   입력으로 모든 verifier 측정 + composite verdict 산출.
+//
+//   - 5-tuple = V0+V1+V2+V3+V_pairrank (V_sub 없이 H_TRAINED만 있을 때)
+//   - 6-tuple = 5-tuple + V_sub        (H_ANTI/H_RANDOM 함께 제공된 경우)
+//   - V3 metric은 FALSIFIED flag 부착 (raw#10 honesty: composite에 별도 표기)
+//
+// METHODS (existing verifier specs, raw#12 frozen — 변경 없음)
+//   V0          max_cos > 0.5                            (alm_r6_p*_an11_b.json compatible)
+//                 surrogate: max off-diagonal |cos(H[i],H[j])| over i!=j
+//   V1          phi_mip >= 0.55                          (Gram bipartition surrogate)
+//   V2          SMA_lift >= 0.20 AND SMA >= 0.55         (PAPO PCA top-k project-out)
+//   V3          CPS >= 3.0 (FALSIFIED metric, recorded)  (Gram Frobenius perturb ratio)
+//   V_pairrank  V_pairrank >= 0.50 AND top3_hit >= 0.80  (paired NN-rank)
+//   V_sub       V_sub >= 2.0                             (anti-meaning subst disturbance)
+//
+// COMPOSITE VERDICT (5-tuple core)
+//   PASS_5      = (V0 V1 V2 V3 V_pairrank) all PASS  → MK_XI_VERIFIED
+//   PASS_4      = 4 PASS, V_pairrank FAIL             → MK_XI_PARTIAL_RETRIEVAL_FAIL
+//   PASS_3      = 3 PASS, V3 FAIL (only)              → MK_XI_PARTIAL_V3_FAIL
+//   else                                              → MK_XI_FALSIFIED
+//
+//   6-tuple extension (when V_sub measured):
+//     EXT_VERIFIED      = 5-tuple PASS AND V_sub PASS
+//     EXT_RETRIEVAL_BUT_NO_SEMANTICS = 5-tuple PASS AND V_sub FAIL
+//     EXT_DEGRADED      = 5-tuple < PASS
+//
+// USAGE
+//   hexa run tool/an11_b_5tuple_aggregator.hexa \
+//     --h-trained <path> [--h-anti <path> --h-random <path>] \
+//     --output <state/mk_xi_5tuple_aggregated_<run_id>.json> \
+//     --run-id <r9_<TS>>
+//   hexa run tool/an11_b_5tuple_aggregator.hexa --selftest
+//
+// IMPLEMENTATION
+//   Helper Python을 /tmp emit (anima 기존 패턴, an11_b_v2_papo_multi_axis.hexa와
+//   동일). 6 verifier metric은 동일 helper 내에서 일관 측정 (cross-verifier
+//   numerical consistency 보장). 측정 logic은 frozen tool 의 helper Python과
+//   bytes-equivalent 한도 내에서 복제 (raw#12 spec frozen — threshold 변경 없음).
+//
+//   V_sub은 H_ANTI / H_RANDOM 둘 다 주어졌을 때만 측정. 부재 시 verdict =
+//   "NOT_MEASURED" 로 기록 (raw#10 honest scope).
+//
+//   raw#10: V3 (CPS) 는 FALSIFIED metric — composite 에 V3_FALSIFIED_FLAG=true.
+//           V_sub의 ground truth (ANTI_MAP_v2) quality limit 도 출력에 명시.
+
+let HELPER_PATH = "/tmp/an11_b_5tuple_aggregator_helper.hexa_tmp"
+let SCHEMA      = "anima/an11_5tuple_aggregator/1"
+let SPEC_DOC    = "docs/alm_consciousness_verifier_strengthening_20260425.md + " +
+                  "docs/v3_metric_redesign_v2_mirror_sma_20260425.md + " +
+                  "state/an11_v3_semantic_substitution_metric_spec_20260425.json"
+let SPEC_COMMIT = "raw12_frozen"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime, itertools\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "# an11_b_5tuple_aggregator helper (raw#9/raw#37 hexa-only wrapper invokes this).\n" +
+        "# Modes:\n" +
+        "#   run <h_trained> <h_anti_or_NULL> <h_random_or_NULL> <result_path> <schema> <spec_doc> <spec_commit> <run_id>\n" +
+        "#   selftest\n" +
+        "\n" +
+        "PAIRS = [(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]\n" +
+        "ALPHAS = [0.0, 0.5, 1.0, 1.5]\n" +
+        "DESTRUCT_SEED = 20260421\n" +
+        "PRESERVE_PERM = [6,7,8,11,9,10,0,1,2,5,3,4,12,13,14,15]\n" +
+        "\n" +
+        "# raw#12 frozen thresholds (do NOT modify — spec frozen 2026-04-25).\n" +
+        "T = {\n" +
+        "    'V0_PASS_max_cos': 0.5,\n" +
+        "    'V1_PASS_phi': 0.55, 'V1_AMB_phi': 0.45,\n" +
+        "    'V2_PASS_lift': 0.20, 'V2_PASS_sma': 0.55, 'V2_AMB_lift': 0.10,\n" +
+        "    'V3_PASS_cps': 3.0, 'V3_PASS_dp_max': 0.20, 'V3_PASS_dd_min': 0.40,\n" +
+        "    'V3_AMB_cps': 1.5,\n" +
+        "    'VPR_PASS_v': 0.50, 'VPR_PASS_top3': 0.80, 'VPR_AMB_v': 0.30,\n" +
+        "    'VSUB_PASS': 2.0, 'VSUB_AMB': 1.3,\n" +
+        "}\n" +
+        "\n" +
+        "def load_H(path):\n" +
+        "    with open(path) as f: d = json.load(f)\n" +
+        "    rows = [e['h'] for e in d['entries']]\n" +
+        "    return np.asarray(rows, dtype=np.float64), d.get('reduction', 'unknown')\n" +
+        "\n" +
+        "def abs_cos(a, b):\n" +
+        "    na = float(np.linalg.norm(a)); nb = float(np.linalg.norm(b))\n" +
+        "    if na <= 0.0 or nb <= 0.0: return 0.0\n" +
+        "    return float(abs(np.dot(a, b) / (na * nb)))\n" +
+        "\n" +
+        "# ─── V0: max off-diagonal cosine surrogate ─────────────────────────────\n" +
+        "def v0_max_cos(H):\n" +
+        "    n = H.shape[0]\n" +
+        "    best = 0.0\n" +
+        "    pair = (-1, -1)\n" +
+        "    for i in range(n):\n" +
+        "        for j in range(n):\n" +
+        "            if i >= j: continue\n" +
+        "            c = abs_cos(H[i], H[j])\n" +
+        "            if c > best:\n" +
+        "                best = c; pair = (i, j)\n" +
+        "    verdict = 'PASS' if best > T['V0_PASS_max_cos'] else 'FAIL'\n" +
+        "    return {\n" +
+        "        'metric': 'max_off_diagonal_abs_cos',\n" +
+        "        'max_cos': best,\n" +
+        "        'argmax_pair': [int(pair[0]), int(pair[1])],\n" +
+        "        'threshold': T['V0_PASS_max_cos'],\n" +
+        "        'verdict': verdict,\n" +
+        "        'note': 'V0 surrogate over H rows (alm_r6_p*_an11_b.json compatible PASS predicate).',\n" +
+        "    }\n" +
+        "\n" +
+        "# ─── V1: phi_mip Gram bipartition ──────────────────────────────────────\n" +
+        "def v1_phi_mip(H):\n" +
+        "    G = H @ H.T\n" +
+        "    n = G.shape[0]\n" +
+        "    G2 = G * G\n" +
+        "    Gn2 = float(G2.sum())\n" +
+        "    if Gn2 <= 0.0:\n" +
+        "        return {'phi_mip': 0.0, 'argmin_S': list(range(n//2)), 'verdict': 'FAIL', 'threshold': T['V1_PASS_phi']}\n" +
+        "    half = n // 2\n" +
+        "    indices = list(range(n))\n" +
+        "    best = None; best_S = None\n" +
+        "    for S in itertools.combinations(indices, half):\n" +
+        "        S_set = set(S)\n" +
+        "        S_idx = np.array(S, dtype=np.intp)\n" +
+        "        Sc_idx = np.array([i for i in indices if i not in S_set], dtype=np.intp)\n" +
+        "        in_block = float(G2[np.ix_(S_idx, S_idx)].sum()) + float(G2[np.ix_(Sc_idx, Sc_idx)].sum())\n" +
+        "        L_part = Gn2 - in_block\n" +
+        "        phi_S = L_part / Gn2\n" +
+        "        if best is None or phi_S < best:\n" +
+        "            best = phi_S; best_S = sorted(S)\n" +
+        "    phi = float(best)\n" +
+        "    if phi >= T['V1_PASS_phi']: v = 'PASS'\n" +
+        "    elif phi >= T['V1_AMB_phi']: v = 'AMBIGUOUS'\n" +
+        "    else: v = 'FAIL'\n" +
+        "    return {\n" +
+        "        'metric': 'phi_mip',\n" +
+        "        'phi_mip': phi,\n" +
+        "        'argmin_S': [int(x) for x in best_S],\n" +
+        "        'threshold': T['V1_PASS_phi'],\n" +
+        "        'verdict': v,\n" +
+        "        'note': '|S|=8 balanced bipartition over C(16,8)=12870.',\n" +
+        "    }\n" +
+        "\n" +
+        "# ─── V2: PAPO PCA top-k project-out (best lift) ────────────────────────\n" +
+        "def _compute_sma(H):\n" +
+        "    n = H.shape[0]\n" +
+        "    paired = set()\n" +
+        "    for (i,j) in PAIRS: paired.add((i,j)); paired.add((j,i))\n" +
+        "    pair_vals = [abs_cos(H[i], H[j]) for (i,j) in PAIRS]\n" +
+        "    SMA = float(np.mean(pair_vals))\n" +
+        "    distractor_vals = []\n" +
+        "    for i in range(n):\n" +
+        "        for j in range(n):\n" +
+        "            if i == j: continue\n" +
+        "            if (i,j) in paired: continue\n" +
+        "            distractor_vals.append(abs_cos(H[i], H[j]))\n" +
+        "    SMA_d = float(np.mean(distractor_vals))\n" +
+        "    return SMA, SMA_d, SMA - SMA_d\n" +
+        "\n" +
+        "def _project_out(H, axes, alpha):\n" +
+        "    Hs = H.copy()\n" +
+        "    for u in axes:\n" +
+        "        Hs = Hs - alpha * (Hs @ u)[:, None] * u[None, :]\n" +
+        "    return Hs\n" +
+        "\n" +
+        "def v2_papo(H):\n" +
+        "    D = np.stack([H[i] - H[j] for (i,j) in PAIRS], axis=0)\n" +
+        "    U, S, Vt = np.linalg.svd(D, full_matrices=False)\n" +
+        "    K_max = min(6, Vt.shape[0])\n" +
+        "    sweep = []\n" +
+        "    for k in range(1, K_max + 1):\n" +
+        "        axes = [Vt[t] for t in range(k)]\n" +
+        "        for a in ALPHAS:\n" +
+        "            Hs = _project_out(H, axes, a)\n" +
+        "            sma, sma_d, lift = _compute_sma(Hs)\n" +
+        "            if lift >= T['V2_PASS_lift'] and sma >= T['V2_PASS_sma']: vv = 'PASS'\n" +
+        "            elif lift >= T['V2_AMB_lift']: vv = 'AMBIGUOUS'\n" +
+        "            else: vv = 'FAIL'\n" +
+        "            sweep.append({'k': k, 'alpha': a, 'SMA': sma, 'SMA_distractor': sma_d, 'SMA_lift': lift, 'verdict': vv})\n" +
+        "    base = next(r for r in sweep if r['k']==1 and r['alpha']==0.0)\n" +
+        "    best = max(sweep, key=lambda r: r['SMA_lift'])\n" +
+        "    return {\n" +
+        "        'metric': 'PAPO PCA top-k project-out (best SMA_lift over sweep)',\n" +
+        "        'singular_values': [float(x) for x in S.tolist()],\n" +
+        "        'baseline_k1_alpha0': base,\n" +
+        "        'best': best,\n" +
+        "        'delta_lift_best_minus_baseline': best['SMA_lift'] - base['SMA_lift'],\n" +
+        "        'sweep_size': len(sweep),\n" +
+        "        'pass_count': sum(1 for r in sweep if r['verdict']=='PASS'),\n" +
+        "        'verdict': best['verdict'],\n" +
+        "        'threshold': {'lift': T['V2_PASS_lift'], 'sma': T['V2_PASS_sma']},\n" +
+        "    }\n" +
+        "\n" +
+        "# ─── V3: CPS Gram Frobenius (FALSIFIED metric, recorded for ledger) ─────\n" +
+        "def v3_cps(H):\n" +
+        "    n = H.shape[0]\n" +
+        "    G = H @ H.T\n" +
+        "    Gnorm = float(np.linalg.norm(G))\n" +
+        "    if Gnorm <= 0.0:\n" +
+        "        return {'CPS': 0.0, 'delta_preserve': 0.0, 'delta_destruct': 0.0, 'verdict': 'FAIL', 'falsified_flag': True}\n" +
+        "    rng = np.random.default_rng(DESTRUCT_SEED)\n" +
+        "    dest_perm = [int(x) for x in rng.permutation(n).tolist()]\n" +
+        "    Hp = H[PRESERVE_PERM, :]\n" +
+        "    Hd = H[dest_perm, :]\n" +
+        "    Gp = Hp @ Hp.T; Gd = Hd @ Hd.T\n" +
+        "    dp = float(np.linalg.norm(Gp - G) / Gnorm)\n" +
+        "    dd = float(np.linalg.norm(Gd - G) / Gnorm)\n" +
+        "    cps = (dd / dp) if dp > 0.0 else float('inf')\n" +
+        "    if cps >= T['V3_PASS_cps'] and dp <= T['V3_PASS_dp_max'] and dd >= T['V3_PASS_dd_min']:\n" +
+        "        v = 'PASS'\n" +
+        "    elif cps >= T['V3_AMB_cps']:\n" +
+        "        v = 'AMBIGUOUS'\n" +
+        "    else:\n" +
+        "        v = 'FAIL'\n" +
+        "    return {\n" +
+        "        'metric': 'CPS = ||G_destruct - G||_F / ||G_preserve - G||_F (Gram Frob ratio)',\n" +
+        "        'CPS': cps if cps != float('inf') else 1e18,\n" +
+        "        'delta_preserve': dp,\n" +
+        "        'delta_destruct': dd,\n" +
+        "        'preserve_permutation': PRESERVE_PERM,\n" +
+        "        'destruct_permutation': dest_perm,\n" +
+        "        'destruct_seed': DESTRUCT_SEED,\n" +
+        "        'verdict': v,\n" +
+        "        'threshold': {'CPS': T['V3_PASS_cps'], 'dp_max': T['V3_PASS_dp_max'], 'dd_min': T['V3_PASS_dd_min']},\n" +
+        "        'falsified_flag': True,\n" +
+        "        'falsified_note': 'V3 metric design FALSIFIED (commit dc871454/1002d16a/c369b375). Recorded for ledger; composite verdict carries V3_FALSIFIED_FLAG.',\n" +
+        "    }\n" +
+        "\n" +
+        "# ─── V_pairrank: paired-token nearest-neighbor rank ─────────────────────\n" +
+        "def _rank_of(H, src, tgt):\n" +
+        "    n = H.shape[0]\n" +
+        "    cosines = []\n" +
+        "    for k in range(n):\n" +
+        "        if k == src: continue\n" +
+        "        cosines.append((k, abs_cos(H[src], H[k])))\n" +
+        "    cosines.sort(key=lambda x: -x[1])\n" +
+        "    for rank_idx, (k, c) in enumerate(cosines):\n" +
+        "        if k == tgt: return rank_idx + 1, c\n" +
+        "    return n, 0.0\n" +
+        "\n" +
+        "def v_pairrank(H):\n" +
+        "    inv_ranks = []; t1 = []; t3 = []; recs = []\n" +
+        "    for (i, j) in PAIRS:\n" +
+        "        rij, cij = _rank_of(H, i, j)\n" +
+        "        rji, cji = _rank_of(H, j, i)\n" +
+        "        pr = (rij + rji) / 2.0\n" +
+        "        inv_ranks.append(1.0 / pr if pr > 0 else 0.0)\n" +
+        "        t1.append(1.0 if (rij == 1 and rji == 1) else 0.0)\n" +
+        "        t3.append(1.0 if (rij <= 3 and rji <= 3) else 0.0)\n" +
+        "        recs.append({'pair': [int(i),int(j)], 'rank_i_view': int(rij), 'rank_j_view': int(rji), 'pair_rank_mean': pr})\n" +
+        "    V_pr = float(np.mean(inv_ranks))\n" +
+        "    top1 = float(np.mean(t1)); top3 = float(np.mean(t3))\n" +
+        "    if V_pr >= T['VPR_PASS_v'] and top3 >= T['VPR_PASS_top3']: v = 'PASS'\n" +
+        "    elif V_pr >= T['VPR_AMB_v']: v = 'AMBIGUOUS'\n" +
+        "    else: v = 'FAIL'\n" +
+        "    return {\n" +
+        "        'metric': 'V_pairrank: paired-token NN-rank',\n" +
+        "        'V_pairrank': V_pr,\n" +
+        "        'top1_hit': top1,\n" +
+        "        'top3_hit': top3,\n" +
+        "        'pair_records': recs,\n" +
+        "        'verdict': v,\n" +
+        "        'threshold': {'V_pairrank': T['VPR_PASS_v'], 'top3_hit': T['VPR_PASS_top3']},\n" +
+        "    }\n" +
+        "\n" +
+        "# ─── V_sub: anti-meaning substitution disturbance ──────────────────────\n" +
+        "def v_sub(H, H_anti, H_random):\n" +
+        "    if H_anti is None or H_random is None:\n" +
+        "        return {\n" +
+        "            'metric': 'V_sub = ||G_anti - G||_F / ||G_random - G||_F',\n" +
+        "            'V_sub': None,\n" +
+        "            'delta_anti': None,\n" +
+        "            'delta_random': None,\n" +
+        "            'verdict': 'NOT_MEASURED',\n" +
+        "            'threshold': T['VSUB_PASS'],\n" +
+        "            'reason': 'H_ANTI / H_RANDOM 미제공 (raw#10 honest scope).',\n" +
+        "            'ground_truth_quality_note': 'ANTI_MAP_v2 ground truth quality 한계 — 측정 시 anti-meaning ledger 사전 등록 필요.',\n" +
+        "        }\n" +
+        "    G = H @ H.T\n" +
+        "    Gnorm = float(np.linalg.norm(G))\n" +
+        "    if Gnorm <= 0.0:\n" +
+        "        return {'V_sub': 0.0, 'delta_anti': 0.0, 'delta_random': 0.0, 'verdict': 'FAIL'}\n" +
+        "    Ga = H_anti @ H_anti.T\n" +
+        "    Gr = H_random @ H_random.T\n" +
+        "    da = float(np.linalg.norm(Ga - G) / Gnorm)\n" +
+        "    dr = float(np.linalg.norm(Gr - G) / Gnorm)\n" +
+        "    vsub = (da / dr) if dr > 0.0 else float('inf')\n" +
+        "    if vsub >= T['VSUB_PASS']: v = 'PASS'\n" +
+        "    elif vsub >= T['VSUB_AMB']: v = 'AMBIGUOUS'\n" +
+        "    else: v = 'FAIL'\n" +
+        "    return {\n" +
+        "        'metric': 'V_sub = ||G_anti - G||_F / ||G_random - G||_F',\n" +
+        "        'V_sub': vsub if vsub != float('inf') else 1e18,\n" +
+        "        'delta_anti': da,\n" +
+        "        'delta_random': dr,\n" +
+        "        'verdict': v,\n" +
+        "        'threshold': T['VSUB_PASS'],\n" +
+        "        'ground_truth_quality_note': 'ANTI_MAP_v2 ground truth quality 한계 — anti-meaning ledger 의 의미적 strictness가 V_sub bound에 영향.',\n" +
+        "    }\n" +
+        "\n" +
+        "# ─── composite verdict aggregation ─────────────────────────────────────\n" +
+        "def composite(v0, v1, v2, v3, vpr, vsub):\n" +
+        "    core = [('V0', v0['verdict']), ('V1', v1['verdict']), ('V2', v2['verdict']),\n" +
+        "            ('V3', v3['verdict']), ('V_pairrank', vpr['verdict'])]\n" +
+        "    pass_set = [name for name, vd in core if vd == 'PASS']\n" +
+        "    fail_set = [name for name, vd in core if vd != 'PASS']\n" +
+        "    n_pass = len(pass_set)\n" +
+        "    composite_5 = 'MK_XI_FALSIFIED'\n" +
+        "    if n_pass == 5:\n" +
+        "        composite_5 = 'MK_XI_VERIFIED'\n" +
+        "    elif n_pass == 4 and 'V_pairrank' in fail_set:\n" +
+        "        composite_5 = 'MK_XI_PARTIAL_RETRIEVAL_FAIL'\n" +
+        "    elif n_pass == 3 and 'V3' in fail_set and 'V_pairrank' in fail_set:\n" +
+        "        # V3 + V_pairrank 동시 fail은 retrieval+stability 둘 다 무너진 상태\n" +
+        "        composite_5 = 'MK_XI_FALSIFIED'\n" +
+        "    elif n_pass == 4 and 'V3' in fail_set:\n" +
+        "        composite_5 = 'MK_XI_PARTIAL_V3_FAIL'\n" +
+        "    failing_axes = fail_set\n" +
+        "    # 6-tuple extension\n" +
+        "    if vsub['verdict'] == 'NOT_MEASURED':\n" +
+        "        composite_6 = 'NOT_MEASURED'\n" +
+        "    elif composite_5 == 'MK_XI_VERIFIED' and vsub['verdict'] == 'PASS':\n" +
+        "        composite_6 = 'EXT_VERIFIED'\n" +
+        "    elif composite_5 == 'MK_XI_VERIFIED' and vsub['verdict'] != 'PASS':\n" +
+        "        composite_6 = 'EXT_RETRIEVAL_BUT_NO_SEMANTICS'\n" +
+        "        if vsub['verdict'] != 'PASS': failing_axes = failing_axes + ['V_sub']\n" +
+        "    else:\n" +
+        "        composite_6 = 'EXT_DEGRADED'\n" +
+        "        if vsub['verdict'] != 'PASS': failing_axes = failing_axes + ['V_sub']\n" +
+        "    return {\n" +
+        "        'composite_5tuple': composite_5,\n" +
+        "        'composite_6tuple': composite_6,\n" +
+        "        'pass_count_5tuple': n_pass,\n" +
+        "        'failing_axes': failing_axes,\n" +
+        "        'V3_FALSIFIED_FLAG': True,\n" +
+        "        'V3_falsified_note': 'V3 (CPS) metric design FALSIFIED — included for ledger but should not be load-bearing.',\n" +
+        "    }\n" +
+        "\n" +
+        "def cmd_run(h_trained, h_anti_or_null, h_random_or_null, result_path, schema, spec_doc, spec_commit, run_id):\n" +
+        "    if not os.path.exists(h_trained):\n" +
+        "        print(f'ERR: missing h_trained {h_trained}', file=sys.stderr); sys.exit(2)\n" +
+        "    H, reduction = load_H(h_trained)\n" +
+        "    if H.shape[0] != 16:\n" +
+        "        print(f'ERR: expected 16 prompts in H, got {H.shape[0]}', file=sys.stderr); sys.exit(2)\n" +
+        "    H_anti = None; H_rand = None\n" +
+        "    h_anti_used = None; h_rand_used = None\n" +
+        "    if h_anti_or_null != 'NULL' and h_random_or_null != 'NULL':\n" +
+        "        if not os.path.exists(h_anti_or_null):\n" +
+        "            print(f'ERR: missing h_anti {h_anti_or_null}', file=sys.stderr); sys.exit(2)\n" +
+        "        if not os.path.exists(h_random_or_null):\n" +
+        "            print(f'ERR: missing h_random {h_random_or_null}', file=sys.stderr); sys.exit(2)\n" +
+        "        H_anti, _ = load_H(h_anti_or_null)\n" +
+        "        H_rand, _ = load_H(h_random_or_null)\n" +
+        "        if H_anti.shape != H.shape or H_rand.shape != H.shape:\n" +
+        "            print(f'ERR: shape mismatch H={H.shape} H_anti={H_anti.shape} H_random={H_rand.shape}', file=sys.stderr); sys.exit(2)\n" +
+        "        h_anti_used = h_anti_or_null; h_rand_used = h_random_or_null\n" +
+        "    r0 = v0_max_cos(H)\n" +
+        "    r1 = v1_phi_mip(H)\n" +
+        "    r2 = v2_papo(H)\n" +
+        "    r3 = v3_cps(H)\n" +
+        "    rpr = v_pairrank(H)\n" +
+        "    rsub = v_sub(H, H_anti, H_rand)\n" +
+        "    comp = composite(r0, r1, r2, r3, rpr, rsub)\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'tool': 'tool/an11_b_5tuple_aggregator.hexa',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_commit': spec_commit,\n" +
+        "        'run_id': run_id,\n" +
+        "        'ts': ts,\n" +
+        "        'inputs': {\n" +
+        "            'h_trained': h_trained,\n" +
+        "            'h_anti': h_anti_used,\n" +
+        "            'h_random': h_rand_used,\n" +
+        "            'reduction': reduction,\n" +
+        "            'shape': [int(H.shape[0]), int(H.shape[1])],\n" +
+        "        },\n" +
+        "        'verifiers': {\n" +
+        "            'V0': r0,\n" +
+        "            'V1': r1,\n" +
+        "            'V2': r2,\n" +
+        "            'V3': r3,\n" +
+        "            'V_pairrank': rpr,\n" +
+        "            'V_sub': rsub,\n" +
+        "        },\n" +
+        "        'composite': comp,\n" +
+        "        'thresholds_frozen_raw12': T,\n" +
+        "        'raw_compliance': [\n" +
+        "            'raw#9 hexa-only / Python helper /tmp emit',\n" +
+        "            'raw#10 V3 FALSIFIED flag emitted; V_sub ANTI_MAP quality limit recorded',\n" +
+        "            'raw#12 thresholds frozen (no override)',\n" +
+        "            'raw#15 SSOT = this output file',\n" +
+        "            'raw#37 idempotent helper, deterministic over (H, H_anti, H_random)',\n" +
+        "            'POLICY R4 existing verifier scope unchanged; aggregation 신규 axis only',\n" +
+        "        ],\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'reduction={reduction}')\n" +
+        "    print(f'V0_verdict={r0[\"verdict\"]} max_cos={r0[\"max_cos\"]:.6f}')\n" +
+        "    print(f'V1_verdict={r1[\"verdict\"]} phi_mip={r1[\"phi_mip\"]:.6f}')\n" +
+        "    print(f'V2_verdict={r2[\"verdict\"]} best_lift={r2[\"best\"][\"SMA_lift\"]:.6f} best_sma={r2[\"best\"][\"SMA\"]:.6f}')\n" +
+        "    print(f'V3_verdict={r3[\"verdict\"]} CPS={r3[\"CPS\"]:.6f} (FALSIFIED metric)')\n" +
+        "    print(f'V_pairrank_verdict={rpr[\"verdict\"]} V_pr={rpr[\"V_pairrank\"]:.6f} top3={rpr[\"top3_hit\"]:.6f}')\n" +
+        "    print(f'V_sub_verdict={rsub[\"verdict\"]}')\n" +
+        "    print(f'composite_5tuple={comp[\"composite_5tuple\"]}')\n" +
+        "    print(f'composite_6tuple={comp[\"composite_6tuple\"]}')\n" +
+        "    print(f'pass_count_5tuple={comp[\"pass_count_5tuple\"]}')\n" +
+        "    print(f'failing_axes={\",\".join(comp[\"failing_axes\"]) if comp[\"failing_axes\"] else \"none\"}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "# ─── selftest: synthetic H designed so all verifiers PASS ──────────────\n" +
+        "def _synthetic_pass_H(seed=20260425, dim=64):\n" +
+        "    # Construct H so paired tokens are near-aligned, others orthogonal-ish.\n" +
+        "    rng = np.random.default_rng(seed)\n" +
+        "    n = 16\n" +
+        "    base = rng.standard_normal((n, dim))\n" +
+        "    # Use 6 distinct anchor directions for the 6 PAIRS; align both members.\n" +
+        "    anchors = rng.standard_normal((6, dim))\n" +
+        "    H = base.copy() * 0.05  # small noise floor\n" +
+        "    for k, (i, j) in enumerate(PAIRS):\n" +
+        "        a = anchors[k] / (np.linalg.norm(anchors[k]) + 1e-12)\n" +
+        "        # paired tokens share the same anchor with small perturbation\n" +
+        "        H[i] = H[i] + 1.0 * a + 0.02 * rng.standard_normal(dim)\n" +
+        "        H[j] = H[j] + 1.0 * a + 0.02 * rng.standard_normal(dim)\n" +
+        "    # remaining indices [12,13,14,15] remain weakly random (distractors)\n" +
+        "    return H\n" +
+        "\n" +
+        "def _synthetic_anti_H(H, seed=20260426):\n" +
+        "    # anti substitution: large Gram perturbation by negating paired alignment\n" +
+        "    rng = np.random.default_rng(seed)\n" +
+        "    H_anti = H.copy()\n" +
+        "    n, d = H.shape\n" +
+        "    # flip sign on paired indices and add noise (large delta_anti)\n" +
+        "    for (i, j) in PAIRS:\n" +
+        "        H_anti[i] = -H[i] + 0.1 * rng.standard_normal(d)\n" +
+        "        H_anti[j] = -H[j] + 0.1 * rng.standard_normal(d)\n" +
+        "    return H_anti\n" +
+        "\n" +
+        "def _synthetic_random_H(H, seed=20260427):\n" +
+        "    # random substitution: mild Gram perturbation\n" +
+        "    rng = np.random.default_rng(seed)\n" +
+        "    n, d = H.shape\n" +
+        "    H_rand = H + 0.05 * rng.standard_normal((n, d))\n" +
+        "    return H_rand\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    H = _synthetic_pass_H()\n" +
+        "    H_anti = _synthetic_anti_H(H)\n" +
+        "    H_rand = _synthetic_random_H(H)\n" +
+        "    r0 = v0_max_cos(H)\n" +
+        "    r1 = v1_phi_mip(H)\n" +
+        "    r2 = v2_papo(H)\n" +
+        "    r3 = v3_cps(H)\n" +
+        "    rpr = v_pairrank(H)\n" +
+        "    rsub = v_sub(H, H_anti, H_rand)\n" +
+        "    comp = composite(r0, r1, r2, r3, rpr, rsub)\n" +
+        "    # Sanity asserts (no PASS requirement on synthetic — just no crash + range checks).\n" +
+        "    assert 0.0 <= r0['max_cos'] <= 1.0, f'V0 max_cos out of range: {r0}'\n" +
+        "    assert 0.0 <= r1['phi_mip'] <= 1.0, f'V1 phi out of range: {r1}'\n" +
+        "    assert -1.0 <= r2['best']['SMA_lift'] <= 1.0, f'V2 lift out of range: {r2}'\n" +
+        "    assert r3['CPS'] >= 0.0, f'V3 CPS negative: {r3}'\n" +
+        "    assert 0.0 <= rpr['V_pairrank'] <= 1.0, f'V_pairrank out of range: {rpr}'\n" +
+        "    assert rsub['V_sub'] is None or rsub['V_sub'] >= 0.0, f'V_sub negative: {rsub}'\n" +
+        "    assert comp['composite_5tuple'] in ['MK_XI_VERIFIED','MK_XI_PARTIAL_RETRIEVAL_FAIL','MK_XI_PARTIAL_V3_FAIL','MK_XI_FALSIFIED'], f'composite_5 unexpected: {comp}'\n" +
+        "    assert comp['composite_6tuple'] in ['EXT_VERIFIED','EXT_RETRIEVAL_BUT_NO_SEMANTICS','EXT_DEGRADED','NOT_MEASURED'], f'composite_6 unexpected: {comp}'\n" +
+        "    # H_anti=None → V_sub NOT_MEASURED branch\n" +
+        "    rsub_nm = v_sub(H, None, None)\n" +
+        "    assert rsub_nm['verdict'] == 'NOT_MEASURED', f'V_sub NOT_MEASURED branch broken: {rsub_nm}'\n" +
+        "    comp_nm = composite(r0, r1, r2, r3, rpr, rsub_nm)\n" +
+        "    assert comp_nm['composite_6tuple'] == 'NOT_MEASURED', f'composite NOT_MEASURED branch broken: {comp_nm}'\n" +
+        "    # Synthetic H is constructed so paired tokens dominate → V_pairrank should PASS or AMBIGUOUS\n" +
+        "    assert rpr['top3_hit'] >= 0.5, f'V_pairrank top3 too low for paired-aligned synthetic H: {rpr}'\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'V0_verdict={r0[\"verdict\"]} max_cos={r0[\"max_cos\"]:.6f}')\n" +
+        "    print(f'V1_verdict={r1[\"verdict\"]} phi={r1[\"phi_mip\"]:.6f}')\n" +
+        "    print(f'V2_verdict={r2[\"verdict\"]} best_lift={r2[\"best\"][\"SMA_lift\"]:.6f}')\n" +
+        "    print(f'V3_verdict={r3[\"verdict\"]} CPS={r3[\"CPS\"]:.6f}')\n" +
+        "    print(f'V_pairrank_verdict={rpr[\"verdict\"]} V_pr={rpr[\"V_pairrank\"]:.6f} top3={rpr[\"top3_hit\"]:.6f}')\n" +
+        "    print(f'V_sub_verdict={rsub[\"verdict\"]} V_sub_value={rsub[\"V_sub\"]}')\n" +
+        "    print(f'composite_5tuple={comp[\"composite_5tuple\"]}')\n" +
+        "    print(f'composite_6tuple={comp[\"composite_6tuple\"]}')\n" +
+        "    print(f'pass_count_5tuple={comp[\"pass_count_5tuple\"]}')\n" +
+        "    print(f'NOT_MEASURED_branch_ok=1')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'run': cmd_run(*sys.argv[2:10])\n" +
+        "    elif mode == 'selftest': cmd_selftest()\n" +
+        "    else: print(f'unknown mode: {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut h_trained = ""
+    let mut h_anti = ""
+    let mut h_random = ""
+    let mut output = ""
+    let mut run_id = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--h-trained" && i + 1 < len(av) { h_trained = av[i+1]; i = i + 2; continue }
+        if a == "--h-anti" && i + 1 < len(av) { h_anti = av[i+1]; i = i + 2; continue }
+        if a == "--h-random" && i + 1 < len(av) { h_random = av[i+1]; i = i + 2; continue }
+        if a == "--output" && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        if a == "--run-id" && i + 1 < len(av) { run_id = av[i+1]; i = i + 2; continue }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_5tuple_aggregator selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 {
+            eprintln("selftest FAILED (exit " + to_string(r[1]) + ")")
+            exit(1)
+        }
+        if _kv_lookup(r[0], "selftest") != "ok" {
+            eprintln("selftest marker missing")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if h_trained == "" || output == "" || run_id == "" {
+        eprintln("ABORT: --h-trained <path> --output <path> --run-id <id> required (or --selftest).")
+        eprintln("  optional: --h-anti <path> --h-random <path>  (V_sub measurement)")
+        eprintln("  usage: hexa run tool/an11_b_5tuple_aggregator.hexa \\")
+        eprintln("           --h-trained state/h_last_raw_p1_TRAINED_r9.json \\")
+        eprintln("           --output state/mk_xi_5tuple_aggregated_r9_<TS>.json \\")
+        eprintln("           --run-id r9_<TS>")
+        exit(2)
+    }
+    if !file_exists(h_trained) {
+        eprintln("ABORT: missing h_trained " + h_trained)
+        exit(2)
+    }
+
+    // Both h_anti and h_random must be paired (or both absent).
+    let anti_provided = h_anti != ""
+    let rand_provided = h_random != ""
+    if anti_provided != rand_provided {
+        eprintln("ABORT: --h-anti and --h-random must be specified together (or both omitted).")
+        exit(2)
+    }
+    if anti_provided && !file_exists(h_anti) {
+        eprintln("ABORT: missing h_anti " + h_anti)
+        exit(2)
+    }
+    if rand_provided && !file_exists(h_random) {
+        eprintln("ABORT: missing h_random " + h_random)
+        exit(2)
+    }
+
+    let anti_arg = if anti_provided { h_anti } else { "NULL" }
+    let rand_arg = if rand_provided { h_random } else { "NULL" }
+
+    println("── an11_b_5tuple_aggregator ──")
+    println("h_trained: " + h_trained)
+    println("h_anti:    " + anti_arg)
+    println("h_random:  " + rand_arg)
+    println("output:    " + output)
+    println("run_id:    " + run_id)
+
+    let args = "run " +
+        _sh_quote(h_trained) + " " +
+        _sh_quote(anti_arg) + " " +
+        _sh_quote(rand_arg) + " " +
+        _sh_quote(output) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC) + " " +
+        _sh_quote(SPEC_COMMIT) + " " +
+        _sh_quote(run_id)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 {
+        eprintln("ABORT: helper run exited " + to_string(st))
+        eprintln(out)
+        exit(2)
+    }
+    println(out)
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()
