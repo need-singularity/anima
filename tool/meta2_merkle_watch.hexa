@@ -1,0 +1,457 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/meta2_merkle_watch.hexa — daemon-style Merkle root watcher
+//
+//  CLUSTER   adjacent to cluster #34 (cert hash-chain auto-verifier)
+//  RAW       raw#9  hexa-only       raw#10 proof-carrying
+//            raw#11 snake_case      raw#15 no-hardcode
+//            V8 SAFE_COMMIT · LLM=none · deterministic
+//
+//  PURPOSE
+//    Watch .meta2-cert/ for mtime changes.  When ANY entry mtime changes:
+//      1) Recompute Merkle root via tool/meta2_merkle_build.hexa
+//      2) Compare new root to previous root (state/meta2_merkle_root.json)
+//      3) If root changed:
+//           - emit witness state/meta2_merkle_root_witness.jsonl
+//             { ts, prev_root, new_root, leaf_count, padded_count, tree_depth,
+//               trigger_paths, raw_strict }
+//           - publish new root JSON to R2 anima-logs/cert_chain/...
+//           - append asset_archive_log.jsonl entry (raw#10)
+//      4) Persist watcher fingerprint to state/meta2_merkle_watch_state.json
+//
+//  USAGE
+//    hexa tool/meta2_merkle_watch.hexa --once          single poll then exit
+//    hexa tool/meta2_merkle_watch.hexa --selftest      inline selftest
+//    hexa tool/meta2_merkle_watch.hexa                 single poll (cron-driven)
+//
+//  EXIT CODES
+//    0  poll OK (no change OR change handled successfully) / selftest PASS
+//    1  build failure (meta2_merkle_build returned non-zero)
+//    2  state write failure
+//    3  selftest FAIL
+//    4  R2 publish failure (logged, not fatal — root file still updated)
+// ════════════════════════════════════════════════════════════════════════════
+
+let TOOL_NAME       = "meta2_merkle_watch"
+let TOOL_VERSION    = "v1"
+let SCHEMA_STATE    = "anima.meta2.merkle.watch.state.v1"
+let SCHEMA_WITNESS  = "anima.meta2.merkle.witness.v1"
+let RAW_STRICT      = "raw#9 raw#10 raw#11 raw#15 deterministic LLM=none V8"
+
+let CERT_ROOT_DEFAULT  = ".meta2-cert"
+let ROOT_FILE_DEFAULT  = "state/meta2_merkle_root.json"
+let STATE_FILE_DEFAULT = "state/meta2_merkle_watch_state.json"
+let WITNESS_FILE_DEF   = "state/meta2_merkle_root_witness.jsonl"
+let ARCHIVE_LOG_DEF    = "state/asset_archive_log.jsonl"
+let R2_PREFIX_DEFAULT  = "r2:anima-logs/cert_chain"
+let RCLONE_CFG_DEFAULT = ""   // empty → rclone uses default config search
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+// INLINE_DEPRECATED[H42]: see shared/util/sh_quote.hexa for canonical impl — kept inline (hexa stage0 loader)
+fn _sh_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec(cmd: string) -> string { return _str(exec(cmd)) }
+
+fn _trim(s: string) -> string { return s.trim() }
+
+fn _file_exists(p: string) -> bool {
+    return _trim(_exec("test -e " + _sh_quote(p) + " && echo 1 || echo 0")) == "1"
+}
+
+fn _dir_exists(p: string) -> bool {
+    return _trim(_exec("test -d " + _sh_quote(p) + " && echo 1 || echo 0")) == "1"
+}
+
+fn _now_iso() -> string { return _trim(_exec("date -u +%FT%TZ")) }
+
+fn _now_stamp() -> string { return _trim(_exec("date -u +%Y%m%dT%H%M%SZ")) }
+
+fn _mtime(path: string) -> string {
+    // portable: GNU stat or BSD stat fallback
+    let g = _trim(_exec("stat -c '%Y' " + _sh_quote(path) + " 2>/dev/null"))
+    if g != "" { return g }
+    return _trim(_exec("stat -f '%m' " + _sh_quote(path) + " 2>/dev/null"))
+}
+
+fn _read_file(path: string) -> string {
+    if !_file_exists(path) { return "" }
+    return _exec("cat " + _sh_quote(path))
+}
+
+fn _sha256_file(path: string) -> string {
+    return _trim(_exec("shasum -a 256 " + _sh_quote(path) + " 2>/dev/null | awk '{print $1}'"))
+}
+
+fn _file_size(path: string) -> string {
+    let g = _trim(_exec("stat -c '%s' " + _sh_quote(path) + " 2>/dev/null"))
+    if g != "" { return g }
+    return _trim(_exec("stat -f '%z' " + _sh_quote(path) + " 2>/dev/null"))
+}
+
+// ─── cert dir scan ─────────────────────────────────────────────────────────
+
+fn _list_cert_files(cert_root: string) -> list {
+    let raw = _exec("find " + _sh_quote(cert_root) + " -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort")
+    let mut out = []
+    let lines = _str(raw).split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = _trim(_str(lines[i]))
+        if ln != "" { out = out.push(ln) }
+        i = i + 1
+    }
+    return out
+}
+
+// returns "<path>|<mtime>|<size>" joined for fingerprint hashing
+fn _fingerprint_dir(cert_root: string) -> string {
+    let files = _list_cert_files(cert_root)
+    let mut s = ""
+    let mut i = 0
+    while i < len(files) {
+        let p = _str(files[i])
+        s = s + p + "|" + _mtime(p) + "|" + _file_size(p) + "\n"
+        i = i + 1
+    }
+    return s
+}
+
+fn _fp_hash(cert_root: string) -> string {
+    let fp = _fingerprint_dir(cert_root)
+    let tmp = "/tmp/meta2_merkle_watch_fp_" + _now_stamp() + ".txt"
+    write_file(tmp, fp)
+    let h = _trim(_exec("shasum -a 256 " + _sh_quote(tmp) + " | awk '{print $1}'"))
+    let _ = _exec("rm -f " + _sh_quote(tmp))
+    return h
+}
+
+// ─── prev root extraction ──────────────────────────────────────────────────
+
+fn _extract_prev_root(root_file: string) -> string {
+    if !_file_exists(root_file) { return "" }
+    return _trim(_exec("jq -r '.merkle_root // empty' " + _sh_quote(root_file) + " 2>/dev/null"))
+}
+
+fn _extract_field_str(root_file: string, jq_expr: string) -> string {
+    if !_file_exists(root_file) { return "" }
+    return _trim(_exec("jq -r " + _sh_quote(jq_expr) + " " + _sh_quote(root_file) + " 2>/dev/null"))
+}
+
+// ─── state persist ─────────────────────────────────────────────────────────
+
+fn _emit_state_json(cert_root: string, fp: string, last_root: string,
+                    last_check: string, last_change: string) -> string {
+    let mut s = "{\n"
+    s = s + "  \"schema\": \""       + SCHEMA_STATE + "\",\n"
+    s = s + "  \"tool\": \""         + TOOL_NAME + "\",\n"
+    s = s + "  \"version\": \""      + TOOL_VERSION + "\",\n"
+    s = s + "  \"cert_root\": \""    + cert_root + "\",\n"
+    s = s + "  \"fingerprint\": \""  + fp + "\",\n"
+    s = s + "  \"last_root\": \""    + last_root + "\",\n"
+    s = s + "  \"last_check\": \""   + last_check + "\",\n"
+    s = s + "  \"last_change\": \""  + last_change + "\",\n"
+    s = s + "  \"raw_strict\": \""   + RAW_STRICT + "\"\n"
+    s = s + "}\n"
+    return s
+}
+
+fn _write_state(state_file: string, cert_root: string, fp: string,
+                last_root: string, last_check: string, last_change: string) -> bool {
+    let body = _emit_state_json(cert_root, fp, last_root, last_check, last_change)
+    write_file(state_file, body)
+    return _file_exists(state_file)
+}
+
+fn _read_state_field(state_file: string, key: string) -> string {
+    if !_file_exists(state_file) { return "" }
+    return _trim(_exec("jq -r '." + key + " // empty' " + _sh_quote(state_file) + " 2>/dev/null"))
+}
+
+// ─── witness emission (JSONL append) ───────────────────────────────────────
+
+fn _emit_witness_line(prev_root: string, new_root: string, leaf_count: string,
+                      padded_count: string, tree_depth: string,
+                      trigger_fp: string, ts: string) -> string {
+    // single-line JSON for JSONL
+    let mut s = "{"
+    s = s + "\"schema\":\""       + SCHEMA_WITNESS + "\","
+    s = s + "\"ts\":\""           + ts + "\","
+    s = s + "\"tool\":\""         + TOOL_NAME + "\","
+    s = s + "\"prev_root\":\""    + prev_root + "\","
+    s = s + "\"new_root\":\""     + new_root + "\","
+    s = s + "\"leaf_count\":"     + leaf_count + ","
+    s = s + "\"padded_count\":"   + padded_count + ","
+    s = s + "\"tree_depth\":"     + tree_depth + ","
+    s = s + "\"fingerprint\":\""  + trigger_fp + "\","
+    s = s + "\"raw_strict\":\""   + RAW_STRICT + "\""
+    s = s + "}\n"
+    return s
+}
+
+fn _append_witness(witness_file: string, line: string) -> bool {
+    let tmp = "/tmp/meta2_merkle_watch_w_" + _now_stamp() + ".jsonl"
+    write_file(tmp, line)
+    let r = _exec("cat " + _sh_quote(tmp) + " >> " + _sh_quote(witness_file))
+    let _ = _exec("rm -f " + _sh_quote(tmp))
+    return _file_exists(witness_file)
+}
+
+// ─── archive log append (raw#10) ───────────────────────────────────────────
+
+fn _append_archive_log(archive_file: string, ts: string, root_file: string,
+                       r2_path: string, sha: string, size: string,
+                       new_root: string) -> bool {
+    let mut s = "{"
+    s = s + "\"ts\":\""      + ts + "\","
+    s = s + "\"path\":\""    + root_file + "\","
+    s = s + "\"action\":\"archive_no_delete\","
+    s = s + "\"status\":\"verified\","
+    s = s + "\"detail\":\"r2_path=" + r2_path + " size=" + size
+    s = s + " sha256=" + sha + " merkle_root=" + new_root
+    s = s + " trigger=meta2_merkle_watch raw#10\""
+    s = s + "}\n"
+    let tmp = "/tmp/meta2_merkle_watch_a_" + _now_stamp() + ".jsonl"
+    write_file(tmp, s)
+    let _ = _exec("cat " + _sh_quote(tmp) + " >> " + _sh_quote(archive_file))
+    let _ = _exec("rm -f " + _sh_quote(tmp))
+    return true
+}
+
+// ─── R2 publish ────────────────────────────────────────────────────────────
+
+fn _publish_r2(root_file: string, r2_prefix: string, rclone_cfg: string) -> list {
+    let stamp = _now_stamp()
+    let r2_obj = r2_prefix + "/meta2_merkle_root_" + stamp + ".json"
+    let cfg_arg = if rclone_cfg == "" { "" } else { "--config " + _sh_quote(rclone_cfg) + " " }
+    let cmd = "rclone " + cfg_arg + "copyto " + _sh_quote(root_file) + " " + _sh_quote(r2_obj) + " 2>&1"
+    let out = _exec(cmd)
+    let ok = _trim(_exec("rclone " + cfg_arg + "lsf " + _sh_quote(r2_obj) + " 2>/dev/null")) != ""
+    let mut r = []
+    r = r.push(if ok { "OK" } else { "FAIL" })
+    r = r.push(r2_obj)
+    r = r.push(_str(out))
+    return r
+}
+
+// ─── invoke meta2_merkle_build ─────────────────────────────────────────────
+
+fn _rebuild_root(cert_root: string, root_file: string) -> int {
+    // Use the canonical builder to ensure identical algorithm.
+    let cmd = "hexa tool/meta2_merkle_build.hexa --root " + _sh_quote(cert_root)
+            + " --out-root " + _sh_quote(root_file)
+            + " --out-proofs state/meta2_merkle_proofs.json 2>&1"
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+// ─── one-shot poll ─────────────────────────────────────────────────────────
+
+fn poll_once(cert_root: string, root_file: string, state_file: string,
+             witness_file: string, archive_file: string,
+             r2_prefix: string, rclone_cfg: string,
+             do_publish: bool) -> int {
+    let ts = _now_iso()
+    println("[" + ts + "] meta2_merkle_watch: polling " + cert_root)
+
+    if !_dir_exists(cert_root) {
+        println("  ERROR: cert_root missing: " + cert_root)
+        return 1
+    }
+
+    let new_fp  = _fp_hash(cert_root)
+    let prev_fp = _read_state_field(state_file, "fingerprint")
+    let prev_root_state = _read_state_field(state_file, "last_root")
+    let prev_root_file  = _extract_prev_root(root_file)
+    let prev_root = if prev_root_state != "" { prev_root_state } else { prev_root_file }
+
+    println("  prev_fp = " + (if prev_fp == "" { "<none>" } else { prev_fp.substring(0, 16) }))
+    println("  new_fp  = " + new_fp.substring(0, 16))
+
+    if new_fp == prev_fp && prev_fp != "" {
+        println("  no change (fingerprint match) — skipping rebuild")
+        let _ = _write_state(state_file, cert_root, new_fp, prev_root, ts,
+                             _read_state_field(state_file, "last_change"))
+        return 0
+    }
+
+    println("  fingerprint delta — rebuilding root via meta2_merkle_build")
+    let rc = _rebuild_root(cert_root, root_file)
+    if rc != 0 {
+        println("  BUILD FAILURE rc=" + str(rc))
+        return 1
+    }
+
+    let new_root     = _extract_prev_root(root_file)
+    let leaf_count   = _extract_field_str(root_file, ".leaf_count")
+    let padded_count = _extract_field_str(root_file, ".padded_count")
+    let tree_depth   = _extract_field_str(root_file, ".tree_depth")
+
+    println("  new_root  = " + new_root)
+    println("  prev_root = " + (if prev_root == "" { "<none>" } else { prev_root }))
+
+    if new_root == prev_root && prev_root != "" {
+        println("  fingerprint changed but root identical (mtime-only touch) — no witness")
+        let _ = _write_state(state_file, cert_root, new_fp, new_root, ts,
+                             _read_state_field(state_file, "last_change"))
+        return 0
+    }
+
+    // root changed (or first run with empty prev) → emit witness
+    let line = _emit_witness_line(prev_root, new_root,
+                                  if leaf_count == "" { "0" } else { leaf_count },
+                                  if padded_count == "" { "0" } else { padded_count },
+                                  if tree_depth == "" { "0" } else { tree_depth },
+                                  new_fp, ts)
+    let _ = _append_witness(witness_file, line)
+    println("  witness appended: " + witness_file)
+
+    let last_change = ts
+
+    // R2 publish (best-effort)
+    if do_publish {
+        let pr = _publish_r2(root_file, r2_prefix, rclone_cfg)
+        let status = _str(pr[0])
+        let r2_obj = _str(pr[1])
+        if status == "OK" {
+            println("  R2 publish OK: " + r2_obj)
+            let sha  = _sha256_file(root_file)
+            let size = _file_size(root_file)
+            let r2_path = r2_obj.replace("r2:", "")
+            let _ = _append_archive_log(archive_file, ts, root_file, r2_path,
+                                        sha, size, new_root)
+        } else {
+            println("  R2 publish FAIL — root file updated locally; archive log not appended")
+            println("  rclone output: " + _str(pr[2]))
+        }
+    } else {
+        println("  R2 publish skipped (--no-publish)")
+    }
+
+    let _ = _write_state(state_file, cert_root, new_fp, new_root, ts, last_change)
+    println("  state written: " + state_file)
+    return 0
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn _selftest() -> int {
+    println("meta2_merkle_watch v1 — selftest")
+    let tmpdir = "/tmp/meta2_merkle_watch_selftest_" + _now_stamp()
+    let _ = _exec("mkdir -p " + _sh_quote(tmpdir + "/cert"))
+
+    let cert = tmpdir + "/cert"
+    let root_file    = tmpdir + "/root.json"
+    let state_file   = tmpdir + "/watch_state.json"
+    let witness_file = tmpdir + "/witness.jsonl"
+    let archive_file = tmpdir + "/archive.jsonl"
+
+    // T1 fingerprint stability: same dir → same fingerprint
+    write_file(cert + "/a.json", "{\"slug\":\"a\",\"v\":1}\n")
+    write_file(cert + "/b.json", "{\"slug\":\"b\",\"v\":1}\n")
+    let fp1 = _fp_hash(cert)
+    let fp2 = _fp_hash(cert)
+    let t1 = if fp1 == fp2 && fp1 != "" { "PASS" } else { "FAIL" }
+    println("  T1 fingerprint stable: " + t1 + " " + fp1.substring(0, 12))
+
+    // T2 fingerprint changes when file added
+    let _ = _exec("sleep 1")  // ensure mtime tick
+    write_file(cert + "/c.json", "{\"slug\":\"c\",\"v\":1}\n")
+    let fp3 = _fp_hash(cert)
+    let t2 = if fp3 != fp1 { "PASS" } else { "FAIL" }
+    println("  T2 fingerprint delta on add: " + t2 + " " + fp3.substring(0, 12))
+
+    // T3 witness line is valid JSON
+    let line = _emit_witness_line("aa", "bb", "3", "1", "2", "fp123", _now_iso())
+    let tmp_w = tmpdir + "/w.jsonl"
+    write_file(tmp_w, line)
+    let valid = _trim(_exec("jq -e '.schema' " + _sh_quote(tmp_w) + " >/dev/null 2>&1 && echo OK || echo FAIL"))
+    let t3 = if valid == "OK" { "PASS" } else { "FAIL" }
+    println("  T3 witness JSON valid: " + t3)
+
+    // T4 state read/write round-trip
+    let _ = _write_state(state_file, cert, fp3, "deadbeef", _now_iso(), _now_iso())
+    let r_fp = _read_state_field(state_file, "fingerprint")
+    let r_root = _read_state_field(state_file, "last_root")
+    let t4 = if r_fp == fp3 && r_root == "deadbeef" { "PASS" } else { "FAIL" }
+    println("  T4 state round-trip: " + t4)
+
+    // T5 prev_root extraction tolerates missing file
+    let missing = _extract_prev_root(tmpdir + "/no_such_file.json")
+    let t5 = if missing == "" { "PASS" } else { "FAIL" }
+    println("  T5 prev_root missing-file safe: " + t5)
+
+    let _ = _exec("rm -rf " + _sh_quote(tmpdir))
+
+    let mut passed = 0
+    if t1 == "PASS" { passed = passed + 1 }
+    if t2 == "PASS" { passed = passed + 1 }
+    if t3 == "PASS" { passed = passed + 1 }
+    if t4 == "PASS" { passed = passed + 1 }
+    if t5 == "PASS" { passed = passed + 1 }
+    println("selftest result: " + str(passed) + "/5 PASS")
+    if passed == 5 { return 0 }
+    return 3
+}
+
+// ─── arg helpers ───────────────────────────────────────────────────────────
+
+fn arg_present(av, key: string) -> bool {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn arg_value(av, key: string, dflt: string) -> string {
+    let mut i = 0
+    while i < len(av) {
+        if _str(av[i]) == key && i + 1 < len(av) { return _str(av[i + 1]) }
+        i = i + 1
+    }
+    return dflt
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = argv()
+
+    if arg_present(av, "--help") {
+        println("usage: hexa tool/meta2_merkle_watch.hexa [--once] [--selftest]")
+        println("       [--root <dir>] [--root-file <json>] [--state-file <json>]")
+        println("       [--witness-file <jsonl>] [--archive-file <jsonl>]")
+        println("       [--r2-prefix <r2:bucket/path>] [--rclone-cfg <path>]")
+        println("       [--no-publish]")
+        exit(0)
+    }
+
+    if arg_present(av, "--selftest") {
+        let rc = _selftest()
+        exit(rc)
+    }
+
+    let cert_root    = arg_value(av, "--root",          CERT_ROOT_DEFAULT)
+    let root_file    = arg_value(av, "--root-file",     ROOT_FILE_DEFAULT)
+    let state_file   = arg_value(av, "--state-file",    STATE_FILE_DEFAULT)
+    let witness_file = arg_value(av, "--witness-file",  WITNESS_FILE_DEF)
+    let archive_file = arg_value(av, "--archive-file",  ARCHIVE_LOG_DEF)
+    let r2_prefix    = arg_value(av, "--r2-prefix",     R2_PREFIX_DEFAULT)
+    let rclone_cfg   = arg_value(av, "--rclone-cfg",    RCLONE_CFG_DEFAULT)
+    let do_publish   = !arg_present(av, "--no-publish")
+
+    let rc = poll_once(cert_root, root_file, state_file, witness_file,
+                       archive_file, r2_prefix, rclone_cfg, do_publish)
+    exit(rc)
+}
+
+main()
