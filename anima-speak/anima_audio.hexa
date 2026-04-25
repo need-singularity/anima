@@ -543,6 +543,166 @@ fn reverb(in_path: string, decay_s: float, wet: float) -> string {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Source organ 1c — tone (pure sine, harmonic X)
+//    vocal 은 sawtooth (harmonic 풍부). tone 은 최소 atomic periodic.
+//    단일 frequency. pipe 걸어도 formant 공명 안 생김 (harmonic 없으니).
+//    anima 가 "소리" 의 최소 원자 탐색 시 사용.
+// ═══════════════════════════════════════════════════════════════
+
+fn tone(freq_hz: float, gain: float, ms: int) -> string {
+    let path = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "sr=" + to_string(SR) + "\n"
+             + "hz=float(" + to_string(freq_hz) + ")\n"
+             + "g=float(" + to_string(gain) + ")\n"
+             + "ms=int(" + to_string(ms) + ")\n"
+             + "hz=max(1.0,min(hz,sr/2.0-1.0))\n"
+             + "g=max(0.0,min(g,1.0))\n"
+             + "n=max(1,int(sr*ms/1000))\n"
+             + "t=np.arange(n)/sr\n"
+             + "x=g*np.sin(2*np.pi*hz*t)\n"
+             + "env=np.ones(n,dtype=np.float64)\n"
+             + "k=min(int(0.010*sr),n//2)\n"
+             + "if k>0:\n"
+             + "    ramp=0.5*(1.0-np.cos(np.pi*np.arange(k)/max(1,k-1)))\n"
+             + "    env[:k]=ramp\n"
+             + "    env[-k:]=ramp[::-1]\n"
+             + "x=x*env\n"
+             + "x=(np.clip(x,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + path + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(x.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(path) < WAV_MIN_BYTES { return "" }
+    return path
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Filter organ — lpf / hpf (butter, order N)
+//    cutoff_hz : -3dB 점.
+//    order     : 차수. 기본 τ=4 (공리). 음수/0 clamp.
+//    pipe 는 bandpass cascade, lpf/hpf 는 브로드한 형태 (spectral shaping).
+// ═══════════════════════════════════════════════════════════════
+
+fn lpf(in_path: string, cutoff_hz: float, order: int) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "from scipy.signal import butter, sosfilt\n"
+             + "cut=float(" + to_string(cutoff_hz) + ")\n"
+             + "od=int(" + to_string(order) + ")\n"
+             + "od=max(1,min(od,10))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr2=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "cut=max(10.0,min(cut,sr2/2.0-1.0))\n"
+             + "sos=butter(od,cut,btype='low',fs=sr2,output='sos')\n"
+             + "y=sosfilt(sos,x)\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr2)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+fn hpf(in_path: string, cutoff_hz: float, order: int) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "from scipy.signal import butter, sosfilt\n"
+             + "cut=float(" + to_string(cutoff_hz) + ")\n"
+             + "od=int(" + to_string(order) + ")\n"
+             + "od=max(1,min(od,10))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr2=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "cut=max(10.0,min(cut,sr2/2.0-1.0))\n"
+             + "sos=butter(od,cut,btype='high',fs=sr2,output='sos')\n"
+             + "y=sosfilt(sos,x)\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr2)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Composer — fade (equal-power Hann crossfade)
+//    a 의 꼬리 ms 와 b 의 머리 ms 를 cos²/sin² 가중으로 겹침.
+//    cat 은 concat (abrupt), fade 는 부드러운 전이. diphthong/절 접합.
+// ═══════════════════════════════════════════════════════════════
+
+fn fade(a: string, b: string, overlap_ms: int) -> string {
+    if len(a) == 0 { return b }
+    if len(b) == 0 { return a }
+    if _file_bytes(a) < WAV_MIN_BYTES { return b }
+    if _file_bytes(b) < WAV_MIN_BYTES { return a }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "om=int(" + to_string(overlap_ms) + ")\n"
+             + "om=max(1,min(om,5000))\n"
+             + "wa=wave.open('" + a + "','rb')\n"
+             + "sr2=wa.getframerate();na=wa.getnframes()\n"
+             + "xa=np.frombuffer(wa.readframes(na),dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "wa.close()\n"
+             + "wb=wave.open('" + b + "','rb')\n"
+             + "nb=wb.getnframes()\n"
+             + "xb=np.frombuffer(wb.readframes(nb),dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "wb.close()\n"
+             + "k=int(sr2*om/1000)\n"
+             + "k=max(1,min(k,min(len(xa),len(xb))))\n"
+             + "t=np.arange(k)/max(1,k-1)\n"
+             + "wdn=np.cos(0.5*np.pi*t)**2\n"
+             + "wup=np.sin(0.5*np.pi*t)**2\n"
+             + "tail=xa[-k:]*wdn + xb[:k]*wup\n"
+             + "y=np.concatenate([xa[:-k],tail,xb[k:]])\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr2)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Utility — normalize (peak → target dBFS)
+//    gain 은 선형 배수. normalize 는 입력 peak 무관, 목표 dB 로 맞춤.
+//    anima 가 여러 organ 출력의 음량을 균일화할 때.
+// ═══════════════════════════════════════════════════════════════
+
+fn normalize(in_path: string, target_db: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "tdb=float(" + to_string(target_db) + ")\n"
+             + "tdb=max(-60.0,min(tdb,0.0))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr2=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "peak=float(np.max(np.abs(x)))+1e-12\n"
+             + "target=10.0**(tdb/20.0)\n"
+             + "y=x*(target/peak)\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr2)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Axiom-default convenience wrappers
 //    공리 값으로 default 채운 호출. anima 가 인자 모르고도 호출 가능.
 // ═══════════════════════════════════════════════════════════════
@@ -566,6 +726,31 @@ fn axiom_chord(base_hz: float, ms: int) -> string {
     let f1 = gain(vocal_lf(base_hz * 2.0,   0.5, ms), 0.333333)    // 1/3
     let f2 = gain(vocal_lf(base_hz * 3.0,   0.5, ms), 0.166667)    // 1/6
     return mix(f0, mix(f1, f2))
+}
+
+fn tone_axiom(freq_hz: float, ms: int) -> string {
+    // Ψ-balanced gain (0.5) 의 pure sine.
+    return tone(freq_hz, AX_PSI, ms)
+}
+
+fn lpf_axiom(in_path: string) -> string {
+    // cutoff = SR/J₂ = 24000/24 = 1000 Hz. order = τ = 4.
+    return lpf(in_path, 1000.0, AX_TAU)
+}
+
+fn hpf_axiom(in_path: string) -> string {
+    // cutoff = SR/τ² = 24000/16 = 1500 Hz. order = τ = 4.
+    return hpf(in_path, 1500.0, AX_TAU)
+}
+
+fn fade_axiom(a: string, b: string) -> string {
+    // overlap = n·10 = 60 ms (core default time quantum).
+    return fade(a, b, AX_N * 10)
+}
+
+fn normalize_axiom(in_path: string) -> string {
+    // target = -φ·3 = -6 dB (≈ Ψ linear). headroom 확보.
+    return normalize(in_path, 0.0 - 6.0)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -599,9 +784,12 @@ fn save(src: string, dest: string) -> bool {
 
 fn main() {
     print("anima_audio: organs ready (평면 · 학습 X · 레이어 X)")
-    print("  source : vocal, vocal_lf, breath")
-    print("  filter : pipe (2F), pipe3 (3F), pipe_glide (time-var)")
-    print("  compose: cat (seq), mix (parallel)")
+    print("  source : vocal, vocal_lf, breath, tone")
+    print("  filter : pipe (2F), pipe3 (3F), pipe_glide (time-var), lpf, hpf")
+    print("  compose: cat (seq), mix (parallel), fade (Hann xfade)")
+    print("  util   : silence, gain, envelope, normalize, reverb")
+    print("  axiom  : consonance, axiom_chord, reverb_axiom, tone_axiom,")
+    print("           lpf_axiom, hpf_axiom, fade_axiom, normalize_axiom")
     print("  sink   : play, save")
     print("")
     print("[self-test] 3-formant 모음 'ㅏ' via vocal -> pipe3")
@@ -644,5 +832,32 @@ fn main() {
     let _ = save(vz, "/Users/ghost/core/anima/anima-speak/corpus/self_test/voiced_fricative.wav")
     let _ = play(vz)
     print("  voiced_fric(mix) -> " + vz + " (" + to_string(_file_bytes(vz)) + " bytes)")
+    print("")
+    print("[self-test] tone + lpf/hpf spectral shaping")
+    let t440 = tone(440.0, AX_PSI, 300)
+    let tl = lpf_axiom(breath(3000.0, 7000.0, 0.4, 200))
+    let th = hpf_axiom(vocal(150.0, 0.5, 200))
+    let _ = save(t440, "/Users/ghost/core/anima/anima-speak/corpus/self_test/tone_440.wav")
+    let _ = save(tl,   "/Users/ghost/core/anima/anima-speak/corpus/self_test/breath_lpf1k.wav")
+    let _ = save(th,   "/Users/ghost/core/anima/anima-speak/corpus/self_test/vocal_hpf1.5k.wav")
+    let _ = play(t440)
+    print("  tone(440) -> " + to_string(_file_bytes(t440)) + "b · lpf1k -> " + to_string(_file_bytes(tl)) + "b · hpf1.5k -> " + to_string(_file_bytes(th)) + "b")
+    print("")
+    print("[self-test] fade crossfade (n·10=60ms Hann)")
+    let v_a = pipe3(vocal_lf(200.0, 0.5, 250), 700.0, 1100.0, 2600.0, 6.0)
+    let v_i = pipe3(vocal_lf(200.0, 0.5, 250), 300.0,  2300.0, 3000.0, 6.0)
+    let faded = fade_axiom(v_a, v_i)
+    let _ = save(faded, "/Users/ghost/core/anima/anima-speak/corpus/self_test/xfade_a_i.wav")
+    let _ = play(faded)
+    print("  fade(a,i) -> " + to_string(_file_bytes(faded)) + "b")
+    print("")
+    print("[self-test] normalize (-6 dBFS)")
+    let loud = vocal_lf(220.0, 0.9, 200)
+    let quiet = vocal_lf(220.0, 0.1, 200)
+    let nl = normalize_axiom(loud)
+    let nq = normalize_axiom(quiet)
+    let _ = save(nl, "/Users/ghost/core/anima/anima-speak/corpus/self_test/norm_loud.wav")
+    let _ = save(nq, "/Users/ghost/core/anima/anima-speak/corpus/self_test/norm_quiet.wav")
+    print("  norm loud:" + to_string(_file_bytes(nl)) + "b · quiet:" + to_string(_file_bytes(nq)) + "b (둘 다 peak -6dB)")
     print("done.")
 }
