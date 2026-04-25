@@ -34,14 +34,12 @@
 //   2  setup/config problem
 //   3  ERROR (resolve failed — non-stuck)
 //
-// CHAIN NESTING (airgenome hook CLI-ONLY, graceful skip if unavailable)
-//   parent      ps-<problem_sha8>-<YYYYMMDD>         roadmap
-//   step N      ps-<problem_sha8>-<YYYYMMDD>-s<N>    roadmap (inside parent)
-//   step PASS:  touch(last_stable sha=<before>) + touch(finding result_sha=<sha>)
-//               + release(step N done)
-//   step FAIL:  touch(failure retry=N reason=...) + touch(last_stable sha=... for rollback)
-//   stuck (retry>3): touch(note stuck at step N) + exit 1 (sub/parent remain active)
-//   ps_10 PASS → parent release "cl-rotate complete sha=<milestone_sha>"
+// RETRY / ROLLBACK SEMANTICS
+//   parent     ps-<problem_sha8>-<YYYYMMDD>          in-memory step group id
+//   step N     ps-<problem_sha8>-<YYYYMMDD>-s<N>     per-step sub group id
+//   step PASS: record last-known-good before_sha + result_sha=h(issue|step|sha)
+//   step FAIL: retry up to 3 times (in-memory counter, raw-audit logged)
+//   stuck (retry>3): emit step_stuck audit entry + exit 1 (operator escalation)
 //
 // RULES
 //   raw#1  chflags uchg (step 9, milestone landing)
@@ -50,11 +48,6 @@
 //   raw#11 snake_case filenames
 //   raw#15 config-driven (config/problem_solving_protocol_config.json)
 //   recursion_guard: 자기 issue SSOT scan 제외
-//
-// AIRGENOME STATE DISCIPLINE
-//   모든 hook state 변경은 오직 `airgenome hook <sub>` CLI 경유 (또는 향후
-//   hexa-lang/tool/airgenome_hook.hexa wrapper). airgenome 바이너리 부재 시
-//   모든 hook 호출은 no-op (graceful skip) — ps-protocol 자체는 정상 동작.
 
 let DEFAULT_CONFIG = "/Users/ghost/core/anima/config/problem_solving_protocol_config.json"
 
@@ -121,57 +114,15 @@ fn _git_head(cwd: string) -> string {
     return out
 }
 
-// ─── airgenome hook CLI (chain nesting / touch / release) ────────────
+// ─── chain id helpers (in-memory group keys, raw-audit detail) ───────
 //
-// CLI-ONLY: every state mutation routes through `airgenome hook <sub>`.
-// Graceful skip when the binary is absent or the `hook` subcommand
-// returns non-zero (raw#15 no-hardcode, raw#9 hexa-only).
+// Chain ids are NOT externalized; they exist purely as raw-audit + selftest
+// grouping keys. Keeps the orchestrator deterministic without coupling to
+// any external state daemon (raw#15 no-hardcode).
 //
-// Sub-chain naming:
+// Naming:
 //   parent   ps-<problem_sha8>-<YYYYMMDD>
 //   child N  ps-<problem_sha8>-<YYYYMMDD>-s<N>
-
-fn _ag_bin() -> string {
-    let ov = to_string(env("AIRGENOME_BIN")).trim()
-    if ov != "" {
-        let chk = _exec_out("test -x " + _sh_quote(ov) + " && echo 1 || echo 0").trim()
-        if chk == "1" { return ov }
-        return ""
-    }
-    let w = _exec_out("command -v airgenome 2>/dev/null").trim()
-    return w
-}
-
-fn _ag_available() -> bool {
-    let bin = _ag_bin()
-    if bin == "" { return false }
-    let rc = _exec_code(_sh_quote(bin) + " hook status >/dev/null 2>&1")
-    return rc == 0
-}
-
-fn _ag_activate(chain: string, seed: string, command: string) -> bool {
-    let bin = _ag_bin()
-    if bin == "" { return false }
-    let cmd = _sh_quote(bin) + " hook activate " + _sh_quote(chain) + " " +
-              _sh_quote(seed) + " " + _sh_quote(command) + " >/dev/null 2>&1"
-    return _exec_code(cmd) == 0
-}
-
-fn _ag_touch(chain: string, kind: string, payload: string) -> bool {
-    let bin = _ag_bin()
-    if bin == "" { return false }
-    let cmd = _sh_quote(bin) + " hook touch " + _sh_quote(chain) + " " +
-              _sh_quote(kind) + " " + _sh_quote(payload) + " >/dev/null 2>&1"
-    return _exec_code(cmd) == 0
-}
-
-fn _ag_release(chain: string, reason: string) -> bool {
-    let bin = _ag_bin()
-    if bin == "" { return false }
-    let cmd = _sh_quote(bin) + " hook release " + _sh_quote(chain) + " " +
-              _sh_quote(reason) + " >/dev/null 2>&1"
-    return _exec_code(cmd) == 0
-}
 
 fn _problem_sha8(problem: string) -> string {
     let full = _sha256_of_string(problem)
@@ -516,18 +467,17 @@ fn _raw_audit_append(cfg, action: string, issue_id: string, step_n: int, detail:
 
 // ─── resolve: run steps 1-10 sequentially for an issue ───────────────
 //
-// Chain nesting (CLI-ONLY via `airgenome hook`):
-//   parent  = ps-<problem_sha8>-<YYYYMMDD>        activated once at start
-//   step N  = ps-<problem_sha8>-<YYYYMMDD>-s<N>   per-step sub-chain
+// Chain ids (in-memory only — used for raw-audit detail keys + selftest):
+//   parent  = ps-<problem_sha8>-<YYYYMMDD>
+//   step N  = ps-<problem_sha8>-<YYYYMMDD>-s<N>
 //
 // Retry counter (in-memory per step): retry_count ∈ {0..3}
-//   rc != 0 → retry_count++, touch(kind=failure, payload="retry=N reason=...")
-//   retry > 3 → touch(kind=note, payload="stuck at <step>") + exit 1
+//   rc != 0 → retry_count++, raw-audit(step_exec, retry=N)
+//   retry > 3 → raw-audit(step_stuck) + exit 1
 //
-// last-stable-touch (rollback points):
-//   each step records git HEAD before execution (last_known_good_sha)
-//   FAIL → touch(kind=last_stable, payload="sha=<...> for rollback")
-//   PASS steps accumulate time-ordered last_stable entries in findings.jsonl.
+// last-stable rollback hint:
+//   each step records git HEAD before execution; emitted via raw-audit detail
+//   so an operator can roll back the working tree if needed.
 
 fn resolve_issue(cfg, issue_id: string, dry_run: bool) -> int {
     if !_issue_exists(cfg, issue_id) {
@@ -551,11 +501,9 @@ fn resolve_issue(cfg, issue_id: string, dry_run: bool) -> int {
     }
 
     let repo_root = _cfg_str(cfg, "repo_root", "/Users/ghost/core/anima")
-    let ag_ok = _ag_available()
     let parent_chain = _parent_chain_id(problem)
-    if ag_ok {
-        let _ok = _ag_activate(parent_chain, problem, "roadmap")
-    }
+    let _ = _raw_audit_append(cfg, "parent_activate", issue_id, 0,
+                              "chain=" + parent_chain + " problem=" + problem)
 
     let mut s = cur
     let mut last_rc = 0
@@ -569,9 +517,6 @@ fn resolve_issue(cfg, issue_id: string, dry_run: bool) -> int {
         }
 
         let sub_chain = _sub_chain_id(parent_chain, s)
-        if ag_ok {
-            let _a = _ag_activate(sub_chain, "step " + to_string(s), "roadmap")
-        }
 
         // retry loop for this step — bounded by 3 retries
         let mut retry_count = 0
@@ -583,36 +528,30 @@ fn resolve_issue(cfg, issue_id: string, dry_run: bool) -> int {
             rc = run_step(cfg, s, issue_id)
             last_rc = rc
             let _sha = _raw_audit_append(cfg, "step_exec", issue_id, s,
-                                         "rc=" + to_string(rc) + " retry=" + to_string(retry_count))
+                                         "chain=" + sub_chain +
+                                         " rc=" + to_string(rc) +
+                                         " retry=" + to_string(retry_count) +
+                                         " before_sha=" + before_sha)
             if rc == 0 {
-                // PASS — record last_stable rollback point + finding, release sub-chain
                 let result_sha = _sha256_of_string(issue_id + "|" + to_string(s) + "|" + before_sha)
-                if ag_ok {
-                    let _t1 = _ag_touch(sub_chain, "last_stable",
-                                        "sha=" + before_sha + " step=" + to_string(s) + " PASS")
-                    let _t2 = _ag_touch(sub_chain, "finding",
-                                        "result_sha=" + result_sha)
-                    let _r = _ag_release(sub_chain, "step " + to_string(s) + " done")
-                }
+                let _ok = _raw_audit_append(cfg, "step_pass", issue_id, s,
+                                            "chain=" + sub_chain +
+                                            " last_stable=" + before_sha +
+                                            " result_sha=" + result_sha)
                 if s == 10 { milestone_sha = result_sha }
                 done = true
             } else {
                 retry_count = retry_count + 1
-                if ag_ok {
-                    let _tf = _ag_touch(sub_chain, "failure",
-                                        "retry=" + to_string(retry_count) + " reason=rc=" + to_string(rc))
-                    let _tl = _ag_touch(sub_chain, "last_stable",
-                                        "sha=" + before_sha + " for rollback")
-                }
+                let _fl = _raw_audit_append(cfg, "step_fail", issue_id, s,
+                                            "chain=" + sub_chain +
+                                            " retry=" + to_string(retry_count) +
+                                            " rc=" + to_string(rc) +
+                                            " last_stable=" + before_sha)
                 if retry_count > 3 {
                     eprintln("  step " + to_string(s) + " STUCK (retry>" + to_string(3) + ") rc=" + to_string(rc))
-                    if ag_ok {
-                        let _tn = _ag_touch(sub_chain, "note",
-                                            "stuck at step " + to_string(s))
-                        // leave sub-chain active so operator can inspect; also leave parent.
-                    }
                     let _rs = _raw_audit_append(cfg, "step_stuck", issue_id, s,
-                                                "retry=" + to_string(retry_count))
+                                                "chain=" + sub_chain +
+                                                " retry=" + to_string(retry_count))
                     return 1  // escalate — user intervention requested
                 }
                 // otherwise retry in-place
@@ -622,14 +561,13 @@ fn resolve_issue(cfg, issue_id: string, dry_run: bool) -> int {
         s = s + 1
     }
 
-    if ag_ok {
-        let reason = if milestone_sha != "" {
-            "cl-rotate complete sha=" + milestone_sha
-        } else {
-            "cl-rotate complete"
-        }
-        let _r = _ag_release(parent_chain, reason)
+    let close_reason = if milestone_sha != "" {
+        "cl-rotate complete sha=" + milestone_sha
+    } else {
+        "cl-rotate complete"
     }
+    let _close = _raw_audit_append(cfg, "parent_release", issue_id, 0,
+                                   "chain=" + parent_chain + " reason=" + close_reason)
     return last_rc
 }
 
@@ -667,10 +605,10 @@ fn emit_summary(cfg, signals: array, created: array, listed: array) -> string {
 // ─── self-test: chain-nesting + retry + last-stable (mock 10-step) ──
 //
 // Replays the resolve_issue orchestration logic against an injected
-// rc sequence without invoking real sub-tools or airgenome CLI. Writes
-// a deterministic findings.jsonl into a throwaway dir (schema matches
-// airgenome _lifecycle: {ts,kind,payload}). This validates the protocol
-// side — CLI-side state remains owned by airgenome (raw#15 no-hardcode).
+// rc sequence without invoking real sub-tools. Writes a deterministic
+// findings.jsonl per chain id into a throwaway dir using a simple
+// {ts,kind,payload} schema. Validates orchestrator-side retry and
+// last-stable semantics in pure-hexa (no external state daemon).
 
 fn _selftest_findings_path(chain: string, root: string) -> string {
     let dir = root + "/" + chain
