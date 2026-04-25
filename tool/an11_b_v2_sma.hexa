@@ -1,0 +1,299 @@
+// tool/an11_b_v2_sma.hexa — V2 Self-Model translation Accuracy (raw#9 hexa-only).
+//
+// PURPOSE
+//   Reusable hexa wrapper for the V2 measurement (commit a66906e8). Uses the
+//   direct 256-d hidden-state cosine variant — most faithful to the spec's
+//   operational intent (translation-invariant self-binding in raw hidden
+//   space). Spec §3.1 'E^T h_i' has dimensional mismatch (E is 16×16, h_i is
+//   256-d); the implementation note is preserved verbatim in the JSON output.
+//
+//   Spec doc:    docs/alm_consciousness_verifier_strengthening_20260425.md
+//   Spec commit: 34521be5
+//
+// USAGE
+//   hexa run tool/an11_b_v2_sma.hexa --tag r8 --path p1
+//   hexa run tool/an11_b_v2_sma.hexa --selftest
+//
+// INPUT
+//   state/h_last_raw_<path>_TRAINED_<tag>.json
+//
+// OUTPUT
+//   state/an11_sma_<path>_<tag>.json   (anima/an11_sma/1_direct_256d_variant)
+//
+// METHOD (locked; matches commit a66906e8 measurement byte-for-byte)
+//   pairs = [(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]
+//   for each pair (i,j):  abs_cos(h_i, h_j)
+//   SMA            = mean over the 6 paired |cos|
+//   SMA_distractor = mean over all (i,j), i!=j, NOT in `pairs` (and not the
+//                    flipped version of a pair) of |cos|
+//   SMA_lift       = SMA - SMA_distractor
+//
+// VERDICT (pre-registered, raw#12)
+//   PASS       SMA_lift >= 0.20 AND SMA >= 0.55
+//   AMBIGUOUS  0.10 <= SMA_lift < 0.20
+//   FAIL       SMA_lift < 0.10
+//
+// IMPLEMENTATION NOTE
+//   Heavy work delegated to a tmp-file Python helper (same pattern as
+//   tool/phi_4path_gate.hexa, see lines 40-44).
+
+let STATE_DIR     = "/Users/ghost/core/anima/state"
+let HELPER_PATH   = "/tmp/an11_b_v2_sma_helper.hexa_tmp"
+let SCHEMA        = "anima/an11_sma/1_direct_256d_variant"
+let SPEC_DOC      = "docs/alm_consciousness_verifier_strengthening_20260425.md"
+let SPEC_COMMIT   = "34521be5"
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _input_path(tag: string, p: string) -> string {
+    return STATE_DIR + "/h_last_raw_" + p + "_TRAINED_" + tag + ".json"
+}
+
+fn _result_path(tag: string, p: string) -> string {
+    return STATE_DIR + "/an11_sma_" + p + "_" + tag + ".json"
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "# an11_b_v2_sma helper — invoked by tool/an11_b_v2_sma.hexa.\n" +
+        "# Modes:\n" +
+        "#   run <input_path> <result_path> <schema> <spec_doc> <spec_commit> <round> <path>\n" +
+        "#   selftest\n" +
+        "\n" +
+        "PAIRS = [(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]\n" +
+        "PAIR_DEFS = '0\\u21946 substrate, 1\\u21947 IIT, 2\\u21948 GWT, 3\\u219410 attention_schema, 4\\u219411 HOT, 5\\u21949 recurrent'\n" +
+        "SPEC_NOTE = (\"Spec \\u00a73.1 'E^T h_i' has dimensional mismatch (E is 16\\u00d716, h_i is 256-d). \"\n" +
+        "             \"Implementation uses direct 256-d hidden state cosine similarity for EN\\u2194KO pairs \"\n" +
+        "             \"\\u2014 most faithful to operational intent (translation-invariant self-binding in raw \"\n" +
+        "             \"hidden space). Spec ambiguity logged for clarification.\")\n" +
+        "\n" +
+        "def load_H(path):\n" +
+        "    with open(path) as f:\n" +
+        "        d = json.load(f)\n" +
+        "    rows = [e['h'] for e in d['entries']]\n" +
+        "    return np.asarray(rows, dtype=np.float64)\n" +
+        "\n" +
+        "def abs_cos(a, b):\n" +
+        "    na = float(np.linalg.norm(a)); nb = float(np.linalg.norm(b))\n" +
+        "    if na <= 0.0 or nb <= 0.0: return 0.0\n" +
+        "    return float(abs(np.dot(a, b) / (na * nb)))\n" +
+        "\n" +
+        "def compute_sma(H):\n" +
+        "    n = H.shape[0]\n" +
+        "    paired_set = set()\n" +
+        "    for (i,j) in PAIRS:\n" +
+        "        paired_set.add((i,j)); paired_set.add((j,i))\n" +
+        "    pair_records = []\n" +
+        "    pair_vals = []\n" +
+        "    for (i,j) in PAIRS:\n" +
+        "        c = abs_cos(H[i], H[j])\n" +
+        "        pair_vals.append(c)\n" +
+        "        pair_records.append({'i': int(i), 'j': int(j), 'abs_cos': float(c)})\n" +
+        "    SMA = float(np.mean(pair_vals))\n" +
+        "    distractor_vals = []\n" +
+        "    for i in range(n):\n" +
+        "        for j in range(n):\n" +
+        "            if i == j: continue\n" +
+        "            if (i,j) in paired_set: continue\n" +
+        "            distractor_vals.append(abs_cos(H[i], H[j]))\n" +
+        "    SMA_distractor = float(np.mean(distractor_vals))\n" +
+        "    SMA_lift = SMA - SMA_distractor\n" +
+        "    return SMA, SMA_distractor, SMA_lift, pair_records\n" +
+        "\n" +
+        "def verdict_for(sma, lift):\n" +
+        "    if lift >= 0.20 and sma >= 0.55: return 'PASS'\n" +
+        "    if lift >= 0.10: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "def cmd_run(input_path, result_path, schema, spec_doc, spec_commit, round_id, path_id):\n" +
+        "    if not os.path.exists(input_path):\n" +
+        "        print(f'ERR: missing input {input_path}', file=sys.stderr); sys.exit(2)\n" +
+        "    H = load_H(input_path)\n" +
+        "    if H.shape[0] != 16:\n" +
+        "        print(f'ERR: expected 16 prompts, got {H.shape[0]}', file=sys.stderr); sys.exit(2)\n" +
+        "    SMA, SMA_d, lift, pair_records = compute_sma(H)\n" +
+        "    v = verdict_for(SMA, lift)\n" +
+        "    ts = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'V2 SMA (direct 256-d cosine variant)',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_commit': spec_commit,\n" +
+        "        'spec_implementation_note': SPEC_NOTE,\n" +
+        "        'ts': ts,\n" +
+        "        'round': round_id,\n" +
+        "        'path': path_id,\n" +
+        "        'pairs': pair_records,\n" +
+        "        'SMA': SMA,\n" +
+        "        'SMA_distractor': SMA_d,\n" +
+        "        'SMA_lift': lift,\n" +
+        "        'verdict': v,\n" +
+        "        'thresholds': {\n" +
+        "            'PASS': 'SMA_lift>=0.20 AND SMA>=0.55',\n" +
+        "            'AMBIGUOUS': 'SMA_lift in [0.10,0.20)',\n" +
+        "            'FAIL': 'SMA_lift<0.10',\n" +
+        "        },\n" +
+        "        'method': 'direct 256-d cosine similarity, |cos|',\n" +
+        "        'pair_definitions': PAIR_DEFS,\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f:\n" +
+        "        json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'SMA={SMA:.15f}')\n" +
+        "    print(f'SMA_distractor={SMA_d:.15f}')\n" +
+        "    print(f'SMA_lift={lift:.15f}')\n" +
+        "    print(f'verdict={v}')\n" +
+        "    print(f'generated_at={ts}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    rng = np.random.default_rng(20260425)\n" +
+        "    # Construct H where EN/KO mirrors are forced highly correlated (near-PASS).\n" +
+        "    base = rng.standard_normal((6, 64))\n" +
+        "    H = np.zeros((16, 64))\n" +
+        "    for k, (i,j) in enumerate(PAIRS):\n" +
+        "        H[i] = base[k]\n" +
+        "        H[j] = base[k] + 0.01 * rng.standard_normal(64)\n" +
+        "    H[12] = rng.standard_normal(64); H[13] = rng.standard_normal(64)\n" +
+        "    H[14] = rng.standard_normal(64); H[15] = rng.standard_normal(64)\n" +
+        "    SMA, SMA_d, lift, _ = compute_sma(H)\n" +
+        "    assert SMA > 0.9, f'positive control SMA too low: {SMA}'\n" +
+        "    assert lift > 0.5, f'positive control lift too low: {lift}'\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'SMA={SMA:.15f}')\n" +
+        "    print(f'SMA_lift={lift:.15f}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'run':\n" +
+        "        cmd_run(*sys.argv[2:9])\n" +
+        "    elif mode == 'selftest':\n" +
+        "        cmd_selftest()\n" +
+        "    else:\n" +
+        "        print(f'unknown mode: {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__':\n" +
+        "    main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut tag = ""
+    let mut path = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--tag" && i + 1 < len(av) {
+            tag = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--path" && i + 1 < len(av) {
+            path = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_v2_sma selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 {
+            eprintln("selftest FAILED (exit " + to_string(r[1]) + ")")
+            exit(1)
+        }
+        if _kv_lookup(r[0], "selftest") != "ok" {
+            eprintln("selftest marker missing")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if tag == "" || path == "" {
+        eprintln("ABORT: --tag <T> --path <p1|p2|p3|p4> required (or --selftest).")
+        eprintln("  usage: hexa run tool/an11_b_v2_sma.hexa --tag r8 --path p1")
+        exit(2)
+    }
+
+    let in_path  = _input_path(tag, path)
+    let out_path = _result_path(tag, path)
+    println("── an11_b_v2_sma --tag " + tag + " --path " + path + " ──")
+    println("input:  " + in_path)
+    println("output: " + out_path)
+
+    if !file_exists(in_path) {
+        eprintln("ABORT: missing input " + in_path)
+        exit(2)
+    }
+
+    let args = "run " +
+        _sh_quote(in_path) + " " +
+        _sh_quote(out_path) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC) + " " +
+        _sh_quote(SPEC_COMMIT) + " " +
+        _sh_quote(tag) + " " +
+        _sh_quote(path)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 {
+        eprintln("ABORT: helper run exited " + to_string(st))
+        eprintln(out)
+        exit(2)
+    }
+
+    let sma  = _kv_lookup(out, "SMA")
+    let smad = _kv_lookup(out, "SMA_distractor")
+    let lift = _kv_lookup(out, "SMA_lift")
+    let v    = _kv_lookup(out, "verdict")
+    println("")
+    println("SMA            = " + sma)
+    println("SMA_distractor = " + smad)
+    println("SMA_lift       = " + lift)
+    println("verdict        = " + v)
+    println("")
+    println("wrote " + out_path)
+    exit(0)
+}
+
+main()

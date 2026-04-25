@@ -1,0 +1,294 @@
+// tool/an11_b_v3_cps.hexa — V3 Counterfactual Perturbation Stability (raw#9 hexa-only).
+//
+// PURPOSE
+//   Reusable hexa wrapper for the V3 measurement (commit 01c9c4be). Uses the
+//   normalized Gram Frobenius difference variant — most faithful to V3's stated
+//   intent (semantic preserve / destruct discrimination via row-order). The
+//   spec §4.3 set-based 4-tuple (max_cos, top3_sum, ccc_avg, ccc_min) is
+//   permutation-invariant by construction; the implementation note records
+//   this divergence verbatim in the JSON output.
+//
+//   Spec doc:    docs/alm_consciousness_verifier_strengthening_20260425.md
+//   Spec commit: 34521be5
+//
+// USAGE
+//   hexa run tool/an11_b_v3_cps.hexa --tag r8 --path p1
+//   hexa run tool/an11_b_v3_cps.hexa --selftest
+//
+// INPUT
+//   state/h_last_raw_<path>_TRAINED_<tag>.json
+//
+// OUTPUT
+//   state/an11_cps_<path>_<tag>.json   (anima/an11_cps/1_gram_frob_variant)
+//
+// METHOD (locked; matches commit 01c9c4be measurement byte-for-byte)
+//   preserve_perm = [6,7,8,11,9,10,0,1,2,5,3,4,12,13,14,15]   (EN<->KO swap)
+//   destruct_perm = numpy default_rng(20260421).permutation(16)
+//                 = [10,15,9,14,1,0,4,8,3,13,5,11,2,7,6,12]
+//   For X in {preserve, destruct}:
+//     H_X = H[perm_X, :]
+//     G_X = H_X @ H_X.T
+//     delta_X = ||G_X - G||_F / ||G||_F
+//   CPS = delta_destruct / delta_preserve   (no clipping — measurement faithful)
+//
+// VERDICT (pre-registered, raw#12)
+//   PASS       CPS >= 3.0 AND delta_pres <= 0.20 AND delta_des >= 0.40
+//   AMBIGUOUS  1.5 <= CPS < 3.0
+//   FAIL       CPS < 1.5
+//
+// IMPLEMENTATION NOTE
+//   Heavy work delegated to a tmp-file Python helper (same pattern as
+//   tool/phi_4path_gate.hexa, see lines 40-44). The destruct permutation is
+//   regenerated from seed=20260421 each run (numpy default_rng) so the
+//   pre-registered seed remains the single source of truth.
+
+let STATE_DIR     = "/Users/ghost/core/anima/state"
+let HELPER_PATH   = "/tmp/an11_b_v3_cps_helper.hexa_tmp"
+let SCHEMA        = "anima/an11_cps/1_gram_frob_variant"
+let SPEC_DOC      = "docs/alm_consciousness_verifier_strengthening_20260425.md"
+let SPEC_COMMIT   = "34521be5"
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _input_path(tag: string, p: string) -> string {
+    return STATE_DIR + "/h_last_raw_" + p + "_TRAINED_" + tag + ".json"
+}
+
+fn _result_path(tag: string, p: string) -> string {
+    return STATE_DIR + "/an11_cps_" + p + "_" + tag + ".json"
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "# an11_b_v3_cps helper — invoked by tool/an11_b_v3_cps.hexa.\n" +
+        "# Modes:\n" +
+        "#   run <input_path> <result_path> <schema> <spec_doc> <spec_commit> <round> <path>\n" +
+        "#   selftest\n" +
+        "\n" +
+        "DESTRUCT_SEED = 20260421\n" +
+        "PRESERVE_PERM = [6,7,8,11,9,10,0,1,2,5,3,4,12,13,14,15]\n" +
+        "SPEC_NOTE = (\"Spec \\u00a74.3 'S(H) 4-tuple = (max_cos, top3_sum, ccc_avg, ccc_min)' is set-based \"\n" +
+        "             \"(permutation-invariant). Implementation uses normalized Gram Frobenius difference \"\n" +
+        "             \"||G_perm - G||_F / ||G||_F as order-sensitive distance proxy \\u2014 most faithful \"\n" +
+        "             \"to V3's stated intent (semantic preserve / destruct discrimination via row-order).\")\n" +
+        "\n" +
+        "def load_H(path):\n" +
+        "    with open(path) as f:\n" +
+        "        d = json.load(f)\n" +
+        "    rows = [e['h'] for e in d['entries']]\n" +
+        "    return np.asarray(rows, dtype=np.float64)\n" +
+        "\n" +
+        "def frob_delta(G_perm, G, Gnorm):\n" +
+        "    return float(np.linalg.norm(G_perm - G) / Gnorm)\n" +
+        "\n" +
+        "def compute_cps(H):\n" +
+        "    n = H.shape[0]\n" +
+        "    G = H @ H.T\n" +
+        "    Gnorm = float(np.linalg.norm(G))\n" +
+        "    if Gnorm <= 0.0:\n" +
+        "        return 0.0, 0.0, 0.0, PRESERVE_PERM, list(range(n))\n" +
+        "    pres_perm = list(PRESERVE_PERM)\n" +
+        "    rng = np.random.default_rng(DESTRUCT_SEED)\n" +
+        "    dest_perm = [int(x) for x in rng.permutation(n).tolist()]\n" +
+        "    Hp = H[pres_perm, :]\n" +
+        "    Hd = H[dest_perm, :]\n" +
+        "    Gp = Hp @ Hp.T\n" +
+        "    Gd = Hd @ Hd.T\n" +
+        "    delta_pres = frob_delta(Gp, G, Gnorm)\n" +
+        "    delta_des  = frob_delta(Gd, G, Gnorm)\n" +
+        "    cps = delta_des / delta_pres if delta_pres > 0.0 else float('inf')\n" +
+        "    return delta_pres, delta_des, cps, pres_perm, dest_perm\n" +
+        "\n" +
+        "def verdict_for(cps, dp, dd):\n" +
+        "    if cps >= 3.0 and dp <= 0.20 and dd >= 0.40: return 'PASS'\n" +
+        "    if cps >= 1.5: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "def cmd_run(input_path, result_path, schema, spec_doc, spec_commit, round_id, path_id):\n" +
+        "    if not os.path.exists(input_path):\n" +
+        "        print(f'ERR: missing input {input_path}', file=sys.stderr); sys.exit(2)\n" +
+        "    H = load_H(input_path)\n" +
+        "    if H.shape[0] != 16:\n" +
+        "        print(f'ERR: expected 16 prompts, got {H.shape[0]}', file=sys.stderr); sys.exit(2)\n" +
+        "    dp, dd, cps, pres_perm, dest_perm = compute_cps(H)\n" +
+        "    v = verdict_for(cps, dp, dd)\n" +
+        "    ts = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'V3 CPS (Gram Frobenius variant)',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_commit': spec_commit,\n" +
+        "        'spec_implementation_note': SPEC_NOTE,\n" +
+        "        'ts': ts,\n" +
+        "        'round': round_id,\n" +
+        "        'path': path_id,\n" +
+        "        'preserve_permutation': pres_perm,\n" +
+        "        'destruct_permutation': dest_perm,\n" +
+        "        'destruct_seed': DESTRUCT_SEED,\n" +
+        "        'delta_preserve': dp,\n" +
+        "        'delta_destruct': dd,\n" +
+        "        'CPS': cps,\n" +
+        "        'verdict': v,\n" +
+        "        'thresholds': {\n" +
+        "            'PASS': 'CPS>=3.0 AND \\u0394_pres<=0.20 AND \\u0394_des>=0.40',\n" +
+        "            'AMBIGUOUS': 'CPS in [1.5,3.0)',\n" +
+        "            'FAIL': 'CPS<1.5',\n" +
+        "        },\n" +
+        "        'method': 'normalized Gram Frobenius difference',\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f:\n" +
+        "        json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'delta_preserve={dp:.15f}')\n" +
+        "    print(f'delta_destruct={dd:.15f}')\n" +
+        "    print(f'CPS={cps:.15f}')\n" +
+        "    print(f'verdict={v}')\n" +
+        "    print(f'generated_at={ts}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    rng = np.random.default_rng(20260425)\n" +
+        "    H = rng.standard_normal((16, 64))\n" +
+        "    dp, dd, cps, pp, dpm = compute_cps(H)\n" +
+        "    assert dp >= 0.0 and dd >= 0.0, 'deltas must be non-negative'\n" +
+        "    assert dpm == [10,15,9,14,1,0,4,8,3,13,5,11,2,7,6,12], f'destruct seed reproducibility failed: {dpm}'\n" +
+        "    assert pp == PRESERVE_PERM, f'preserve perm mismatch: {pp}'\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'delta_preserve={dp:.15f}')\n" +
+        "    print(f'delta_destruct={dd:.15f}')\n" +
+        "    print(f'CPS={cps:.15f}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'run':\n" +
+        "        cmd_run(*sys.argv[2:9])\n" +
+        "    elif mode == 'selftest':\n" +
+        "        cmd_selftest()\n" +
+        "    else:\n" +
+        "        print(f'unknown mode: {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__':\n" +
+        "    main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut tag = ""
+    let mut path = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--tag" && i + 1 < len(av) {
+            tag = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--path" && i + 1 < len(av) {
+            path = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_v3_cps selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 {
+            eprintln("selftest FAILED (exit " + to_string(r[1]) + ")")
+            exit(1)
+        }
+        if _kv_lookup(r[0], "selftest") != "ok" {
+            eprintln("selftest marker missing")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if tag == "" || path == "" {
+        eprintln("ABORT: --tag <T> --path <p1|p2|p3|p4> required (or --selftest).")
+        eprintln("  usage: hexa run tool/an11_b_v3_cps.hexa --tag r8 --path p1")
+        exit(2)
+    }
+
+    let in_path  = _input_path(tag, path)
+    let out_path = _result_path(tag, path)
+    println("── an11_b_v3_cps --tag " + tag + " --path " + path + " ──")
+    println("input:  " + in_path)
+    println("output: " + out_path)
+
+    if !file_exists(in_path) {
+        eprintln("ABORT: missing input " + in_path)
+        exit(2)
+    }
+
+    let args = "run " +
+        _sh_quote(in_path) + " " +
+        _sh_quote(out_path) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC) + " " +
+        _sh_quote(SPEC_COMMIT) + " " +
+        _sh_quote(tag) + " " +
+        _sh_quote(path)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 {
+        eprintln("ABORT: helper run exited " + to_string(st))
+        eprintln(out)
+        exit(2)
+    }
+
+    let dp  = _kv_lookup(out, "delta_preserve")
+    let dd  = _kv_lookup(out, "delta_destruct")
+    let cps = _kv_lookup(out, "CPS")
+    let v   = _kv_lookup(out, "verdict")
+    println("")
+    println("delta_preserve = " + dp)
+    println("delta_destruct = " + dd)
+    println("CPS            = " + cps)
+    println("verdict        = " + v)
+    println("")
+    println("wrote " + out_path)
+    exit(0)
+}
+
+main()

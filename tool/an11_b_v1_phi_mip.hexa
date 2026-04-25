@@ -1,0 +1,290 @@
+// tool/an11_b_v1_phi_mip.hexa — V1 IIT-Φ_mip partition surrogate (raw#9 hexa-only).
+//
+// PURPOSE
+//   Reusable hexa wrapper for the V1 measurement that was implemented ad-hoc
+//   via inline Python in 2026-04-25 (commit 5bdd0cd0). Promotes the ad-hoc
+//   measurement to a pre-registered, repeatable hexa tool so future rounds
+//   (r9+) can re-measure with one command.
+//
+//   Spec doc:    docs/alm_consciousness_verifier_strengthening_20260425.md
+//   Spec commit: 34521be5
+//
+// USAGE
+//   hexa run tool/an11_b_v1_phi_mip.hexa --tag r8 --path p1
+//   hexa run tool/an11_b_v1_phi_mip.hexa --selftest
+//
+// INPUT
+//   state/h_last_raw_<path>_TRAINED_<tag>.json   (h_last_raw schema/2)
+//
+// OUTPUT
+//   state/an11_phi_mip_<path>_<tag>.json         (anima/an11_phi_mip/1)
+//
+// METHOD (locked; matches commit 5bdd0cd0 measurement byte-for-byte)
+//   H = stack(entries[].h)             # 16 × 256
+//   G = H @ H.T                         # 16 × 16
+//   for each balanced bipartition S, |S|=8 (C(16,8)=12870):
+//     L_part(S) = sum of squared off-block entries of G under split (S, S^c)
+//     phi_S     = L_part(S) / ||G||_F^2
+//   Phi_mip = min phi_S
+//   argmin_S  = sorted indices of S achieving the minimum (lex first on tie)
+//
+// VERDICT (pre-registered, raw#12)
+//   PASS       Phi_mip >= 0.55
+//   AMBIGUOUS  0.45 <= Phi_mip < 0.55
+//   FAIL       Phi_mip < 0.45
+//
+// IMPLEMENTATION NOTE
+//   Hexa-lang lacks numpy / itertools and the C(16,8) inner loop is hot, so
+//   the heavy work runs in a tmp-file Python helper (same pattern as
+//   tool/phi_4path_gate.hexa, see lines 40-44 of that tool). The hexa side
+//   does arg parsing, input existence checks, helper invocation, and KV
+//   summary printing.
+
+let STATE_DIR     = "/Users/ghost/core/anima/state"
+let HELPER_PATH   = "/tmp/an11_b_v1_phi_mip_helper.hexa_tmp"
+let SCHEMA        = "anima/an11_phi_mip/1"
+let SPEC_DOC      = "docs/alm_consciousness_verifier_strengthening_20260425.md"
+let SPEC_COMMIT   = "34521be5"
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _input_path(tag: string, p: string) -> string {
+    return STATE_DIR + "/h_last_raw_" + p + "_TRAINED_" + tag + ".json"
+}
+
+fn _result_path(tag: string, p: string) -> string {
+    return STATE_DIR + "/an11_phi_mip_" + p + "_" + tag + ".json"
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime, itertools\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "# an11_b_v1_phi_mip helper — invoked by tool/an11_b_v1_phi_mip.hexa.\n" +
+        "# Modes:\n" +
+        "#   run <input_path> <result_path> <schema> <spec_doc> <spec_commit> <round> <path>\n" +
+        "#   selftest\n" +
+        "\n" +
+        "PASS_T = 0.55\n" +
+        "FAIL_T = 0.45\n" +
+        "\n" +
+        "def load_H(path):\n" +
+        "    with open(path) as f:\n" +
+        "        d = json.load(f)\n" +
+        "    rows = [e['h'] for e in d['entries']]\n" +
+        "    return np.asarray(rows, dtype=np.float64)\n" +
+        "\n" +
+        "def compute_phi_mip(H):\n" +
+        "    G = H @ H.T\n" +
+        "    n = G.shape[0]\n" +
+        "    G2 = G * G\n" +
+        "    Gnorm2 = float(G2.sum())\n" +
+        "    if Gnorm2 <= 0.0:\n" +
+        "        return 0.0, list(range(n // 2))\n" +
+        "    half = n // 2\n" +
+        "    indices = list(range(n))\n" +
+        "    best = None\n" +
+        "    best_S = None\n" +
+        "    for S in itertools.combinations(indices, half):\n" +
+        "        S_set = set(S)\n" +
+        "        # off-block mass = full mass - in-block mass\n" +
+        "        # in-block mass = sum G2[i,j] for i,j both in S OR both in S^c\n" +
+        "        S_idx = np.array(S, dtype=np.intp)\n" +
+        "        Sc_idx = np.array([i for i in indices if i not in S_set], dtype=np.intp)\n" +
+        "        in_block = float(G2[np.ix_(S_idx, S_idx)].sum()) + float(G2[np.ix_(Sc_idx, Sc_idx)].sum())\n" +
+        "        L_part = Gnorm2 - in_block\n" +
+        "        phi_S = L_part / Gnorm2\n" +
+        "        if best is None or phi_S < best:\n" +
+        "            best = phi_S\n" +
+        "            best_S = sorted(S)\n" +
+        "    return float(best), [int(x) for x in best_S]\n" +
+        "\n" +
+        "def verdict_for(phi):\n" +
+        "    if phi >= PASS_T: return 'PASS'\n" +
+        "    if phi >= FAIL_T: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "def cmd_run(input_path, result_path, schema, spec_doc, spec_commit, round_id, path_id):\n" +
+        "    if not os.path.exists(input_path):\n" +
+        "        print(f'ERR: missing input {input_path}', file=sys.stderr); sys.exit(2)\n" +
+        "    H = load_H(input_path)\n" +
+        "    n = H.shape[0]\n" +
+        "    if n != 16:\n" +
+        "        print(f'ERR: expected 16 prompts, got {n}', file=sys.stderr); sys.exit(2)\n" +
+        "    phi, S_star = compute_phi_mip(H)\n" +
+        "    v = verdict_for(phi)\n" +
+        "    ts = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'V1 IIT-Phi_mip partition surrogate',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_commit': spec_commit,\n" +
+        "        'ts': ts,\n" +
+        "        'round': round_id,\n" +
+        "        'path': path_id,\n" +
+        "        'phi_mip': phi,\n" +
+        "        'argmin_S': S_star,\n" +
+        "        'verdict': v,\n" +
+        "        'thresholds': {\n" +
+        "            'PASS': '>=0.55',\n" +
+        "            'AMBIGUOUS': '0.45-0.55',\n" +
+        "            'FAIL': '<0.45',\n" +
+        "        },\n" +
+        "        'n_partitions_enumerated': 12870,\n" +
+        "        'measurement_method': 'all C(16,8)=12870 balanced bipartitions, min L_part(S)/||G||_F^2',\n" +
+        "        'raw_compliance': [\n" +
+        "            'raw#9 deterministic',\n" +
+        "            'raw#10 proof-carrying',\n" +
+        "            'raw#12 pre-registered',\n" +
+        "            'raw#15 no-hardcode',\n" +
+        "        ],\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f:\n" +
+        "        json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'phi_mip={phi:.15f}')\n" +
+        "    print(f'verdict={v}')\n" +
+        "    print(f'argmin_S={\",\".join(str(x) for x in S_star)}')\n" +
+        "    print(f'generated_at={ts}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    rng = np.random.default_rng(20260425)\n" +
+        "    H = rng.standard_normal((16, 32))\n" +
+        "    phi, S = compute_phi_mip(H)\n" +
+        "    assert 0.0 <= phi <= 1.0, f'phi out of [0,1]: {phi}'\n" +
+        "    assert len(S) == 8, f'argmin |S|!=8: {len(S)}'\n" +
+        "    assert sorted(S) == S, 'argmin S not sorted'\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'phi_mip={phi:.15f}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'run':\n" +
+        "        cmd_run(*sys.argv[2:9])\n" +
+        "    elif mode == 'selftest':\n" +
+        "        cmd_selftest()\n" +
+        "    else:\n" +
+        "        print(f'unknown mode: {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__':\n" +
+        "    main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut tag = ""
+    let mut path = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--tag" && i + 1 < len(av) {
+            tag = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--path" && i + 1 < len(av) {
+            path = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_v1_phi_mip selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 {
+            eprintln("selftest FAILED (exit " + to_string(r[1]) + ")")
+            exit(1)
+        }
+        if _kv_lookup(r[0], "selftest") != "ok" {
+            eprintln("selftest marker missing")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if tag == "" || path == "" {
+        eprintln("ABORT: --tag <T> --path <p1|p2|p3|p4> required (or --selftest).")
+        eprintln("  usage: hexa run tool/an11_b_v1_phi_mip.hexa --tag r8 --path p1")
+        exit(2)
+    }
+
+    let in_path = _input_path(tag, path)
+    let out_path = _result_path(tag, path)
+    println("── an11_b_v1_phi_mip --tag " + tag + " --path " + path + " ──")
+    println("input:  " + in_path)
+    println("output: " + out_path)
+
+    if !file_exists(in_path) {
+        eprintln("ABORT: missing input " + in_path)
+        exit(2)
+    }
+
+    let args = "run " +
+        _sh_quote(in_path) + " " +
+        _sh_quote(out_path) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC) + " " +
+        _sh_quote(SPEC_COMMIT) + " " +
+        _sh_quote(tag) + " " +
+        _sh_quote(path)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 {
+        eprintln("ABORT: helper run exited " + to_string(st))
+        eprintln(out)
+        exit(2)
+    }
+
+    let phi = _kv_lookup(out, "phi_mip")
+    let v   = _kv_lookup(out, "verdict")
+    let am  = _kv_lookup(out, "argmin_S")
+    println("")
+    println("phi_mip  = " + phi)
+    println("argmin_S = " + am)
+    println("verdict  = " + v)
+    println("")
+    println("wrote " + out_path)
+    exit(0)
+}
+
+main()
