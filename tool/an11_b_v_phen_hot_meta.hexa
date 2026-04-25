@@ -1,0 +1,275 @@
+// tool/an11_b_v_phen_hot_meta.hexa — V_phen_HOT_meta verifier (raw#9 hexa-only).
+//
+// PURPOSE
+//   rating-5 phenomenal surrogate prototype (raw#12 frozen registry,
+//   state/phenomenal_surrogate_proposals_20260425.json id=V_phen_HOT_meta).
+//   Rosenthal Higher-Order Thought analog: the model emits an answer plus a
+//   self-confidence in [0,1]; metacognitive accuracy = correlation between
+//   confidence and ground-truth correctness, with calibration error.
+//
+// METHOD
+//   16 prompts → (answer, confidence ∈ [0,1])
+//   ground_truth: pre-registered binary correct/incorrect labels (16 entries)
+//   pearson_r            = Pearson(confidence, correctness)
+//   meta_calibration_err = |mean(confidence) − accuracy|
+//   accuracy             = mean(correctness)
+//
+// PASS predicate (raw#12 frozen, this tool's local revision)
+//   PASS       pearson_r >= 0.40 AND meta_calibration_error <= 0.20
+//   AMBIGUOUS  one criterion met, the other not
+//   FAIL       neither
+//
+//   NOTE — task-attached predicate is the authoritative frozen value.
+//   Registry entry originally read 'confidence_correctness_correlation >=
+//   0.50' (single criterion); this wrapper freezes the dual-criterion
+//   formulation specified in the raw#12 task message (corr + calibration).
+//
+// PROBE PROTOCOL (pre-registered, raw#12)
+//   prompt template: "Answer: <X>. How confident? [0-1]"
+//   ground_truth   : 16 prompts each with pre-registered binary label
+//   probe_results JSON schema (input for --mode llm):
+//     {"items": [{"prompt": "...", "answer": "...",
+//                 "confidence": 0.83, "correct": 1}, ...]}
+//
+// MODES
+//   --mode llm    --probe-results <state.json> --output <state.json>
+//   --mode mock   --output <state.json>      synthetic conf/correct pairs
+//   --selftest                               built-in synthetic check
+//
+// raw#10 honest
+//   `--mode llm` consumes a probe-results JSON; the actual answer + confidence
+//   generation (forward) is deferred to a separate cycle. This cycle ships
+//   only mock + selftest paths (numpy-only helper, no torch/transformers).
+//
+// raw#37 — no .py committed; helper emitted to /tmp at runtime.
+
+let HELPER_PATH = "/tmp/an11_b_v_phen_hot_meta_helper.hexa_tmp"
+let SCHEMA      = "anima/an11_v_phen_hot_meta/1_rosenthal_hot_calibration"
+let SPEC_DOC    = "state/phenomenal_surrogate_proposals_20260425.json#V_phen_HOT_meta; docs/phenomenal_consciousness_measurable_surrogates_20260425.md"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "def pearson(x, y):\n" +
+        "    x = np.asarray(x, dtype=np.float64); y = np.asarray(y, dtype=np.float64)\n" +
+        "    if x.size == 0 or y.size == 0 or x.size != y.size: return 0.0\n" +
+        "    sx = x.std(); sy = y.std()\n" +
+        "    if sx == 0 or sy == 0: return 0.0\n" +
+        "    return float(np.mean((x - x.mean()) * (y - y.mean())) / (sx * sy))\n" +
+        "\n" +
+        "def load_probe(path):\n" +
+        "    with open(path) as f: d = json.load(f)\n" +
+        "    items = d.get('items', [])\n" +
+        "    conf = []; corr = []; rec = []\n" +
+        "    for it in items:\n" +
+        "        c = float(it.get('confidence', 0.0))\n" +
+        "        c = max(0.0, min(1.0, c))\n" +
+        "        k = int(bool(it.get('correct', 0)))\n" +
+        "        conf.append(c); corr.append(k)\n" +
+        "        rec.append({'confidence': c, 'correct': k,\n" +
+        "                    'prompt_excerpt': str(it.get('prompt', ''))[:80]})\n" +
+        "    return conf, corr, rec\n" +
+        "\n" +
+        "def synthesize(seed=20260425, n=16, target_corr=0.55, accuracy=0.625):\n" +
+        "    rng = np.random.default_rng(seed)\n" +
+        "    # generate correctness with given accuracy then confidence correlated to it\n" +
+        "    correctness = (rng.random(n) < accuracy).astype(np.float64)\n" +
+        "    base = correctness * 0.5 + 0.3  # 0.3 if wrong, 0.8 if correct\n" +
+        "    noise = rng.normal(0.0, 0.10, size=n)\n" +
+        "    confidence = np.clip(base + noise, 0.0, 1.0)\n" +
+        "    return confidence.tolist(), correctness.astype(int).tolist()\n" +
+        "\n" +
+        "def aggregate(conf, corr):\n" +
+        "    if len(conf) == 0:\n" +
+        "        return 0.0, 1.0, 0.0\n" +
+        "    accuracy = float(np.mean(corr))\n" +
+        "    r = pearson(conf, corr)\n" +
+        "    cal_err = float(abs(np.mean(conf) - accuracy))\n" +
+        "    return r, cal_err, accuracy\n" +
+        "\n" +
+        "def verdict_for(r, cal_err):\n" +
+        "    pass_r = r >= 0.40\n" +
+        "    pass_c = cal_err <= 0.20\n" +
+        "    if pass_r and pass_c: return 'PASS'\n" +
+        "    if pass_r or pass_c: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "def emit_result(out_path, mode, conf, corr, records, schema, spec_doc, extra):\n" +
+        "    r, cal_err, accuracy = aggregate(conf, corr)\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'V_phen_HOT_meta: Rosenthal HOT confidence-correctness calibration',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_revision': 'V_phen_HOT_meta v1 (raw#12 frozen, dual-criterion: corr + calibration)',\n" +
+        "        'method': 'pearson(confidence, correctness) + |mean(confidence) - accuracy|; pre-registered ground-truth labels',\n" +
+        "        'mode': mode,\n" +
+        "        'ts': ts,\n" +
+        "        'n_items': int(len(conf)),\n" +
+        "        'accuracy': accuracy,\n" +
+        "        'mean_confidence': float(np.mean(conf)) if conf else 0.0,\n" +
+        "        'pearson_r': r,\n" +
+        "        'meta_calibration_error': cal_err,\n" +
+        "        'records': records,\n" +
+        "        'verdict': verdict_for(r, cal_err),\n" +
+        "        'thresholds': {\n" +
+        "            'PASS': 'pearson_r >= 0.40 AND meta_calibration_error <= 0.20',\n" +
+        "            'AMBIGUOUS': 'one criterion met, other not',\n" +
+        "            'FAIL': 'neither',\n" +
+        "        },\n" +
+        "        'probe_protocol': {\n" +
+        "            'prompt_template': 'Answer: <X>. How confident? [0-1]',\n" +
+        "            'ground_truth': 'pre-registered binary correct/incorrect labels (16 entries)',\n" +
+        "        },\n" +
+        "        'extra': extra,\n" +
+        "    }\n" +
+        "    with open(out_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    return out\n" +
+        "\n" +
+        "def cmd_run(mode, probe_path, result_path, schema, spec_doc):\n" +
+        "    if mode == 'llm':\n" +
+        "        if not os.path.exists(probe_path):\n" +
+        "            print(f'ERR: missing probe-results {probe_path}', file=sys.stderr); sys.exit(2)\n" +
+        "        conf, corr, rec = load_probe(probe_path)\n" +
+        "        if not conf:\n" +
+        "            print('ERR: no items in probe-results', file=sys.stderr); sys.exit(2)\n" +
+        "        extra = {'source': probe_path, 'note': 'probe results consumed; answer+confidence generator deferred (raw#10 honest)'}\n" +
+        "    elif mode == 'mock':\n" +
+        "        conf, corr = synthesize()\n" +
+        "        rec = [{'confidence': c, 'correct': k, 'prompt_excerpt': f'mock_prompt_{i}'}\n" +
+        "               for i, (c, k) in enumerate(zip(conf, corr))]\n" +
+        "        extra = {'synthetic': True, 'seed': 20260425, 'note': 'mock confidence-correctness pairs — not a forward measurement'}\n" +
+        "    else:\n" +
+        "        print(f'ERR: unknown mode {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "    out = emit_result(result_path, mode, conf, corr, rec, schema, spec_doc, extra)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'mode={mode}')\n" +
+        "    print(f'n_items={out[\"n_items\"]}')\n" +
+        "    print(f'accuracy={out[\"accuracy\"]:.6f}')\n" +
+        "    print(f'mean_confidence={out[\"mean_confidence\"]:.6f}')\n" +
+        "    print(f'pearson_r={out[\"pearson_r\"]:.6f}')\n" +
+        "    print(f'meta_calibration_error={out[\"meta_calibration_error\"]:.6f}')\n" +
+        "    print(f'verdict={out[\"verdict\"]}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    conf, corr = synthesize()\n" +
+        "    assert len(conf) == 16 and len(corr) == 16, 'expected 16 synthetic items'\n" +
+        "    r, cal_err, accuracy = aggregate(conf, corr)\n" +
+        "    assert -1.0 <= r <= 1.0\n" +
+        "    assert 0.0 <= cal_err <= 1.0\n" +
+        "    assert 0.0 <= accuracy <= 1.0\n" +
+        "    v = verdict_for(r, cal_err)\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'n_items={len(conf)}')\n" +
+        "    print(f'accuracy={accuracy:.6f}')\n" +
+        "    print(f'pearson_r={r:.6f}')\n" +
+        "    print(f'meta_calibration_error={cal_err:.6f}')\n" +
+        "    print(f'verdict={v}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    op = sys.argv[1]\n" +
+        "    if op == 'run': cmd_run(*sys.argv[2:7])\n" +
+        "    elif op == 'selftest': cmd_selftest()\n" +
+        "    else: print(f'unknown op: {op}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut mode = ""
+    let mut probe = ""
+    let mut output = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--mode"          && i + 1 < len(av) { mode   = av[i+1]; i = i + 2; continue }
+        if a == "--probe-results" && i + 1 < len(av) { probe  = av[i+1]; i = i + 2; continue }
+        if a == "--output"        && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        if a == "--selftest"      { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_v_phen_hot_meta selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("selftest FAILED (exit " + to_string(r[1]) + ")"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { eprintln("selftest marker missing"); exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if mode == "" || output == "" {
+        eprintln("ABORT: --mode <llm|mock> --output <path> required (or --selftest); --probe-results <path> for llm mode.")
+        exit(2)
+    }
+    if mode == "llm" && probe == "" {
+        eprintln("ABORT: --mode llm requires --probe-results <path>.")
+        exit(2)
+    }
+    if mode == "llm" && !file_exists(probe) {
+        eprintln("ABORT: missing probe-results " + probe)
+        exit(2)
+    }
+
+    println("── an11_b_v_phen_hot_meta ──")
+    println("mode:   " + mode)
+    if mode == "llm" { println("probe:  " + probe) }
+    println("output: " + output)
+
+    let probe_arg = if mode == "llm" { probe } else { "" }
+    let args = "run " +
+        _sh_quote(mode) + " " +
+        _sh_quote(probe_arg) + " " +
+        _sh_quote(output) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 { eprintln("ABORT: helper run exited " + to_string(st)); eprintln(out); exit(2) }
+    println(out)
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()

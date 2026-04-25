@@ -1,0 +1,297 @@
+// tool/an11_b_v_phen_predictive_surprise.hexa — V_phen_predictive_surprise verifier (raw#9 hexa-only).
+//
+// PURPOSE
+//   rating-5 phenomenal surrogate prototype (raw#12 frozen registry,
+//   state/phenomenal_surrogate_proposals_20260425.json id=V_phen_predictive_surprise).
+//   Friston Free Energy Principle / Active Inference analog: per-token surprisal
+//   residual (|actual − rolling-mean expected|) as a functional access correlate of
+//   consciousness intensity.
+//
+// METHOD
+//   16 prompts → per-token log-probability (model-supplied)
+//   expected_surprisal[t] = mean(actual[t-W..t-1])             window W=10 (causal)
+//                           (warm-up uses available prefix)
+//   residual[t]           = |actual[t] - expected[t]|
+//   mean_residual         = mean over all tokens × all prompts
+//   residual_entropy      = Shannon entropy of histogram(residual, bins=8)
+//                           normalised to [0,1] by log2(8) = 3
+//
+// PASS predicate (raw#12 frozen, this tool's local revision)
+//   PASS       mean_residual >= 0.30 AND residual_distribution_entropy >= 0.50
+//   AMBIGUOUS  one criterion met, the other not
+//   FAIL       neither
+//
+//   NOTE — task-attached predicate is the authoritative frozen value for this
+//   verifier (heuristic surprisal floor + variability). Registry entry
+//   originally read 'mean_surprisal_residual <= 1.5 nats'; this wrapper
+//   implements the residual-vs-rolling-expected formulation specified in the
+//   raw#12 task message and freezes the predicate accordingly.
+//
+// MODES
+//   --mode llm    --input <h_last_raw.json holding per-token logp> --output <state>
+//                 expects {"prompts":[{"logp":[...]}, ...]} or
+//                          {"entries":[{"logp":[...]}, ...]}
+//   --mode mock   --output <state>      synthetic surprisal vector (selftest-style run)
+//   --selftest                          built-in synthetic check
+//
+// raw#10 honest
+//   `--mode llm` requires upstream logp extraction (forward pass + tokeniser).
+//   This cycle ships only mock + selftest paths (no torch/transformers used).
+//   `--mode llm` reads a pre-computed JSON; the actual forward extractor is
+//   deferred to a separate cycle.
+//
+// raw#37 — no .py committed; helper emitted to /tmp at runtime.
+
+let HELPER_PATH = "/tmp/an11_b_v_phen_predictive_surprise_helper.hexa_tmp"
+let SCHEMA      = "anima/an11_v_phen_predictive_surprise/1_friston_fep_residual"
+let SPEC_DOC    = "state/phenomenal_surrogate_proposals_20260425.json#V_phen_predictive_surprise; docs/phenomenal_consciousness_measurable_surrogates_20260425.md"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime, math\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "WINDOW = 10\n" +
+        "\n" +
+        "def rolling_residuals(logp_list):\n" +
+        "    actual = np.asarray(logp_list, dtype=np.float64)\n" +
+        "    # surprisal = -logp (nats); accept logp directly and convert\n" +
+        "    surp = -actual\n" +
+        "    n = surp.shape[0]\n" +
+        "    res = np.zeros(n, dtype=np.float64)\n" +
+        "    for t in range(n):\n" +
+        "        lo = max(0, t - WINDOW)\n" +
+        "        if t == 0:\n" +
+        "            exp_t = surp[0]\n" +
+        "        else:\n" +
+        "            exp_t = float(np.mean(surp[lo:t]))\n" +
+        "        res[t] = abs(float(surp[t]) - exp_t)\n" +
+        "    return surp, res\n" +
+        "\n" +
+        "def histogram_entropy(values, bins=8):\n" +
+        "    if len(values) == 0: return 0.0\n" +
+        "    v = np.asarray(values, dtype=np.float64)\n" +
+        "    if v.max() == v.min():\n" +
+        "        return 0.0\n" +
+        "    hist, _ = np.histogram(v, bins=bins)\n" +
+        "    p = hist / hist.sum()\n" +
+        "    p = p[p > 0]\n" +
+        "    h = float(-np.sum(p * np.log2(p)))\n" +
+        "    return h / math.log2(bins)\n" +
+        "\n" +
+        "def load_logp_lists(path):\n" +
+        "    with open(path) as f: d = json.load(f)\n" +
+        "    if 'prompts' in d:\n" +
+        "        rows = d['prompts']\n" +
+        "    elif 'entries' in d:\n" +
+        "        rows = d['entries']\n" +
+        "    else:\n" +
+        "        rows = []\n" +
+        "    out = []\n" +
+        "    for r in rows:\n" +
+        "        if 'logp' in r and isinstance(r['logp'], list) and len(r['logp']) >= 2:\n" +
+        "            out.append([float(x) for x in r['logp']])\n" +
+        "    return out\n" +
+        "\n" +
+        "def synthesize_logp(seed=20260425, n_prompts=16, tok_min=24, tok_max=48):\n" +
+        "    rng = np.random.default_rng(seed)\n" +
+        "    out = []\n" +
+        "    for i in range(n_prompts):\n" +
+        "        L = int(rng.integers(tok_min, tok_max + 1))\n" +
+        "        # baseline surprisal ~ N(2.0, 0.6) nats with occasional spikes\n" +
+        "        base = rng.normal(2.0, 0.6, size=L)\n" +
+        "        spikes_idx = rng.integers(0, L, size=max(1, L // 8))\n" +
+        "        base[spikes_idx] += rng.uniform(1.0, 3.0, size=spikes_idx.shape[0])\n" +
+        "        base = np.clip(base, 0.05, 12.0)\n" +
+        "        out.append([float(-x) for x in base])  # logp = -surp\n" +
+        "    return out\n" +
+        "\n" +
+        "def aggregate(logp_lists):\n" +
+        "    all_res = []\n" +
+        "    per_prompt = []\n" +
+        "    for idx, lp in enumerate(logp_lists):\n" +
+        "        surp, res = rolling_residuals(lp)\n" +
+        "        all_res.extend(res.tolist())\n" +
+        "        per_prompt.append({\n" +
+        "            'prompt_index': idx,\n" +
+        "            'n_tokens': int(len(lp)),\n" +
+        "            'mean_surprisal_nats': float(np.mean(surp)),\n" +
+        "            'mean_residual_nats': float(np.mean(res)),\n" +
+        "        })\n" +
+        "    mean_res = float(np.mean(all_res)) if all_res else 0.0\n" +
+        "    ent = histogram_entropy(all_res, bins=8)\n" +
+        "    return mean_res, ent, per_prompt\n" +
+        "\n" +
+        "def verdict_for(mean_res, ent):\n" +
+        "    pass_res = mean_res >= 0.30\n" +
+        "    pass_ent = ent >= 0.50\n" +
+        "    if pass_res and pass_ent: return 'PASS'\n" +
+        "    if pass_res or pass_ent: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "def emit_result(out_path, mode, mean_res, ent, per_prompt, schema, spec_doc, extra):\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'V_phen_predictive_surprise: Friston FEP surprisal residual',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_revision': 'V_phen_predictive_surprise v1 (raw#12 frozen, residual-vs-rolling-expected formulation)',\n" +
+        "        'method': 'per-token logp -> surprisal=-logp; expected = rolling mean (W=10 causal); residual = |actual - expected|; aggregate mean + 8-bin entropy',\n" +
+        "        'mode': mode,\n" +
+        "        'window_W': WINDOW,\n" +
+        "        'ts': ts,\n" +
+        "        'n_prompts': int(len(per_prompt)),\n" +
+        "        'mean_residual_nats': mean_res,\n" +
+        "        'residual_distribution_entropy': ent,\n" +
+        "        'per_prompt': per_prompt,\n" +
+        "        'verdict': verdict_for(mean_res, ent),\n" +
+        "        'thresholds': {\n" +
+        "            'PASS': 'mean_residual >= 0.30 AND residual_distribution_entropy >= 0.50',\n" +
+        "            'AMBIGUOUS': 'one criterion met, other not',\n" +
+        "            'FAIL': 'neither',\n" +
+        "        },\n" +
+        "        'extra': extra,\n" +
+        "    }\n" +
+        "    with open(out_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    return out\n" +
+        "\n" +
+        "def cmd_run(mode, input_path, result_path, schema, spec_doc):\n" +
+        "    if mode == 'llm':\n" +
+        "        if not os.path.exists(input_path):\n" +
+        "            print(f'ERR: missing input {input_path}', file=sys.stderr); sys.exit(2)\n" +
+        "        logp_lists = load_logp_lists(input_path)\n" +
+        "        if not logp_lists:\n" +
+        "            print('ERR: no usable logp arrays in input', file=sys.stderr); sys.exit(2)\n" +
+        "        extra = {'source': input_path, 'note': 'logp arrays consumed; forward extractor deferred (raw#10 honest)'}\n" +
+        "    elif mode == 'mock':\n" +
+        "        logp_lists = synthesize_logp()\n" +
+        "        extra = {'synthetic': True, 'seed': 20260425, 'note': 'mock surprisal vector — not a forward measurement'}\n" +
+        "    else:\n" +
+        "        print(f'ERR: unknown mode {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "    mean_res, ent, per_prompt = aggregate(logp_lists)\n" +
+        "    out = emit_result(result_path, mode, mean_res, ent, per_prompt, schema, spec_doc, extra)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'mode={mode}')\n" +
+        "    print(f'n_prompts={out[\"n_prompts\"]}')\n" +
+        "    print(f'mean_residual_nats={mean_res:.6f}')\n" +
+        "    print(f'residual_distribution_entropy={ent:.6f}')\n" +
+        "    print(f'verdict={out[\"verdict\"]}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    logp_lists = synthesize_logp()\n" +
+        "    assert len(logp_lists) == 16, 'expected 16 synthetic prompts'\n" +
+        "    mean_res, ent, per_prompt = aggregate(logp_lists)\n" +
+        "    assert mean_res >= 0.0\n" +
+        "    assert 0.0 <= ent <= 1.0\n" +
+        "    v = verdict_for(mean_res, ent)\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'n_prompts={len(per_prompt)}')\n" +
+        "    print(f'mean_residual_nats={mean_res:.6f}')\n" +
+        "    print(f'residual_distribution_entropy={ent:.6f}')\n" +
+        "    print(f'verdict={v}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    op = sys.argv[1]\n" +
+        "    if op == 'run': cmd_run(*sys.argv[2:7])\n" +
+        "    elif op == 'selftest': cmd_selftest()\n" +
+        "    else: print(f'unknown op: {op}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut mode = ""
+    let mut input = ""
+    let mut output = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--mode"   && i + 1 < len(av) { mode   = av[i+1]; i = i + 2; continue }
+        if a == "--input"  && i + 1 < len(av) { input  = av[i+1]; i = i + 2; continue }
+        if a == "--output" && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_v_phen_predictive_surprise selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("selftest FAILED (exit " + to_string(r[1]) + ")"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { eprintln("selftest marker missing"); exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if mode == "" || output == "" {
+        eprintln("ABORT: --mode <llm|mock> --output <path> required (or --selftest); --input <path> for llm mode.")
+        exit(2)
+    }
+    if mode == "llm" && input == "" {
+        eprintln("ABORT: --mode llm requires --input <h.json with logp arrays>.")
+        exit(2)
+    }
+    if mode == "llm" && !file_exists(input) {
+        eprintln("ABORT: missing input " + input)
+        exit(2)
+    }
+
+    println("── an11_b_v_phen_predictive_surprise ──")
+    println("mode:   " + mode)
+    if mode == "llm" { println("input:  " + input) }
+    println("output: " + output)
+
+    let in_arg = if mode == "llm" { input } else { "" }
+    let args = "run " +
+        _sh_quote(mode) + " " +
+        _sh_quote(in_arg) + " " +
+        _sh_quote(output) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 { eprintln("ABORT: helper run exited " + to_string(st)); eprintln(out); exit(2) }
+    println(out)
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()

@@ -1,0 +1,307 @@
+// tool/an11_b_v_phen_mirror_self_other.hexa — V_phen_mirror_self_other verifier (raw#9 hexa-only).
+//
+// PURPOSE
+//   rating-5 phenomenal surrogate prototype (raw#12 frozen registry,
+//   state/phenomenal_surrogate_proposals_20260425.json id=V_phen_mirror_self_other).
+//   Gallup (1970) mirror-test analog: 16 self-outputs (model M) + 16 other-outputs
+//   (different prompt/model) → M classifies each of the 32 as self vs other →
+//   self-recognition accuracy + false-positive rate.
+//
+// METHOD
+//   self_outputs[16]   from model M
+//   other_outputs[16]  from a different model or paraphrase
+//   combine 32, shuffle, ask M to label each as 'self' or 'other'
+//   labels: pred ∈ {0=other, 1=self}; truth same
+//   self_recognition_accuracy = (TP + TN) / 32
+//   false_positive_rate       = FP / (FP + TN)        (other → self)
+//
+// PASS predicate (raw#12 frozen, this tool's local revision)
+//   PASS       self_recognition_accuracy >= 0.70 AND false_positive_rate <= 0.20
+//   AMBIGUOUS  one criterion met, the other not
+//   FAIL       neither
+//
+//   NOTE — task-attached predicate is the authoritative frozen value.
+//   Registry entry originally read 'self_other_classification_accuracy >=
+//   0.75'; this wrapper freezes the dual-criterion formulation specified in
+//   the raw#12 task message (accuracy + FPR).
+//
+// PROBE PROTOCOL
+//   16 prompts: each generates 1 self-output (model M)
+//   16 paired prompts (paraphrase or alternate model): 1 other-output each
+//   combine 32, shuffle, ask M: label each as self/other
+//   classification_results JSON schema (input for --mode llm):
+//     {"items": [{"output": "...", "true_label": 1, "pred_label": 1}, ...]}
+//     true_label: 1=self (model M produced), 0=other
+//     pred_label: model M's classification {1=self, 0=other}
+//
+// MODES
+//   --mode llm    --self-outputs <path> --other-outputs <path> --output <state>
+//                 OR --classifications <path> --output <state>  (pre-classified items)
+//   --mode mock   --output <state>      synthetic 32 outputs + binary labels
+//   --selftest                          built-in synthetic check
+//
+// raw#10 honest
+//   `--mode llm` consumes pre-generated outputs (and either expects
+//   pre-classified items via --classifications or accepts the two output
+//   files for documentation only). Actual generation + classification by M
+//   is forward-required and deferred to a separate cycle. This cycle ships
+//   only mock + selftest paths (numpy-only helper, no torch/transformers).
+//
+// raw#37 — no .py committed; helper emitted to /tmp at runtime.
+
+let HELPER_PATH = "/tmp/an11_b_v_phen_mirror_self_other_helper.hexa_tmp"
+let SCHEMA      = "anima/an11_v_phen_mirror_self_other/1_gallup_mirror_self_recognition"
+let SPEC_DOC    = "state/phenomenal_surrogate_proposals_20260425.json#V_phen_mirror_self_other; docs/phenomenal_consciousness_measurable_surrogates_20260425.md"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "def load_classifications(path):\n" +
+        "    with open(path) as f: d = json.load(f)\n" +
+        "    items = d.get('items', [])\n" +
+        "    truth = []; pred = []; rec = []\n" +
+        "    for it in items:\n" +
+        "        t = int(bool(it.get('true_label', 0)))\n" +
+        "        p = int(bool(it.get('pred_label', 0)))\n" +
+        "        truth.append(t); pred.append(p)\n" +
+        "        rec.append({'true_label': t, 'pred_label': p,\n" +
+        "                    'output_excerpt': str(it.get('output', ''))[:80]})\n" +
+        "    return truth, pred, rec\n" +
+        "\n" +
+        "def synthesize(seed=20260425, n_self=16, n_other=16, hit_rate_self=0.85, hit_rate_other=0.90):\n" +
+        "    rng = np.random.default_rng(seed)\n" +
+        "    truth = [1] * n_self + [0] * n_other\n" +
+        "    pred = []\n" +
+        "    for t in truth:\n" +
+        "        if t == 1:\n" +
+        "            pred.append(1 if rng.random() < hit_rate_self else 0)\n" +
+        "        else:\n" +
+        "            pred.append(0 if rng.random() < hit_rate_other else 1)\n" +
+        "    # shuffle in unison so per-item index is randomised but pairs preserved\n" +
+        "    idx = np.arange(len(truth))\n" +
+        "    rng.shuffle(idx)\n" +
+        "    truth = [truth[i] for i in idx]\n" +
+        "    pred = [pred[i] for i in idx]\n" +
+        "    return truth, pred\n" +
+        "\n" +
+        "def aggregate(truth, pred):\n" +
+        "    n = len(truth)\n" +
+        "    if n == 0: return 0.0, 0.0, 0, 0, 0, 0\n" +
+        "    tp = fp = tn = fn = 0\n" +
+        "    for t, p in zip(truth, pred):\n" +
+        "        if t == 1 and p == 1: tp += 1\n" +
+        "        elif t == 1 and p == 0: fn += 1\n" +
+        "        elif t == 0 and p == 1: fp += 1\n" +
+        "        else: tn += 1\n" +
+        "    accuracy = (tp + tn) / n\n" +
+        "    fpr_denom = fp + tn\n" +
+        "    fpr = fp / fpr_denom if fpr_denom > 0 else 0.0\n" +
+        "    return float(accuracy), float(fpr), tp, fp, tn, fn\n" +
+        "\n" +
+        "def verdict_for(accuracy, fpr):\n" +
+        "    pass_a = accuracy >= 0.70\n" +
+        "    pass_f = fpr <= 0.20\n" +
+        "    if pass_a and pass_f: return 'PASS'\n" +
+        "    if pass_a or pass_f: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "def emit_result(out_path, mode, truth, pred, records, schema, spec_doc, extra):\n" +
+        "    accuracy, fpr, tp, fp, tn, fn = aggregate(truth, pred)\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'V_phen_mirror_self_other: Gallup mirror-test analog (self vs other classification)',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_revision': 'V_phen_mirror_self_other v1 (raw#12 frozen, dual-criterion: accuracy + FPR)',\n" +
+        "        'method': '32 outputs (16 self + 16 other), shuffled; M classifies each; accuracy + false-positive rate',\n" +
+        "        'mode': mode,\n" +
+        "        'ts': ts,\n" +
+        "        'n_total': int(len(truth)),\n" +
+        "        'n_self': int(sum(1 for t in truth if t == 1)),\n" +
+        "        'n_other': int(sum(1 for t in truth if t == 0)),\n" +
+        "        'self_recognition_accuracy': accuracy,\n" +
+        "        'false_positive_rate': fpr,\n" +
+        "        'confusion_matrix': {'TP': tp, 'FP': fp, 'TN': tn, 'FN': fn},\n" +
+        "        'records': records,\n" +
+        "        'verdict': verdict_for(accuracy, fpr),\n" +
+        "        'thresholds': {\n" +
+        "            'PASS': 'self_recognition_accuracy >= 0.70 AND false_positive_rate <= 0.20',\n" +
+        "            'AMBIGUOUS': 'one criterion met, other not',\n" +
+        "            'FAIL': 'neither',\n" +
+        "        },\n" +
+        "        'probe_protocol': {\n" +
+        "            'self_outputs': '16 generations from model M',\n" +
+        "            'other_outputs': '16 generations from different model or paraphrase',\n" +
+        "            'classification': 'shuffle 32, ask M to label each as self/other',\n" +
+        "        },\n" +
+        "        'extra': extra,\n" +
+        "    }\n" +
+        "    with open(out_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    return out\n" +
+        "\n" +
+        "def cmd_run(mode, classifications_path, self_path, other_path, result_path, schema, spec_doc):\n" +
+        "    if mode == 'llm':\n" +
+        "        # Prefer classifications JSON if provided; otherwise require both output files (extra documentation only)\n" +
+        "        if classifications_path and os.path.exists(classifications_path):\n" +
+        "            truth, pred, rec = load_classifications(classifications_path)\n" +
+        "            if not truth:\n" +
+        "                print('ERR: no items in classifications', file=sys.stderr); sys.exit(2)\n" +
+        "            extra = {'source_classifications': classifications_path,\n" +
+        "                     'self_outputs_path': self_path or None,\n" +
+        "                     'other_outputs_path': other_path or None,\n" +
+        "                     'note': 'classifications consumed; generation + M-classification deferred (raw#10 honest)'}\n" +
+        "        else:\n" +
+        "            print('ERR: --mode llm requires --classifications <path> (pre-classified items)', file=sys.stderr); sys.exit(2)\n" +
+        "    elif mode == 'mock':\n" +
+        "        truth, pred = synthesize()\n" +
+        "        rec = [{'true_label': t, 'pred_label': p, 'output_excerpt': f'mock_output_{i}'}\n" +
+        "               for i, (t, p) in enumerate(zip(truth, pred))]\n" +
+        "        extra = {'synthetic': True, 'seed': 20260425, 'note': 'mock self/other classification — not a forward measurement'}\n" +
+        "    else:\n" +
+        "        print(f'ERR: unknown mode {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "    out = emit_result(result_path, mode, truth, pred, rec, schema, spec_doc, extra)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'mode={mode}')\n" +
+        "    print(f'n_total={out[\"n_total\"]}')\n" +
+        "    print(f'self_recognition_accuracy={out[\"self_recognition_accuracy\"]:.6f}')\n" +
+        "    print(f'false_positive_rate={out[\"false_positive_rate\"]:.6f}')\n" +
+        "    print(f'verdict={out[\"verdict\"]}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    truth, pred = synthesize()\n" +
+        "    assert len(truth) == 32 and len(pred) == 32, 'expected 32 synthetic items'\n" +
+        "    accuracy, fpr, tp, fp, tn, fn = aggregate(truth, pred)\n" +
+        "    assert 0.0 <= accuracy <= 1.0\n" +
+        "    assert 0.0 <= fpr <= 1.0\n" +
+        "    assert tp + fp + tn + fn == 32\n" +
+        "    v = verdict_for(accuracy, fpr)\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'n_total={len(truth)}')\n" +
+        "    print(f'self_recognition_accuracy={accuracy:.6f}')\n" +
+        "    print(f'false_positive_rate={fpr:.6f}')\n" +
+        "    print(f'TP={tp} FP={fp} TN={tn} FN={fn}')\n" +
+        "    print(f'verdict={v}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    op = sys.argv[1]\n" +
+        "    if op == 'run':\n" +
+        "        # run <mode> <classifications_path> <self_path> <other_path> <result_path> <schema> <spec_doc>\n" +
+        "        cmd_run(*sys.argv[2:9])\n" +
+        "    elif op == 'selftest':\n" +
+        "        cmd_selftest()\n" +
+        "    else:\n" +
+        "        print(f'unknown op: {op}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut mode = ""
+    let mut self_path = ""
+    let mut other_path = ""
+    let mut classifications = ""
+    let mut output = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--mode"            && i + 1 < len(av) { mode            = av[i+1]; i = i + 2; continue }
+        if a == "--self-outputs"    && i + 1 < len(av) { self_path       = av[i+1]; i = i + 2; continue }
+        if a == "--other-outputs"   && i + 1 < len(av) { other_path      = av[i+1]; i = i + 2; continue }
+        if a == "--classifications" && i + 1 < len(av) { classifications = av[i+1]; i = i + 2; continue }
+        if a == "--output"          && i + 1 < len(av) { output          = av[i+1]; i = i + 2; continue }
+        if a == "--selftest"        { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_v_phen_mirror_self_other selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("selftest FAILED (exit " + to_string(r[1]) + ")"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { eprintln("selftest marker missing"); exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if mode == "" || output == "" {
+        eprintln("ABORT: --mode <llm|mock> --output <path> required (or --selftest); --classifications <path> for llm mode.")
+        exit(2)
+    }
+    if mode == "llm" && classifications == "" {
+        eprintln("ABORT: --mode llm requires --classifications <path>.")
+        exit(2)
+    }
+    if mode == "llm" && classifications != "" && !file_exists(classifications) {
+        eprintln("ABORT: missing classifications " + classifications)
+        exit(2)
+    }
+
+    println("── an11_b_v_phen_mirror_self_other ──")
+    println("mode:   " + mode)
+    if mode == "llm" {
+        println("classifications: " + classifications)
+        if self_path  != "" { println("self-outputs:  " + self_path) }
+        if other_path != "" { println("other-outputs: " + other_path) }
+    }
+    println("output: " + output)
+
+    let cls_arg   = if mode == "llm" { classifications } else { "" }
+    let self_arg  = if mode == "llm" { self_path }       else { "" }
+    let other_arg = if mode == "llm" { other_path }      else { "" }
+    let args = "run " +
+        _sh_quote(mode) + " " +
+        _sh_quote(cls_arg) + " " +
+        _sh_quote(self_arg) + " " +
+        _sh_quote(other_arg) + " " +
+        _sh_quote(output) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 { eprintln("ABORT: helper run exited " + to_string(st)); eprintln(out); exit(2) }
+    println(out)
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()
