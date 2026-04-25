@@ -1,0 +1,167 @@
+// tool/p4_sweep_runner.hexa — Mk.X G1 P4 saturation sweep verifier (#115).
+//
+// PURPOSE
+//   CP2 G1 게이트: 3+ consecutive iters domain saturated AND tier_10_plus_absorption == 0
+//   over rolling window 5, max_iter 20.
+//
+//   Reads p4_sweep_log.jsonl entries, evaluates G1 PASS predicate,
+//   emits verdict JSON.
+//
+//   spec: state/cp2_mk_x_evaluation_protocol_20260425.json §G1_P4_saturation_protocol
+//
+// PASS predicate (raw#12 frozen):
+//   exists 3 consecutive iters i, i+1, i+2 in [last 5 of max 20] where
+//     domain_saturated[i] == True AND tier_10_plus_absorption[i] == 0
+//
+// USAGE
+//   hexa run tool/p4_sweep_runner.hexa --selftest
+//   hexa run tool/p4_sweep_runner.hexa mock --output <path>
+//   hexa run tool/p4_sweep_runner.hexa run --sweep-log <p4_sweep_log.jsonl> --output <path>
+
+let HELPER_PATH = "/tmp/p4_sweep_runner_helper.hexa_tmp"
+let SCHEMA = "anima/cp2_g1_p4_saturation/1"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) { return ln.substring(prefix.len(), ln.len()) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("import json, os, sys, datetime, argparse, random\n\n")
+    parts.push("THRESHOLDS = {'consecutive_required': 3, 'rolling_window': 5, 'max_iter': 20, 'tier_10_plus_absorption_max': 0}\n\n")
+    parts.push("def evaluate_g1(iters):\n")
+    parts.push("    \"\"\"iters: list[{'iter': int, 'domain_saturated': bool, 'tier_10_plus_absorption': int}].\"\"\"\n")
+    parts.push("    n = len(iters)\n")
+    parts.push("    if n == 0: return {'verdict': 'INSUFFICIENT_DATA', 'consecutive_satisfied': 0, 'reason': 'no iters'}\n")
+    parts.push("    if n > THRESHOLDS['max_iter']:\n")
+    parts.push("        iters = iters[-THRESHOLDS['max_iter']:]; n = len(iters)\n")
+    parts.push("    window = iters[-THRESHOLDS['rolling_window']:] if n >= THRESHOLDS['rolling_window'] else iters\n")
+    parts.push("    consec = 0; max_consec = 0\n")
+    parts.push("    for it in window:\n")
+    parts.push("        sat = bool(it.get('domain_saturated', False))\n")
+    parts.push("        absorb = int(it.get('tier_10_plus_absorption', 1))\n")
+    parts.push("        if sat and absorb == 0: consec += 1; max_consec = max(max_consec, consec)\n")
+    parts.push("        else: consec = 0\n")
+    parts.push("    pass_g1 = max_consec >= THRESHOLDS['consecutive_required']\n")
+    parts.push("    return {\n")
+    parts.push("        'verdict': 'PASS' if pass_g1 else 'FAIL',\n")
+    parts.push("        'consecutive_satisfied': max_consec,\n")
+    parts.push("        'consecutive_required': THRESHOLDS['consecutive_required'],\n")
+    parts.push("        'window_size': len(window),\n")
+    parts.push("        'total_iters_evaluated': n\n")
+    parts.push("    }\n\n")
+    parts.push("def cmd_run(args):\n")
+    parts.push("    iters = []\n")
+    parts.push("    with open(args.sweep_log) as f:\n")
+    parts.push("        for line in f:\n")
+    parts.push("            line = line.strip()\n")
+    parts.push("            if not line: continue\n")
+    parts.push("            try: iters.append(json.loads(line))\n")
+    parts.push("            except json.JSONDecodeError as e:\n")
+    parts.push("                print(f'ABORT: malformed jsonl: {e}'); sys.exit(2)\n")
+    parts.push("    result = evaluate_g1(iters)\n")
+    parts.push("    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n")
+    parts.push("    out = {\n")
+    parts.push("        'schema': 'anima/cp2_g1_p4_saturation/1',\n")
+    parts.push("        'spec_doc': 'state/cp2_mk_x_evaluation_protocol_20260425.json',\n")
+    parts.push("        'ts': ts, 'thresholds': THRESHOLDS,\n")
+    parts.push("        **result,\n")
+    parts.push("        'sweep_log_path': args.sweep_log,\n")
+    parts.push("        'raw10_honest': 'P4 saturation은 absorption 신호의 trailing window 분석. 3+ consecutive iter saturated AND tier_10_plus_absorption==0 강한 evidence — anti-cherry-pick window cap 20 iters.'\n")
+    parts.push("    }\n")
+    parts.push("    with open(args.output, 'w') as f: json.dump(out, f, indent=2)\n")
+    parts.push("    print(f'verdict={result[\"verdict\"]} consec={result[\"consecutive_satisfied\"]}/{result[\"consecutive_required\"]}')\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def cmd_mock(args):\n")
+    parts.push("    random.seed(11)\n")
+    parts.push("    iters = []\n")
+    parts.push("    for i in range(20):\n")
+    parts.push("        sat = i >= 15  # last 5 saturated\n")
+    parts.push("        absorb = 0 if i >= 15 else random.randint(1, 5)\n")
+    parts.push("        iters.append({'iter': i, 'domain_saturated': sat, 'tier_10_plus_absorption': absorb, 'domain': 'mock'})\n")
+    parts.push("    result = evaluate_g1(iters)\n")
+    parts.push("    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n")
+    parts.push("    out = {\n")
+    parts.push("        'schema': 'anima/cp2_g1_p4_saturation/1', 'mode': 'mock', 'ts': ts,\n")
+    parts.push("        'thresholds': THRESHOLDS, **result,\n")
+    parts.push("        'mock_iters_count': len(iters),\n")
+    parts.push("        'raw10_honest': 'mock = synthetic 20 iters, last 5 saturated_clear → expect PASS verdict.'\n")
+    parts.push("    }\n")
+    parts.push("    with open(args.output, 'w') as f: json.dump(out, f, indent=2)\n")
+    parts.push("    print(f'mock verdict={result[\"verdict\"]} consec={result[\"consecutive_satisfied\"]}')\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def cmd_selftest():\n")
+    parts.push("    iters_pass = [{'iter': i, 'domain_saturated': True, 'tier_10_plus_absorption': 0} for i in range(5)]\n")
+    parts.push("    iters_fail = [{'iter': i, 'domain_saturated': False, 'tier_10_plus_absorption': 3} for i in range(5)]\n")
+    parts.push("    iters_partial = [{'iter': 0, 'domain_saturated': True, 'tier_10_plus_absorption': 0},\n")
+    parts.push("                     {'iter': 1, 'domain_saturated': True, 'tier_10_plus_absorption': 0},\n")
+    parts.push("                     {'iter': 2, 'domain_saturated': False, 'tier_10_plus_absorption': 1},\n")
+    parts.push("                     {'iter': 3, 'domain_saturated': True, 'tier_10_plus_absorption': 0},\n")
+    parts.push("                     {'iter': 4, 'domain_saturated': True, 'tier_10_plus_absorption': 0}]\n")
+    parts.push("    r1 = evaluate_g1(iters_pass); r2 = evaluate_g1(iters_fail); r3 = evaluate_g1(iters_partial)\n")
+    parts.push("    print('selftest=ok')\n")
+    parts.push("    print(f'pass_case={r1[\"verdict\"]} consec={r1[\"consecutive_satisfied\"]}')\n")
+    parts.push("    print(f'fail_case={r2[\"verdict\"]} consec={r2[\"consecutive_satisfied\"]}')\n")
+    parts.push("    print(f'partial_case={r3[\"verdict\"]} consec={r3[\"consecutive_satisfied\"]}')\n")
+    parts.push("    if r1['verdict'] != 'PASS' or r2['verdict'] != 'FAIL' or r3['verdict'] != 'FAIL':\n")
+    parts.push("        print('selftest_assertion=FAIL'); sys.exit(1)\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    sub = p.add_subparsers(dest='cmd', required=True)\n")
+    parts.push("    sub.add_parser('selftest')\n")
+    parts.push("    m = sub.add_parser('mock'); m.add_argument('--output', required=True)\n")
+    parts.push("    r = sub.add_parser('run'); r.add_argument('--sweep-log', dest='sweep_log', required=True); r.add_argument('--output', required=True)\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    if args.cmd == 'selftest': cmd_selftest()\n")
+    parts.push("    elif args.cmd == 'mock': cmd_mock(args)\n")
+    parts.push("    else: cmd_run(args)\n\n")
+    parts.push("if __name__ == '__main__': main()\n")
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) { if av[i] == "--selftest" { selftest = true; break }; i = i + 1 }
+    _write_helper()
+    if selftest {
+        println("── p4_sweep_runner selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("FAILED"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+    let mut a = ""; let mut j = 3
+    while j < len(av) { a = a + " " + _sh_quote(av[j]); j = j + 1 }
+    let r = _run_helper(a.trim())
+    println(r[0])
+    exit(r[1])
+}
+
+main()

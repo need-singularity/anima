@@ -1,0 +1,175 @@
+// tool/mk_x_atom_generator.hexa — Mk.X tier-10 atom generator (#117).
+//
+// PURPOSE
+//   CP2 Phase 5: tier-10 atom (slot_index, feature_signature, novelty_proof) tuple.
+//   Validation criteria per docs/mk_x_engine_design:
+//     - slot_index in [10, 13]
+//     - feature_signature unique (no duplication with foundation 82 atoms)
+//     - novelty_proof: P4 sweep failed to absorb without this atom
+//
+//   spec: state/cp2_mk_x_evaluation_protocol_20260425.json §atom_generation_spec
+//
+// VALIDATION (raw#12 frozen):
+//   slot_index ∈ {10, 11, 12, 13}
+//   feature_signature: 32+ char hex hash, not in foundation_82_signatures
+//   novelty_proof: { p4_absorption_without_atom: float, p4_absorption_with_atom: float,
+//                    delta >= 0.1 }
+//
+// USAGE
+//   hexa run tool/mk_x_atom_generator.hexa --selftest
+//   hexa run tool/mk_x_atom_generator.hexa mock-validate --output <path>
+//   hexa run tool/mk_x_atom_generator.hexa validate --atom <atom.json> \
+//     --foundation <state/foundation_82_signatures.json> --output <path>
+
+let HELPER_PATH = "/tmp/mk_x_atom_generator_helper.hexa_tmp"
+let SCHEMA = "anima/mk_x_atom_validation/1"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) { return ln.substring(prefix.len(), ln.len()) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("import json, os, sys, hashlib, datetime, argparse, random\n\n")
+    parts.push("VALID_SLOTS = {10, 11, 12, 13}\n")
+    parts.push("MIN_SIG_LEN = 32; MIN_NOVELTY_DELTA = 0.1\n\n")
+    parts.push("def validate_atom(atom, foundation_sigs):\n")
+    parts.push("    issues = []\n")
+    parts.push("    slot = atom.get('slot_index')\n")
+    parts.push("    sig = atom.get('feature_signature', '')\n")
+    parts.push("    novelty = atom.get('novelty_proof', {})\n")
+    parts.push("    if slot not in VALID_SLOTS:\n")
+    parts.push("        issues.append(f'slot_index {slot} not in {{10,11,12,13}}')\n")
+    parts.push("    if not isinstance(sig, str) or len(sig) < MIN_SIG_LEN:\n")
+    parts.push("        issues.append(f'feature_signature length {len(sig) if isinstance(sig, str) else 0} < {MIN_SIG_LEN}')\n")
+    parts.push("    if sig in foundation_sigs:\n")
+    parts.push("        issues.append(f'feature_signature collides with foundation 82 atoms')\n")
+    parts.push("    p4_without = novelty.get('p4_absorption_without_atom')\n")
+    parts.push("    p4_with = novelty.get('p4_absorption_with_atom')\n")
+    parts.push("    if p4_without is None or p4_with is None:\n")
+    parts.push("        issues.append('novelty_proof missing p4_absorption_with/without_atom')\n")
+    parts.push("    else:\n")
+    parts.push("        delta = float(p4_with) - float(p4_without)\n")
+    parts.push("        if delta < MIN_NOVELTY_DELTA:\n")
+    parts.push("            issues.append(f'novelty delta {delta:.4f} < required {MIN_NOVELTY_DELTA}')\n")
+    parts.push("    return {\n")
+    parts.push("        'verdict': 'VALID' if not issues else 'INVALID',\n")
+    parts.push("        'slot_index': slot,\n")
+    parts.push("        'feature_signature_prefix': sig[:16] if isinstance(sig, str) else None,\n")
+    parts.push("        'novelty_delta': (p4_with - p4_without) if (p4_with is not None and p4_without is not None) else None,\n")
+    parts.push("        'issues': issues\n")
+    parts.push("    }\n\n")
+    parts.push("def cmd_validate(args):\n")
+    parts.push("    atom = json.load(open(args.atom))\n")
+    parts.push("    foundation = set()\n")
+    parts.push("    if args.foundation and os.path.exists(args.foundation):\n")
+    parts.push("        f_data = json.load(open(args.foundation))\n")
+    parts.push("        if isinstance(f_data, list): foundation = set(f_data)\n")
+    parts.push("        elif isinstance(f_data, dict): foundation = set(f_data.get('signatures', []))\n")
+    parts.push("    result = validate_atom(atom, foundation)\n")
+    parts.push("    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n")
+    parts.push("    out = {\n")
+    parts.push("        'schema': 'anima/mk_x_atom_validation/1',\n")
+    parts.push("        'spec_doc': 'state/cp2_mk_x_evaluation_protocol_20260425.json',\n")
+    parts.push("        'ts': ts, 'thresholds': {'valid_slots': sorted(VALID_SLOTS), 'min_sig_len': MIN_SIG_LEN, 'min_novelty_delta': MIN_NOVELTY_DELTA},\n")
+    parts.push("        **result, 'atom_path': args.atom, 'foundation_count': len(foundation),\n")
+    parts.push("        'raw10_honest': 'atom validation = static check + novelty proof statistical (P4 absorption delta). 실제 atom generation은 Mk.IX L_IX integrator forward 필요 — 본 도구는 validation only.'\n")
+    parts.push("    }\n")
+    parts.push("    with open(args.output, 'w') as f: json.dump(out, f, indent=2)\n")
+    parts.push("    print(f'verdict={result[\"verdict\"]} slot={result[\"slot_index\"]} delta={result[\"novelty_delta\"]} issues={len(result[\"issues\"])}')\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def cmd_mock_validate(args):\n")
+    parts.push("    random.seed(13)\n")
+    parts.push("    atom = {\n")
+    parts.push("        'slot_index': 11,\n")
+    parts.push("        'feature_signature': hashlib.sha256(b'mock_d11_speak_atom_seed').hexdigest(),\n")
+    parts.push("        'novelty_proof': {'p4_absorption_without_atom': 0.45, 'p4_absorption_with_atom': 0.78}\n")
+    parts.push("    }\n")
+    parts.push("    foundation = set()\n")
+    parts.push("    result = validate_atom(atom, foundation)\n")
+    parts.push("    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n")
+    parts.push("    out = {\n")
+    parts.push("        'schema': 'anima/mk_x_atom_validation/1', 'mode': 'mock', 'ts': ts,\n")
+    parts.push("        **result, 'mock_atom': atom,\n")
+    parts.push("        'raw10_honest': 'mock atom = synthetic D11 speak slot=11 with novelty delta 0.33 → expect VALID.'\n")
+    parts.push("    }\n")
+    parts.push("    with open(args.output, 'w') as f: json.dump(out, f, indent=2)\n")
+    parts.push("    print(f'mock verdict={result[\"verdict\"]} slot={result[\"slot_index\"]} delta={result[\"novelty_delta\"]:.4f}')\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def cmd_selftest():\n")
+    parts.push("    valid = validate_atom({'slot_index': 10, 'feature_signature': 'a'*64, 'novelty_proof': {'p4_absorption_without_atom': 0.4, 'p4_absorption_with_atom': 0.6}}, set())\n")
+    parts.push("    bad_slot = validate_atom({'slot_index': 9, 'feature_signature': 'a'*64, 'novelty_proof': {'p4_absorption_without_atom': 0.4, 'p4_absorption_with_atom': 0.6}}, set())\n")
+    parts.push("    short_sig = validate_atom({'slot_index': 10, 'feature_signature': 'short', 'novelty_proof': {'p4_absorption_without_atom': 0.4, 'p4_absorption_with_atom': 0.6}}, set())\n")
+    parts.push("    no_novelty = validate_atom({'slot_index': 10, 'feature_signature': 'a'*64, 'novelty_proof': {'p4_absorption_without_atom': 0.5, 'p4_absorption_with_atom': 0.55}}, set())\n")
+    parts.push("    foundation_collision = validate_atom({'slot_index': 10, 'feature_signature': 'a'*64, 'novelty_proof': {'p4_absorption_without_atom': 0.4, 'p4_absorption_with_atom': 0.6}}, {'a'*64})\n")
+    parts.push("    print('selftest=ok')\n")
+    parts.push("    print(f'valid={valid[\"verdict\"]}')\n")
+    parts.push("    print(f'bad_slot={bad_slot[\"verdict\"]} issues={len(bad_slot[\"issues\"])}')\n")
+    parts.push("    print(f'short_sig={short_sig[\"verdict\"]}')\n")
+    parts.push("    print(f'no_novelty={no_novelty[\"verdict\"]}')\n")
+    parts.push("    print(f'foundation_collision={foundation_collision[\"verdict\"]}')\n")
+    parts.push("    if valid['verdict'] != 'VALID' or bad_slot['verdict'] != 'INVALID' or short_sig['verdict'] != 'INVALID' or no_novelty['verdict'] != 'INVALID' or foundation_collision['verdict'] != 'INVALID':\n")
+    parts.push("        print('selftest_assertion=FAIL'); sys.exit(1)\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    sub = p.add_subparsers(dest='cmd', required=True)\n")
+    parts.push("    sub.add_parser('selftest')\n")
+    parts.push("    m = sub.add_parser('mock-validate'); m.add_argument('--output', required=True)\n")
+    parts.push("    v = sub.add_parser('validate')\n")
+    parts.push("    v.add_argument('--atom', required=True)\n")
+    parts.push("    v.add_argument('--foundation', default=None)\n")
+    parts.push("    v.add_argument('--output', required=True)\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    if args.cmd == 'selftest': cmd_selftest()\n")
+    parts.push("    elif args.cmd == 'mock-validate': cmd_mock_validate(args)\n")
+    parts.push("    else: cmd_validate(args)\n\n")
+    parts.push("if __name__ == '__main__': main()\n")
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) { if av[i] == "--selftest" { selftest = true; break }; i = i + 1 }
+    _write_helper()
+    if selftest {
+        println("── mk_x_atom_generator selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("FAILED"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+    let mut a = ""; let mut j = 3
+    while j < len(av) { a = a + " " + _sh_quote(av[j]); j = j + 1 }
+    let r = _run_helper(a.trim())
+    println(r[0])
+    exit(r[1])
+}
+
+main()
