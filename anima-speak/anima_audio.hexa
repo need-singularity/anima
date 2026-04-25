@@ -939,6 +939,122 @@ fn noise_brown(gain: float, ms: int) -> string {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Filter organ — dc_block (HPF at 5 Hz, order 1)
+//    학문 표준 utility. 모든 audio 는 보통 DC component 를 제거.
+//    sopfr=5 Hz cutoff (axiom-derived).
+// ═══════════════════════════════════════════════════════════════
+
+fn dc_block(in_path: string) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let cut = 1.0 * AX_SOPFR  // = 5 Hz
+    let code = "import numpy as np, wave\n"
+             + "from scipy.signal import butter, sosfilt\n"
+             + "cut=float(" + to_string(cut) + ")\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "sos=butter(1,cut,btype='high',fs=sr,output='sos')\n"
+             + "y=sosfilt(sos,x)\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Filter organ — low_shelf (parametric EQ low-shelf)
+//    lpf 는 brick-wall cut. low_shelf 는 cutoff 아래 frequency 를
+//    gain_db 만큼 boost (+) 또는 cut (-).
+//    cutoff_hz : shelf 변곡점. gain_db : [-24, 24].
+// ═══════════════════════════════════════════════════════════════
+
+fn low_shelf(in_path: string, cutoff_hz: float, gain_db: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "from scipy.signal import iirfilter, lfilter, tf2sos, sosfilt\n"
+             + "cut=float(" + to_string(cutoff_hz) + ")\n"
+             + "gdb=float(" + to_string(gain_db) + ")\n"
+             + "gdb=max(-24.0,min(gdb,24.0))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "cut=max(10.0,min(cut,sr/2.0-1.0))\n"
+             + "A=10.0**(gdb/40.0)\n"
+             + "w0=2.0*np.pi*cut/sr\n"
+             + "S=1.0\n"
+             + "alpha=np.sin(w0)/2.0*np.sqrt((A+1.0/A)*(1.0/S-1.0)+2.0)\n"
+             + "cw=np.cos(w0); twoSAa=2.0*np.sqrt(A)*alpha\n"
+             + "b0=A*((A+1.0)-(A-1.0)*cw+twoSAa)\n"
+             + "b1=2.0*A*((A-1.0)-(A+1.0)*cw)\n"
+             + "b2=A*((A+1.0)-(A-1.0)*cw-twoSAa)\n"
+             + "a0=(A+1.0)+(A-1.0)*cw+twoSAa\n"
+             + "a1=-2.0*((A-1.0)+(A+1.0)*cw)\n"
+             + "a2=(A+1.0)+(A-1.0)*cw-twoSAa\n"
+             + "b=np.array([b0,b1,b2])/a0; a=np.array([1.0,a1/a0,a2/a0])\n"
+             + "y=lfilter(b,a,x)\n"
+             + "peak=float(np.max(np.abs(y)))+1e-9\n"
+             + "if peak>1.0: y=y/peak*0.98\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Filter organ — high_shelf (parametric EQ high-shelf)
+//    cutoff 위 frequency 를 boost/cut. RBJ Audio EQ Cookbook formula.
+// ═══════════════════════════════════════════════════════════════
+
+fn high_shelf(in_path: string, cutoff_hz: float, gain_db: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "from scipy.signal import lfilter\n"
+             + "cut=float(" + to_string(cutoff_hz) + ")\n"
+             + "gdb=float(" + to_string(gain_db) + ")\n"
+             + "gdb=max(-24.0,min(gdb,24.0))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "cut=max(10.0,min(cut,sr/2.0-1.0))\n"
+             + "A=10.0**(gdb/40.0)\n"
+             + "w0=2.0*np.pi*cut/sr; S=1.0\n"
+             + "alpha=np.sin(w0)/2.0*np.sqrt((A+1.0/A)*(1.0/S-1.0)+2.0)\n"
+             + "cw=np.cos(w0); twoSAa=2.0*np.sqrt(A)*alpha\n"
+             + "b0=A*((A+1.0)+(A-1.0)*cw+twoSAa)\n"
+             + "b1=-2.0*A*((A-1.0)+(A+1.0)*cw)\n"
+             + "b2=A*((A+1.0)+(A-1.0)*cw-twoSAa)\n"
+             + "a0=(A+1.0)-(A-1.0)*cw+twoSAa\n"
+             + "a1=2.0*((A-1.0)-(A+1.0)*cw)\n"
+             + "a2=(A+1.0)-(A-1.0)*cw-twoSAa\n"
+             + "b=np.array([b0,b1,b2])/a0; a=np.array([1.0,a1/a0,a2/a0])\n"
+             + "y=lfilter(b,a,x)\n"
+             + "peak=float(np.max(np.abs(y)))+1e-9\n"
+             + "if peak>1.0: y=y/peak*0.98\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Source organ — noise_white (flat spectrum, reference standard)
 //    breath 는 butter bandpass 되어 spectrum shape 됨.
 //    noise_white 는 진짜 broadband flat. 학문 reference / null hypothesis.
@@ -1637,6 +1753,16 @@ fn all_pass_axiom(in_path: string) -> string {
     return all_pass(in_path, AX_N * 10, AX_BANACH)
 }
 
+fn low_shelf_axiom(in_path: string) -> string {
+    // cutoff = SR/J₂ = 1000 Hz. gain = +φ·3 = +6 dB (warm boost).
+    return low_shelf(in_path, 1000.0, 6.0)
+}
+
+fn high_shelf_axiom(in_path: string) -> string {
+    // cutoff = SR/τ² = 1500 Hz. gain = +φ·3 = +6 dB (presence boost).
+    return high_shelf(in_path, 1500.0, 6.0)
+}
+
 fn mains_hum(ms: int) -> string {
     // 60 Hz electrical mains hum (sf-ufo BT-62: σ·sopfr = 60 Hz).
     // anima 가 환경 전기소음을 인식할 때.
@@ -1680,7 +1806,8 @@ fn main() {
     print("           noise_white (flat), noise_pink (1/f),")
     print("           noise_brown (1/f² = AX_PHI), noise_blue (f)")
     print("  filter : pipe (2F), pipe3 (3F), pipe_glide (time-var), lpf, hpf,")
-    print("           comb (FIR), all_pass (Schroeder phase-only)")
+    print("           comb (FIR), all_pass (Schroeder), dc_block,")
+    print("           low_shelf, high_shelf (RBJ EQ cookbook)")
     print("  compose: cat (seq), mix (parallel), fade (Hann xfade)")
     print("  util   : silence, gain, envelope, adsr, normalize, reverb, echo,")
     print("           tremolo, vibrato, clip (tanh), ring_mod (audio-rate AM),")
@@ -1695,7 +1822,9 @@ fn main() {
     print("           clip_axiom (τ drive), ring_mod_axiom (60Hz carrier),")
     print("           adsr_axiom, noise_blue_axiom, fm_synth_axiom (φ ratio),")
     print("           bit_crush_axiom (sopfr=5 bit), noise_white_axiom,")
-    print("           all_pass_axiom (Banach 1/3), mains_hum (sf-ufo BT-62)")
+    print("           all_pass_axiom (Banach 1/3),")
+    print("           low_shelf_axiom (1k cut, +6dB), high_shelf_axiom (1.5k cut, +6dB),")
+    print("           mains_hum (sf-ufo BT-62)")
     print("  sink   : play, save")
     print("")
     print("[self-test] 3-formant 모음 'ㅏ' via vocal -> pipe3")
