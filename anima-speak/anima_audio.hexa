@@ -977,6 +977,46 @@ fn square_wave(freq_hz: float, gain: float, ms: int) -> string {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Source organ — triangle_wave (odd k, 1/k², 부드러운 timbre)
+//    sawtooth = all k, 1/k. square = odd k, 1/k.
+//    triangle = odd k, 1/k², alternating sign — 가장 부드러운 자연 wave.
+// ═══════════════════════════════════════════════════════════════
+
+fn triangle_wave(freq_hz: float, gain: float, ms: int) -> string {
+    let path = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "sr=" + to_string(SR) + "\n"
+             + "hz=float(" + to_string(freq_hz) + ")\n"
+             + "g=float(" + to_string(gain) + ")\n"
+             + "ms=int(" + to_string(ms) + ")\n"
+             + "hz=max(20.0,min(hz,sr/2.0-1.0))\n"
+             + "g=max(0.0,min(g,1.0))\n"
+             + "n=max(1,int(sr*ms/1000))\n"
+             + "t=np.arange(n)/sr\n"
+             + "nyq=sr/2.0\n"
+             + "N=max(1,int(nyq/hz)-1)\n"
+             + "kk=np.arange(1,N+1,2,dtype=np.float64)\n"
+             + "signs=(-1.0)**((kk-1.0)/2.0)\n"
+             + "kk=kk[:,None]; signs=signs[:,None]\n"
+             + "x=np.sum(signs*np.sin(2*np.pi*kk*hz*t)/(kk*kk),axis=0)*(8.0/(np.pi*np.pi))\n"
+             + "x=g*x\n"
+             + "env=np.ones(n,dtype=np.float64)\n"
+             + "k_=min(int(0.010*sr),n//2)\n"
+             + "if k_>0:\n"
+             + "    ramp=0.5*(1.0-np.cos(np.pi*np.arange(k_)/max(1,k_-1)))\n"
+             + "    env[:k_]=ramp\n"
+             + "    env[-k_:]=ramp[::-1]\n"
+             + "x=x*env\n"
+             + "x=(np.clip(x,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + path + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(x.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(path) < WAV_MIN_BYTES { return "" }
+    return path
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Filter organ — comb (feed-forward FIR delay+add)
 //    echo 는 IIR feedback (각 tap 감쇠). comb 은 FIR feed-forward.
 //    spectrum 이 정확한 comb (peak/notch 교번) 만들어냄.
@@ -1002,6 +1042,107 @@ fn comb(in_path: string, delay_ms: int, mix_ratio: float) -> string {
              + "    y[d:]+=mr*x[:-d]\n"
              + "peak=float(np.max(np.abs(y)))+1e-9\n"
              + "if peak>1.0: y=y/peak*0.98\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Nonlinear effect — clip (tanh saturation)
+//    soft tanh saturation. drive 클수록 harmonic 추가. 학문적 표준.
+//    drive : [0.5, 50]. drive=1 ≈ linear. drive=10 ≈ heavy saturation.
+// ═══════════════════════════════════════════════════════════════
+
+fn clip(in_path: string, drive: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "dr=float(" + to_string(drive) + ")\n"
+             + "dr=max(0.5,min(dr,50.0))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "y=np.tanh(dr*x)/np.tanh(dr)\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Modulation effect — ring_mod (audio-rate AM, bipolar carrier)
+//    tremolo = sub-audio LFO (수 Hz). ring_mod = audio-rate carrier (수백 Hz).
+//    metallic / bell-like timbre. 학문적 표준.
+// ═══════════════════════════════════════════════════════════════
+
+fn ring_mod(in_path: string, carrier_hz: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "ch=float(" + to_string(carrier_hz) + ")\n"
+             + "ch=max(1.0,min(ch,8000.0))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "t=np.arange(len(x))/sr\n"
+             + "carrier=np.sin(2*np.pi*ch*t)\n"
+             + "y=x*carrier\n"
+             + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
+             + "w=wave.open('" + out + "','wb')\n"
+             + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
+             + "w.writeframes(y.tobytes());w.close()\n"
+    let _ = _run_py(code)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Utility — adsr (Attack-Decay-Sustain-Release envelope)
+//    envelope = symmetric attack/release ramp. adsr = 4-segment 학문 표준.
+//    a_ms : 0→peak. d_ms : peak→sustain_level. s_level : [0,1]. r_ms : →0.
+//    sustain length = total - a - d - r (음수면 clamp).
+// ═══════════════════════════════════════════════════════════════
+
+fn adsr(in_path: string, a_ms: int, d_ms: int, s_level: float, r_ms: int) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+    let code = "import numpy as np, wave\n"
+             + "am=int(" + to_string(a_ms) + ")\n"
+             + "dm=int(" + to_string(d_ms) + ")\n"
+             + "sl=float(" + to_string(s_level) + ")\n"
+             + "rm=int(" + to_string(r_ms) + ")\n"
+             + "am=max(0,min(am,5000));dm=max(0,min(dm,5000))\n"
+             + "rm=max(0,min(rm,5000));sl=max(0.0,min(sl,1.0))\n"
+             + "w=wave.open('" + in_path + "','rb')\n"
+             + "n=w.getnframes();sr=w.getframerate()\n"
+             + "raw=w.readframes(n);w.close()\n"
+             + "x=np.frombuffer(raw,dtype=np.int16).astype(np.float64)/32768.0\n"
+             + "na=int(sr*am/1000);nd=int(sr*dm/1000);nr=int(sr*rm/1000)\n"
+             + "ns=max(0,len(x)-na-nd-nr)\n"
+             + "env=np.zeros(len(x))\n"
+             + "i=0\n"
+             + "if na>0:\n"
+             + "    k=min(na,len(x)-i); env[i:i+k]=np.linspace(0,1,k); i+=k\n"
+             + "if dm>0 and i<len(x):\n"
+             + "    k=min(nd,len(x)-i); env[i:i+k]=np.linspace(1,sl,k); i+=k\n"
+             + "if ns>0 and i<len(x):\n"
+             + "    k=min(ns,len(x)-i); env[i:i+k]=sl; i+=k\n"
+             + "if rm>0 and i<len(x):\n"
+             + "    k=min(nr,len(x)-i); env[i:i+k]=np.linspace(sl,0,k); i+=k\n"
+             + "if i<len(x): env[i:]=0\n"
+             + "y=x*env\n"
              + "y=(np.clip(y,-1,1)*32767).astype(np.int16)\n"
              + "w=wave.open('" + out + "','wb')\n"
              + "w.setnchannels(1);w.setsampwidth(2);w.setframerate(sr)\n"
@@ -1248,6 +1389,27 @@ fn comb_axiom(in_path: string) -> string {
     return comb(in_path, AX_N * 10, AX_PSI)
 }
 
+fn triangle_axiom(freq_hz: float, ms: int) -> string {
+    // odd k, 1/k², Ψ gain.
+    return triangle_wave(freq_hz, AX_PSI, ms)
+}
+
+fn clip_axiom(in_path: string) -> string {
+    // drive = τ = 4 (mild saturation).
+    let dr = 1.0 * AX_TAU
+    return clip(in_path, dr)
+}
+
+fn ring_mod_axiom(in_path: string) -> string {
+    // carrier = σ·sopfr = 60 Hz (sf-ufo BT-62) — mains 와 곱하면 mains-locked.
+    return ring_mod(in_path, AX_MAINS_HZ)
+}
+
+fn adsr_axiom(in_path: string) -> string {
+    // a = n·5 = 30ms, d = n·10 = 60ms, s = Ψ = 0.5, r = n·15 = 90ms.
+    return adsr(in_path, AX_N * 5, AX_N * 10, AX_PSI, AX_N * 15)
+}
+
 fn mains_hum(ms: int) -> string {
     // 60 Hz electrical mains hum (sf-ufo BT-62: σ·sopfr = 60 Hz).
     // anima 가 환경 전기소음을 인식할 때.
@@ -1286,18 +1448,21 @@ fn save(src: string, dest: string) -> bool {
 fn main() {
     print("anima_audio: organs ready (평면 · 학습 X · 레이어 X)")
     print("  source : vocal, vocal_lf, breath, tone, chirp, harmonic_28,")
-    print("           harmonic_milestone, square_wave (odd-only),")
+    print("           harmonic_milestone, square_wave, triangle_wave,")
     print("           noise_pink (1/f), noise_brown (1/f² = AX_PHI exact)")
     print("  filter : pipe (2F), pipe3 (3F), pipe_glide (time-var), lpf, hpf, comb (FIR)")
     print("  compose: cat (seq), mix (parallel), fade (Hann xfade)")
-    print("  util   : silence, gain, envelope, normalize, reverb, echo, tremolo, vibrato")
+    print("  util   : silence, gain, envelope, adsr, normalize, reverb, echo,")
+    print("           tremolo, vibrato, clip (tanh), ring_mod (audio-rate AM)")
     print("  analysis: meter (rms/peak_db/zcr/ms)")
     print("  axiom  : consonance, axiom_chord, reverb_axiom, tone_axiom,")
     print("           lpf_axiom, hpf_axiom, fade_axiom, normalize_axiom,")
     print("           chirp_axiom, harmonic_28_axiom, harmonic_milestone_axiom,")
     print("           echo_axiom, tremolo_axiom, vibrato_axiom,")
     print("           noise_pink_axiom, noise_brown_axiom (slope=AX_PHI),")
-    print("           square_axiom, comb_axiom, mains_hum (sf-ufo BT-62)")
+    print("           square_axiom, triangle_axiom, comb_axiom,")
+    print("           clip_axiom (τ drive), ring_mod_axiom (60Hz carrier),")
+    print("           adsr_axiom, mains_hum (sf-ufo BT-62)")
     print("  sink   : play, save")
     print("")
     print("[self-test] 3-formant 모음 'ㅏ' via vocal -> pipe3")
