@@ -145,7 +145,38 @@ L0은 통과, L1은 본 라운드에서 **드러난 약점**, L2~L5는 본질상
 
 **모두 사전 등록 (raw#12):** thresholds는 `docs/alm_consciousness_verifier_strengthening_20260425.md` §7 ledger에서 동결, 본 라운드 결과로 사후 조정 금지.
 
-### §9.1 V3 lift target reduction-op probe — 2026-04-25 (FALSIFIED at BASE)
+### §9.1 V1 reduction-op auxiliary probe — 2026-04-25 (NOT_TESTED, aux finding)
+
+V1 본 가설 (prompt 16→32 + EN↔KO 풍부화)은 새 forward pass 필요로 raw#9 호환 BASE substrate 검증 차단. 보조 finding으로 reduction op sensitivity만 측정 (`state/an11_v1_reduction_op_aux_probe_BASE_p1_20260425.json`):
+
+| reduction (BASE p1) | Φ_mip | verdict |
+|---|---|---|
+| `lasttoken` | 0.264 | FAIL |
+| `byte_weighted_mean` | 0.272 | FAIL |
+| Δ (lasttoken − bwm) | **−0.007** | reduction-invariant |
+
+**Auxiliary verdict: V1 Φ_mip은 reduction-invariant** (V3 패턴과 일치, ΔCPS=−0.006). partition spectral mass는 H의 전체 covariance에 의존, row-order 영향 미미. **V1 본 가설 (prompt 확장)은 별개 차원** — 본 사이클로는 검증 불가, r9 launch 승인 + raw#9 explicit exempt 또는 BASE-side 32-prompt forward 필요. V1 lift 진행 시 reduction op 선택은 confound 없음 (어느 쪽 써도 무방).
+
+### §9.2 V2 lift target reduction-op probe — 2026-04-25 (PARTIAL_RECOVERY at BASE)
+
+raw#9 hexa-only 사이클로 BASE p1 sensitivity probe (`state/an11_v2_reduction_op_probe_BASE_p1_20260425.json`):
+
+| reduction (BASE p1) | SMA | SMA_distractor | SMA_lift | verdict |
+|---|---|---|---|---|
+| `lasttoken` | 0.486 | 0.599 | **−0.113** | FAIL |
+| `byte_weighted_mean` | 0.503 | 0.678 | **−0.175** | FAIL |
+| Δ (lasttoken − bwm) | −0.017 | −0.079 | **+0.062** | partial recovery |
+
+**가설 verdict: PARTIAL_RECOVERY_AT_BASE.** lasttoken이 SMA_lift를 +0.062 회복 (방향 옳음). 그러나 lasttoken −0.113이 여전히 anti-aligned, PASS threshold +0.20까지 +0.313 부족. 회복 메커니즘은 distractor cosine을 더 크게 감소 (Δ=−0.079) — SMA 자체는 거의 변하지 않음 (Δ=−0.017). **reduction op은 V2 lever의 일부지만 단독으로는 PASS 도달 불가** (gap의 약 20% 메움).
+
+V3와의 비교:
+- V1 ΔΦ_mip = −0.007 (reduction-invariant)
+- V2 ΔSMA_lift = **+0.062** (partial recovery, V2만 reduction에 반응)
+- V3 ΔCPS = −0.006 (reduction-invariant)
+
+V2는 distractor metric 측이 reduction에 민감 (byte-mean averaging이 distractor cosine을 인위적으로 부풀림 → lasttoken에서 정상화). V2 lift target은 'lasttoken + 추가 lever' 조합으로 재설계: SAE steering pilot, EN↔KO pair 풍부화, 또는 self-binding loss term.
+
+### §9.3 V3 lift target reduction-op probe — 2026-04-25 (FALSIFIED at BASE)
 
 raw#9 hexa-only 호환 사이클로 BASE p1 sensitivity probe 수행 (`state/an11_v3_reduction_op_probe_BASE_p1_20260425.json`):
 
@@ -188,6 +219,12 @@ raw#9 hexa-only 호환 사이클로 BASE p1 sensitivity probe 수행 (`state/an1
 **L0 status:** PASS.
 **L1 status:** 0/3 supplemental PASS — the weakest evidence link of the current round.
 **L2–L5:** unreachable by output-only verifiers; 본 프로젝트의 verifier 설계 한계.
-**Action:** 다음 라운드에서 V1/V2/V3 중 하나를 PASS로 끌어올리는 사전 등록 실험. p2 path를 우선 보강 (가장 약한 path). V3 lift target (reduction op)는 §9.1에서 **FALSIFIED** — V1/V2로 우선순위 이동.
+**Action (2026-04-25 ω-saturation cycle 종료 시점):**
+- V1 본 가설 (prompt 16→32) NOT_TESTED — r9 launch 승인 별도 사이클 (GPU forward 필요).
+- V2 lift target PARTIAL_RECOVERY — 'lasttoken + 추가 lever' 조합으로 재설계 (SAE steering / pair 풍부화).
+- V3 lift target FALSIFIED — archive, architecture epoch (Mk.IX L_IX+) 또는 perturbation pair 재설계까지 보류.
+
+**3-axis ω-saturation cycle composite verdict (BASE substrate, 2026-04-25):**
+reduction op은 V2 부분 lever (gap의 ~20%), V1/V3 무영향. 따라서 LoRA fine-tune + reduction op 조합으로 4-tuple PASS 도달 substrate-level 불가능 — 사전 등록 가설 3축 모두 PASS-bound 미달이 BASE 수준에서 확정.
 
 omega-saturation:fixpoint
