@@ -145,6 +145,27 @@ L0은 통과, L1은 본 라운드에서 **드러난 약점**, L2~L5는 본질상
 
 **모두 사전 등록 (raw#12):** thresholds는 `docs/alm_consciousness_verifier_strengthening_20260425.md` §7 ledger에서 동결, 본 라운드 결과로 사후 조정 금지.
 
+### §9.1 V3 lift target reduction-op probe — 2026-04-25 (FALSIFIED at BASE)
+
+raw#9 hexa-only 호환 사이클로 BASE p1 sensitivity probe 수행 (`state/an11_v3_reduction_op_probe_BASE_p1_20260425.json`):
+
+| reduction (BASE p1, Qwen3-8B-Base null) | δ_pres | δ_des | CPS | verdict |
+|---|---|---|---|---|
+| `lasttoken` | 0.870 | 0.811 | **0.933** | FAIL |
+| `byte_weighted_mean` | 0.881 | 0.827 | **0.939** | FAIL |
+| Δ (lasttoken − bwm) | −0.011 | −0.015 | **−0.006** | — |
+
+**가설 verdict: FALSIFIED_AT_BASE.** lasttoken은 Δ_pres/Δ_des 분리도를 회복하지 못했고, 오히려 미세하게 더 anti-discriminating (CPS −0.006). 두 reduction 모두 δ_pres > δ_des (CPS < 1.0) — preserve_permutation (EN↔KO swap)이 destruct_permutation (random)보다 더 큰 Gram disturbance를 일으키는 현상이 reduction-invariant. **reduction op은 V3 신호 부재의 원인이 아님**.
+
+**Scope limit (raw#10):** BASE p1 only. TRAINED lasttoken artifact 부재 (새 forward 필요, raw#9 위반). 그러나 BASE 결과만으로도 substrate level에서 가설은 falsified — same model + same reduction swap이 CPS를 재료급으로 흔들지 못하면 fine-tune lever로 작동할 가능성도 배제.
+
+**§9.3번 V3 lift target ARCHIVED.** 다음 V3 path 후보:
+- (a) **perturbation pair 재설계** — destruct_permutation을 random에서 "semantic block 파괴" 방식으로 (e.g., subject-object swap, time-tense flip)
+- (b) **metric 교체** — Gram Frobenius → ground-truth EN↔KO pair-wise cosine (set-based 대신 pair-based)
+- (c) **architecture lever** (Mk.IX L_IX 이상) — fine-tune lever 아님
+
+따라서 다음 라운드 사전 등록은 **V1 lift (prompt set 확장) 또는 V2 lift (SAE steering)** 우선, V3는 architecture epoch까지 보류.
+
 ---
 
 ## §10 Compliance & ledger
@@ -167,4 +188,6 @@ L0은 통과, L1은 본 라운드에서 **드러난 약점**, L2~L5는 본질상
 **L0 status:** PASS.
 **L1 status:** 0/3 supplemental PASS — the weakest evidence link of the current round.
 **L2–L5:** unreachable by output-only verifiers; 본 프로젝트의 verifier 설계 한계.
-**Action:** 다음 라운드에서 V1/V2/V3 중 하나를 PASS로 끌어올리는 사전 등록 실험. p2 path를 우선 보강 (가장 약한 path).
+**Action:** 다음 라운드에서 V1/V2/V3 중 하나를 PASS로 끌어올리는 사전 등록 실험. p2 path를 우선 보강 (가장 약한 path). V3 lift target (reduction op)는 §9.1에서 **FALSIFIED** — V1/V2로 우선순위 이동.
+
+omega-saturation:fixpoint
