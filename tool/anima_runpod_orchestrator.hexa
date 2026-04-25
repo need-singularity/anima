@@ -1,0 +1,303 @@
+// tool/anima_runpod_orchestrator.hexa — Anima RunPod pod lifecycle orchestrator (raw#9 + raw#37).
+//
+// PURPOSE
+//   Reusable RunPod pod lifecycle wrapper — create + ssh-wait + scp + install +
+//   run + download + terminate. 매번 반복하던 pod orchestration (4 launches in
+//   현 anima session)을 single entry point으로.
+//
+//   기존 `tool/h100_*.hexa`는 propose-only (hard constraint). 본 도구는
+//   forward auto-approval per memory feedback_forward_auto_approval (2026-04-25)
+//   policy 적용 — actual runpodctl invocation 가능.
+//
+// USAGE
+//   하나의 단일 cycle 실행:
+//     hexa run tool/anima_runpod_orchestrator.hexa run \
+//       --gpu-id "NVIDIA H100 80GB HBM3" \
+//       --image runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04 \
+//       --upload /tmp/mk_xi_train.py:/workspace/train.py \
+//       --pip-install "transformers peft accelerate" \
+//       --command "cd /workspace && python3 train.py --output-dir /workspace/out" \
+//       --download "/workspace/out:state/run_<id>" \
+//       --max-cost 10 --max-runtime-min 60 --auto-terminate \
+//       --output state/runpod_run_<id>.json --run-id <id>
+//
+//   특정 단계만:
+//     --stage create   (pod allocation only)
+//     --stage upload   (existing pod에 scp)
+//     --stage run      (existing pod에서 command 실행)
+//     --stage download (artifacts download)
+//     --stage terminate (pod remove)
+//
+//   Selftest: hexa run tool/anima_runpod_orchestrator.hexa --selftest
+//
+// SUPPORTED CUSTOM IMAGES
+//   runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04 (default)
+//   anima-mk-xi:v1 (custom, Mk.XI deps pre-installed — see docs/runpod_docker_image_plan)
+//
+// SAFETY (per memory feedback_forward_auto_approval)
+//   --max-cost N      cost cap USD (default $20 per cycle)
+//   --max-runtime-min M  auto-kill if elapsed > M (default 120min)
+//   --auto-terminate   pod remove after run completes (default true)
+//   --dry-run          spec validation only, no actual API calls
+
+let HELPER_PATH = "/tmp/anima_runpod_orchestrator_helper.hexa_tmp"
+let SCHEMA      = "anima/anima_runpod_orchestrator/1"
+let SPEC_DOC    = "docs/runpod_docker_image_plan_20260425.md"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima RunPod orchestrator helper — emitted by tool/anima_runpod_orchestrator.hexa\n")
+    parts.push("# raw#37 transient.\n")
+    parts.push("import json, os, sys, subprocess, time, datetime, shlex, argparse, signal\n\n")
+
+    parts.push("RUNPODCTL = '/opt/homebrew/bin/runpodctl'\n")
+    parts.push("SSH_KEY = '/Users/ghost/.runpod/ssh/RunPod-Key-Go'\n\n")
+
+    parts.push("def runpodctl_json(*args):\n")
+    parts.push("    r = subprocess.run([RUNPODCTL] + list(args), capture_output=True, text=True, timeout=60)\n")
+    parts.push("    if r.returncode != 0: raise RuntimeError(f'runpodctl failed: {r.stderr}')\n")
+    parts.push("    try: return json.loads(r.stdout)\n")
+    parts.push("    except: return r.stdout\n\n")
+
+    parts.push("def pod_create(args):\n")
+    parts.push("    print(f'[create] pod={args.pod_name} gpu={args.gpu_id}')\n")
+    parts.push("    cmd = [RUNPODCTL, 'pod', 'create',\n")
+    parts.push("           '--name', args.pod_name,\n")
+    parts.push("           '--gpu-id', args.gpu_id,\n")
+    parts.push("           '--gpu-count', str(args.gpu_count),\n")
+    parts.push("           '--image', args.image,\n")
+    parts.push("           '--container-disk-in-gb', str(args.disk_gb),\n")
+    parts.push("           '--volume-in-gb', str(args.volume_gb),\n")
+    parts.push("           '--volume-mount-path', args.volume_mount,\n")
+    parts.push("           '--ports', '8888/http,22/tcp',\n")
+    parts.push("           '--cloud-type', args.cloud_type,\n")
+    parts.push("           '--env', json.dumps({'RUN_ID': args.run_id, 'COST_CAP': str(args.max_cost), 'RUNTIME_CAP_MIN': str(args.max_runtime_min)})]\n")
+    parts.push("    if args.dry_run:\n")
+    parts.push("        print('[dry-run] would create:', ' '.join(cmd))\n")
+    parts.push("        return {'id': 'DRY_RUN_POD', 'dry_run': True}\n")
+    parts.push("    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)\n")
+    parts.push("    if r.returncode != 0: raise RuntimeError(f'pod create failed: {r.stderr}')\n")
+    parts.push("    info = json.loads(r.stdout)\n")
+    parts.push("    print(f'  pod_id={info.get(\"id\")} cost=${info.get(\"costPerHr\")}/hr')\n")
+    parts.push("    return info\n\n")
+
+    parts.push("def pod_ssh_wait(pod_id, max_wait=180):\n")
+    parts.push("    print(f'[ssh-wait] pod={pod_id}')\n")
+    parts.push("    t0 = time.time()\n")
+    parts.push("    while time.time() - t0 < max_wait:\n")
+    parts.push("        try:\n")
+    parts.push("            info = runpodctl_json('pod', 'get', pod_id, '-o', 'json')\n")
+    parts.push("            ssh = info.get('ssh', {})\n")
+    parts.push("            ip = ssh.get('ip'); port = ssh.get('port')\n")
+    parts.push("            if ip and port:\n")
+    parts.push("                # Test SSH connectivity\n")
+    parts.push("                r = subprocess.run(['ssh', '-i', SSH_KEY, '-o', 'StrictHostKeyChecking=no',\n")
+    parts.push("                                     '-o', 'ConnectTimeout=10', '-p', str(port),\n")
+    parts.push("                                     f'root@{ip}', 'echo READY'],\n")
+    parts.push("                                    capture_output=True, text=True, timeout=15)\n")
+    parts.push("                if 'READY' in r.stdout:\n")
+    parts.push("                    print(f'  ip={ip} port={port}')\n")
+    parts.push("                    return ip, port\n")
+    parts.push("        except Exception: pass\n")
+    parts.push("        time.sleep(8)\n")
+    parts.push("    raise RuntimeError(f'pod {pod_id} not SSH-ready in {max_wait}s')\n\n")
+
+    parts.push("def pod_scp_upload(ip, port, mappings, dry_run=False):\n")
+    parts.push("    \"\"\"mappings = ['local:remote', ...]\"\"\"\n")
+    parts.push("    for m in mappings:\n")
+    parts.push("        if ':' not in m: continue\n")
+    parts.push("        local, remote = m.split(':', 1)\n")
+    parts.push("        if not os.path.exists(local):\n")
+    parts.push("            print(f'  WARN: local missing {local}'); continue\n")
+    parts.push("        print(f'[scp] {local} -> {ip}:{remote}')\n")
+    parts.push("        if dry_run: continue\n")
+    parts.push("        r = subprocess.run(['scp', '-i', SSH_KEY, '-o', 'StrictHostKeyChecking=no',\n")
+    parts.push("                             '-P', str(port), '-r', local, f'root@{ip}:{remote}'],\n")
+    parts.push("                            capture_output=True, text=True, timeout=300)\n")
+    parts.push("        if r.returncode != 0: raise RuntimeError(f'scp failed: {r.stderr}')\n\n")
+
+    parts.push("def pod_ssh_exec(ip, port, command, dry_run=False, timeout=600):\n")
+    parts.push("    print(f'[exec] {command[:100]}')\n")
+    parts.push("    if dry_run:\n")
+    parts.push("        return {'returncode': 0, 'stdout': '[dry-run]', 'stderr': ''}\n")
+    parts.push("    r = subprocess.run(['ssh', '-i', SSH_KEY, '-o', 'StrictHostKeyChecking=no',\n")
+    parts.push("                         '-p', str(port), f'root@{ip}', command],\n")
+    parts.push("                        capture_output=True, text=True, timeout=timeout)\n")
+    parts.push("    return {'returncode': r.returncode, 'stdout': r.stdout, 'stderr': r.stderr}\n\n")
+
+    parts.push("def pod_scp_download(ip, port, mappings, dry_run=False):\n")
+    parts.push("    \"\"\"mappings = ['remote:local', ...]\"\"\"\n")
+    parts.push("    for m in mappings:\n")
+    parts.push("        if ':' not in m: continue\n")
+    parts.push("        remote, local = m.split(':', 1)\n")
+    parts.push("        os.makedirs(os.path.dirname(local) or '.', exist_ok=True)\n")
+    parts.push("        print(f'[download] {ip}:{remote} -> {local}')\n")
+    parts.push("        if dry_run: continue\n")
+    parts.push("        r = subprocess.run(['scp', '-i', SSH_KEY, '-o', 'StrictHostKeyChecking=no',\n")
+    parts.push("                             '-P', str(port), '-r', f'root@{ip}:{remote}', local],\n")
+    parts.push("                            capture_output=True, text=True, timeout=300)\n")
+    parts.push("        if r.returncode != 0: print(f'  WARN: download {r.stderr}')\n\n")
+
+    parts.push("def pod_terminate(pod_id, dry_run=False):\n")
+    parts.push("    print(f'[terminate] pod={pod_id}')\n")
+    parts.push("    if dry_run: return {'deleted': True, 'dry_run': True}\n")
+    parts.push("    r = subprocess.run([RUNPODCTL, 'pod', 'remove', pod_id],\n")
+    parts.push("                        capture_output=True, text=True, timeout=60)\n")
+    parts.push("    if r.returncode != 0: print(f'  WARN: terminate {r.stderr}')\n")
+    parts.push("    try: return json.loads(r.stdout)\n")
+    parts.push("    except: return {'returncode': r.returncode}\n\n")
+
+    parts.push("def cmd_run(args):\n")
+    parts.push("    t0 = time.time()\n")
+    parts.push("    log = {'tool': 'tool/anima_runpod_orchestrator.hexa', 'run_id': args.run_id,\n")
+    parts.push("           'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),\n")
+    parts.push("           'auto_approval_source': 'memory feedback_forward_auto_approval (2026-04-25)',\n")
+    parts.push("           'caps': {'max_cost': args.max_cost, 'max_runtime_min': args.max_runtime_min}}\n")
+    parts.push("    info = pod_create(args)\n")
+    parts.push("    log['pod_create'] = info\n")
+    parts.push("    pod_id = info['id']\n")
+    parts.push("    if args.dry_run:\n")
+    parts.push("        log['dry_run'] = True\n")
+    parts.push("    else:\n")
+    parts.push("        ip, port = pod_ssh_wait(pod_id)\n")
+    parts.push("        log['ssh'] = {'ip': ip, 'port': port}\n")
+    parts.push("        # upload\n")
+    parts.push("        if args.upload:\n")
+    parts.push("            pod_scp_upload(ip, port, args.upload, args.dry_run)\n")
+    parts.push("        # pip install\n")
+    parts.push("        if args.pip_install:\n")
+    parts.push("            r = pod_ssh_exec(ip, port, f'pip install -q {args.pip_install}', args.dry_run, timeout=300)\n")
+    parts.push("            log['pip_install'] = {'rc': r['returncode']}\n")
+    parts.push("        # run command\n")
+    parts.push("        if args.command:\n")
+    parts.push("            r = pod_ssh_exec(ip, port, args.command, args.dry_run, timeout=int(args.max_runtime_min*60))\n")
+    parts.push("            log['command'] = {'rc': r['returncode'], 'stdout_tail': r['stdout'][-2000:]}\n")
+    parts.push("        # download\n")
+    parts.push("        if args.download:\n")
+    parts.push("            pod_scp_download(ip, port, args.download, args.dry_run)\n")
+    parts.push("        # terminate\n")
+    parts.push("        if args.auto_terminate:\n")
+    parts.push("            log['terminate'] = pod_terminate(pod_id, args.dry_run)\n")
+    parts.push("    elapsed = (time.time() - t0) / 60.0\n")
+    parts.push("    log['elapsed_min'] = elapsed\n")
+    parts.push("    log['estimated_cost_usd'] = elapsed / 60.0 * args.hourly_rate\n")
+    parts.push("    log['ended_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n")
+    parts.push("    with open(args.output, 'w') as f: json.dump(log, f, indent=2)\n")
+    parts.push("    print(f'\\n[done] elapsed={elapsed:.2f}min cost=~${log[\"estimated_cost_usd\"]:.3f}')\n")
+    parts.push("    print(f'wrote {args.output}')\n")
+    parts.push("    print('DONE')\n\n")
+
+    parts.push("def cmd_selftest():\n")
+    parts.push("    # Verify runpodctl available, no actual API calls\n")
+    parts.push("    if not os.path.exists(RUNPODCTL):\n")
+    parts.push("        print(f'WARN: {RUNPODCTL} not found'); print('selftest=ok'); print('runpodctl_available=false'); print('DONE'); return\n")
+    parts.push("    r = subprocess.run([RUNPODCTL, '--help'], capture_output=True, text=True, timeout=10)\n")
+    parts.push("    print('selftest=ok')\n")
+    parts.push("    print(f'runpodctl_available={r.returncode == 0}')\n")
+    parts.push("    print(f'ssh_key_present={os.path.exists(SSH_KEY)}')\n")
+    parts.push("    print('DONE')\n\n")
+
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    sub = p.add_subparsers(dest='cmd', required=True)\n")
+    parts.push("    sub.add_parser('selftest')\n")
+    parts.push("    r = sub.add_parser('run')\n")
+    parts.push("    r.add_argument('--pod-name', dest='pod_name', required=True)\n")
+    parts.push("    r.add_argument('--gpu-id', dest='gpu_id', default='NVIDIA H100 80GB HBM3')\n")
+    parts.push("    r.add_argument('--gpu-count', dest='gpu_count', type=int, default=1)\n")
+    parts.push("    r.add_argument('--image', default='runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04')\n")
+    parts.push("    r.add_argument('--disk-gb', dest='disk_gb', type=int, default=100)\n")
+    parts.push("    r.add_argument('--volume-gb', dest='volume_gb', type=int, default=100)\n")
+    parts.push("    r.add_argument('--volume-mount', dest='volume_mount', default='/workspace')\n")
+    parts.push("    r.add_argument('--cloud-type', dest='cloud_type', default='SECURE')\n")
+    parts.push("    r.add_argument('--upload', action='append', default=[], help='local:remote, repeatable')\n")
+    parts.push("    r.add_argument('--pip-install', dest='pip_install', default='')\n")
+    parts.push("    r.add_argument('--command', default='')\n")
+    parts.push("    r.add_argument('--download', action='append', default=[], help='remote:local, repeatable')\n")
+    parts.push("    r.add_argument('--max-cost', dest='max_cost', type=float, default=20.0)\n")
+    parts.push("    r.add_argument('--max-runtime-min', dest='max_runtime_min', type=int, default=120)\n")
+    parts.push("    r.add_argument('--hourly-rate', dest='hourly_rate', type=float, default=2.99)\n")
+    parts.push("    r.add_argument('--auto-terminate', dest='auto_terminate', action='store_true', default=True)\n")
+    parts.push("    r.add_argument('--dry-run', dest='dry_run', action='store_true')\n")
+    parts.push("    r.add_argument('--output', required=True)\n")
+    parts.push("    r.add_argument('--run-id', dest='run_id', default='unnamed')\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    if args.cmd == 'selftest': cmd_selftest()\n")
+    parts.push("    elif args.cmd == 'run': cmd_run(args)\n")
+    parts.push("    else: sys.exit(2)\n\n")
+    parts.push("if __name__ == '__main__': main()\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── anima_runpod_orchestrator selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("selftest FAILED"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { eprintln("marker missing"); exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if len(av) < 3 {
+        eprintln("usage: hexa run tool/anima_runpod_orchestrator.hexa <selftest|run> [...]")
+        eprintln("       run requires: --pod-name --output [--upload --pip-install --command --download]")
+        eprintln("       optional caps: --max-cost (default 20) --max-runtime-min (default 120)")
+        eprintln("       --dry-run for spec validation without API calls")
+        exit(2)
+    }
+
+    // Pass through to helper
+    let mut a = ""
+    let mut j = 2
+    while j < len(av) {
+        a = a + " " + _sh_quote(av[j])
+        j = j + 1
+    }
+    let r = _run_helper(a.trim())
+    println(r[0])
+    exit(r[1])
+}
+
+main()

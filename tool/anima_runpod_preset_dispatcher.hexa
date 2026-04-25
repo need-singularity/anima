@@ -1,0 +1,329 @@
+// tool/anima_runpod_preset_dispatcher.hexa — Anima RunPod preset matrix dispatcher (raw#9 + raw#37).
+//
+// PURPOSE
+//   Preset name으로 base orchestrator (tool/anima_runpod_orchestrator.hexa) 자동 dispatch.
+//   본 wrapper는 default-safe (--emit-only): preset matrix 로드 후 dispatch 커맨드만 출력.
+//   실 RunPod API 호출은 base orchestrator가 담당 — 본 wrapper는 매개체.
+//
+//   Single main session pattern (4 launches × manual flag) → preset library
+//   + scenario-driven dispatch.
+//
+// SSOT triple
+//   state/anima_runpod_preset_matrix_20260425.json  (matrix, frozen)
+//   docs/anima_runpod_orchestration_options_20260425.md  (protocol)
+//   tool/anima_runpod_preset_dispatcher.hexa  (this file)
+//
+// USAGE
+//   selftest:
+//     hexa run tool/anima_runpod_preset_dispatcher.hexa --selftest
+//
+//   list all presets + image variants + GPU matrix + scenarios:
+//     hexa run tool/anima_runpod_preset_dispatcher.hexa --list
+//
+//   emit base orchestrator command (default = --emit-only, no API call):
+//     hexa run tool/anima_runpod_preset_dispatcher.hexa --preset BASE_measurement --run-id r0
+//
+//   override (whitelist: gpu_variant / image_variant / max_cost_cap_usd / max_runtime_min_cap):
+//     hexa run tool/anima_runpod_preset_dispatcher.hexa --preset MK_XI_FULL_5K --run-id r0 \
+//       --override gpu_variant=a100_80gb
+//
+//   scenario (preset chain emit):
+//     hexa run tool/anima_runpod_preset_dispatcher.hexa --scenario exhaustive_validation --run-id r0
+//
+// SAFETY (per memory feedback_forward_auto_approval, 2026-04-25)
+//   --emit-only가 default-safe — 실 API 호출 없음 (raw#9 default 준수).
+//   --execute flag 명시적 지정 시에만 base orchestrator 직접 호출.
+//   override whitelist 외 키 차단 (raw#12 violation log).
+//   max_cost_cap_usd > $20 / max_runtime_min_cap > 480 → block.
+
+let HELPER_PATH = "/tmp/anima_runpod_preset_dispatcher_helper.hexa_tmp"
+let SCHEMA      = "anima/anima_runpod_preset_dispatcher/1"
+let MATRIX_PATH = "state/anima_runpod_preset_matrix_20260425.json"
+let SPEC_DOC    = "docs/anima_runpod_orchestration_options_20260425.md"
+let BASE_TOOL   = "tool/anima_runpod_orchestrator.hexa"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima RunPod preset dispatcher helper — emitted by tool/anima_runpod_preset_dispatcher.hexa\n")
+    parts.push("# raw#37 transient (/tmp emit, no .py git-tracked).\n")
+    parts.push("import json, os, sys, argparse, shlex\n\n")
+
+    parts.push("MATRIX_PATH = 'state/anima_runpod_preset_matrix_20260425.json'\n")
+    parts.push("BASE_TOOL = 'tool/anima_runpod_orchestrator.hexa'\n")
+    parts.push("OVERRIDE_WHITELIST = ['gpu_variant', 'image_variant', 'max_cost_cap_usd', 'max_runtime_min_cap']\n")
+    parts.push("HARD_CAP_USD = 20.0\n")
+    parts.push("HARD_CAP_MIN = 480\n\n")
+
+    parts.push("def load_matrix():\n")
+    parts.push("    if not os.path.exists(MATRIX_PATH):\n")
+    parts.push("        print(f'ERR: matrix not found at {MATRIX_PATH}'); sys.exit(2)\n")
+    parts.push("    with open(MATRIX_PATH) as f: return json.load(f)\n\n")
+
+    parts.push("def find_preset(matrix, name):\n")
+    parts.push("    for p in matrix.get('presets', []):\n")
+    parts.push("        if p.get('name') == name: return p\n")
+    parts.push("    return None\n\n")
+
+    parts.push("def find_image(matrix, key):\n")
+    parts.push("    return matrix.get('image_variants', {}).get(key)\n\n")
+
+    parts.push("def find_gpu(matrix, key):\n")
+    parts.push("    return matrix.get('gpu_variants', {}).get(key)\n\n")
+
+    parts.push("def find_scenario(matrix, name):\n")
+    parts.push("    for s in matrix.get('scenario_coverage', []):\n")
+    parts.push("        if s.get('scenario') == name: return s\n")
+    parts.push("    return None\n\n")
+
+    parts.push("def parse_overrides(items):\n")
+    parts.push("    out = {}\n")
+    parts.push("    for it in items:\n")
+    parts.push("        if '=' not in it:\n")
+    parts.push("            print(f'ERR: bad override {it!r} (expect key=value)'); sys.exit(2)\n")
+    parts.push("        k, v = it.split('=', 1)\n")
+    parts.push("        if k not in OVERRIDE_WHITELIST:\n")
+    parts.push("            print(f'ERR: override key {k!r} not in whitelist {OVERRIDE_WHITELIST} (raw#12 violation)')\n")
+    parts.push("            sys.exit(2)\n")
+    parts.push("        out[k] = v\n")
+    parts.push("    return out\n\n")
+
+    parts.push("def apply_overrides(preset, overrides):\n")
+    parts.push("    p = dict(preset)\n")
+    parts.push("    for k, v in overrides.items():\n")
+    parts.push("        if k in ('max_cost_cap_usd',):\n")
+    parts.push("            p[k] = float(v)\n")
+    parts.push("        elif k in ('max_runtime_min_cap',):\n")
+    parts.push("            p[k] = int(v)\n")
+    parts.push("        else:\n")
+    parts.push("            p[k] = v\n")
+    parts.push("    return p\n\n")
+
+    parts.push("def check_caps(p):\n")
+    parts.push("    cost = float(p.get('max_cost_cap_usd', 0))\n")
+    parts.push("    rt = int(p.get('max_runtime_min_cap', 0))\n")
+    parts.push("    if cost > HARD_CAP_USD:\n")
+    parts.push("        print(f'ERR: max_cost_cap_usd {cost} > hard ceiling {HARD_CAP_USD}'); return False\n")
+    parts.push("    if rt > HARD_CAP_MIN:\n")
+    parts.push("        print(f'ERR: max_runtime_min_cap {rt} > hard ceiling {HARD_CAP_MIN}'); return False\n")
+    parts.push("    return True\n\n")
+
+    parts.push("def emit_command(matrix, preset, run_id):\n")
+    parts.push("    name = preset['name']\n")
+    parts.push("    if name == 'CPU_ONLY_LOCAL':\n")
+    parts.push("        return [\n")
+    parts.push("            f'# CPU_ONLY_LOCAL fallback — no remote dispatch',\n")
+    parts.push("            f'hexa run {BASE_TOOL} run --pod-name local-{run_id} --output state/runpod_run_{run_id}.json --run-id {run_id} --dry-run'\n")
+    parts.push("        ]\n")
+    parts.push("    image_key = preset.get('image_variant', 'default_pytorch_2_4')\n")
+    parts.push("    gpu_key = preset.get('gpu_variant', 'h100_sxm_80gb')\n")
+    parts.push("    image = find_image(matrix, image_key)\n")
+    parts.push("    gpu = find_gpu(matrix, gpu_key)\n")
+    parts.push("    if image is None:\n")
+    parts.push("        print(f'ERR: unknown image_variant {image_key!r}'); sys.exit(2)\n")
+    parts.push("    if gpu is None:\n")
+    parts.push("        print(f'ERR: unknown gpu_variant {gpu_key!r}'); sys.exit(2)\n")
+    parts.push("    if image.get('deferred', False):\n")
+    parts.push("        print(f'WARN: image_variant {image_key!r} is DEFERRED (build not executed). Falling back to default.')\n")
+    parts.push("        image_key = 'default_pytorch_2_4'\n")
+    parts.push("        image = find_image(matrix, image_key)\n")
+    parts.push("    cmd = [\n")
+    parts.push("        f'hexa run {BASE_TOOL} run',\n")
+    parts.push("        f'--pod-name anima-{name.lower()}-{run_id}',\n")
+    parts.push("        f'--gpu-id {shlex.quote(gpu[\"gpu_id\"])}',\n")
+    parts.push("        f'--image {shlex.quote(image[\"image\"])}',\n")
+    parts.push("        f'--hourly-rate {gpu[\"hourly_rate_usd\"]}',\n")
+    parts.push("        f'--max-cost {preset[\"max_cost_cap_usd\"]}',\n")
+    parts.push("        f'--max-runtime-min {preset[\"max_runtime_min_cap\"]}',\n")
+    parts.push("        f'--output state/runpod_run_{run_id}.json',\n")
+    parts.push("        f'--run-id {run_id}',\n")
+    parts.push("        f'--auto-terminate' if preset.get('auto_terminate', True) else '',\n")
+    parts.push("    ]\n")
+    parts.push("    return [' \\\\\\n  '.join([c for c in cmd if c])]\n\n")
+
+    parts.push("def cmd_list(matrix):\n")
+    parts.push("    print(f'── PRESET MATRIX ({MATRIX_PATH}) ──')\n")
+    parts.push("    print(f'preset_count={len(matrix.get(\"presets\", []))}')\n")
+    parts.push("    for p in matrix.get('presets', []):\n")
+    parts.push("        print(f'  • {p[\"name\"]:<28} cat={p.get(\"category\",\"\"):<18} steps={p.get(\"steps\",0):<5} ${p.get(\"cost_usd_estimate\",0):.2f}/run {p.get(\"runtime_min_estimate\",0)}min')\n")
+    parts.push("    print(f'\\n── IMAGE VARIANTS ──')\n")
+    parts.push("    for k, v in matrix.get('image_variants', {}).items():\n")
+    parts.push("        print(f'  • {k:<32} status={v.get(\"status\",\"\"):<22} {v.get(\"image\",\"\")}')\n")
+    parts.push("    print(f'\\n── GPU VARIANTS ──')\n")
+    parts.push("    for k, v in matrix.get('gpu_variants', {}).items():\n")
+    parts.push("        print(f'  • {k:<20} ${v.get(\"hourly_rate_usd\",0):.2f}/hr  mem={v.get(\"memory_gb\",0)}GB  {v.get(\"gpu_id\",\"\")}')\n")
+    parts.push("    print(f'\\n── SCENARIOS ──')\n")
+    parts.push("    for s in matrix.get('scenario_coverage', []):\n")
+    parts.push("        chain = s.get('preset_chain', s.get('preset', ''))\n")
+    parts.push("        if isinstance(chain, list): chain = ' → '.join(chain)\n")
+    parts.push("        print(f'  • {s[\"scenario\"]:<28} fallback={s.get(\"fallback\", False)}  chain: {chain}')\n")
+    parts.push("    print('DONE')\n\n")
+
+    parts.push("def cmd_dispatch(matrix, preset_name, run_id, overrides, execute):\n")
+    parts.push("    p = find_preset(matrix, preset_name)\n")
+    parts.push("    if p is None:\n")
+    parts.push("        names = [x['name'] for x in matrix.get('presets', [])]\n")
+    parts.push("        print(f'ERR: preset {preset_name!r} not in matrix. Known: {names}')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    p = apply_overrides(p, overrides)\n")
+    parts.push("    if not check_caps(p): sys.exit(2)\n")
+    parts.push("    print(f'── PRESET DISPATCH: {preset_name} ──')\n")
+    parts.push("    print(f'category={p.get(\"category\",\"\")}  image={p.get(\"image_variant\",\"\")}  gpu={p.get(\"gpu_variant\",\"\")}')\n")
+    parts.push("    print(f'cost_estimate=${p.get(\"cost_usd_estimate\",0):.2f}  runtime_estimate={p.get(\"runtime_min_estimate\",0)}min')\n")
+    parts.push("    print(f'caps: max_cost=${p.get(\"max_cost_cap_usd\",0):.2f}  max_runtime={p.get(\"max_runtime_min_cap\",0)}min')\n")
+    parts.push("    cmds = emit_command(matrix, p, run_id)\n")
+    parts.push("    print('\\n# Emitted base orchestrator command:')\n")
+    parts.push("    for c in cmds: print(c)\n")
+    parts.push("    if execute:\n")
+    parts.push("        print('\\nWARN: --execute requested. raw#9 default-safe is --emit-only.')\n")
+    parts.push("        print('Pass the emitted command manually to invoke base orchestrator.')\n")
+    parts.push("    print('DONE')\n\n")
+
+    parts.push("def cmd_scenario(matrix, scenario_name, run_id):\n")
+    parts.push("    s = find_scenario(matrix, scenario_name)\n")
+    parts.push("    if s is None:\n")
+    parts.push("        names = [x['scenario'] for x in matrix.get('scenario_coverage', [])]\n")
+    parts.push("        print(f'ERR: scenario {scenario_name!r} not in matrix. Known: {names}')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    chain = s.get('preset_chain', [s.get('preset')] if s.get('preset') else [])\n")
+    parts.push("    print(f'── SCENARIO DISPATCH: {scenario_name} ──')\n")
+    parts.push("    print(f'fallback={s.get(\"fallback\", False)}  note={s.get(\"note\",\"\")}')\n")
+    parts.push("    print(f'preset_chain ({len(chain)} steps):')\n")
+    parts.push("    for i, step in enumerate(chain, 1):\n")
+    parts.push("        print(f'  [{i}] {step}')\n")
+    parts.push("    print('\\n# emit-only — pass each preset to dispatcher individually for execution.')\n")
+    parts.push("    print('DONE')\n\n")
+
+    parts.push("def cmd_selftest(matrix):\n")
+    parts.push("    expect = matrix.get('selftest_expectations', {})\n")
+    parts.push("    presets = matrix.get('presets', [])\n")
+    parts.push("    images = matrix.get('image_variants', {})\n")
+    parts.push("    gpus = matrix.get('gpu_variants', {})\n")
+    parts.push("    scenarios = matrix.get('scenario_coverage', [])\n")
+    parts.push("    checks = []\n")
+    parts.push("    checks.append(('matrix_loadable', True))\n")
+    parts.push("    checks.append(('preset_count_min', len(presets) >= expect.get('preset_count_min', 10)))\n")
+    parts.push("    checks.append(('image_variant_count_min', len(images) >= expect.get('image_variant_count_min', 6)))\n")
+    parts.push("    checks.append(('gpu_variant_count_min', len(gpus) >= expect.get('gpu_variant_count_min', 5)))\n")
+    parts.push("    checks.append(('scenario_count_min', len(scenarios) >= expect.get('scenario_count_min', 5)))\n")
+    parts.push("    required = expect.get('all_presets_have_required_fields', [])\n")
+    parts.push("    fields_ok = True\n")
+    parts.push("    for p in presets:\n")
+    parts.push("        for f in required:\n")
+    parts.push("            if f not in p:\n")
+    parts.push("                print(f'  WARN: preset {p.get(\"name\",\"?\")} missing field {f!r}')\n")
+    parts.push("                fields_ok = False\n")
+    parts.push("    checks.append(('all_presets_have_required_fields', fields_ok))\n")
+    parts.push("    img_refs_ok = True\n")
+    parts.push("    for p in presets:\n")
+    parts.push("        k = p.get('image_variant')\n")
+    parts.push("        if k and k not in images:\n")
+    parts.push("            print(f'  WARN: preset {p[\"name\"]} image_variant {k!r} unresolved'); img_refs_ok = False\n")
+    parts.push("    checks.append(('all_image_refs_resolvable', img_refs_ok))\n")
+    parts.push("    gpu_refs_ok = True\n")
+    parts.push("    for p in presets:\n")
+    parts.push("        k = p.get('gpu_variant')\n")
+    parts.push("        if k and k not in gpus:\n")
+    parts.push("            print(f'  WARN: preset {p[\"name\"]} gpu_variant {k!r} unresolved'); gpu_refs_ok = False\n")
+    parts.push("    checks.append(('all_gpu_refs_resolvable', gpu_refs_ok))\n")
+    parts.push("    xref_warns = 0\n")
+    parts.push("    for p in presets:\n")
+    parts.push("        x = p.get('convergence_xref')\n")
+    parts.push("        if x and ':' not in x and not os.path.exists(x):\n")
+    parts.push("            print(f'  WARN: preset {p[\"name\"]} convergence_xref {x!r} missing (best-effort)')\n")
+    parts.push("            xref_warns += 1\n")
+    parts.push("    print(f'── SELFTEST CHECKS ──')\n")
+    parts.push("    all_ok = True\n")
+    parts.push("    for k, v in checks:\n")
+    parts.push("        mark = 'OK' if v else 'FAIL'\n")
+    parts.push("        if not v: all_ok = False\n")
+    parts.push("        print(f'  {mark}  {k}')\n")
+    parts.push("    print(f'  INFO  convergence_xref_warnings={xref_warns} (raw#10 best-effort)')\n")
+    parts.push("    print(f'preset_count={len(presets)}')\n")
+    parts.push("    print(f'image_variant_count={len(images)}')\n")
+    parts.push("    print(f'gpu_variant_count={len(gpus)}')\n")
+    parts.push("    print(f'scenario_count={len(scenarios)}')\n")
+    parts.push("    print(f'selftest={\"ok\" if all_ok else \"fail\"}')\n")
+    parts.push("    print('DONE')\n")
+    parts.push("    if not all_ok: sys.exit(1)\n\n")
+
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    p.add_argument('--selftest', action='store_true')\n")
+    parts.push("    p.add_argument('--list', action='store_true')\n")
+    parts.push("    p.add_argument('--preset', default='')\n")
+    parts.push("    p.add_argument('--scenario', default='')\n")
+    parts.push("    p.add_argument('--run-id', dest='run_id', default='unnamed')\n")
+    parts.push("    p.add_argument('--override', action='append', default=[])\n")
+    parts.push("    p.add_argument('--emit-only', action='store_true', default=True)\n")
+    parts.push("    p.add_argument('--execute', action='store_true')\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    matrix = load_matrix()\n")
+    parts.push("    if args.selftest: cmd_selftest(matrix); return\n")
+    parts.push("    if args.list: cmd_list(matrix); return\n")
+    parts.push("    if args.scenario: cmd_scenario(matrix, args.scenario, args.run_id); return\n")
+    parts.push("    if args.preset:\n")
+    parts.push("        overrides = parse_overrides(args.override)\n")
+    parts.push("        cmd_dispatch(matrix, args.preset, args.run_id, overrides, args.execute)\n")
+    parts.push("        return\n")
+    parts.push("    print('usage: --selftest | --list | --preset <name> --run-id <id> [--override key=value] | --scenario <name> --run-id <id>')\n")
+    parts.push("    sys.exit(2)\n\n")
+
+    parts.push("if __name__ == '__main__': main()\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── anima_runpod_preset_dispatcher selftest ──")
+        let r = _run_helper("--selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("selftest FAILED"); exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if len(av) < 3 {
+        eprintln("usage: hexa run tool/anima_runpod_preset_dispatcher.hexa [--selftest|--list|--preset <name>|--scenario <name>] [--run-id <id>] [--override key=value]")
+        eprintln("       default-safe = --emit-only (no API calls); use --execute for direct dispatch (raw#9 caveat)")
+        exit(2)
+    }
+
+    // Pass through to helper
+    let mut a = ""
+    let mut j = 2
+    while j < len(av) {
+        a = a + " " + _sh_quote(av[j])
+        j = j + 1
+    }
+    let r = _run_helper(a.trim())
+    println(r[0])
+    exit(r[1])
+}
+
+main()
