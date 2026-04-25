@@ -91,6 +91,8 @@ fn _write_helper() {
         "\n" +
         "DESTRUCT_SEED = 20260421\n" +
         "PRESERVE_PERM = [6,7,8,11,9,10,0,1,2,5,3,4,12,13,14,15]\n" +
+        "PRESERVE_PERM_FIXED = [6,7,8,10,11,9,0,1,2,3,4,5,12,13,14,15]\n" +
+        "# PRESERVE_PERM_FIXED: raw#12 new revision (1002d16a finding). PAIRS=[(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)] consistent swap pattern. Original PRESERVE_PERM has positions [3,4,5] mismatched with PAIRS — fixed version corrects mismatch.\n" +
         "SPEC_NOTE = (\"Spec \\u00a74.3 'S(H) 4-tuple = (max_cos, top3_sum, ccc_avg, ccc_min)' is set-based \"\n" +
         "             \"(permutation-invariant). Implementation uses normalized Gram Frobenius difference \"\n" +
         "             \"||G_perm - G||_F / ||G||_F as order-sensitive distance proxy \\u2014 most faithful \"\n" +
@@ -105,13 +107,14 @@ fn _write_helper() {
         "def frob_delta(G_perm, G, Gnorm):\n" +
         "    return float(np.linalg.norm(G_perm - G) / Gnorm)\n" +
         "\n" +
-        "def compute_cps(H):\n" +
+        "def compute_cps(H, use_fixed_perm=False):\n" +
         "    n = H.shape[0]\n" +
         "    G = H @ H.T\n" +
         "    Gnorm = float(np.linalg.norm(G))\n" +
+        "    pres_perm_choice = PRESERVE_PERM_FIXED if use_fixed_perm else PRESERVE_PERM\n" +
         "    if Gnorm <= 0.0:\n" +
-        "        return 0.0, 0.0, 0.0, PRESERVE_PERM, list(range(n))\n" +
-        "    pres_perm = list(PRESERVE_PERM)\n" +
+        "        return 0.0, 0.0, 0.0, pres_perm_choice, list(range(n))\n" +
+        "    pres_perm = list(pres_perm_choice)\n" +
         "    rng = np.random.default_rng(DESTRUCT_SEED)\n" +
         "    dest_perm = [int(x) for x in rng.permutation(n).tolist()]\n" +
         "    Hp = H[pres_perm, :]\n" +
@@ -128,24 +131,26 @@ fn _write_helper() {
         "    if cps >= 1.5: return 'AMBIGUOUS'\n" +
         "    return 'FAIL'\n" +
         "\n" +
-        "def cmd_run(input_path, result_path, schema, spec_doc, spec_commit, round_id, path_id):\n" +
+        "def cmd_run(input_path, result_path, schema, spec_doc, spec_commit, round_id, path_id, fixed_flag='0'):\n" +
         "    if not os.path.exists(input_path):\n" +
         "        print(f'ERR: missing input {input_path}', file=sys.stderr); sys.exit(2)\n" +
         "    H = load_H(input_path)\n" +
         "    if H.shape[0] != 16:\n" +
         "        print(f'ERR: expected 16 prompts, got {H.shape[0]}', file=sys.stderr); sys.exit(2)\n" +
-        "    dp, dd, cps, pres_perm, dest_perm = compute_cps(H)\n" +
+        "    use_fixed = (str(fixed_flag) == '1')\n" +
+        "    dp, dd, cps, pres_perm, dest_perm = compute_cps(H, use_fixed_perm=use_fixed)\n" +
         "    v = verdict_for(cps, dp, dd)\n" +
         "    ts = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
         "    out = {\n" +
         "        'schema': schema,\n" +
-        "        'verifier': 'V3 CPS (Gram Frobenius variant)',\n" +
+        "        'verifier': 'V3 CPS (Gram Frobenius variant)' + (' [fixed PRESERVE_PERM raw#12 new revision]' if use_fixed else ''),\n" +
         "        'spec_doc': spec_doc,\n" +
         "        'spec_commit': spec_commit,\n" +
         "        'spec_implementation_note': SPEC_NOTE,\n" +
         "        'ts': ts,\n" +
         "        'round': round_id,\n" +
         "        'path': path_id,\n" +
+        "        'preserve_perm_variant': 'fixed' if use_fixed else 'original',\n" +
         "        'preserve_permutation': pres_perm,\n" +
         "        'destruct_permutation': dest_perm,\n" +
         "        'destruct_seed': DESTRUCT_SEED,\n" +
@@ -188,7 +193,8 @@ fn _write_helper() {
         "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
         "    mode = sys.argv[1]\n" +
         "    if mode == 'run':\n" +
-        "        cmd_run(*sys.argv[2:9])\n" +
+        "        # accept optional 8th arg: fixed_flag ('0' or '1')\n" +
+        "        cmd_run(*sys.argv[2:10])\n" +
         "    elif mode == 'selftest':\n" +
         "        cmd_selftest()\n" +
         "    else:\n" +
@@ -214,6 +220,7 @@ fn main() {
     let mut input_override = ""
     let mut output_override = ""
     let mut selftest = false
+    let mut fixed_perm = false
     let mut i = 2
     while i < len(av) {
         let a = av[i]
@@ -229,6 +236,7 @@ fn main() {
         if a == "--output" && i + 1 < len(av) {
             output_override = av[i + 1]; i = i + 2; continue
         }
+        if a == "--fixed-perm" { fixed_perm = true; i = i + 1; continue }
         if a == "--selftest" { selftest = true; i = i + 1; continue }
         i = i + 1
     }
@@ -275,6 +283,7 @@ fn main() {
         exit(2)
     }
 
+    let fixed_str = if fixed_perm { "1" } else { "0" }
     let args = "run " +
         _sh_quote(in_path) + " " +
         _sh_quote(out_path) + " " +
@@ -282,7 +291,8 @@ fn main() {
         _sh_quote(SPEC_DOC) + " " +
         _sh_quote(SPEC_COMMIT) + " " +
         _sh_quote(tag) + " " +
-        _sh_quote(path)
+        _sh_quote(path) + " " +
+        _sh_quote(fixed_str)
     let r = _run_helper(args)
     let out = r[0]
     let st  = r[1]
