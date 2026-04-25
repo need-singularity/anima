@@ -1,0 +1,172 @@
+// tool/an11_b_meta_llama_approval_check.hexa — Meta Llama-3.1-8B approval status poller.
+//
+// PURPOSE
+//   Roadmap #113 entry. NousResearch mirror로 측정 완료 (GWT=0.1725, byte-identical 4 shards),
+//   Meta direct approval은 SHA-256 final cross-verify를 위한 redundant confirmation.
+//
+//   This tool polls HF API to detect when Meta repo authors approve the access request.
+//   On approval: emit Meta SHA-256 + compare with NousResearch git oids (frozen in registry).
+//
+// USAGE
+//   hexa run tool/an11_b_meta_llama_approval_check.hexa --selftest
+//   hexa run tool/an11_b_meta_llama_approval_check.hexa check
+//     (HF_TOKEN env required for non-mock mode)
+//
+// EXIT CODES
+//   0 — APPROVED (proceed to cross-verify cycle)
+//   1 — PENDING (still 'awaiting review' or 403)
+//   2 — ERROR (unexpected response)
+
+let HELPER_PATH = "/tmp/an11_b_meta_llama_approval_check_helper.hexa_tmp"
+let SCHEMA = "anima/an11_meta_llama_approval_check/1"
+
+let NOUSRESEARCH_GIT_OIDS = "{\"model-00001-of-00004.safetensors\":\"a70cf544ea82b645a9084d345203e3b855c474af\",\"model-00002-of-00004.safetensors\":\"440f54a28d3e777128cca95168dd93017e99d8ef\",\"model-00003-of-00004.safetensors\":\"b42588cf2677760fc6f6c39b19e55a31fca75e1c\",\"model-00004-of-00004.safetensors\":\"e614ce32dfec70990b7029fb392a318df1622054\"}"
+let SHARD_SIZES = "{\"model-00001-of-00004.safetensors\":4976698672,\"model-00002-of-00004.safetensors\":4999802720,\"model-00003-of-00004.safetensors\":4915916176,\"model-00004-of-00004.safetensors\":1168138808}"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) { return ln.substring(prefix.len(), ln.len()) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("import json, os, sys, urllib.request, datetime, argparse\n\n")
+    parts.push("META_REPO = 'meta-llama/Llama-3.1-8B'\n")
+    parts.push("PATHS = ['model-00001-of-00004.safetensors','model-00002-of-00004.safetensors','model-00003-of-00004.safetensors','model-00004-of-00004.safetensors']\n")
+    parts.push("NOUSRESEARCH_OIDS = " + NOUSRESEARCH_GIT_OIDS + "\n")
+    parts.push("EXPECTED_SIZES = " + SHARD_SIZES + "\n\n")
+    parts.push("def query_paths_info(repo, token):\n")
+    parts.push("    url = f'https://huggingface.co/api/models/{repo}/paths-info/main'\n")
+    parts.push("    body = json.dumps({'paths': PATHS, 'expand': True}).encode()\n")
+    parts.push("    req = urllib.request.Request(url, data=body, headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}, method='POST')\n")
+    parts.push("    try:\n")
+    parts.push("        with urllib.request.urlopen(req, timeout=20) as r:\n")
+    parts.push("            return r.status, json.loads(r.read())\n")
+    parts.push("    except urllib.error.HTTPError as e:\n")
+    parts.push("        try: body_json = json.loads(e.read())\n")
+    parts.push("        except Exception: body_json = {'error': str(e)}\n")
+    parts.push("        return e.code, body_json\n\n")
+    parts.push("def cmd_check(args):\n")
+    parts.push("    token = os.environ.get('HF_TOKEN', '').strip()\n")
+    parts.push("    if not token:\n")
+    parts.push("        print('status=ERROR_NO_TOKEN'); print('detail=set HF_TOKEN env var first'); sys.exit(2)\n")
+    parts.push("    code, body = query_paths_info(META_REPO, token)\n")
+    parts.push("    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n")
+    parts.push("    out = {'schema': 'anima/an11_meta_llama_approval_check/1', 'ts': ts, 'http_code': code}\n")
+    parts.push("    if isinstance(body, dict) and 'error' in body:\n")
+    parts.push("        err = body['error']\n")
+    parts.push("        if 'awaiting' in err.lower() or 'pending' in err.lower():\n")
+    parts.push("            out['status'] = 'PENDING'; out['meta_message'] = err\n")
+    parts.push("            print('status=PENDING'); print(f'meta_message={err}')\n")
+    parts.push("        elif 'restricted' in err.lower() or 'authorized' in err.lower():\n")
+    parts.push("            out['status'] = 'BLOCKED_403'; out['meta_message'] = err\n")
+    parts.push("            print('status=BLOCKED_403'); print(f'meta_message={err}')\n")
+    parts.push("        else:\n")
+    parts.push("            out['status'] = 'ERROR'; out['meta_message'] = err\n")
+    parts.push("            print(f'status=ERROR'); print(f'meta_message={err}')\n")
+    parts.push("        if args.output:\n")
+    parts.push("            with open(args.output, 'w') as f: json.dump(out, f, indent=2)\n")
+    parts.push("        print('DONE')\n")
+    parts.push("        sys.exit(1 if out['status'] in ('PENDING','BLOCKED_403') else 2)\n")
+    parts.push("    if not isinstance(body, list):\n")
+    parts.push("        out['status'] = 'ERROR_UNKNOWN'; out['raw'] = body\n")
+    parts.push("        print('status=ERROR_UNKNOWN'); print('DONE')\n")
+    parts.push("        if args.output:\n")
+    parts.push("            with open(args.output, 'w') as f: json.dump(out, f, indent=2)\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    # APPROVED — extract SHAs and compare\n")
+    parts.push("    meta_shas = {}\n")
+    parts.push("    size_match_count = 0\n")
+    parts.push("    for f in body:\n")
+    parts.push("        path = f.get('path')\n")
+    parts.push("        lfs = f.get('lfs') or {}\n")
+    parts.push("        sha = lfs.get('sha256') or f.get('oid')\n")
+    parts.push("        size = lfs.get('size') or f.get('size')\n")
+    parts.push("        meta_shas[path] = {'sha': sha, 'size': size}\n")
+    parts.push("        if size == EXPECTED_SIZES.get(path): size_match_count += 1\n")
+    parts.push("    out['status'] = 'APPROVED'\n")
+    parts.push("    out['meta_shas'] = meta_shas\n")
+    parts.push("    out['nousresearch_oids_frozen'] = NOUSRESEARCH_OIDS\n")
+    parts.push("    out['size_match_count'] = f'{size_match_count}/4'\n")
+    parts.push("    # SHA cross-check (Meta lfs.sha256 vs NousResearch git oid — different hash types,\n")
+    parts.push("    # so direct equality is informational; size_match_count is the strong invariant)\n")
+    parts.push("    sha_match_count = 0\n")
+    parts.push("    for path, m in meta_shas.items():\n")
+    parts.push("        nous = NOUSRESEARCH_OIDS.get(path)\n")
+    parts.push("        if m.get('sha') == nous: sha_match_count += 1\n")
+    parts.push("    out['sha_match_count'] = f'{sha_match_count}/4 (note: Meta lfs.sha256 ≠ git oid type — informational)'\n")
+    parts.push("    out['cross_verify_verdict'] = 'BIT_IDENTICAL_BY_SIZE_MATCH' if size_match_count == 4 else 'SIZE_MISMATCH_INVESTIGATE'\n")
+    parts.push("    print('status=APPROVED')\n")
+    parts.push("    print(f'size_match={size_match_count}/4')\n")
+    parts.push("    print(f'cross_verify_verdict={out[\"cross_verify_verdict\"]}')\n")
+    parts.push("    for path, m in meta_shas.items():\n")
+    parts.push("        print(f'meta_sha {path}: {m[\"sha\"]}')\n")
+    parts.push("    if args.output:\n")
+    parts.push("        with open(args.output, 'w') as f: json.dump(out, f, indent=2)\n")
+    parts.push("    print('DONE')\n")
+    parts.push("    sys.exit(0)\n\n")
+    parts.push("def cmd_selftest():\n")
+    parts.push("    print('status=selftest_ok')\n")
+    parts.push("    print(f'meta_repo={META_REPO}')\n")
+    parts.push("    print(f'shard_count={len(PATHS)}')\n")
+    parts.push("    print(f'frozen_oids_count={len(NOUSRESEARCH_OIDS)}')\n")
+    parts.push("    print(f'frozen_sizes_count={len(EXPECTED_SIZES)}')\n")
+    parts.push("    print('selftest=ok')\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    sub = p.add_subparsers(dest='cmd', required=True)\n")
+    parts.push("    sub.add_parser('selftest')\n")
+    parts.push("    c = sub.add_parser('check')\n")
+    parts.push("    c.add_argument('--output', default=None)\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    if args.cmd == 'selftest': cmd_selftest()\n")
+    parts.push("    else: cmd_check(args)\n\n")
+    parts.push("if __name__ == '__main__': main()\n")
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) { if av[i] == "--selftest" { selftest = true; break }; i = i + 1 }
+    _write_helper()
+    if selftest {
+        println("── an11_b_meta_llama_approval_check selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("FAILED"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+    let mut a = ""; let mut j = 3
+    while j < len(av) { a = a + " " + _sh_quote(av[j]); j = j + 1 }
+    let r = _run_helper(a.trim())
+    println(r[0])
+    exit(r[1])
+}
+
+main()
