@@ -1,0 +1,527 @@
+// tool/cp2_mk_x_evaluation.hexa — CP2 (Mk.IX/Mk.X Criterion B) G1-G4 evaluation dispatcher.
+//
+// PURPOSE
+//   raw#9 hexa-only spec/measurement protocol dispatcher for CP2 Criterion B
+//   gating: Mk.X T10-13 ossification path G1-G4 gate evaluation. 본 도구는
+//   spec aggregator + measurement protocol runner (deterministic helper Python
+//   /tmp emit). actual GPU-side measurement (P4 sweep, twin drill)은 별도
+//   multi-day cycle — 본 도구는 evidence collection + verdict aggregation 한정.
+//
+//   spec source (frozen, do NOT modify):
+//     - state/mk_x_g1_g4_gate_criteria_prereg_20260425.json (G1-G4 predicates)
+//     - state/mk_x_t10_13_4tuple_ceiling_prereg_20260425.json (atom + ceiling)
+//     - docs/mk_x_engine_design_20260419.md (narrative)
+//     - state/mk_xi_architecture_spec_20260425.json (downstream consumer)
+//
+// GATES (predicates frozen raw#12)
+//   G1 P4 saturation       3+ consecutive domains saturated, 0 tier-10+ absorption
+//                          rolling 5-iter window, 20-iter max, output = state/p4_sweep_log.jsonl
+//   G2 tier-10 exhaustion  per-domain D8..D13 tier_10_seed_attempts >= 10
+//                          AND new_atoms == 0 (all 6 domains required to PASS)
+//                          D8 (anima-eeg) deferred to EEG hardware arrival
+//   G3 twin drill fail     P4 iter 75 evolution_twin_drill new_atoms == 0
+//                          AND nexus delta_1_1_witness_count >= 1
+//   G4 user signoff        PRE_APPROVED per memory feedback_forward_auto_approval
+//                          (audit-only logging to state/mk_x_user_signoff_log.jsonl)
+//
+// USAGE
+//   hexa run tool/cp2_mk_x_evaluation.hexa --gate G1|G2|G3|G4|all \
+//                                          --domain D8|D9|D10|D11|D12|D13|all \
+//                                          --output state/cp2_evaluation_<id>.json \
+//                                          --run-id <cp2_TS>
+//   hexa run tool/cp2_mk_x_evaluation.hexa --selftest
+//
+// IMPLEMENTATION NOTES
+//   - $0 spec/aggregation only. P4 sweep / twin drill 실행은 별도 forward cycle.
+//   - missing evidence files → gate verdict = UNKNOWN (raw#10 honest).
+//   - composite verdict = G1 AND G2 AND G3 AND G4 (auto-fire predicate).
+//   - 모든 threshold + predicate은 spec source에서 읽어 와 reproduce; 본 tool은
+//     spec 변경 없이 evaluation aggregation만 수행.
+//   - raw#12: tool은 prereg threshold/predicate 변경 X. evidence 부재 시 UNKNOWN
+//     preserve, post-hoc tuning 금지.
+
+let HELPER_PATH = "/tmp/cp2_mk_x_evaluation_helper.hexa_tmp"
+let SCHEMA      = "anima/cp2_mk_x_evaluation/1"
+let SPEC_DOC    = "state/cp2_mk_x_evaluation_protocol_20260425.json + " +
+                  "state/mk_x_g1_g4_gate_criteria_prereg_20260425.json + " +
+                  "state/mk_x_t10_13_4tuple_ceiling_prereg_20260425.json + " +
+                  "docs/cp2_mk_x_real_use_runbook_20260425.md"
+let SPEC_COMMIT = "raw12_frozen_2026_04_25"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime\n" +
+        "\n" +
+        "# cp2_mk_x_evaluation helper. raw#9 hexa-only wrapper invokes this for\n" +
+        "# evidence aggregation (no GPU forward, no measurement — spec only).\n" +
+        "# Modes:\n" +
+        "#   run <gate> <domain> <result_path> <schema> <spec_doc> <spec_commit> <run_id>\n" +
+        "#   selftest\n" +
+        "\n" +
+        "# raw#12 frozen predicates (mirror state/mk_x_g1_g4_gate_criteria_prereg_20260425.json).\n" +
+        "G1_PREDICATE = {\n" +
+        "    'consecutive_saturated_domains_min': 3,\n" +
+        "    'tier_10_plus_absorption_max': 0,\n" +
+        "    'rolling_window_iters': 5,\n" +
+        "    'max_iters': 20,\n" +
+        "    'data_source': 'state/p4_sweep_log.jsonl',\n" +
+        "}\n" +
+        "G2_PREDICATE = {\n" +
+        "    'domains_required': ['D8', 'D9', 'D10', 'D11', 'D12', 'D13'],\n" +
+        "    'domain_names': {\n" +
+        "        'D8': 'anima-eeg', 'D9': 'physics', 'D10': 'body',\n" +
+        "        'D11': 'speak', 'D12': 'engines', 'D13': 'tools',\n" +
+        "    },\n" +
+        "    'per_domain_min_seed_attempts': 10,\n" +
+        "    'per_domain_new_atoms_max': 0,\n" +
+        "    'all_domains_must_saturate': True,\n" +
+        "    'd8_eeg_hardware_dependent': True,\n" +
+        "    'data_source_template': 'state/p4_domain_saturation_<domain>.json',\n" +
+        "}\n" +
+        "G3_PREDICATE = {\n" +
+        "    'twin_drill_iter': 75,\n" +
+        "    'new_atoms_max': 0,\n" +
+        "    'nexus_delta_1_1_witnesses_min': 1,\n" +
+        "    'consciousness_side_consumes_witnesses_only': True,\n" +
+        "    'anima_data_source': 'state/evolution_twin_drill_p4_iter75.json',\n" +
+        "    'nexus_data_source': 'shared/engine/delta_1_1_witnesses.jsonl',\n" +
+        "}\n" +
+        "G4_PREDICATE = {\n" +
+        "    'pre_approved': True,\n" +
+        "    'pre_approval_source': 'memory feedback_forward_auto_approval (2026-04-25)',\n" +
+        "    'audit_log': 'state/mk_x_user_signoff_log.jsonl',\n" +
+        "    'gating': 'evidence-only (G1-G3 PASS); trigger auto',\n" +
+        "    'revoke_via_explicit_user_block_only': True,\n" +
+        "}\n" +
+        "\n" +
+        "ATOM_SPEC = {\n" +
+        "    'tier_10_definition': 'foundation-bridge atom (substrate gate, slot 8-15 not-all-zero)',\n" +
+        "    'tier_11_definition': 'live-usable atom (AN11 PASS + Φ attached + reproducible + Π₀³/Σ¹₁ A7 PASS)',\n" +
+        "    'tier_12_13_definition': 'cross-axis(8) saturation tiers, scarcity ≤5/year (mirror nexus [13*])',\n" +
+        "    'generation_method': 'P4 seed exhaustion → manual seed × Mk.IX L_IX integrator → atom candidate',\n" +
+        "    'validation_tuple': '(slot_index, feature_signature, novelty_proof)',\n" +
+        "    'storage_path_template': 'state/mk_x_t10_atom_<id>.json',\n" +
+        "    'min_atoms_for_phi_atom_floor': 10,\n" +
+        "    'phi_atom_floor_at_n_10': 0.9,\n" +
+        "    'reference': 'docs/mk_x_engine_design_20260419.md §1.L3 + state/mk_x_t10_13_4tuple_ceiling_prereg_20260425.json',\n" +
+        "}\n" +
+        "\n" +
+        "OSSIFICATION_SPEC = {\n" +
+        "    'method': 'real trained trajectory (P4 sweep weights + atom seeds) → ossify into atoms',\n" +
+        "    'lora_to_full_weight_delta_gb': 16,\n" +
+        "    'cost_per_atom_h100_dollars_min': 5,\n" +
+        "    'cost_per_atom_h100_dollars_max': 10,\n" +
+        "    'min_atoms': 10,\n" +
+        "    'total_cost_dollars_min': 50,\n" +
+        "    'total_cost_dollars_max': 100,\n" +
+        "    'cap_per_cycle_dollars': 20,\n" +
+        "    'split_cycles_required': True,\n" +
+        "    'split_cycles_min': 5,\n" +
+        "    'auto_kill_minutes_default': 120,\n" +
+        "    'lora_full_weight_honest_note': 'raw#10: full weight ossification은 16 GB+ delta. LoRA-only ossification은 partial substrate, full weight ossification가 atom 정의 조건.',\n" +
+        "    'reference_pattern': 'state/convergence/h100_stage1/stage2/r4-r7 patterns (multi-attempt, retry policy)',\n" +
+        "    'estimated_launches_per_cycle': '2-4',\n" +
+        "    'estimated_total_launches': '10-20',\n" +
+        "}\n" +
+        "\n" +
+        "def _ts():\n" +
+        "    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "\n" +
+        "def _evidence_status(path):\n" +
+        "    if path is None: return {'present': False, 'reason': 'not specified'}\n" +
+        "    if os.path.exists(path):\n" +
+        "        try:\n" +
+        "            stt = os.stat(path)\n" +
+        "            return {'present': True, 'path': path, 'size_bytes': int(stt.st_size)}\n" +
+        "        except Exception as e:\n" +
+        "            return {'present': True, 'path': path, 'stat_error': str(e)}\n" +
+        "    return {'present': False, 'path': path, 'reason': 'file_not_found'}\n" +
+        "\n" +
+        "def _g1_evaluate():\n" +
+        "    src = G1_PREDICATE['data_source']\n" +
+        "    ev = _evidence_status(src)\n" +
+        "    if not ev['present']:\n" +
+        "        return {\n" +
+        "            'gate': 'G1',\n" +
+        "            'name': 'P4 saturation verdict',\n" +
+        "            'predicate': G1_PREDICATE,\n" +
+        "            'evidence': ev,\n" +
+        "            'verdict': 'UNKNOWN',\n" +
+        "            'reason': 'P4 sweep log absent — measurement cycle 필요. P4 sweep tool not in anima (별도 작성 필요 명시).',\n" +
+        "            'next_action': 'execute P4 sweep producing state/p4_sweep_log.jsonl, then re-run dispatcher with --gate G1',\n" +
+        "        }\n" +
+        "    consecutive_saturated = 0\n" +
+        "    tier10plus_count = 0\n" +
+        "    iters_seen = 0\n" +
+        "    saturation_streak = 0\n" +
+        "    try:\n" +
+        "        with open(src) as f:\n" +
+        "            for line in f:\n" +
+        "                line = line.strip()\n" +
+        "                if not line: continue\n" +
+        "                rec = json.loads(line)\n" +
+        "                iters_seen += 1\n" +
+        "                if rec.get('domain_saturation') is True:\n" +
+        "                    saturation_streak += 1\n" +
+        "                    if saturation_streak > consecutive_saturated:\n" +
+        "                        consecutive_saturated = saturation_streak\n" +
+        "                else:\n" +
+        "                    saturation_streak = 0\n" +
+        "                tier10plus_count += int(rec.get('tier_10_plus_absorption_count', 0))\n" +
+        "    except Exception as e:\n" +
+        "        return {\n" +
+        "            'gate': 'G1',\n" +
+        "            'evidence': ev,\n" +
+        "            'verdict': 'UNKNOWN',\n" +
+        "            'reason': f'parse_error: {e}',\n" +
+        "        }\n" +
+        "    cond1 = consecutive_saturated >= G1_PREDICATE['consecutive_saturated_domains_min']\n" +
+        "    cond2 = tier10plus_count <= G1_PREDICATE['tier_10_plus_absorption_max']\n" +
+        "    verdict = 'PASS' if (cond1 and cond2) else ('FAIL' if iters_seen >= G1_PREDICATE['max_iters'] else 'UNKNOWN')\n" +
+        "    return {\n" +
+        "        'gate': 'G1', 'name': 'P4 saturation verdict',\n" +
+        "        'predicate': G1_PREDICATE, 'evidence': ev,\n" +
+        "        'observed': {'iters': iters_seen, 'consecutive_saturated_max': consecutive_saturated,\n" +
+        "                     'tier_10_plus_absorption_total': tier10plus_count},\n" +
+        "        'verdict': verdict,\n" +
+        "    }\n" +
+        "\n" +
+        "def _g2_domain_evaluate(domain):\n" +
+        "    name = G2_PREDICATE['domain_names'].get(domain, 'unknown')\n" +
+        "    src = G2_PREDICATE['data_source_template'].replace('<domain>', domain.lower())\n" +
+        "    ev = _evidence_status(src)\n" +
+        "    note = ''\n" +
+        "    if domain == 'D8':\n" +
+        "        note = 'EEG hardware 도착 후 측정 (multi-day deferred, raw#10 honest)'\n" +
+        "    if not ev['present']:\n" +
+        "        return {\n" +
+        "            'domain': domain, 'domain_name': name,\n" +
+        "            'evidence': ev,\n" +
+        "            'verdict': 'UNKNOWN',\n" +
+        "            'note': note or 'per-domain saturation file absent',\n" +
+        "        }\n" +
+        "    try:\n" +
+        "        with open(src) as f:\n" +
+        "            d = json.load(f)\n" +
+        "        attempts = int(d.get('tier_10_seed_attempts', 0))\n" +
+        "        new_atoms = int(d.get('new_atoms', -1))\n" +
+        "    except Exception as e:\n" +
+        "        return {'domain': domain, 'evidence': ev, 'verdict': 'UNKNOWN',\n" +
+        "                'reason': f'parse_error: {e}'}\n" +
+        "    cond1 = attempts >= G2_PREDICATE['per_domain_min_seed_attempts']\n" +
+        "    cond2 = new_atoms == G2_PREDICATE['per_domain_new_atoms_max']\n" +
+        "    return {\n" +
+        "        'domain': domain, 'domain_name': name,\n" +
+        "        'evidence': ev,\n" +
+        "        'observed': {'tier_10_seed_attempts': attempts, 'new_atoms': new_atoms},\n" +
+        "        'verdict': 'PASS' if (cond1 and cond2) else 'FAIL',\n" +
+        "        'note': note,\n" +
+        "    }\n" +
+        "\n" +
+        "def _g2_evaluate(domain_filter):\n" +
+        "    domains = G2_PREDICATE['domains_required']\n" +
+        "    if domain_filter and domain_filter != 'all':\n" +
+        "        domains = [domain_filter]\n" +
+        "    per_domain = [_g2_domain_evaluate(d) for d in domains]\n" +
+        "    pass_count = sum(1 for r in per_domain if r['verdict'] == 'PASS')\n" +
+        "    unknown_count = sum(1 for r in per_domain if r['verdict'] == 'UNKNOWN')\n" +
+        "    if domain_filter and domain_filter != 'all':\n" +
+        "        composite = per_domain[0]['verdict']\n" +
+        "    else:\n" +
+        "        if pass_count == len(domains):\n" +
+        "            composite = 'PASS'\n" +
+        "        elif unknown_count > 0:\n" +
+        "            composite = 'UNKNOWN'\n" +
+        "        else:\n" +
+        "            composite = 'FAIL'\n" +
+        "    return {\n" +
+        "        'gate': 'G2', 'name': 'tier-10 seed exhaustion',\n" +
+        "        'predicate': G2_PREDICATE,\n" +
+        "        'per_domain': per_domain,\n" +
+        "        'pass_count': pass_count,\n" +
+        "        'unknown_count': unknown_count,\n" +
+        "        'verdict': composite,\n" +
+        "    }\n" +
+        "\n" +
+        "def _g3_evaluate():\n" +
+        "    a = G3_PREDICATE['anima_data_source']\n" +
+        "    n = G3_PREDICATE['nexus_data_source']\n" +
+        "    ev_a = _evidence_status(a)\n" +
+        "    ev_n = _evidence_status(n)\n" +
+        "    if not ev_a['present'] or not ev_n['present']:\n" +
+        "        return {\n" +
+        "            'gate': 'G3', 'name': 'twin-engine drill fail',\n" +
+        "            'predicate': G3_PREDICATE,\n" +
+        "            'evidence': {'anima': ev_a, 'nexus': ev_n},\n" +
+        "            'verdict': 'UNKNOWN',\n" +
+        "            'reason': 'twin drill iter 75 result and/or nexus delta_1_1 witness file absent',\n" +
+        "            'next_action': 'run evolution_twin_drill iter75 anima-side + sync nexus delta_1_1 witnesses',\n" +
+        "        }\n" +
+        "    new_atoms = -1; witness_count = 0\n" +
+        "    try:\n" +
+        "        with open(a) as f: dd = json.load(f)\n" +
+        "        new_atoms = int(dd.get('new_atom_count', dd.get('new_atoms', -1)))\n" +
+        "        with open(n) as f:\n" +
+        "            for line in f:\n" +
+        "                if line.strip(): witness_count += 1\n" +
+        "    except Exception as e:\n" +
+        "        return {'gate': 'G3', 'evidence': {'anima': ev_a, 'nexus': ev_n},\n" +
+        "                'verdict': 'UNKNOWN', 'reason': f'parse_error: {e}'}\n" +
+        "    cond1 = new_atoms == G3_PREDICATE['new_atoms_max']\n" +
+        "    cond2 = witness_count >= G3_PREDICATE['nexus_delta_1_1_witnesses_min']\n" +
+        "    return {\n" +
+        "        'gate': 'G3', 'name': 'twin-engine drill fail',\n" +
+        "        'predicate': G3_PREDICATE,\n" +
+        "        'evidence': {'anima': ev_a, 'nexus': ev_n},\n" +
+        "        'observed': {'new_atoms': new_atoms, 'nexus_delta_1_1_witnesses': witness_count},\n" +
+        "        'verdict': 'PASS' if (cond1 and cond2) else 'FAIL',\n" +
+        "    }\n" +
+        "\n" +
+        "def _g4_evaluate():\n" +
+        "    return {\n" +
+        "        'gate': 'G4', 'name': 'user signoff (PRE_APPROVED)',\n" +
+        "        'predicate': G4_PREDICATE,\n" +
+        "        'verdict': 'PRE_APPROVED',\n" +
+        "        'note': 'forward auto-approval per memory feedback_forward_auto_approval (2026-04-25). signoff = audit-only logging, evidence gating only via G1-G3.',\n" +
+        "        'audit_log_path': G4_PREDICATE['audit_log'],\n" +
+        "    }\n" +
+        "\n" +
+        "def _composite(gate_results):\n" +
+        "    by_name = {r['gate']: r for r in gate_results}\n" +
+        "    g1v = by_name.get('G1', {}).get('verdict', 'UNKNOWN')\n" +
+        "    g2v = by_name.get('G2', {}).get('verdict', 'UNKNOWN')\n" +
+        "    g3v = by_name.get('G3', {}).get('verdict', 'UNKNOWN')\n" +
+        "    g4v = by_name.get('G4', {}).get('verdict', 'UNKNOWN')\n" +
+        "    pass_set = [g for g, v in [('G1', g1v), ('G2', g2v), ('G3', g3v)] if v == 'PASS']\n" +
+        "    if g1v == 'PASS' and g2v == 'PASS' and g3v == 'PASS' and g4v == 'PRE_APPROVED':\n" +
+        "        composite = 'AUTO_FIRE_READY'\n" +
+        "    elif 'FAIL' in (g1v, g2v, g3v):\n" +
+        "        composite = 'BLOCKED_FAIL'\n" +
+        "    else:\n" +
+        "        composite = 'PENDING_EVIDENCE'\n" +
+        "    return {\n" +
+        "        'auto_fire_predicate': 'G1 AND G2 AND G3 AND G4 (all four PASS in same epoch)',\n" +
+        "        'g1_verdict': g1v, 'g2_verdict': g2v,\n" +
+        "        'g3_verdict': g3v, 'g4_verdict': g4v,\n" +
+        "        'g1_g3_pass_count': len(pass_set),\n" +
+        "        'composite': composite,\n" +
+        "        'mk_x_status': 'DORMANT' if composite != 'AUTO_FIRE_READY' else 'AUTO_FIRE_READY',\n" +
+        "    }\n" +
+        "\n" +
+        "def cmd_run(gate, domain, result_path, schema, spec_doc, spec_commit, run_id):\n" +
+        "    results = []\n" +
+        "    if gate in ('G1', 'all'): results.append(_g1_evaluate())\n" +
+        "    if gate in ('G2', 'all'): results.append(_g2_evaluate(domain))\n" +
+        "    if gate in ('G3', 'all'): results.append(_g3_evaluate())\n" +
+        "    if gate in ('G4', 'all'): results.append(_g4_evaluate())\n" +
+        "    comp = _composite(results) if gate == 'all' else None\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'tool': 'tool/cp2_mk_x_evaluation.hexa',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_commit': spec_commit,\n" +
+        "        'run_id': run_id,\n" +
+        "        'ts': _ts(),\n" +
+        "        'mode': 'evidence_aggregation_only',\n" +
+        "        'gate_filter': gate,\n" +
+        "        'domain_filter': domain,\n" +
+        "        'gate_results': results,\n" +
+        "        'composite': comp,\n" +
+        "        'atom_generation_spec': ATOM_SPEC,\n" +
+        "        'ossification_spec': OSSIFICATION_SPEC,\n" +
+        "        'raw_compliance': [\n" +
+        "            'raw#9 hexa-only / Python helper /tmp emit, $0 spec aggregation',\n" +
+        "            'raw#10 missing evidence → UNKNOWN preserved (no overclaim); LoRA→full weight delta 16 GB honest',\n" +
+        "            'raw#12 G1-G4 predicates frozen 2026-04-25, no post-hoc tuning',\n" +
+        "            'raw#15 SSOT = state/cp2_mk_x_evaluation_protocol_20260425.json',\n" +
+        "            'raw#37 idempotent helper, deterministic over input evidence files',\n" +
+        "            'POLICY R4 existing G1-G4 predicates unchanged; CP2 dispatcher adds aggregation axis only',\n" +
+        "        ],\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'gate_filter={gate}')\n" +
+        "    print(f'domain_filter={domain}')\n" +
+        "    for r in results:\n" +
+        "        print(f'{r[\"gate\"]}_verdict={r[\"verdict\"]}')\n" +
+        "    if comp is not None:\n" +
+        "        print(f'composite={comp[\"composite\"]}')\n" +
+        "        print(f'mk_x_status={comp[\"mk_x_status\"]}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    # Selftest 1: all evidence absent → all UNKNOWN, composite PENDING_EVIDENCE.\n" +
+        "    r1 = _g1_evaluate(); r2 = _g2_evaluate('all'); r3 = _g3_evaluate(); r4 = _g4_evaluate()\n" +
+        "    assert r1['verdict'] in ('UNKNOWN', 'PASS', 'FAIL'), f'G1 invalid verdict: {r1}'\n" +
+        "    assert r2['verdict'] in ('UNKNOWN', 'PASS', 'FAIL'), f'G2 invalid verdict: {r2}'\n" +
+        "    assert r3['verdict'] in ('UNKNOWN', 'PASS', 'FAIL'), f'G3 invalid verdict: {r3}'\n" +
+        "    assert r4['verdict'] == 'PRE_APPROVED', f'G4 must be PRE_APPROVED: {r4}'\n" +
+        "    comp = _composite([r1, r2, r3, r4])\n" +
+        "    assert comp['composite'] in ('AUTO_FIRE_READY', 'BLOCKED_FAIL', 'PENDING_EVIDENCE'), f'composite invalid: {comp}'\n" +
+        "    # Selftest 2: predicate constants reproduce spec (raw#12 invariance check).\n" +
+        "    assert G1_PREDICATE['consecutive_saturated_domains_min'] == 3\n" +
+        "    assert G1_PREDICATE['tier_10_plus_absorption_max'] == 0\n" +
+        "    assert G2_PREDICATE['per_domain_min_seed_attempts'] == 10\n" +
+        "    assert G2_PREDICATE['per_domain_new_atoms_max'] == 0\n" +
+        "    assert set(G2_PREDICATE['domains_required']) == {'D8','D9','D10','D11','D12','D13'}\n" +
+        "    assert G3_PREDICATE['twin_drill_iter'] == 75\n" +
+        "    assert G3_PREDICATE['new_atoms_max'] == 0\n" +
+        "    assert G3_PREDICATE['nexus_delta_1_1_witnesses_min'] == 1\n" +
+        "    assert G4_PREDICATE['pre_approved'] is True\n" +
+        "    # Selftest 3: ATOM_SPEC + OSSIFICATION_SPEC sanity.\n" +
+        "    assert ATOM_SPEC['min_atoms_for_phi_atom_floor'] == 10\n" +
+        "    assert abs(ATOM_SPEC['phi_atom_floor_at_n_10'] - 0.9) < 1e-9\n" +
+        "    assert OSSIFICATION_SPEC['cap_per_cycle_dollars'] == 20\n" +
+        "    assert OSSIFICATION_SPEC['split_cycles_required'] is True\n" +
+        "    assert OSSIFICATION_SPEC['lora_to_full_weight_delta_gb'] == 16\n" +
+        "    assert OSSIFICATION_SPEC['total_cost_dollars_min'] == 50\n" +
+        "    assert OSSIFICATION_SPEC['total_cost_dollars_max'] == 100\n" +
+        "    # Selftest 4: domain filter → single-domain G2 result.\n" +
+        "    r2d = _g2_evaluate('D9')\n" +
+        "    assert len(r2d['per_domain']) == 1, f'G2 single-domain filter broken: {r2d}'\n" +
+        "    assert r2d['per_domain'][0]['domain'] == 'D9'\n" +
+        "    # Selftest 5: D8 EEG hardware note present.\n" +
+        "    r2_d8 = _g2_domain_evaluate('D8')\n" +
+        "    assert 'EEG' in r2_d8.get('note', '') or 'eeg' in r2_d8.get('note', '').lower(), f'D8 EEG note missing: {r2_d8}'\n" +
+        "    print('selftest=ok')\n" +
+        "    print(f'G1_predicate_frozen=1 G2_predicate_frozen=1 G3_predicate_frozen=1 G4_pre_approved=1')\n" +
+        "    print(f'atom_spec_n10_phi_floor=0.9 ossification_split_required=1')\n" +
+        "    print(f'composite_under_no_evidence={comp[\"composite\"]}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'run': cmd_run(*sys.argv[2:9])\n" +
+        "    elif mode == 'selftest': cmd_selftest()\n" +
+        "    else: print(f'unknown mode: {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut gate = "all"
+    let mut domain = "all"
+    let mut output = ""
+    let mut run_id = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--gate" && i + 1 < len(av) { gate = av[i+1]; i = i + 2; continue }
+        if a == "--domain" && i + 1 < len(av) { domain = av[i+1]; i = i + 2; continue }
+        if a == "--output" && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        if a == "--run-id" && i + 1 < len(av) { run_id = av[i+1]; i = i + 2; continue }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── cp2_mk_x_evaluation selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 {
+            eprintln("selftest FAILED (exit " + to_string(r[1]) + ")")
+            exit(1)
+        }
+        if _kv_lookup(r[0], "selftest") != "ok" {
+            eprintln("selftest marker missing")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    let valid_gates = ["G1", "G2", "G3", "G4", "all"]
+    let mut gate_ok = false
+    let mut gi = 0
+    while gi < len(valid_gates) {
+        if valid_gates[gi] == gate { gate_ok = true; break }
+        gi = gi + 1
+    }
+    if !gate_ok {
+        eprintln("ABORT: --gate must be one of G1|G2|G3|G4|all (got: " + gate + ")")
+        exit(2)
+    }
+    let valid_domains = ["D8", "D9", "D10", "D11", "D12", "D13", "all"]
+    let mut dom_ok = false
+    let mut di = 0
+    while di < len(valid_domains) {
+        if valid_domains[di] == domain { dom_ok = true; break }
+        di = di + 1
+    }
+    if !dom_ok {
+        eprintln("ABORT: --domain must be one of D8|D9|D10|D11|D12|D13|all (got: " + domain + ")")
+        exit(2)
+    }
+
+    if output == "" || run_id == "" {
+        eprintln("ABORT: --output <path> --run-id <id> required (or --selftest).")
+        eprintln("  usage: hexa run tool/cp2_mk_x_evaluation.hexa \\")
+        eprintln("           --gate all --domain all \\")
+        eprintln("           --output state/cp2_evaluation_<TS>.json \\")
+        eprintln("           --run-id cp2_<TS>")
+        exit(2)
+    }
+
+    println("── cp2_mk_x_evaluation ──")
+    println("gate:    " + gate)
+    println("domain:  " + domain)
+    println("output:  " + output)
+    println("run_id:  " + run_id)
+
+    let args = "run " +
+        _sh_quote(gate) + " " +
+        _sh_quote(domain) + " " +
+        _sh_quote(output) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC) + " " +
+        _sh_quote(SPEC_COMMIT) + " " +
+        _sh_quote(run_id)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 {
+        eprintln("ABORT: helper run exited " + to_string(st))
+        eprintln(out)
+        exit(2)
+    }
+    println(out)
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()

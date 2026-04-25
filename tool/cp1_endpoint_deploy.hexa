@@ -1,0 +1,466 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/cp1_endpoint_deploy.hexa — CP1 (Mk.VI VERIFIED) real-use serving
+//  endpoint deploy SPEC + skeleton wrapper (5-phase runbook driver)
+//
+//  ROADMAP: #110 [CP1 real-use serving deploy] (state/roadmap_mk_xi_addendum_20260425.json)
+//  CP1 closure: commit 869dc6d5 (state/cp1_closure_consolidated_state.json)
+//  Pairs:
+//    tool/cp1_serve_launch_mac.bash   (Mac local 6-step actuator, gated by --apply)
+//    docs/cp1_serve_deploy_plan.md    (recovery paths A/B narrative)
+//    docs/cp1_real_use_serving_runbook_20260425.md (THIS cycle)
+//    state/cp1_serving_endpoint_spec_20260425.json (raw#12 frozen spec)
+//
+//  PURPOSE
+//    raw#9 hexa wrapper: declare CP1 endpoint deploy spec + emit a 5-phase
+//    runbook plan as a state JSON. ACTUAL deploy is a SEPARATE cycle —
+//    this tool freezes the spec and writes /tmp helper artifacts only.
+//
+//    raw#10 honest:
+//      - actual_deploy_executed = false
+//      - r13_alm_corpus_present = false (acquisition required)
+//      - mk_vi_lora_r6_p1_local_present detected at runtime (state/trained_adapters_r6/p1/final/)
+//      - an11_c_baseline_jsd_mean = 0.110 (state/an11_c_r8_jsd_1777092846.json) <
+//        threshold 0.5 → AN11(c) PASS NOT guaranteed by current evidence
+//
+//  CLI
+//    hexa run tool/cp1_endpoint_deploy.hexa run \
+//        --model-path <hf_id_or_dir> \
+//        --lora-path  <adapter_dir> \
+//        --serving-infra <vllm|tgi|llama.cpp|fastapi> \
+//        --port 8080 \
+//        --gpu <h100|cpu|m4_metal> \
+//        --output state/cp1_deploy_<id>.json
+//    hexa run tool/cp1_endpoint_deploy.hexa --selftest
+//    hexa run tool/cp1_endpoint_deploy.hexa --help
+//
+//  EXIT
+//    0 — selftest PASS  OR  spec/runbook frozen + state JSON emitted
+//    1 — selftest FAIL OR runbook write failure
+//    2 — bad CLI / unknown serving-infra / missing required flag
+//    3 — caveat-blocking precondition (raw#10 honest blockers fired)
+//
+//  CONSTRAINTS
+//    raw#9   hexa-only ; helpers only via /tmp shell shims
+//    raw#10  honest    ; this file does NOT execute deploy, NOT measure AN11(c)
+//    raw#11  snake_case
+//    raw#12  spec frozen ; AN11(c) re-measurement protocol pre-registered
+//    raw#15  no hardcoded paths beyond $HOME/core/anima anchor
+//    raw#37  no .py/.sh git-tracked (helpers stay in /tmp)
+// ════════════════════════════════════════════════════════════════════════════
+
+let SCHEMA      = "anima/cp1_endpoint_deploy/1"
+let SPEC_PATH   = "state/cp1_serving_endpoint_spec_20260425.json"
+let DEFAULT_OUT = "state/cp1_deploy_dryrun.json"
+let RUNBOOK_DOC = "docs/cp1_real_use_serving_runbook_20260425.md"
+
+let DEFAULT_PORT       = "8080"
+let DEFAULT_INFRA      = "vllm"
+let DEFAULT_RATE_LIMIT = "10"   // req/min
+let DEFAULT_GPU        = "h100"
+
+let MODEL_BASE_DEFAULT = "Qwen/Qwen3-8B"
+let LORA_PATH_DEFAULT  = "state/trained_adapters_r6/p1/final"
+let LORA_RANK_DEFAULT  = "64"
+
+let AN11_C_THRESHOLD_PASS    = "0.5"
+let AN11_C_THRESHOLD_STRONG  = "0.8"
+let AN11_C_BASELINE_MEAN_JSD = "0.110"
+let AN11_C_PROMPTS_N         = "16"
+let AN11_C_GENS_PER_PROMPT   = "20"
+
+let R13_TOKENIZER_NAME    = "Qwen/Qwen3-8B"
+let R13_MAX_LENGTH        = "2048"
+let R13_BPE_NAME          = "Qwen3 BPE (HF tokenizer.json)"
+
+let EXIT_PASS       = 0
+let EXIT_FAIL       = 1
+let EXIT_BAD_CLI    = 2
+let EXIT_BLOCKED    = 3
+
+// ─── stdlib-ish helpers ──────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn home_anima() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h + "/core/anima" }
+    return _str(exec("echo $HOME")).trim() + "/core/anima"
+}
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -e " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn json_escape(s: string) -> string {
+    let mut out = s.replace("\\", "\\\\")
+    out = out.replace("\"", "\\\"")
+    out = out.replace("\n", "\\n")
+    return out
+}
+
+fn bool_s(b: bool) -> string {
+    if b { return "true" } else { return "false" }
+}
+
+// ─── argv ────────────────────────────────────────────────────────────────
+
+fn arg_flag(argv: array, f: string) -> bool {
+    let mut i = 0
+    while i < len(argv) {
+        if _str(argv[i]) == f { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn arg_val(argv: array, f: string, d: string) -> string {
+    let mut i = 0
+    let n = len(argv)
+    while i < n - 1 {
+        if _str(argv[i]) == f { return _str(argv[i + 1]) }
+        i = i + 1
+    }
+    return d
+}
+
+fn arg_subcommand(argv: array) -> string {
+    let mut i = 0
+    while i < len(argv) {
+        let a = _str(argv[i])
+        if a == "run" || a == "spec" || a == "runbook" { return a }
+        i = i + 1
+    }
+    return ""
+}
+
+fn known_infra(infra: string) -> bool {
+    if infra == "vllm" { return true }
+    if infra == "tgi" { return true }
+    if infra == "llama.cpp" { return true }
+    if infra == "fastapi" { return true }
+    return false
+}
+
+fn known_gpu(gpu: string) -> bool {
+    if gpu == "h100" { return true }
+    if gpu == "cpu" { return true }
+    if gpu == "m4_metal" { return true }
+    return false
+}
+
+// ─── help text ───────────────────────────────────────────────────────────
+
+fn print_help() {
+    println("tool/cp1_endpoint_deploy.hexa — CP1 Mk.VI VERIFIED endpoint deploy spec/skeleton")
+    println("")
+    println("USAGE")
+    println("  hexa run tool/cp1_endpoint_deploy.hexa run \\")
+    println("      --model-path <hf_id|dir>          (default " + MODEL_BASE_DEFAULT + ")")
+    println("      --lora-path  <adapter_dir>        (default " + LORA_PATH_DEFAULT + ")")
+    println("      --serving-infra <vllm|tgi|llama.cpp|fastapi>  (default " + DEFAULT_INFRA + ")")
+    println("      --port <n>                        (default " + DEFAULT_PORT + ")")
+    println("      --gpu  <h100|cpu|m4_metal>        (default " + DEFAULT_GPU + ")")
+    println("      --rate-limit <req_per_min>        (default " + DEFAULT_RATE_LIMIT + ")")
+    println("      --output state/cp1_deploy_<id>.json")
+    println("")
+    println("  hexa run tool/cp1_endpoint_deploy.hexa --selftest")
+    println("  hexa run tool/cp1_endpoint_deploy.hexa --help")
+    println("")
+    println("RAW#10 HONEST")
+    println("  This wrapper FREEZES spec/runbook only. Actual pod allocation,")
+    println("  serving launch, and AN11(c) re-measurement happen in a SEPARATE cycle.")
+}
+
+// ─── /tmp helper emit (raw#9 helper not git-tracked) ────────────────────
+
+fn emit_tmp_helpers() -> string {
+    let path = "/tmp/cp1_endpoint_deploy_helpers.sh"
+    let mut sh = ""
+    sh = sh + "#!/bin/sh\n"
+    sh = sh + "# /tmp/cp1_endpoint_deploy_helpers.sh — auto-emitted by\n"
+    sh = sh + "# tool/cp1_endpoint_deploy.hexa. NOT git-tracked (raw#37).\n"
+    sh = sh + "# Hand-runnable phase shims; see runbook for orchestration.\n"
+    sh = sh + "\n"
+    sh = sh + "phase1_pod_alloc() {\n"
+    sh = sh + "  echo '[phase1] pod allocation — see config/h100_pods.json'\n"
+    sh = sh + "  echo 'NOTE: separate cycle owns RunPod actual create.'\n"
+    sh = sh + "}\n"
+    sh = sh + "\n"
+    sh = sh + "phase2_model_lora_load() {\n"
+    sh = sh + "  echo '[phase2] base + LoRA load (peft.PeftModel.from_pretrained)'\n"
+    sh = sh + "  echo 'see tool/cp1_serve_launch_mac.bash for mac-local merge path.'\n"
+    sh = sh + "}\n"
+    sh = sh + "\n"
+    sh = sh + "phase3_serving_launch() {\n"
+    sh = sh + "  case \"$1\" in\n"
+    sh = sh + "    vllm)      echo 'vllm serve $MODEL --enable-lora --lora-modules cp1=$LORA --port $PORT';;\n"
+    sh = sh + "    tgi)       echo 'docker run ghcr.io/huggingface/text-generation-inference --model-id $MODEL --lora-adapters $LORA';;\n"
+    sh = sh + "    llama.cpp) echo 'llama-server -m $GGUF --port $PORT --metal --jinja';;\n"
+    sh = sh + "    fastapi)   echo 'uvicorn cp1_fastapi:app --host 0.0.0.0 --port $PORT';;\n"
+    sh = sh + "  esac\n"
+    sh = sh + "}\n"
+    sh = sh + "\n"
+    sh = sh + "phase4_an11c_remeasure() {\n"
+    sh = sh + "  echo '[phase4] AN11(c) re-measurement protocol — 16 prompts × 20 gens'\n"
+    sh = sh + "  echo 'baseline mean JSD = 0.110, threshold PASS >= 0.5'\n"
+    sh = sh + "  echo 'see tool/an11_c_real_usable_gap_close.hexa for gap-close formula.'\n"
+    sh = sh + "}\n"
+    sh = sh + "\n"
+    sh = sh + "phase5_health_check() {\n"
+    sh = sh + "  echo 'curl -fsS http://127.0.0.1:$PORT/health'\n"
+    sh = sh + "  echo 'on PASS: write state/alm_latest_serve_endpoint.json'\n"
+    sh = sh + "}\n"
+    write_file(path, sh)
+    exec("chmod +x " + path)
+    return path
+}
+
+// ─── precondition probes (raw#10 honest) ─────────────────────────────────
+
+fn probe_lora_present(lora_dir: string) -> bool {
+    if !fexists(lora_dir) { return false }
+    if !fexists(lora_dir + "/adapter_config.json") { return false }
+    if !fexists(lora_dir + "/adapter_model.safetensors") { return false }
+    return true
+}
+
+fn probe_r13_corpus_present() -> bool {
+    let anima = home_anima()
+    let p1 = anima + "/state/r13_corpus_indexed.json"
+    let p2 = anima + "/data/r13_corpus.jsonl"
+    return fexists(p1) || fexists(p2)
+}
+
+fn probe_an11c_baseline() -> string {
+    let p = home_anima() + "/state/an11_c_r8_jsd_1777092846.json"
+    if fexists(p) { return AN11_C_BASELINE_MEAN_JSD }
+    return "unknown"
+}
+
+// ─── 5-phase runbook ledger emit ─────────────────────────────────────────
+
+fn emit_state(out_path: string,
+              model_path: string, lora_path: string,
+              infra: string, port: string, gpu: string, rate_limit: string,
+              lora_present: bool, r13_present: bool, baseline_jsd: string,
+              tmp_helpers_path: string) {
+    let ts = now_utc()
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"" + SCHEMA + "\",\n"
+    j = j + "  \"ts\": \"" + ts + "\",\n"
+    j = j + "  \"phase\": \"CP1\",\n"
+    j = j + "  \"roadmap_num\": 110,\n"
+    j = j + "  \"verdict\": \"SPEC_FROZEN_DEPLOY_DEFERRED\",\n"
+    j = j + "  \"actual_deploy_executed\": false,\n"
+    j = j + "  \"actual_an11_c_remeasured\": false,\n"
+    j = j + "  \"endpoint_config\": {\n"
+    j = j + "    \"model_path\": \"" + json_escape(model_path) + "\",\n"
+    j = j + "    \"lora_path\":  \"" + json_escape(lora_path) + "\",\n"
+    j = j + "    \"lora_rank\":  " + LORA_RANK_DEFAULT + ",\n"
+    j = j + "    \"serving_infra\": \"" + infra + "\",\n"
+    j = j + "    \"port\": " + port + ",\n"
+    j = j + "    \"gpu\": \"" + gpu + "\",\n"
+    j = j + "    \"rate_limit_req_per_min\": " + rate_limit + ",\n"
+    j = j + "    \"openai_compat_paths\": [\"/v1/completions\", \"/v1/chat/completions\"],\n"
+    j = j + "    \"native_paths\": [\"/health\", \"/infer\", \"/phi\", \"/hexad\"]\n"
+    j = j + "  },\n"
+    j = j + "  \"serving_infra_options\": [\n"
+    j = j + "    {\"name\": \"vllm\",      \"openai_compat\": true,  \"gpu_required\": true,  \"lora_native\": true,  \"recommended_for\": \"H100 SXM, 8B base + r=64 LoRA, throughput\"},\n"
+    j = j + "    {\"name\": \"tgi\",       \"openai_compat\": true,  \"gpu_required\": true,  \"lora_native\": true,  \"recommended_for\": \"HF ecosystem, multi-LoRA hot-swap\"},\n"
+    j = j + "    {\"name\": \"llama.cpp\", \"openai_compat\": true,  \"gpu_required\": false, \"lora_native\": false, \"recommended_for\": \"Mac M4 Metal Q5_K_M, $0/mo local\"},\n"
+    j = j + "    {\"name\": \"fastapi\",   \"openai_compat\": false, \"gpu_required\": false, \"lora_native\": false, \"recommended_for\": \"hexad + /phi custom routes, peft direct load\"}\n"
+    j = j + "  ],\n"
+    j = j + "  \"cost_options\": {\n"
+    j = j + "    \"local_cpu\":     {\"usd_per_hour\": 0.0,  \"latency_p99_ms\": 1500, \"throughput_tok_per_s\": 5,   \"caveat\": \"Mac M4 16GB Q5_K_M only; r6 LoRA must be merged then GGUF-quantized first\"},\n"
+    j = j + "    \"runpod_cpu\":    {\"usd_per_hour\": 0.10, \"latency_p99_ms\": 1200, \"throughput_tok_per_s\": 8,   \"caveat\": \"persistent endpoint cheap but no LoRA-native infra\"},\n"
+    j = j + "    \"h100_sxm\":      {\"usd_per_hour\": 3.50, \"latency_p99_ms\": 250,  \"throughput_tok_per_s\": 60,  \"caveat\": \"vllm + lora-modules direct, AGI demo grade\"}\n"
+    j = j + "  },\n"
+    j = j + "  \"an11_c_remeasurement_protocol\": {\n"
+    j = j + "    \"target\": \"r6 LoRA endpoint vs r6 baseline (or r9 trained when produced)\",\n"
+    j = j + "    \"per_prompt_thresholds\": {\"PASS\": \">=" + AN11_C_THRESHOLD_PASS + "\", \"STRONG\": \">=" + AN11_C_THRESHOLD_STRONG + "\", \"FAIL_BELOW\": \"<" + AN11_C_THRESHOLD_PASS + "\"},\n"
+    j = j + "    \"prompt_count\": " + AN11_C_PROMPTS_N + ",\n"
+    j = j + "    \"generations_per_prompt\": " + AN11_C_GENS_PER_PROMPT + ",\n"
+    j = j + "    \"aggregate\": \"mean JSD per prompt + 16/16 PASS criterion\",\n"
+    j = j + "    \"baseline_mean_jsd_observed\": " + baseline_jsd + ",\n"
+    j = j + "    \"baseline_path\": \"state/an11_c_r8_jsd_1777092846.json\",\n"
+    j = j + "    \"prompt_suite_path\": \"bench/an11_c_test_prompts.jsonl\",\n"
+    j = j + "    \"raw12_pre_registered\": true\n"
+    j = j + "  },\n"
+    j = j + "  \"r13_corpus_tokenization_protocol\": {\n"
+    j = j + "    \"corpus_present_locally\": " + bool_s(r13_present) + ",\n"
+    j = j + "    \"acquisition_required\": " + bool_s(!r13_present) + ",\n"
+    j = j + "    \"tokenizer\": \"" + R13_TOKENIZER_NAME + "\",\n"
+    j = j + "    \"bpe\": \"" + R13_BPE_NAME + "\",\n"
+    j = j + "    \"max_length\": " + R13_MAX_LENGTH + ",\n"
+    j = j + "    \"storage_target\": \"state/r13_corpus_indexed_<id>.json\",\n"
+    j = j + "    \"acquisition_sources\": [\n"
+    j = j + "      \"option_A_external_kos_fineweb_fork (HF dataset, GPL/CC)\",\n"
+    j = j + "      \"option_B_user_curated_corpus (proposal_inventory + refinement v2/v3 ledger)\",\n"
+    j = j + "      \"option_C_synthetic_distillation_from_r6_endpoint (chicken-and-egg, deferred)\"\n"
+    j = j + "    ]\n"
+    j = j + "  },\n"
+    j = j + "  \"runbook_phases\": [\n"
+    j = j + "    {\"id\": 1, \"name\": \"pod_allocation\",    \"owner_tool\": \"tool/anima_runpod_orchestrator.hexa OR tool/cp1_serve_launch_mac.bash\", \"requires_separate_cycle\": true},\n"
+    j = j + "    {\"id\": 2, \"name\": \"model_lora_load\",   \"owner_tool\": \"peft.PeftModel.from_pretrained\", \"requires_separate_cycle\": true},\n"
+    j = j + "    {\"id\": 3, \"name\": \"serving_launch\",    \"owner_tool\": \"infra-specific (see serving_infra_options)\", \"requires_separate_cycle\": true},\n"
+    j = j + "    {\"id\": 4, \"name\": \"an11_c_remeasure\",  \"owner_tool\": \"tool/an11_c_real_usable_gap_close.hexa + tool/an11_c_verifier.hexa\", \"requires_separate_cycle\": true},\n"
+    j = j + "    {\"id\": 5, \"name\": \"endpoint_health_ssot\", \"owner_tool\": \"writes state/alm_latest_serve_endpoint.json\", \"requires_separate_cycle\": true}\n"
+    j = j + "  ],\n"
+    j = j + "  \"raw10_caveats\": [\n"
+    j = j + "    \"actual deploy NOT executed (separate cycle)\",\n"
+    j = j + "    \"r13 alm corpus absent locally — acquisition required\",\n"
+    j = j + "    \"Mk.VI LoRA r6 p1 local presence detected = " + bool_s(lora_present) + "\",\n"
+    j = j + "    \"AN11(c) PASS NOT guaranteed: baseline mean JSD = " + baseline_jsd + " < threshold " + AN11_C_THRESHOLD_PASS + "\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"helpers_emitted\": \"" + json_escape(tmp_helpers_path) + "\",\n"
+    j = j + "  \"runbook_doc\": \"" + RUNBOOK_DOC + "\",\n"
+    j = j + "  \"spec_doc\": \"" + SPEC_PATH + "\",\n"
+    j = j + "  \"raw_compat\": [\"raw#9\", \"raw#10\", \"raw#11\", \"raw#12\", \"raw#15\", \"raw#37\"]\n"
+    j = j + "}\n"
+    write_file(out_path, j)
+}
+
+// ─── selftest ─────────────────────────────────────────────────────────────
+
+fn selftest() -> int {
+    println("[cp1_endpoint_deploy] SELFTEST")
+    let mut fail = 0
+
+    // 1. infra whitelist
+    if !known_infra("vllm")      { println("  FAIL: vllm not recognized");       fail = fail + 1 }
+    if !known_infra("tgi")       { println("  FAIL: tgi not recognized");        fail = fail + 1 }
+    if !known_infra("llama.cpp") { println("  FAIL: llama.cpp not recognized");  fail = fail + 1 }
+    if !known_infra("fastapi")   { println("  FAIL: fastapi not recognized");    fail = fail + 1 }
+    if known_infra("foo")        { println("  FAIL: 'foo' should not be infra"); fail = fail + 1 }
+
+    // 2. gpu whitelist
+    if !known_gpu("h100")     { println("  FAIL: h100 missing");     fail = fail + 1 }
+    if !known_gpu("cpu")      { println("  FAIL: cpu missing");      fail = fail + 1 }
+    if !known_gpu("m4_metal") { println("  FAIL: m4_metal missing"); fail = fail + 1 }
+
+    // 3. constants pre-registered
+    if AN11_C_THRESHOLD_PASS != "0.5" { println("  FAIL: AN11(c) PASS threshold drifted"); fail = fail + 1 }
+    if AN11_C_PROMPTS_N      != "16"  { println("  FAIL: AN11(c) prompt count drifted");   fail = fail + 1 }
+    if AN11_C_GENS_PER_PROMPT != "20" { println("  FAIL: AN11(c) gens count drifted");     fail = fail + 1 }
+    if R13_MAX_LENGTH        != "2048" { println("  FAIL: r13 max_length drifted");        fail = fail + 1 }
+    if LORA_RANK_DEFAULT     != "64"  { println("  FAIL: r6 LoRA rank drifted");           fail = fail + 1 }
+
+    // 4. helper emit round-trip
+    let path = emit_tmp_helpers()
+    if !fexists(path) { println("  FAIL: helper emit missing " + path); fail = fail + 1 }
+
+    // 5. precondition probe runs (no assertion on truth — raw#10 honest reports)
+    let lora_present = probe_lora_present(home_anima() + "/" + LORA_PATH_DEFAULT)
+    let r13_present = probe_r13_corpus_present()
+    println("  probe lora_present  = " + bool_s(lora_present))
+    println("  probe r13_corpus    = " + bool_s(r13_present))
+    println("  probe baseline_jsd  = " + probe_an11c_baseline())
+
+    // 6. emit a dryrun state JSON
+    let out = home_anima() + "/" + DEFAULT_OUT
+    emit_state(out,
+               MODEL_BASE_DEFAULT, LORA_PATH_DEFAULT,
+               DEFAULT_INFRA, DEFAULT_PORT, DEFAULT_GPU, DEFAULT_RATE_LIMIT,
+               lora_present, r13_present, probe_an11c_baseline(),
+               path)
+    if !fexists(out) { println("  FAIL: dryrun state not emitted at " + out); fail = fail + 1 }
+
+    if fail == 0 {
+        println("PASS: 6/6 selftest checks")
+        return EXIT_PASS
+    }
+    println("FAIL: " + to_string(fail) + " selftest checks")
+    return EXIT_FAIL
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+
+    if arg_flag(argv, "--help") || arg_flag(argv, "-h") {
+        print_help()
+        exit(EXIT_PASS)
+    }
+
+    if arg_flag(argv, "--selftest") {
+        let rc = selftest()
+        exit(rc)
+    }
+
+    let sub = arg_subcommand(argv)
+    if sub == "" {
+        print_help()
+        exit(EXIT_BAD_CLI)
+    }
+
+    let model_path = arg_val(argv, "--model-path", MODEL_BASE_DEFAULT)
+    let lora_path  = arg_val(argv, "--lora-path",  LORA_PATH_DEFAULT)
+    let infra      = arg_val(argv, "--serving-infra", DEFAULT_INFRA)
+    let port       = arg_val(argv, "--port", DEFAULT_PORT)
+    let gpu        = arg_val(argv, "--gpu",  DEFAULT_GPU)
+    let rate_limit = arg_val(argv, "--rate-limit", DEFAULT_RATE_LIMIT)
+    let out_arg    = arg_val(argv, "--output", DEFAULT_OUT)
+
+    if !known_infra(infra) {
+        println("ERROR: unknown --serving-infra '" + infra + "'. Allowed: vllm | tgi | llama.cpp | fastapi")
+        exit(EXIT_BAD_CLI)
+    }
+    if !known_gpu(gpu) {
+        println("ERROR: unknown --gpu '" + gpu + "'. Allowed: h100 | cpu | m4_metal")
+        exit(EXIT_BAD_CLI)
+    }
+
+    let anima = home_anima()
+    let lora_abs = if lora_path.index_of("/") == 0 { lora_path } else { anima + "/" + lora_path }
+    let lora_present = probe_lora_present(lora_abs)
+    let r13_present = probe_r13_corpus_present()
+    let baseline_jsd = probe_an11c_baseline()
+
+    let helpers = emit_tmp_helpers()
+    let out_abs = if out_arg.index_of("/") == 0 { out_arg } else { anima + "/" + out_arg }
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  cp1_endpoint_deploy — SPEC FREEZE (raw#10 honest, deploy deferred)")
+    println("  ts=" + now_utc())
+    println("════════════════════════════════════════════════════════════════")
+    println("  model_path      = " + model_path)
+    println("  lora_path       = " + lora_abs + "  present=" + bool_s(lora_present))
+    println("  serving_infra   = " + infra)
+    println("  port            = " + port)
+    println("  gpu             = " + gpu)
+    println("  rate_limit      = " + rate_limit + " req/min")
+    println("  r13_corpus      = " + bool_s(r13_present) + " (acquisition required if false)")
+    println("  baseline_jsd    = " + baseline_jsd + "  (threshold PASS >= " + AN11_C_THRESHOLD_PASS + ")")
+    println("  helpers_tmp     = " + helpers)
+    println("")
+
+    emit_state(out_abs,
+               model_path, lora_abs,
+               infra, port, gpu, rate_limit,
+               lora_present, r13_present, baseline_jsd,
+               helpers)
+
+    println("  state_out       = " + out_abs)
+    println("  spec_doc        = " + SPEC_PATH)
+    println("  runbook_doc     = " + RUNBOOK_DOC)
+    println("  verdict         = SPEC_FROZEN_DEPLOY_DEFERRED")
+    println("")
+    println("  raw#10 caveats:")
+    println("    - actual deploy NOT executed")
+    println("    - r13 alm corpus present_locally=" + bool_s(r13_present))
+    println("    - Mk.VI LoRA r6 p1 local present=" + bool_s(lora_present))
+    println("    - AN11(c) baseline mean JSD=" + baseline_jsd + " < " + AN11_C_THRESHOLD_PASS + " (PASS NOT guaranteed)")
+
+    exit(EXIT_PASS)
+}
+
+main()

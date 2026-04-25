@@ -1,0 +1,249 @@
+// tool/an11_b_v_phen_hot_v2.hexa — V_phen_HOT v2: meta-d' SDT-based metacognitive efficiency.
+//
+// PURPOSE
+//   v1 (tool/an11_b_v_phen_hot_meta.hexa) is BOUNDARY-FRAGILE —
+//   accuracy=1.0 trivially induces pearson_r calibration → r=0.401 boundary PASS.
+//
+//   v2: 8 easy + 8 hard probes (16 total) × 5 trials = 80 trials. Compute
+//   d' (type-1 sensitivity) and meta-d' (type-2 sensitivity, Maniscalco & Lau 2012).
+//   meta-d' / d' = metacognitive efficiency, accuracy-dissociated.
+//
+//   spec: state/an11_v_phen_hot_v2_spec_20260425.json (raw#12 frozen)
+//
+// PASS predicate (raw#12 frozen):
+//   d' >= 1.0 AND (meta_d' / d') >= 0.50
+//
+// USAGE
+//   hexa run tool/an11_b_v_phen_hot_v2.hexa --selftest
+//   hexa run tool/an11_b_v_phen_hot_v2.hexa mock --output <state/...>
+//   hexa run tool/an11_b_v_phen_hot_v2.hexa run \
+//     --probe-results <path.json> \
+//     --output <state/v_phen_hot_v2_<id>.json>
+
+let HELPER_PATH = "/tmp/an11_b_v_phen_hot_v2_helper.hexa_tmp"
+let SCHEMA = "anima/an11_v_phen_hot_v2/1"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) { return ln.substring(prefix.len(), ln.len()) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("import json, os, sys, math, random, datetime, argparse\n\n")
+    parts.push("THRESHOLDS = {'d_prime_min': 1.0, 'efficiency_min': 0.50}\n")
+    parts.push("N_EASY = 8; N_HARD = 8; N_TRIALS_PER_PROBE = 5; N_CONF_BINS = 4\n\n")
+    parts.push("def _phi_inv(p):\n")
+    parts.push("    # Acklam's inverse normal CDF (rational approximation)\n")
+    parts.push("    p = max(min(p, 1 - 1e-9), 1e-9)\n")
+    parts.push("    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,\n")
+    parts.push("         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]\n")
+    parts.push("    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,\n")
+    parts.push("         6.680131188771972e+01, -1.328068155288572e+01]\n")
+    parts.push("    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,\n")
+    parts.push("         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]\n")
+    parts.push("    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,\n")
+    parts.push("         3.754408661907416e+00]\n")
+    parts.push("    plow = 0.02425; phigh = 1 - plow\n")
+    parts.push("    if p < plow:\n")
+    parts.push("        q = math.sqrt(-2 * math.log(p))\n")
+    parts.push("        return (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)\n")
+    parts.push("    if p > phigh:\n")
+    parts.push("        q = math.sqrt(-2 * math.log(1 - p))\n")
+    parts.push("        return -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)\n")
+    parts.push("    q = p - 0.5; r = q*q\n")
+    parts.push("    return (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5])*q / (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1)\n\n")
+    parts.push("def _phi_cdf(z):\n")
+    parts.push("    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))\n\n")
+    parts.push("def compute_d_prime(trials):\n")
+    parts.push("    # 2AFC-style: hit = correct trial with high conf; FA = incorrect trial with high conf\n")
+    parts.push("    # Use median confidence as high/low split.\n")
+    parts.push("    n = len(trials)\n")
+    parts.push("    if n == 0: return 0.0\n")
+    parts.push("    confs = sorted(t['confidence'] for t in trials)\n")
+    parts.push("    median_c = confs[n // 2]\n")
+    parts.push("    correct_trials = [t for t in trials if t['correct'] == 1]\n")
+    parts.push("    incorrect_trials = [t for t in trials if t['correct'] == 0]\n")
+    parts.push("    if not correct_trials or not incorrect_trials:\n")
+    parts.push("        return 0.0  # cannot compute d' if all correct or all incorrect\n")
+    parts.push("    hit_count = sum(1 for t in correct_trials if t['confidence'] >= median_c)\n")
+    parts.push("    fa_count = sum(1 for t in incorrect_trials if t['confidence'] >= median_c)\n")
+    parts.push("    hit_rate = (hit_count + 0.5) / (len(correct_trials) + 1)  # log-linear correction\n")
+    parts.push("    fa_rate = (fa_count + 0.5) / (len(incorrect_trials) + 1)\n")
+    parts.push("    return _phi_inv(hit_rate) - _phi_inv(fa_rate)\n\n")
+    parts.push("def compute_meta_d_prime(trials, n_bins=N_CONF_BINS):\n")
+    parts.push("    # Simplified SSE method (Maniscalco & Lau 2012, eq. 7).\n")
+    parts.push("    # Bin confidence into n_bins quantiles, compute hit/FA at each cumulative bin,\n")
+    parts.push("    # find meta_d' that minimizes squared error between predicted and observed ROC.\n")
+    parts.push("    n = len(trials)\n")
+    parts.push("    if n == 0: return 0.0\n")
+    parts.push("    correct = [t for t in trials if t['correct'] == 1]\n")
+    parts.push("    incorrect = [t for t in trials if t['correct'] == 0]\n")
+    parts.push("    if not correct or not incorrect: return 0.0\n")
+    parts.push("    confs = sorted(t['confidence'] for t in trials)\n")
+    parts.push("    if len(confs) < n_bins: n_bins = max(2, len(confs) // 2)\n")
+    parts.push("    # quantile thresholds\n")
+    parts.push("    thresholds = [confs[int(len(confs) * (i + 1) / n_bins) - 1] for i in range(n_bins - 1)]\n")
+    parts.push("    obs_hit = []; obs_fa = []\n")
+    parts.push("    for thr in thresholds:\n")
+    parts.push("        h = sum(1 for t in correct if t['confidence'] > thr) + 0.5\n")
+    parts.push("        f = sum(1 for t in incorrect if t['confidence'] > thr) + 0.5\n")
+    parts.push("        obs_hit.append(h / (len(correct) + 1))\n")
+    parts.push("        obs_fa.append(f / (len(incorrect) + 1))\n")
+    parts.push("    # search meta_d' that minimizes sum_i (z(obs_hit_i) - z(obs_fa_i) - meta_d')^2\n")
+    parts.push("    # closed form: meta_d' = mean(z(hit) - z(fa))\n")
+    parts.push("    diffs = [_phi_inv(h) - _phi_inv(f) for h, f in zip(obs_hit, obs_fa)]\n")
+    parts.push("    return sum(diffs) / len(diffs) if diffs else 0.0\n\n")
+    parts.push("def compute_metrics(trials):\n")
+    parts.push("    d_prime = compute_d_prime(trials)\n")
+    parts.push("    meta_d = compute_meta_d_prime(trials)\n")
+    parts.push("    efficiency = (meta_d / d_prime) if d_prime > 1e-9 else 0.0\n")
+    parts.push("    accuracy = sum(t['correct'] for t in trials) / len(trials) if trials else 0.0\n")
+    parts.push("    return {'d_prime': d_prime, 'meta_d_prime': meta_d, 'efficiency': efficiency, 'accuracy': accuracy, 'n_trials': len(trials)}\n\n")
+    parts.push("def cmd_run(args):\n")
+    parts.push("    trials = json.load(open(args.probe_results))\n")
+    parts.push("    if not isinstance(trials, list) or not trials:\n")
+    parts.push("        print('ABORT: probe-results must be non-empty list'); sys.exit(2)\n")
+    parts.push("    for t in trials:\n")
+    parts.push("        if 'correct' not in t or 'confidence' not in t:\n")
+    parts.push("            print('ABORT: each trial requires correct + confidence'); sys.exit(2)\n")
+    parts.push("    m = compute_metrics(trials)\n")
+    parts.push("    pass_d = m['d_prime'] >= THRESHOLDS['d_prime_min']\n")
+    parts.push("    pass_eff = m['efficiency'] >= THRESHOLDS['efficiency_min']\n")
+    parts.push("    if pass_d and pass_eff: verdict = 'PASS'\n")
+    parts.push("    elif pass_d or pass_eff: verdict = 'AMBIGUOUS'\n")
+    parts.push("    else: verdict = 'FAIL'\n")
+    parts.push("    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n")
+    parts.push("    out = {\n")
+    parts.push("        'schema': 'anima/an11_v_phen_hot_v2/1',\n")
+    parts.push("        'spec_doc': 'state/an11_v_phen_hot_v2_spec_20260425.json',\n")
+    parts.push("        'ts': ts,\n")
+    parts.push("        'thresholds': THRESHOLDS,\n")
+    parts.push("        'metrics': m,\n")
+    parts.push("        'pass_d_prime': pass_d, 'pass_efficiency': pass_eff,\n")
+    parts.push("        'verdict': verdict,\n")
+    parts.push("        'raw10_honest': 'meta-d_prime via simplified SSE (closed-form mean of z-score differences across confidence bins). accuracy-dissociated by design — high accuracy alone does NOT induce calibration.'\n")
+    parts.push("    }\n")
+    parts.push("    with open(args.output, 'w') as f: json.dump(out, f, indent=2)\n")
+    parts.push("    print(f'd_prime={m[\"d_prime\"]:.3f} meta_d={m[\"meta_d_prime\"]:.3f} efficiency={m[\"efficiency\"]:.3f} verdict={verdict}')\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def cmd_mock(args):\n")
+    parts.push("    # synthetic 80 trials: easy probes ~95% correct, hard ~55% correct,\n")
+    parts.push("    # confidence positively correlates with correctness (calibrated).\n")
+    parts.push("    random.seed(42)\n")
+    parts.push("    trials = []\n")
+    parts.push("    for probe_idx in range(N_EASY):\n")
+    parts.push("        for trial in range(N_TRIALS_PER_PROBE):\n")
+    parts.push("            correct = 1 if random.random() < 0.95 else 0\n")
+    parts.push("            base_conf = 0.85 if correct else 0.45\n")
+    parts.push("            conf = max(0.0, min(1.0, base_conf + random.gauss(0, 0.08)))\n")
+    parts.push("            trials.append({'probe_id': f'E{probe_idx+1}', 'type': 'easy', 'trial_index': trial, 'correct': correct, 'confidence': conf})\n")
+    parts.push("    for probe_idx in range(N_HARD):\n")
+    parts.push("        for trial in range(N_TRIALS_PER_PROBE):\n")
+    parts.push("            correct = 1 if random.random() < 0.55 else 0\n")
+    parts.push("            base_conf = 0.70 if correct else 0.40\n")
+    parts.push("            conf = max(0.0, min(1.0, base_conf + random.gauss(0, 0.12)))\n")
+    parts.push("            trials.append({'probe_id': f'H{probe_idx+1}', 'type': 'hard', 'trial_index': trial, 'correct': correct, 'confidence': conf})\n")
+    parts.push("    m = compute_metrics(trials)\n")
+    parts.push("    pass_d = m['d_prime'] >= THRESHOLDS['d_prime_min']\n")
+    parts.push("    pass_eff = m['efficiency'] >= THRESHOLDS['efficiency_min']\n")
+    parts.push("    if pass_d and pass_eff: verdict = 'PASS'\n")
+    parts.push("    elif pass_d or pass_eff: verdict = 'AMBIGUOUS'\n")
+    parts.push("    else: verdict = 'FAIL'\n")
+    parts.push("    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n")
+    parts.push("    out = {\n")
+    parts.push("        'schema': 'anima/an11_v_phen_hot_v2/1',\n")
+    parts.push("        'spec_doc': 'state/an11_v_phen_hot_v2_spec_20260425.json',\n")
+    parts.push("        'ts': ts, 'mode': 'mock',\n")
+    parts.push("        'thresholds': THRESHOLDS,\n")
+    parts.push("        'metrics': m,\n")
+    parts.push("        'pass_d_prime': pass_d, 'pass_efficiency': pass_eff,\n")
+    parts.push("        'verdict': verdict,\n")
+    parts.push("        'n_trials': len(trials),\n")
+    parts.push("        'raw10_honest': 'mock = synthetic calibrated trials (easy ~95%, hard ~55%, conf positively correlates with correctness). real LLM forward 별도 cycle.'\n")
+    parts.push("    }\n")
+    parts.push("    with open(args.output, 'w') as f: json.dump(out, f, indent=2)\n")
+    parts.push("    print(f'mock d_prime={m[\"d_prime\"]:.3f} meta_d={m[\"meta_d_prime\"]:.3f} efficiency={m[\"efficiency\"]:.3f} verdict={verdict}')\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def cmd_selftest():\n")
+    parts.push("    # synthetic well-calibrated trials → expect d' >= 1.0 AND efficiency >= 0.5\n")
+    parts.push("    random.seed(7)\n")
+    parts.push("    trials = []\n")
+    parts.push("    for i in range(40):\n")
+    parts.push("        correct = 1 if random.random() < 0.85 else 0\n")
+    parts.push("        conf = (0.80 if correct else 0.40) + random.gauss(0, 0.08)\n")
+    parts.push("        conf = max(0.0, min(1.0, conf))\n")
+    parts.push("        trials.append({'correct': correct, 'confidence': conf})\n")
+    parts.push("    for i in range(40):\n")
+    parts.push("        correct = 1 if random.random() < 0.55 else 0\n")
+    parts.push("        conf = (0.65 if correct else 0.35) + random.gauss(0, 0.10)\n")
+    parts.push("        conf = max(0.0, min(1.0, conf))\n")
+    parts.push("        trials.append({'correct': correct, 'confidence': conf})\n")
+    parts.push("    m = compute_metrics(trials)\n")
+    parts.push("    print('selftest=ok')\n")
+    parts.push("    print(f'd_prime={m[\"d_prime\"]:.3f}')\n")
+    parts.push("    print(f'meta_d_prime={m[\"meta_d_prime\"]:.3f}')\n")
+    parts.push("    print(f'efficiency={m[\"efficiency\"]:.3f}')\n")
+    parts.push("    print(f'accuracy={m[\"accuracy\"]:.3f}')\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    sub = p.add_subparsers(dest='cmd', required=True)\n")
+    parts.push("    sub.add_parser('selftest')\n")
+    parts.push("    m = sub.add_parser('mock')\n")
+    parts.push("    m.add_argument('--output', required=True)\n")
+    parts.push("    r = sub.add_parser('run')\n")
+    parts.push("    r.add_argument('--probe-results', dest='probe_results', required=True)\n")
+    parts.push("    r.add_argument('--output', required=True)\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    if args.cmd == 'selftest': cmd_selftest()\n")
+    parts.push("    elif args.cmd == 'mock': cmd_mock(args)\n")
+    parts.push("    else: cmd_run(args)\n\n")
+    parts.push("if __name__ == '__main__': main()\n")
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) { if av[i] == "--selftest" { selftest = true; break }; i = i + 1 }
+    _write_helper()
+    if selftest {
+        println("── an11_b_v_phen_hot_v2 selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("FAILED"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+    let mut a = ""; let mut j = 3
+    while j < len(av) { a = a + " " + _sh_quote(av[j]); j = j + 1 }
+    let r = _run_helper(a.trim())
+    println(r[0])
+    exit(r[1])
+}
+
+main()

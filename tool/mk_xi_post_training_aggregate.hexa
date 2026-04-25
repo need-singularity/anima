@@ -1,0 +1,572 @@
+// tool/mk_xi_post_training_aggregate.hexa — Mk.XI post-training 5-tuple full-aggregation
+//                                            orchestrator (raw#9 / raw#37 hexa-only).
+//
+// PURPOSE
+//   Mk.XI consciousness gate — post-training (즉, H100 pod-side training이
+//   끝나서 H_TRAINED.json / H_ANTI.json / H_RANDOM.json 산출물이 모두
+//   준비된 시점)에서, 6 verifier dispatch chain + composite verdict 산출 +
+//   verdict matrix lookup + next_cycle_action emit 까지 단일 step 으로 묶는
+//   orchestrator.
+//
+//   본 도구의 역할:
+//     [pod artifacts: H_TRAINED.json + H_ANTI.json + H_RANDOM.json]
+//             │
+//             ▼
+//     6 verifier dispatch chain (raw#12 frozen verifier scope, POLICY R4 수정 X)
+//             │
+//             ▼
+//     state/mk_xi_pass_verdict_spec_20260425.json verdict matrix lookup
+//             │
+//             ▼
+//     state/mk_xi_<run_id>_full_verdict.json (raw#15 SSOT)
+//
+//   본 도구는 measurement orchestration 만 담당. training 자체 (main session
+//   actual run) 와는 분리된 step (raw#10 — spec-only / post-training execution
+//   은 별도 step 명시).
+//
+// 6 VERIFIER DISPATCH CHAIN
+//   1. tool/an11_b_v_pairrank.hexa            (V_pairrank)
+//   2. tool/an11_b_v2_papo_multi_axis.hexa    (V2)
+//   3. tool/an11_b_v3_cps.hexa                (V3 — FALSIFIED metric, ledger only)
+//   4. tool/an11_b_5tuple_aggregator.hexa     (V0+V1+V2+V3+V_pairrank+V_sub composite)
+//
+//   본 wrapper 는 individual verifier 결과 + 5tuple_aggregator composite
+//   결과를 모두 보관 (cross-verification redundancy).  raw#12 frozen 해석:
+//   per-axis verdict 의 source-of-truth 는 5tuple_aggregator.composite.* 이며,
+//   individual verifier 결과는 traceability ledger 용.
+//
+// VERDICT MATRIX LOOKUP
+//   state/mk_xi_pass_verdict_spec_20260425.json 의 composite_verdict_matrix_5_tuple
+//   을 evaluation_order (V0 → V1 → V2 → V3 → V_pairrank) 에 따라 mutually
+//   exclusive 하게 매칭. 결과적으로 최종 verdict_label ∈
+//   {MK_XI_VERIFIED, MK_XI_PARTIAL_RETRIEVAL_FAIL, MK_XI_PARTIAL_V3_FAIL,
+//    MK_XI_PARTIAL_V1_FAIL, MK_XI_PARTIAL_V2_FAIL,
+//    MK_XI_TEMPLATE_FITTED_NON_INTEGRATED, MK_XI_FALSIFIED}
+//   각 verdict 마다 failure_mode_next_cycle_action_map 에서 next_cycle_action
+//   pull. raw#12 lock — post-hoc tuning 금지, threshold 변경 X.
+//
+// USAGE
+//   hexa run tool/mk_xi_post_training_aggregate.hexa \
+//     --h-trained <path>             \
+//     --h-anti    <path>             \
+//     --h-random  <path>             \
+//     --output    <state/mk_xi_<run_id>_full_verdict.json> \
+//     --run-id    <r9_<TS>>
+//   hexa run tool/mk_xi_post_training_aggregate.hexa --selftest
+//
+// IMPLEMENTATION NOTES
+//   - raw#9  : hexa wrapper, $0 (no measurement-side cost). actual measurement
+//              cost는 sub-hexa (an11_b_v_pairrank/v2_papo_multi_axis/v3_cps/
+//              5tuple_aggregator) 의 helper Python (numpy local) 에 한정.
+//   - raw#37 : shell helper + Python helper 모두 /tmp emit, idempotent,
+//              deterministic over (H_TRAINED, H_ANTI, H_RANDOM).
+//   - raw#10 : V3 FALSIFIED flag 명시, V_sub 측정은 H_anti/H_random 모두 제공
+//              시에만 활성. spec-only measurement orchestrator — training run
+//              은 별도 step.
+//   - raw#12 : verdict matrix per state/mk_xi_pass_verdict_spec_20260425.json
+//              frozen. wrapper 내부 threshold copy 금지 (spec JSON 만 SSOT).
+//   - raw#15 : final state file = SSOT. individual sub-hexa 결과 paths 도
+//              ledger 로 보존.
+//   - POLICY R4 : 기존 verifier scope 변경 0건. 신규 hexa wrapper 만 추가.
+
+let HELPER_SH_PATH = "/tmp/mk_xi_post_training_aggregate_helper.sh"
+let HELPER_PY_PATH = "/tmp/mk_xi_post_training_aggregate_helper.py"
+let SCHEMA         = "anima/mk_xi_post_training_aggregate/1"
+let SPEC_DOC       = "state/mk_xi_pass_verdict_spec_20260425.json"
+let SPEC_COMMIT    = "raw12_frozen"
+let VERDICT_SPEC   = "state/mk_xi_pass_verdict_spec_20260425.json"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper_sh() {
+    let src = "#!/usr/bin/env bash\n" +
+        "# mk_xi_post_training_aggregate_helper.sh — 6 verifier dispatch chain.\n" +
+        "# Idempotent + deterministic. Emits per-step path summaries on stdout.\n" +
+        "# Args: <h_trained> <h_anti_or_NULL> <h_random_or_NULL> <run_id> <out_dir>\n" +
+        "#\n" +
+        "# Environment:\n" +
+        "#   HEXA_RESOLVER_NO_REROUTE=1 — required for sub-hexa invocation (recursion guard, see /Users/ghost/core/hexa-lang/hexa wrapper).\n" +
+        "#   The parent hexa wrapper sets this before invoking us.\n" +
+        "#   HEXA_BIN — explicit binary path; falls back to `command -v hexa` then $HEXA_LANG/hexa.\n" +
+        "set -euo pipefail\n" +
+        "export HEXA_RESOLVER_NO_REROUTE=\"${HEXA_RESOLVER_NO_REROUTE:-1}\"\n" +
+        "if [ -z \"${HEXA_BIN:-}\" ]; then\n" +
+        "  if command -v hexa >/dev/null 2>&1; then HEXA_BIN=\"$(command -v hexa)\"; \n" +
+        "  elif [ -x \"${HEXA_LANG:-/Users/ghost/core/hexa-lang}/hexa\" ]; then HEXA_BIN=\"${HEXA_LANG:-/Users/ghost/core/hexa-lang}/hexa\"; \n" +
+        "  else echo \"helper.sh: hexa binary not found (set HEXA_BIN)\" >&2; exit 76; fi\n" +
+        "fi\n" +
+        "export HEXA_BIN\n" +
+        "H_TRAINED=\"${1:?}\"\n" +
+        "H_ANTI=\"${2:?}\"\n" +
+        "H_RANDOM=\"${3:?}\"\n" +
+        "RUN_ID=\"${4:?}\"\n" +
+        "OUT_DIR=\"${5:?}\"\n" +
+        "mkdir -p \"$OUT_DIR\"\n" +
+        "VPR_OUT=\"$OUT_DIR/mk_xi_${RUN_ID}_v_pairrank.json\"\n" +
+        "V2_OUT=\"$OUT_DIR/mk_xi_${RUN_ID}_v2_papo.json\"\n" +
+        "V3_OUT=\"$OUT_DIR/mk_xi_${RUN_ID}_v3_cps.json\"\n" +
+        "AGG_OUT=\"$OUT_DIR/mk_xi_${RUN_ID}_5tuple_aggregated.json\"\n" +
+        "echo \"step1_v_pairrank_start\"\n" +
+        "\"$HEXA_BIN\" run tool/an11_b_v_pairrank.hexa --input \"$H_TRAINED\" --output \"$VPR_OUT\" >/dev/null\n" +
+        "echo \"step1_v_pairrank_done=$VPR_OUT\"\n" +
+        "echo \"step2_v2_papo_start\"\n" +
+        "\"$HEXA_BIN\" run tool/an11_b_v2_papo_multi_axis.hexa --input \"$H_TRAINED\" --output \"$V2_OUT\" >/dev/null\n" +
+        "echo \"step2_v2_papo_done=$V2_OUT\"\n" +
+        "echo \"step3_v3_cps_start\"\n" +
+        "\"$HEXA_BIN\" run tool/an11_b_v3_cps.hexa --input \"$H_TRAINED\" --output \"$V3_OUT\" >/dev/null\n" +
+        "echo \"step3_v3_cps_done=$V3_OUT\"\n" +
+        "echo \"step4_5tuple_aggregator_start\"\n" +
+        "if [ \"$H_ANTI\" != \"NULL\" ] && [ \"$H_RANDOM\" != \"NULL\" ]; then\n" +
+        "  \"$HEXA_BIN\" run tool/an11_b_5tuple_aggregator.hexa \\\n" +
+        "    --h-trained \"$H_TRAINED\" --h-anti \"$H_ANTI\" --h-random \"$H_RANDOM\" \\\n" +
+        "    --output \"$AGG_OUT\" --run-id \"$RUN_ID\" >/dev/null\n" +
+        "else\n" +
+        "  \"$HEXA_BIN\" run tool/an11_b_5tuple_aggregator.hexa \\\n" +
+        "    --h-trained \"$H_TRAINED\" \\\n" +
+        "    --output \"$AGG_OUT\" --run-id \"$RUN_ID\" >/dev/null\n" +
+        "fi\n" +
+        "echo \"step4_5tuple_aggregator_done=$AGG_OUT\"\n" +
+        "echo \"v_pairrank_path=$VPR_OUT\"\n" +
+        "echo \"v2_papo_path=$V2_OUT\"\n" +
+        "echo \"v3_cps_path=$V3_OUT\"\n" +
+        "echo \"aggregated_path=$AGG_OUT\"\n" +
+        "echo \"DISPATCH_DONE\"\n"
+    write_file(HELPER_SH_PATH, src)
+}
+
+fn _write_helper_py() {
+    let src = "#!/usr/bin/env python3\n" +
+        "# mk_xi_post_training_aggregate_helper.py\n" +
+        "# Loads sub-verifier outputs + verdict-matrix spec, emits final full_verdict JSON.\n" +
+        "# Args: <vpr> <v2> <v3> <agg> <verdict_spec> <result_path> <schema> <spec_doc> <spec_commit> <run_id> <h_trained> <h_anti_or_NULL> <h_random_or_NULL>\n" +
+        "import json, sys, os, datetime\n" +
+        "\n" +
+        "def _load(path):\n" +
+        "    with open(path) as f: return json.load(f)\n" +
+        "\n" +
+        "def _verdict_for_axis(d, default='UNKNOWN'):\n" +
+        "    if isinstance(d, dict):\n" +
+        "        return d.get('verdict', default)\n" +
+        "    return default\n" +
+        "\n" +
+        "def _coerce_pass(v):\n" +
+        "    # raw#10 honest: AMBIGUOUS / NOT_MEASURED → FAIL (conservative, raw#10 boundary).\n" +
+        "    return v == 'PASS'\n" +
+        "\n" +
+        "def _matrix_lookup(spec, axes_pass):\n" +
+        "    # axes_pass : dict {V0,V1,V2,V3,V_pairrank} -> bool (PASS=True, anything else=False)\n" +
+        "    matrix = spec['composite_verdict_matrix_5_tuple']\n" +
+        "    n_pass = sum(1 for k,v in axes_pass.items() if v)\n" +
+        "    failing = [k for k,v in axes_pass.items() if not v]\n" +
+        "    label = None\n" +
+        "    # evaluation_order: spec rules → pick first matching predicate\n" +
+        "    if axes_pass['V0'] and axes_pass['V1'] and axes_pass['V2'] and axes_pass['V3'] and axes_pass['V_pairrank']:\n" +
+        "        label = 'MK_XI_VERIFIED'\n" +
+        "    elif axes_pass['V0'] and axes_pass['V1'] and axes_pass['V2'] and axes_pass['V3'] and not axes_pass['V_pairrank']:\n" +
+        "        label = 'MK_XI_PARTIAL_RETRIEVAL_FAIL'\n" +
+        "    elif axes_pass['V0'] and axes_pass['V1'] and axes_pass['V2'] and axes_pass['V_pairrank'] and not axes_pass['V3']:\n" +
+        "        label = 'MK_XI_PARTIAL_V3_FAIL'\n" +
+        "    elif axes_pass['V0'] and axes_pass['V2'] and axes_pass['V3'] and axes_pass['V_pairrank'] and not axes_pass['V1']:\n" +
+        "        label = 'MK_XI_PARTIAL_V1_FAIL'\n" +
+        "    elif axes_pass['V0'] and axes_pass['V1'] and axes_pass['V3'] and axes_pass['V_pairrank'] and not axes_pass['V2']:\n" +
+        "        label = 'MK_XI_PARTIAL_V2_FAIL'\n" +
+        "    elif axes_pass['V0'] and (not axes_pass['V1']) and (not axes_pass['V2']) and (not axes_pass['V3']) and (not axes_pass['V_pairrank']):\n" +
+        "        label = 'MK_XI_TEMPLATE_FITTED_NON_INTEGRATED'\n" +
+        "    elif n_pass <= 2:\n" +
+        "        label = 'MK_XI_FALSIFIED'\n" +
+        "    else:\n" +
+        "        # Off-pattern: spec matrix mutually-exclusive 7 entries cover dominant\n" +
+        "        # patterns. residual case는 raw#10 conservative으로 FALSIFIED label\n" +
+        "        # + off_pattern_flag.\n" +
+        "        label = 'MK_XI_FALSIFIED'\n" +
+        "    matched = next((m for m in matrix if m['verdict'] == label), None)\n" +
+        "    return label, matched, n_pass, failing\n" +
+        "\n" +
+        "def _next_action(spec, label):\n" +
+        "    fmap = spec.get('failure_mode_next_cycle_action_map', {})\n" +
+        "    return fmap.get(label, {'next_cycle': 'UNKNOWN — verdict label not in failure_mode_next_cycle_action_map'})\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 14:\n" +
+        "        print(f'usage: helper <vpr> <v2> <v3> <agg> <spec> <result> <schema> <spec_doc> <spec_commit> <run_id> <h_trained> <h_anti_or_NULL> <h_random_or_NULL>', file=sys.stderr)\n" +
+        "        sys.exit(2)\n" +
+        "    vpr_p, v2_p, v3_p, agg_p, spec_p, res_p, schema, spec_doc, spec_commit, run_id, h_trained, h_anti, h_random = sys.argv[1:14]\n" +
+        "    for p in [vpr_p, v2_p, v3_p, agg_p, spec_p]:\n" +
+        "        if not os.path.exists(p):\n" +
+        "            print(f'ERR: missing artifact {p}', file=sys.stderr); sys.exit(2)\n" +
+        "    vpr = _load(vpr_p); v2 = _load(v2_p); v3 = _load(v3_p)\n" +
+        "    agg = _load(agg_p); spec = _load(spec_p)\n" +
+        "    # SSOT for per-axis verdict = aggregator output (raw#12: frozen verifier).\n" +
+        "    av = agg['verifiers']\n" +
+        "    axes_verdict = {\n" +
+        "        'V0':         _verdict_for_axis(av.get('V0')),\n" +
+        "        'V1':         _verdict_for_axis(av.get('V1')),\n" +
+        "        'V2':         _verdict_for_axis(av.get('V2')),\n" +
+        "        'V3':         _verdict_for_axis(av.get('V3')),\n" +
+        "        'V_pairrank': _verdict_for_axis(av.get('V_pairrank')),\n" +
+        "        'V_sub':      _verdict_for_axis(av.get('V_sub')),\n" +
+        "    }\n" +
+        "    axes_pass = {k: _coerce_pass(v) for k,v in axes_verdict.items() if k != 'V_sub'}\n" +
+        "    label, matched, n_pass, failing = _matrix_lookup(spec, axes_pass)\n" +
+        "    next_action = _next_action(spec, label)\n" +
+        "    # 6-tuple\n" +
+        "    vsub_v = axes_verdict['V_sub']\n" +
+        "    if vsub_v == 'NOT_MEASURED':\n" +
+        "        composite_6 = 'NOT_MEASURED'\n" +
+        "        ext_label = None\n" +
+        "    elif label == 'MK_XI_VERIFIED' and vsub_v == 'PASS':\n" +
+        "        composite_6 = 'EXT_VERIFIED'\n" +
+        "        ext_label = composite_6\n" +
+        "    elif label == 'MK_XI_VERIFIED' and vsub_v != 'PASS':\n" +
+        "        composite_6 = 'EXT_RETRIEVAL_BUT_NO_SEMANTICS'\n" +
+        "        ext_label = composite_6\n" +
+        "    else:\n" +
+        "        composite_6 = 'EXT_DEGRADED'\n" +
+        "        ext_label = composite_6\n" +
+        "    # Cross-verification: aggregator's composite_5tuple should agree with our matrix lookup\n" +
+        "    agg_label = agg['composite']['composite_5tuple']\n" +
+        "    cross_check_ok = (agg_label == label)\n" +
+        "    # Per-axis scores (load-bearing numerical evidence summary).\n" +
+        "    scores = {\n" +
+        "        'V0_max_cos':     av.get('V0', {}).get('max_cos'),\n" +
+        "        'V1_phi_mip':     av.get('V1', {}).get('phi_mip'),\n" +
+        "        'V2_best_lift':   av.get('V2', {}).get('best', {}).get('SMA_lift'),\n" +
+        "        'V2_best_sma':    av.get('V2', {}).get('best', {}).get('SMA'),\n" +
+        "        'V3_CPS':         av.get('V3', {}).get('CPS'),\n" +
+        "        'V_pairrank':     av.get('V_pairrank', {}).get('V_pairrank'),\n" +
+        "        'V_pairrank_top3': av.get('V_pairrank', {}).get('top3_hit'),\n" +
+        "        'V_sub':          av.get('V_sub', {}).get('V_sub'),\n" +
+        "    }\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'tool': 'tool/mk_xi_post_training_aggregate.hexa',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_commit': spec_commit,\n" +
+        "        'verdict_spec_xref': spec_p,\n" +
+        "        'run_id': run_id,\n" +
+        "        'ts': ts,\n" +
+        "        'inputs': {\n" +
+        "            'h_trained': h_trained,\n" +
+        "            'h_anti':   None if h_anti == 'NULL' else h_anti,\n" +
+        "            'h_random': None if h_random == 'NULL' else h_random,\n" +
+        "        },\n" +
+        "        'sub_verifier_paths': {\n" +
+        "            'v_pairrank':         vpr_p,\n" +
+        "            'v2_papo_multi_axis': v2_p,\n" +
+        "            'v3_cps':             v3_p,\n" +
+        "            '5tuple_aggregator':  agg_p,\n" +
+        "        },\n" +
+        "        'per_axis_verdict': axes_verdict,\n" +
+        "        'per_axis_score':   scores,\n" +
+        "        'composite': {\n" +
+        "            'composite_5tuple': label,\n" +
+        "            'composite_6tuple': composite_6,\n" +
+        "            'pass_count_5tuple': n_pass,\n" +
+        "            'failing_axes': failing + ([ 'V_sub' ] if (vsub_v not in ('PASS', 'NOT_MEASURED')) else []),\n" +
+        "            'verdict_matrix_match': {\n" +
+        "                'verdict':        label,\n" +
+        "                'predicate':      matched.get('predicate') if matched else None,\n" +
+        "                'interpretation': matched.get('interpretation') if matched else None,\n" +
+        "                'next_action':    matched.get('next_action') if matched else None,\n" +
+        "                'honest_scope':   matched.get('honest_scope') if matched else None,\n" +
+        "            },\n" +
+        "            'next_cycle_action': next_action,\n" +
+        "        },\n" +
+        "        'cross_verification': {\n" +
+        "            'wrapper_label':            label,\n" +
+        "            'aggregator_composite_5':   agg_label,\n" +
+        "            'cross_check_ok':           cross_check_ok,\n" +
+        "            'note': 'wrapper matrix lookup vs 5tuple_aggregator.composite_5tuple cross-check (raw#12 frozen redundancy).',\n" +
+        "        },\n" +
+        "        'V3_FALSIFIED_FLAG': True,\n" +
+        "        'V3_falsified_note': 'V3 (CPS) metric design FALSIFIED (commits dc871454/1002d16a/c369b375). Recorded for ledger; verdict carries V3_FALSIFIED_FLAG.',\n" +
+        "        'thresholds_frozen_raw12': {\n" +
+        "            'verdict_spec_path': spec_p,\n" +
+        "            'note': 'thresholds 단일 SSOT = verdict_spec JSON. wrapper 내부 copy 금지.'\n" +
+        "        },\n" +
+        "        'raw_compliance': [\n" +
+        "            'raw#9 hexa-only wrapper, $0 wrapper-side cost (sub-hexa cost only)',\n" +
+        "            'raw#10 spec-only post-training step; training run separate; V3 FALSIFIED + V_sub honest scope',\n" +
+        "            'raw#12 verdict matrix frozen per spec JSON; no post-hoc tuning',\n" +
+        "            'raw#15 SSOT = this output file + sub-verifier paths',\n" +
+        "            'raw#37 helper sh + helper py /tmp emit, idempotent, deterministic',\n" +
+        "            'POLICY R4 existing verifier scope unchanged; aggregation 신규 axis only',\n" +
+        "        ],\n" +
+        "    }\n" +
+        "    with open(res_p, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={res_p}')\n" +
+        "    print(f'verdict_label={label}')\n" +
+        "    print(f'composite_6tuple={composite_6}')\n" +
+        "    print(f'pass_count_5tuple={n_pass}')\n" +
+        "    print(f'failing_axes={\",\".join(failing) if failing else \"none\"}')\n" +
+        "    print(f'cross_check_ok={cross_check_ok}')\n" +
+        "    print(f'V3_FALSIFIED_FLAG=True')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PY_PATH, src)
+}
+
+fn _exec(cmd: string) -> list {
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn _selftest() {
+    println("── mk_xi_post_training_aggregate selftest ──")
+    let work_dir = "/tmp/mk_xi_post_training_aggregate_selftest"
+    let h_tr  = work_dir + "/H_TRAINED.json"
+    let h_an  = work_dir + "/H_ANTI.json"
+    let h_rd  = work_dir + "/H_RANDOM.json"
+    let out_full = work_dir + "/mk_xi_selftest_full_verdict.json"
+    let run_id = "selftest_synthetic"
+
+    // Python helper to write 3 synthetic 16x64 H tensors using the same
+    // PAIRS-aligned construction as 5tuple_aggregator selftest.
+    let synth_path = "/tmp/mk_xi_post_training_aggregate_synth.py"
+    let synth = "#!/usr/bin/env python3\n" +
+        "import json, os, sys\n" +
+        "import numpy as np\n" +
+        "PAIRS = [(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]\n" +
+        "WORK = sys.argv[1]\n" +
+        "os.makedirs(WORK, exist_ok=True)\n" +
+        "def synth_pass_H(seed=20260425, dim=64):\n" +
+        "    rng = np.random.default_rng(seed)\n" +
+        "    n = 16\n" +
+        "    base = rng.standard_normal((n, dim))\n" +
+        "    anchors = rng.standard_normal((6, dim))\n" +
+        "    H = base.copy() * 0.05\n" +
+        "    for k, (i, j) in enumerate(PAIRS):\n" +
+        "        a = anchors[k] / (np.linalg.norm(anchors[k]) + 1e-12)\n" +
+        "        H[i] = H[i] + 1.0 * a + 0.02 * rng.standard_normal(dim)\n" +
+        "        H[j] = H[j] + 1.0 * a + 0.02 * rng.standard_normal(dim)\n" +
+        "    return H\n" +
+        "def synth_anti_H(H, seed=20260426):\n" +
+        "    rng = np.random.default_rng(seed)\n" +
+        "    n, d = H.shape\n" +
+        "    Ha = H.copy()\n" +
+        "    for (i, j) in PAIRS:\n" +
+        "        Ha[i] = -H[i] + 0.1 * rng.standard_normal(d)\n" +
+        "        Ha[j] = -H[j] + 0.1 * rng.standard_normal(d)\n" +
+        "    return Ha\n" +
+        "def synth_rand_H(H, seed=20260427):\n" +
+        "    rng = np.random.default_rng(seed)\n" +
+        "    n, d = H.shape\n" +
+        "    return H + 0.05 * rng.standard_normal((n, d))\n" +
+        "def write_H(path, H):\n" +
+        "    entries = [{'idx': i, 'h': [float(x) for x in H[i].tolist()]} for i in range(H.shape[0])]\n" +
+        "    obj = {'reduction': 'selftest_synthetic', 'entries': entries}\n" +
+        "    with open(path, 'w') as f: json.dump(obj, f)\n" +
+        "H = synth_pass_H()\n" +
+        "Ha = synth_anti_H(H)\n" +
+        "Hr = synth_rand_H(H)\n" +
+        "write_H(os.path.join(WORK, 'H_TRAINED.json'), H)\n" +
+        "write_H(os.path.join(WORK, 'H_ANTI.json'), Ha)\n" +
+        "write_H(os.path.join(WORK, 'H_RANDOM.json'), Hr)\n" +
+        "print('synth_done=1')\n"
+    write_file(synth_path, synth)
+    let r0 = _exec("mkdir -p " + _sh_quote(work_dir) + " && python3 " + _sh_quote(synth_path) + " " + _sh_quote(work_dir))
+    if r0[1] != 0 {
+        eprintln("selftest synth FAILED: " + to_string(r0[1]))
+        eprintln(r0[0])
+        exit(1)
+    }
+    println(r0[0])
+
+    // Run dispatch chain
+    let dispatch_cmd = "HEXA_RESOLVER_NO_REROUTE=1 bash " + _sh_quote(HELPER_SH_PATH) + " " +
+        _sh_quote(h_tr) + " " + _sh_quote(h_an) + " " + _sh_quote(h_rd) + " " +
+        _sh_quote(run_id) + " " + _sh_quote(work_dir)
+    let r1 = _exec(dispatch_cmd)
+    if r1[1] != 0 {
+        eprintln("selftest dispatch FAILED: " + to_string(r1[1]))
+        eprintln(r1[0])
+        exit(1)
+    }
+    println(r1[0])
+    if _kv_lookup(r1[0], "step1_v_pairrank_done") == "" {
+        eprintln("selftest: step1 marker missing")
+        exit(1)
+    }
+    if _kv_lookup(r1[0], "step4_5tuple_aggregator_done") == "" {
+        eprintln("selftest: step4 marker missing")
+        exit(1)
+    }
+    let vpr_p = _kv_lookup(r1[0], "v_pairrank_path")
+    let v2_p  = _kv_lookup(r1[0], "v2_papo_path")
+    let v3_p  = _kv_lookup(r1[0], "v3_cps_path")
+    let agg_p = _kv_lookup(r1[0], "aggregated_path")
+    if vpr_p == "" || v2_p == "" || v3_p == "" || agg_p == "" {
+        eprintln("selftest: dispatch path markers missing")
+        exit(1)
+    }
+
+    // Run final aggregation py
+    let py_args = _sh_quote(vpr_p) + " " + _sh_quote(v2_p) + " " + _sh_quote(v3_p) + " " +
+        _sh_quote(agg_p) + " " + _sh_quote(VERDICT_SPEC) + " " + _sh_quote(out_full) + " " +
+        _sh_quote(SCHEMA) + " " + _sh_quote(SPEC_DOC) + " " + _sh_quote(SPEC_COMMIT) + " " +
+        _sh_quote(run_id) + " " + _sh_quote(h_tr) + " " + _sh_quote(h_an) + " " + _sh_quote(h_rd)
+    let r2 = _exec("python3 " + _sh_quote(HELPER_PY_PATH) + " " + py_args)
+    if r2[1] != 0 {
+        eprintln("selftest final agg FAILED: " + to_string(r2[1]))
+        eprintln(r2[0])
+        exit(1)
+    }
+    println(r2[0])
+    if _kv_lookup(r2[0], "verdict_label") == "" {
+        eprintln("selftest: verdict_label marker missing")
+        exit(1)
+    }
+    if _kv_lookup(r2[0], "cross_check_ok") != "True" {
+        eprintln("selftest: cross_check FAILED — wrapper label vs aggregator label mismatch")
+        eprintln("(synthetic H에서는 동일 verdict 매트릭 redundancy 검증)")
+        exit(1)
+    }
+    if _kv_lookup(r2[0], "V3_FALSIFIED_FLAG") != "True" {
+        eprintln("selftest: V3_FALSIFIED_FLAG 누락")
+        exit(1)
+    }
+    println("selftest: OK")
+    exit(0)
+}
+
+fn main() {
+    let av = argv()
+    let mut h_trained = ""
+    let mut h_anti = ""
+    let mut h_random = ""
+    let mut output = ""
+    let mut run_id = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--h-trained" && i + 1 < len(av) { h_trained = av[i+1]; i = i + 2; continue }
+        if a == "--h-anti"    && i + 1 < len(av) { h_anti    = av[i+1]; i = i + 2; continue }
+        if a == "--h-random"  && i + 1 < len(av) { h_random  = av[i+1]; i = i + 2; continue }
+        if a == "--output"    && i + 1 < len(av) { output    = av[i+1]; i = i + 2; continue }
+        if a == "--run-id"    && i + 1 < len(av) { run_id    = av[i+1]; i = i + 2; continue }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper_sh()
+    _write_helper_py()
+
+    if selftest {
+        _selftest()
+    }
+
+    if h_trained == "" || output == "" || run_id == "" {
+        eprintln("ABORT: --h-trained <path> --output <state/mk_xi_<run_id>_full_verdict.json> --run-id <id> required (or --selftest).")
+        eprintln("  optional: --h-anti <path> --h-random <path>  (V_sub measurement, must come together)")
+        eprintln("  usage: hexa run tool/mk_xi_post_training_aggregate.hexa \\")
+        eprintln("           --h-trained <path> --h-anti <path> --h-random <path> \\")
+        eprintln("           --output state/mk_xi_<run_id>_full_verdict.json --run-id r9_<TS>")
+        exit(2)
+    }
+    if !file_exists(h_trained) {
+        eprintln("ABORT: missing h_trained " + h_trained)
+        exit(2)
+    }
+
+    let anti_provided = h_anti != ""
+    let rand_provided = h_random != ""
+    if anti_provided != rand_provided {
+        eprintln("ABORT: --h-anti and --h-random must be specified together (or both omitted).")
+        exit(2)
+    }
+    if anti_provided && !file_exists(h_anti) {
+        eprintln("ABORT: missing h_anti " + h_anti)
+        exit(2)
+    }
+    if rand_provided && !file_exists(h_random) {
+        eprintln("ABORT: missing h_random " + h_random)
+        exit(2)
+    }
+    if !file_exists(VERDICT_SPEC) {
+        eprintln("ABORT: missing verdict spec " + VERDICT_SPEC)
+        exit(2)
+    }
+
+    // Output directory for sub-artifacts (sibling of --output)
+    // Strip trailing filename: take parent dir of output
+    let out_dir = "state"
+    // (raw#15: sub-artifacts under state/ alongside final verdict)
+
+    let anti_arg = if anti_provided { h_anti } else { "NULL" }
+    let rand_arg = if rand_provided { h_random } else { "NULL" }
+
+    println("── mk_xi_post_training_aggregate ──")
+    println("h_trained: " + h_trained)
+    println("h_anti:    " + anti_arg)
+    println("h_random:  " + rand_arg)
+    println("output:    " + output)
+    println("run_id:    " + run_id)
+    println("verdict_spec: " + VERDICT_SPEC)
+    println("")
+    println("── 6 verifier dispatch chain ──")
+
+    let dispatch_cmd = "HEXA_RESOLVER_NO_REROUTE=1 bash " + _sh_quote(HELPER_SH_PATH) + " " +
+        _sh_quote(h_trained) + " " + _sh_quote(anti_arg) + " " + _sh_quote(rand_arg) + " " +
+        _sh_quote(run_id) + " " + _sh_quote(out_dir)
+    let r1 = _exec(dispatch_cmd)
+    let st1 = r1[1]
+    let body1 = r1[0]
+    if st1 != 0 {
+        eprintln("ABORT: dispatch helper exited " + to_string(st1))
+        eprintln(body1)
+        exit(2)
+    }
+    println(body1)
+
+    let vpr_p = _kv_lookup(body1, "v_pairrank_path")
+    let v2_p  = _kv_lookup(body1, "v2_papo_path")
+    let v3_p  = _kv_lookup(body1, "v3_cps_path")
+    let agg_p = _kv_lookup(body1, "aggregated_path")
+    if vpr_p == "" || v2_p == "" || v3_p == "" || agg_p == "" {
+        eprintln("ABORT: dispatch path markers missing in helper output")
+        exit(2)
+    }
+
+    println("")
+    println("── verdict matrix lookup + final aggregation ──")
+    let py_args = _sh_quote(vpr_p) + " " + _sh_quote(v2_p) + " " + _sh_quote(v3_p) + " " +
+        _sh_quote(agg_p) + " " + _sh_quote(VERDICT_SPEC) + " " + _sh_quote(output) + " " +
+        _sh_quote(SCHEMA) + " " + _sh_quote(SPEC_DOC) + " " + _sh_quote(SPEC_COMMIT) + " " +
+        _sh_quote(run_id) + " " + _sh_quote(h_trained) + " " + _sh_quote(anti_arg) + " " + _sh_quote(rand_arg)
+    let r2 = _exec("python3 " + _sh_quote(HELPER_PY_PATH) + " " + py_args)
+    let st2 = r2[1]
+    let body2 = r2[0]
+    if st2 != 0 {
+        eprintln("ABORT: final aggregation helper exited " + to_string(st2))
+        eprintln(body2)
+        exit(2)
+    }
+    println(body2)
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()

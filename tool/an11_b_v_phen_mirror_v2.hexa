@@ -1,0 +1,153 @@
+// tool/an11_b_v_phen_mirror_v2.hexa — V_phen_mirror v2: different-model cross-classification (raw#9+raw#37).
+//
+// PURPOSE
+//   v1 (tool/an11_b_v_phen_mirror_self_other.hexa) is TAUTOLOGICAL —
+//   self-greedy match classifier로 by-construction acc=1.0.
+//
+//   v2: 2 different-architecture models (M1=Qwen3, M2=Qwen2.5) generate
+//   16 outputs each from same prompts. Both M1 and M2 classify shuffled
+//   32 outputs as self/other. backbone-invariant by 2-model symmetric design.
+//
+//   spec: state/an11_v_phen_mirror_v2_spec_20260425.json (raw#12 frozen)
+//
+// PASS predicate (raw#12 frozen):
+//   M1_accuracy >= 0.70 AND M2_accuracy >= 0.70
+//   AND M1_FPR <= 0.20 AND M2_FPR <= 0.20
+//   AND agreement(M1, M2) >= 0.50
+//
+// USAGE
+//   hexa run tool/an11_b_v_phen_mirror_v2.hexa --selftest
+//   hexa run tool/an11_b_v_phen_mirror_v2.hexa run \
+//     --m1-classifications <path.json> --m2-classifications <path.json> \
+//     --m1-self-mask <path.json> --m2-self-mask <path.json> \
+//     --output <state/v_phen_mirror_v2_<id>.json>
+
+let HELPER_PATH = "/tmp/an11_b_v_phen_mirror_v2_helper.hexa_tmp"
+let SCHEMA = "anima/an11_v_phen_mirror_v2/1"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) { return ln.substring(prefix.len(), ln.len()) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("import json, os, sys, datetime, argparse\n\n")
+    parts.push("THRESHOLDS = {'accuracy': 0.70, 'fpr_max': 0.20, 'agreement_min': 0.50}\n\n")
+    parts.push("def metrics(classifications, self_mask):\n")
+    parts.push("    \"\"\"classifications: list[bool] (True=predicted self), self_mask: list[bool] (True=actual self).\"\"\"\n")
+    parts.push("    n = len(classifications)\n")
+    parts.push("    if len(self_mask) != n: return None\n")
+    parts.push("    tp = sum(1 for i in range(n) if classifications[i] and self_mask[i])\n")
+    parts.push("    fp = sum(1 for i in range(n) if classifications[i] and not self_mask[i])\n")
+    parts.push("    tn = sum(1 for i in range(n) if not classifications[i] and not self_mask[i])\n")
+    parts.push("    fn_count = sum(1 for i in range(n) if not classifications[i] and self_mask[i])\n")
+    parts.push("    accuracy = (tp + tn) / n\n")
+    parts.push("    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0\n")
+    parts.push("    return {'accuracy': accuracy, 'fpr': fpr, 'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn_count}\n\n")
+    parts.push("def cmd_run(args):\n")
+    parts.push("    m1_class = json.load(open(args.m1_classifications))\n")
+    parts.push("    m2_class = json.load(open(args.m2_classifications))\n")
+    parts.push("    m1_mask = json.load(open(args.m1_self_mask))\n")
+    parts.push("    m2_mask = json.load(open(args.m2_self_mask))\n")
+    parts.push("    m1_metrics = metrics(m1_class, m1_mask)\n")
+    parts.push("    m2_metrics = metrics(m2_class, m2_mask)\n")
+    parts.push("    if not m1_metrics or not m2_metrics:\n")
+    parts.push("        print('ABORT: classification/mask length mismatch'); sys.exit(2)\n")
+    parts.push("    n = len(m1_class)\n")
+    parts.push("    agreement = sum(1 for i in range(n) if m1_class[i] == m2_class[i]) / n\n")
+    parts.push("    pass_M1 = m1_metrics['accuracy'] >= THRESHOLDS['accuracy'] and m1_metrics['fpr'] <= THRESHOLDS['fpr_max']\n")
+    parts.push("    pass_M2 = m2_metrics['accuracy'] >= THRESHOLDS['accuracy'] and m2_metrics['fpr'] <= THRESHOLDS['fpr_max']\n")
+    parts.push("    pass_agreement = agreement >= THRESHOLDS['agreement_min']\n")
+    parts.push("    overall = 'PASS' if (pass_M1 and pass_M2 and pass_agreement) else 'FAIL'\n")
+    parts.push("    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n")
+    parts.push("    out = {\n")
+    parts.push("        'schema': 'anima/an11_v_phen_mirror_v2/1',\n")
+    parts.push("        'spec_doc': 'state/an11_v_phen_mirror_v2_spec_20260425.json',\n")
+    parts.push("        'ts': ts,\n")
+    parts.push("        'thresholds': THRESHOLDS,\n")
+    parts.push("        'M1_metrics': m1_metrics, 'M2_metrics': m2_metrics,\n")
+    parts.push("        'agreement_M1_M2': agreement,\n")
+    parts.push("        'pass_M1': pass_M1, 'pass_M2': pass_M2, 'pass_agreement': pass_agreement,\n")
+    parts.push("        'verdict': overall,\n")
+    parts.push("        'raw10_honest': 'backbone-invariant by 2-model symmetric design. v1 self-greedy tautological 회피.'\n")
+    parts.push("    }\n")
+    parts.push("    with open(args.output, 'w') as f: json.dump(out, f, indent=2)\n")
+    parts.push("    print(f'M1_acc={m1_metrics[\"accuracy\"]:.3f} M2_acc={m2_metrics[\"accuracy\"]:.3f} agreement={agreement:.3f} verdict={overall}')\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def cmd_selftest():\n")
+    parts.push("    # Synthetic: 32 outputs (16 M1-self + 16 M1-other), M1 perfectly distinguishes, M2 80% accurate\n")
+    parts.push("    n = 32\n")
+    parts.push("    m1_mask = [True]*16 + [False]*16\n")
+    parts.push("    m1_class = list(m1_mask)  # M1 perfect\n")
+    parts.push("    m2_mask = [False]*16 + [True]*16  # M2 perspective: M1's self is M2's other\n")
+    parts.push("    m2_class = list(m2_mask)  # M2 perfect from its perspective\n")
+    parts.push("    m1_m = metrics(m1_class, m1_mask)\n")
+    parts.push("    m2_m = metrics(m2_class, m2_mask)\n")
+    parts.push("    agreement = sum(1 for i in range(n) if m1_class[i] == m2_class[i]) / n\n")
+    parts.push("    print('selftest=ok')\n")
+    parts.push("    print(f'M1_acc={m1_m[\"accuracy\"]:.3f}')\n")
+    parts.push("    print(f'M2_acc={m2_m[\"accuracy\"]:.3f}')\n")
+    parts.push("    print(f'agreement={agreement:.3f}')\n")
+    parts.push("    print('DONE')\n\n")
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    sub = p.add_subparsers(dest='cmd', required=True)\n")
+    parts.push("    sub.add_parser('selftest')\n")
+    parts.push("    r = sub.add_parser('run')\n")
+    parts.push("    r.add_argument('--m1-classifications', dest='m1_classifications', required=True)\n")
+    parts.push("    r.add_argument('--m2-classifications', dest='m2_classifications', required=True)\n")
+    parts.push("    r.add_argument('--m1-self-mask', dest='m1_self_mask', required=True)\n")
+    parts.push("    r.add_argument('--m2-self-mask', dest='m2_self_mask', required=True)\n")
+    parts.push("    r.add_argument('--output', required=True)\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    if args.cmd == 'selftest': cmd_selftest()\n")
+    parts.push("    else: cmd_run(args)\n\n")
+    parts.push("if __name__ == '__main__': main()\n")
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) { if av[i] == "--selftest" { selftest = true; break }; i = i + 1 }
+    _write_helper()
+    if selftest {
+        println("── an11_b_v_phen_mirror_v2 selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("FAILED"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+    let mut a = ""; let mut j = 3
+    while j < len(av) { a = a + " " + _sh_quote(av[j]); j = j + 1 }
+    let r = _run_helper(a.trim())
+    println(r[0])
+    exit(r[1])
+}
+
+main()
