@@ -1,0 +1,240 @@
+// tool/an11_b_v_pairrank.hexa — V_pairrank: paired-rank stability verifier (raw#9 hexa-only).
+//
+// PURPOSE
+//   V3 metric redesign Option C 후보 (raw#12 new revision, 5-tuple expansion).
+//   V3 original Gram Frob ratio + V3_v2 mirror-SMA permutation 모두 design flaw
+//   확인 (dc871454, 1002d16a, c369b375). 새 verifier로 paired binding을 직접
+//   topological 측정 — paired token의 nearest-neighbor rank.
+//
+// METHOD
+//   PAIRS = [(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]
+//   For each (i, j) in PAIRS:
+//     For token i (EN):
+//       cosines = [|cos(H[i], H[k])| for k != i]                  (15 values)
+//       sorted_desc by cos
+//       rank_of_j_in_token_i_view = position of j (1-indexed, lower=better)
+//     For token j (KO): symmetric
+//     pair_rank = mean(rank_i_view_of_j, rank_j_view_of_i)
+//   V_pairrank = mean over PAIRS of (1 / pair_rank)              (higher=better, max=1.0)
+//   top1_hit = mean over PAIRS of (1 if both directions yield rank 1 else 0)
+//   top3_hit = mean over PAIRS of (1 if both rank <= 3)
+//
+// PASS predicate (raw#12 frozen, NEW REVISION):
+//   PASS       V_pairrank >= 0.50 AND top3_hit >= 0.80
+//   AMBIGUOUS  V_pairrank in [0.30, 0.50)
+//   FAIL       V_pairrank < 0.30
+//
+// NOTE
+//   V_pairrank는 V3 original (Gram Frob) + V3_v2 (mirror-SMA permutation) 모두에
+//   적용 안 되는 axis — topological rank-based measure로 paired binding directness
+//   직접 측정. semantic-stability surrogate가 아님; paired representation의 retrieval
+//   accuracy 측정 (information retrieval analogy: paired token이 query의 top-K
+//   nearest neighbor에 들어가는지).
+//
+// USAGE
+//   hexa run tool/an11_b_v_pairrank.hexa --input <h.json> --output <r.json>
+//   hexa run tool/an11_b_v_pairrank.hexa --selftest
+
+let HELPER_PATH = "/tmp/an11_b_v_pairrank_helper.hexa_tmp"
+let SCHEMA      = "anima/an11_v_pairrank/1_paired_nearest_neighbor_rank"
+let SPEC_DOC    = "docs/v3_metric_redesign_v2_mirror_sma_20260425.md (Option C 후보 verifier)"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "PAIRS = [(0,6),(1,7),(2,8),(3,10),(4,11),(5,9)]\n" +
+        "\n" +
+        "def load_H(path):\n" +
+        "    with open(path) as f: d = json.load(f)\n" +
+        "    rows = [e['h'] for e in d['entries']]\n" +
+        "    return np.asarray(rows, dtype=np.float64), d.get('reduction', 'unknown')\n" +
+        "\n" +
+        "def abs_cos(a, b):\n" +
+        "    na = float(np.linalg.norm(a)); nb = float(np.linalg.norm(b))\n" +
+        "    if na <= 0.0 or nb <= 0.0: return 0.0\n" +
+        "    return float(abs(np.dot(a, b) / (na * nb)))\n" +
+        "\n" +
+        "def rank_of(H, src, tgt):\n" +
+        "    n = H.shape[0]\n" +
+        "    cosines = []\n" +
+        "    for k in range(n):\n" +
+        "        if k == src: continue\n" +
+        "        cosines.append((k, abs_cos(H[src], H[k])))\n" +
+        "    cosines.sort(key=lambda x: -x[1])\n" +
+        "    for rank_idx, (k, c) in enumerate(cosines):\n" +
+        "        if k == tgt: return rank_idx + 1, c\n" +
+        "    return n, 0.0\n" +
+        "\n" +
+        "def compute_pairrank(H):\n" +
+        "    pair_records = []\n" +
+        "    inv_ranks = []\n" +
+        "    top1_flags = []\n" +
+        "    top3_flags = []\n" +
+        "    for (i, j) in PAIRS:\n" +
+        "        rij, cij = rank_of(H, i, j)\n" +
+        "        rji, cji = rank_of(H, j, i)\n" +
+        "        pr = (rij + rji) / 2.0\n" +
+        "        inv_ranks.append(1.0 / pr if pr > 0 else 0.0)\n" +
+        "        top1_flags.append(1.0 if (rij == 1 and rji == 1) else 0.0)\n" +
+        "        top3_flags.append(1.0 if (rij <= 3 and rji <= 3) else 0.0)\n" +
+        "        pair_records.append({\n" +
+        "            'pair': [int(i), int(j)],\n" +
+        "            'rank_i_view': int(rij), 'cos_i_view': cij,\n" +
+        "            'rank_j_view': int(rji), 'cos_j_view': cji,\n" +
+        "            'pair_rank_mean': pr\n" +
+        "        })\n" +
+        "    V_pairrank = float(np.mean(inv_ranks))\n" +
+        "    top1_hit = float(np.mean(top1_flags))\n" +
+        "    top3_hit = float(np.mean(top3_flags))\n" +
+        "    return V_pairrank, top1_hit, top3_hit, pair_records\n" +
+        "\n" +
+        "def verdict_for(v, top3):\n" +
+        "    if v >= 0.50 and top3 >= 0.80: return 'PASS'\n" +
+        "    if v >= 0.30: return 'AMBIGUOUS'\n" +
+        "    return 'FAIL'\n" +
+        "\n" +
+        "def cmd_run(input_path, result_path, schema, spec_doc):\n" +
+        "    if not os.path.exists(input_path):\n" +
+        "        print(f'ERR: missing input {input_path}', file=sys.stderr); sys.exit(2)\n" +
+        "    H, reduction = load_H(input_path)\n" +
+        "    if H.shape[0] != 16:\n" +
+        "        print(f'ERR: expected 16 prompts, got {H.shape[0]}', file=sys.stderr); sys.exit(2)\n" +
+        "    V_pr, t1, t3, recs = compute_pairrank(H)\n" +
+        "    v = verdict_for(V_pr, t3)\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'V_pairrank: paired-token nearest-neighbor rank',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_revision': 'V_pairrank v1 (raw#12 new revision; existing V0/V1/V2/V3 frozen specs preserved)',\n" +
+        "        'method': 'For each (i,j) in PAIRS, compute rank of j among neighbors of i (and symmetric); V_pairrank = mean(1/pair_rank); top1/top3 hits',\n" +
+        "        'reduction': reduction,\n" +
+        "        'ts': ts,\n" +
+        "        'PAIRS': PAIRS,\n" +
+        "        'V_pairrank': V_pr,\n" +
+        "        'top1_hit': t1,\n" +
+        "        'top3_hit': t3,\n" +
+        "        'pair_records': recs,\n" +
+        "        'verdict': v,\n" +
+        "        'thresholds': {\n" +
+        "            'PASS': 'V_pairrank >= 0.50 AND top3_hit >= 0.80',\n" +
+        "            'AMBIGUOUS': 'V_pairrank in [0.30, 0.50)',\n" +
+        "            'FAIL': 'V_pairrank < 0.30',\n" +
+        "        }\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'reduction={reduction}')\n" +
+        "    print(f'V_pairrank={V_pr:.6f}')\n" +
+        "    print(f'top1_hit={t1:.6f}')\n" +
+        "    print(f'top3_hit={t3:.6f}')\n" +
+        "    print(f'verdict={v}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    rng = np.random.default_rng(20260425)\n" +
+        "    H = rng.standard_normal((16, 64))\n" +
+        "    V_pr, t1, t3, recs = compute_pairrank(H)\n" +
+        "    assert 0.0 <= V_pr <= 1.0, f'V_pairrank out of range: {V_pr}'\n" +
+        "    assert 0.0 <= t1 <= 1.0 and 0.0 <= t3 <= 1.0, f'hit fractions out of range'\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'V_pairrank={V_pr:.6f}')\n" +
+        "    print(f'top1_hit={t1:.6f}')\n" +
+        "    print(f'top3_hit={t3:.6f}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'run': cmd_run(*sys.argv[2:6])\n" +
+        "    elif mode == 'selftest': cmd_selftest()\n" +
+        "    else: print(f'unknown mode: {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut input = ""
+    let mut output = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--input" && i + 1 < len(av) { input = av[i+1]; i = i + 2; continue }
+        if a == "--output" && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_v_pairrank selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("selftest FAILED (exit " + to_string(r[1]) + ")"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { eprintln("selftest marker missing"); exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if input == "" || output == "" {
+        eprintln("ABORT: --input <path> --output <path> required (or --selftest).")
+        exit(2)
+    }
+    if !file_exists(input) {
+        eprintln("ABORT: missing input " + input)
+        exit(2)
+    }
+
+    println("── an11_b_v_pairrank ──")
+    println("input:  " + input)
+    println("output: " + output)
+    let args = "run " +
+        _sh_quote(input) + " " +
+        _sh_quote(output) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 { eprintln("ABORT: helper run exited " + to_string(st)); eprintln(out); exit(2) }
+    println(out)
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()
