@@ -1,0 +1,221 @@
+// tool/an11_b_v1_phi_mip_subset_probe.hexa — V1 prompt-count sensitivity (raw#9 hexa-only).
+//
+// PURPOSE
+//   V1 main 가설 (prompt 16→32 확장으로 Φ_mip 끌어올림)은 forward 필요로 substrate
+//   검증 차단. 본 도구는 *역방향* sensitivity probe — 16-prompt H에서 random
+//   subset (k=8,10,12,14,16)을 sample해서 Φ_mip의 prompt count 의존성 측정.
+//
+//   Hypothesis: Φ_mip이 prompt count에 크게 의존하면 16→32 확장 효과 strong;
+//   거의 invariant이면 약함. lower bound estimate of V1 lift potential.
+//
+// METHOD (deterministic, raw#12)
+//   For k in [8, 10, 12, 14, 16]:
+//     For seed in {20260425, 20260426, 20260427}:   (3 seeds for variance)
+//       sub_idx = numpy default_rng(seed).choice(16, k, replace=False)
+//       H_sub = H[sorted(sub_idx), :]
+//       phi_mip_sub = compute_phi_mip(H_sub)
+//   stats: mean/std per k; trend via linear fit phi vs k.
+//
+// USAGE
+//   hexa run tool/an11_b_v1_phi_mip_subset_probe.hexa --input <h.json> --output <r.json>
+
+let HELPER_PATH = "/tmp/an11_b_v1_phi_mip_subset_probe_helper.hexa_tmp"
+let SCHEMA      = "anima/an11_v1_phi_mip_subset_probe/1"
+let SPEC_DOC    = "docs/alm_consciousness_joint_matrix_20260425.md §9.1 (V1 sensitivity probe)"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime\n" +
+        "import numpy as np\n" +
+        "from itertools import combinations\n" +
+        "\n" +
+        "def load_H(path):\n" +
+        "    with open(path) as f: d = json.load(f)\n" +
+        "    rows = [e['h'] for e in d['entries']]\n" +
+        "    return np.asarray(rows, dtype=np.float64), d.get('reduction', 'unknown')\n" +
+        "\n" +
+        "def normalize_H(H):\n" +
+        "    norms = np.linalg.norm(H, axis=1, keepdims=True)\n" +
+        "    norms = np.where(norms > 0, norms, 1.0)\n" +
+        "    return H / norms\n" +
+        "\n" +
+        "def compute_phi_mip(H):\n" +
+        "    n = H.shape[0]\n" +
+        "    if n < 2: return 0.0\n" +
+        "    Hn = normalize_H(H)\n" +
+        "    G = Hn @ Hn.T\n" +
+        "    Gnorm = float(np.linalg.norm(G))\n" +
+        "    if Gnorm <= 0.0: return 0.0\n" +
+        "    # MIP = min over bipartitions S of fraction of off-block-diagonal Frob mass\n" +
+        "    # consistent with v1_phi_mip surrogate; use exhaustive search up to n=16.\n" +
+        "    best = 1.0\n" +
+        "    indices = list(range(n))\n" +
+        "    for k in range(1, n // 2 + 1):\n" +
+        "        for S in combinations(indices, k):\n" +
+        "            S_set = set(S)\n" +
+        "            mask = np.array([i in S_set for i in indices])\n" +
+        "            G_block = G.copy()\n" +
+        "            # zero in-block entries (within S or within S^c) — keep only cross-block\n" +
+        "            for i in range(n):\n" +
+        "                for j in range(n):\n" +
+        "                    if (mask[i] == mask[j]):\n" +
+        "                        G_block[i,j] = 0.0\n" +
+        "            cross_mass = float(np.linalg.norm(G_block) / Gnorm)\n" +
+        "            if cross_mass < best:\n" +
+        "                best = cross_mass\n" +
+        "    return best\n" +
+        "\n" +
+        "def cmd_run(input_path, result_path, schema, spec_doc):\n" +
+        "    if not os.path.exists(input_path):\n" +
+        "        print(f'ERR: missing input {input_path}', file=sys.stderr); sys.exit(2)\n" +
+        "    H, reduction = load_H(input_path)\n" +
+        "    if H.shape[0] != 16:\n" +
+        "        print(f'ERR: expected 16 prompts, got {H.shape[0]}', file=sys.stderr); sys.exit(2)\n" +
+        "    K_GRID = [8, 10, 12, 14, 16]\n" +
+        "    SEEDS  = [20260425, 20260426, 20260427]\n" +
+        "    sweep = []\n" +
+        "    for k in K_GRID:\n" +
+        "        per_k = []\n" +
+        "        for seed in SEEDS:\n" +
+        "            if k == 16:\n" +
+        "                sub = list(range(16))\n" +
+        "            else:\n" +
+        "                rng = np.random.default_rng(seed)\n" +
+        "                sub = sorted([int(x) for x in rng.choice(16, k, replace=False).tolist()])\n" +
+        "            H_sub = H[sub, :]\n" +
+        "            phi = compute_phi_mip(H_sub)\n" +
+        "            per_k.append({'seed': seed, 'subset': sub, 'phi_mip': phi})\n" +
+        "            if k == 16: break\n" +
+        "        phis = [r['phi_mip'] for r in per_k]\n" +
+        "        sweep.append({\n" +
+        "            'k': k,\n" +
+        "            'mean_phi_mip': float(np.mean(phis)),\n" +
+        "            'std_phi_mip': float(np.std(phis)),\n" +
+        "            'min_phi_mip': float(np.min(phis)),\n" +
+        "            'max_phi_mip': float(np.max(phis)),\n" +
+        "            'runs': per_k\n" +
+        "        })\n" +
+        "    # linear fit phi vs k\n" +
+        "    ks = np.array([r['k'] for r in sweep], dtype=np.float64)\n" +
+        "    phis = np.array([r['mean_phi_mip'] for r in sweep], dtype=np.float64)\n" +
+        "    slope, intercept = np.polyfit(ks, phis, 1)\n" +
+        "    phi_at_32_extrapolated = float(slope * 32.0 + intercept)\n" +
+        "    delta_per_prompt = float(slope)\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'verifier': 'V1 phi_mip subset sensitivity probe',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'method': 'random subset sweep over k in [8,10,12,14,16] x 3 seeds; linear fit phi vs k; extrapolate to k=32',\n" +
+        "        'reduction': reduction,\n" +
+        "        'ts': ts,\n" +
+        "        'K_GRID': K_GRID,\n" +
+        "        'SEEDS': SEEDS,\n" +
+        "        'sweep': sweep,\n" +
+        "        'linear_fit': {\n" +
+        "            'slope_per_prompt': delta_per_prompt,\n" +
+        "            'intercept': float(intercept),\n" +
+        "            'phi_at_k_32_extrapolated': phi_at_32_extrapolated\n" +
+        "        },\n" +
+        "        'V1_PASS_threshold': 0.55,\n" +
+        "        'gap_at_k32': max(0.0, 0.55 - phi_at_32_extrapolated)\n" +
+        "    }\n" +
+        "    with open(result_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'reduction={reduction}')\n" +
+        "    for r in sweep:\n" +
+        "        print(f\"k={r['k']} mean_phi={r['mean_phi_mip']:.4f} std={r['std_phi_mip']:.4f}\")\n" +
+        "    print(f'slope_per_prompt={delta_per_prompt:.6f}')\n" +
+        "    print(f'phi_at_k_32_extrapolated={phi_at_32_extrapolated:.6f}')\n" +
+        "    print(f'gap_at_k32={max(0.0, 0.55 - phi_at_32_extrapolated):.6f}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    rng = np.random.default_rng(20260425)\n" +
+        "    H = rng.standard_normal((16, 64))\n" +
+        "    phi_full = compute_phi_mip(H)\n" +
+        "    phi_8 = compute_phi_mip(H[:8])\n" +
+        "    assert 0.0 <= phi_full <= 1.0, f'phi out of range: {phi_full}'\n" +
+        "    assert 0.0 <= phi_8 <= 1.0\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'phi_full={phi_full:.6f}')\n" +
+        "    print(f'phi_8={phi_8:.6f}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'run': cmd_run(*sys.argv[2:6])\n" +
+        "    elif mode == 'selftest': cmd_selftest()\n" +
+        "    else: print(f'unknown mode: {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn main() {
+    let av = argv()
+    let mut input = ""
+    let mut output = ""
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--input" && i + 1 < len(av) { input = av[i+1]; i = i + 2; continue }
+        if a == "--output" && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    _write_helper()
+    if selftest {
+        println("── an11_b_v1_phi_mip_subset_probe selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("selftest FAILED"); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" { eprintln("marker missing"); exit(1) }
+        println("selftest: OK")
+        exit(0)
+    }
+    if input == "" || output == "" { eprintln("ABORT: --input/--output required"); exit(2) }
+    if !file_exists(input) { eprintln("ABORT: missing input"); exit(2) }
+    println("── an11_b_v1_phi_mip_subset_probe ──")
+    println("input:  " + input)
+    println("output: " + output)
+    let args = "run " + _sh_quote(input) + " " + _sh_quote(output) + " " + _sh_quote(SCHEMA) + " " + _sh_quote(SPEC_DOC)
+    let r = _run_helper(args)
+    if r[1] != 0 { eprintln("ABORT: helper exit " + to_string(r[1])); eprintln(r[0]); exit(2) }
+    println(r[0])
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()
