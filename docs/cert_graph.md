@@ -1,22 +1,27 @@
 <!-- AUTO-GENERATED, DO NOT EDIT — source: tool/cert_graph_gen.hexa -->
-<!-- generated: 2026-04-22T16:35:09Z -->
+<!-- generated: 2026-04-25T03:34:35Z -->
 <!-- cert_dir: /Users/ghost/core/anima/.meta2-cert -->
-<!-- node_count: 10 -->
-<!-- edge_count: 14 -->
+<!-- node_count: 12 -->
+<!-- edge_count: 20 -->
 
 # .meta2-cert relationship graph
 
-_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-22T16:35:09Z UTC._
+_AUTO-GENERATED, DO NOT EDIT — generated 2026-04-25T03:34:35Z UTC._
 
-**Nodes:** 10 · **Edges:** 14
+**Nodes:** 12 · **Edges:** 20
 
 ## Adjacency list
+
+### `axis10-sigma-phi-identity` — VERIFIED
+_UNIVERSAL\_CONSTANT\_4 axis 10 \u2014 \u03c3\u00b7\u03c6 = n\u00b7\u03c4 identity K=4 at N=10000_
+
+- **cross_ref** → `universal-constant-4`
 
 ### `cell-eigenvec-16` — VERIFIED
 _cell Mk.VIII 1000/1000 → 16 eigenvec (Hexad/Law/Phi/SelfRef)_
 
-- **cross_ref** → `cell-mk8-stationary`
 - **cross_ref** → `cell-hexad-closure`
+- **cross_ref** → `cell-mk8-stationary`
 - **cross_ref** → `mk8-7axis-skeleton`
 - **depends_on** → `rm#22`
 
@@ -61,10 +66,19 @@ _Mk.VIII 7-axis Lagrangian FIXPOINT\_SKELETON\_VERIFIED_
 
 - _(no outgoing edges)_
 
-### `universal-constant-4` — PARTIAL
-_UNIVERSAL\_CONSTANT\_4 — K\_c=4 across 8/8 axes_
+### `raw31-population-rg-coupling` — 5/5 ws_per_mille trajectory 40→125→687→1000→1000 PASS
+_raw#31 POPULATION\_RG\_COUPLING — V\_sync ⊗ V\_RG unified L\_IX (Mk.IX)_
 
-- **cross_ref** → `lora-phase-jump-k4`
 - **cross_ref** → `cell-mk8-stationary`
+- **cross_ref** → `lora-phase-jump-k4`
+- **cross_ref** → `mk8-7axis-skeleton`
+- **cross_ref** → `universal-constant-4`
+
+### `universal-constant-4` — PASS
+_UNIVERSAL\_CONSTANT\_4 \u2014 K\_c=4 across 8/8 axes_
+
+- **cross_ref** → `axis10-sigma-phi-identity`
+- **cross_ref** → `cell-mk8-stationary`
+- **cross_ref** → `lora-phase-jump-k4`
 - **cross_ref** → `mk8-7axis-skeleton`
 
