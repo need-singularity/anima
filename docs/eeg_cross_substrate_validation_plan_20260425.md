@@ -12,13 +12,21 @@
 ## §1 Hardware spec (assumed, user 16ch EEG)
 
 ```
-Channels:    16 (보통 10-20 system or custom layout)
-Sample rate: 250-500Hz typical
-Resolution:  16-24 bit
+Channels:    16 (OpenBCI Cyton+Daisy assumed; 10-20 system or custom layout)
+Sample rate: 125Hz canonical (BoardShim.get_sampling_rate(CYTON_DAISY_BOARD) = 125)
+             — NOT 250Hz. SYNTHETIC_BOARD=250, CYTON 8ch=250, GANGLION 4ch=200.
+             Helpers query fs dynamically via BrainFlow API; never hardcode.
+Resolution:  24-bit (Cyton+Daisy ADS1299)
 Software:    OpenBCI GUI / Brainflow / MNE-Python compatible
-File format: BDF/EDF/FIF (MNE)
+File format: BDF/EDF/FIF (MNE) or live BrainFlow via tool/anima_eeg_brainflow_ingest.hexa
 Reference:   Avg, mastoid, or custom
 ```
+
+**v1.1 correction (2026-04-26)**: previous draft said "250-500Hz typical" — anchored on
+SYNTHETIC=250 misreading. BrainFlow `BoardShim.get_sampling_rate(BoardIds.CYTON_DAISY_BOARD)`
+returns 125 (verified mac-local with brainflow 5.21.0 in `.venv-eeg/`). Cyton+Daisy ADS1299
+runs at 16 kSPS internally and decimates to 125 Hz for the 16-channel union. All four
+fixture/helper/JSON/plan locations updated; sha re-frozen v1.0 → v1.1.
 
 ## §2 Three core protocols (rating 5 surrogates)
 

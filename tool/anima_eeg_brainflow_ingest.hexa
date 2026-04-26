@@ -1,14 +1,14 @@
 // tool/anima_eeg_brainflow_ingest.hexa — BrainFlow live-stream EEG ingest (raw#9 hexa-only, raw#37 emit).
 //
 // PURPOSE
-//   OpenBCI Cyton+Daisy 16ch (250Hz, 24-bit) live capture via BrainFlow SDK.
+//   OpenBCI Cyton+Daisy 16ch (125Hz canonical, 24-bit) live capture via BrainFlow SDK.
 //   Synthetic mode (no hardware) and Cyton mode (auto-detect serial port).
 //   Output: state/eeg_recording_<id>.json (schema: anima/eeg_recording/1) — same
 //   schema as tool/an11_b_eeg_ingest.hexa so downstream verifiers (V_phen_LZ,
 //   V_phen_GWT) can consume both post-recording (BDF/EDF) and live-stream paths.
 //
 // MODES
-//   --selftest                     synthetic 16ch × 10s × 250Hz dry-run, no hardware
+//   --selftest                     synthetic 16ch × 10s dry-run (BrainFlow SYNTHETIC=250Hz), no hardware
 //   --mode synthetic               BrainFlow SYNTHETIC_BOARD stream (BoardIds=-1)
 //   --mode cyton  --serial <port>  OpenBCI Cyton+Daisy via FTDI dongle (BoardIds=2)
 //
@@ -21,7 +21,11 @@
 //   - Cyton+Daisy uses BoardIds.CYTON_DAISY_BOARD = 2.
 //   - macOS: requires FTDI VCP driver if dongle not enumerated as /dev/cu.usbserial-*.
 //     Verify: ls /dev/cu.usbserial* — if missing, install FTDI VCP from ftdichip.com.
-//   - 16ch sample rate fixed at 250Hz (downsampled from 16kHz internally).
+//   - Cyton+Daisy 16ch native sample rate = 125Hz per BrainFlow API
+//     (BoardShim.get_sampling_rate(BoardIds.CYTON_DAISY_BOARD)). Not 250Hz.
+//     SYNTHETIC_BOARD = 250Hz, CYTON 8ch = 250Hz, GANGLION 4ch = 200Hz.
+//   - Helper queries fs dynamically via BoardShim.get_sampling_rate(bid)
+//     — never hardcode. Selftest asserts mode-dependent expected fs.
 //   - First 16 EEG channel indices in BoardShim.get_eeg_channels(2).
 //
 // raw#10 honest scope
@@ -70,11 +74,19 @@ fn _write_helper() {
         "\n" +
         "HAVE_BRAINFLOW = False\n" +
         "BRAINFLOW_VERSION = None\n" +
+        "BRAINFLOW_IMPORT_ERR = None\n" +
         "try:\n" +
         "    from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds\n" +
         "    import brainflow as _bf\n" +
         "    HAVE_BRAINFLOW = True\n" +
-        "    BRAINFLOW_VERSION = getattr(_bf, '__version__', 'unknown')\n" +
+        "    # brainflow 5.21+ removed module-level __version__; use importlib.metadata.\n" +
+        "    BRAINFLOW_VERSION = getattr(_bf, '__version__', None)\n" +
+        "    if BRAINFLOW_VERSION is None:\n" +
+        "        try:\n" +
+        "            from importlib.metadata import version as _v\n" +
+        "            BRAINFLOW_VERSION = _v('brainflow')\n" +
+        "        except Exception:\n" +
+        "            BRAINFLOW_VERSION = 'unknown'\n" +
         "except Exception as _e:\n" +
         "    BRAINFLOW_IMPORT_ERR = str(_e)\n" +
         "\n" +
@@ -83,10 +95,14 @@ fn _write_helper() {
         "\n" +
         "def board_id_for(mode):\n" +
         "    if mode == 'synthetic':\n" +
-        "        return BoardIds.SYNTHETIC_BOARD.value  # -1\n" +
+        "        return BoardIds.SYNTHETIC_BOARD.value  # -1, fs=250Hz\n" +
         "    if mode == 'cyton':\n" +
-        "        return BoardIds.CYTON_DAISY_BOARD.value  # 2\n" +
+        "        return BoardIds.CYTON_DAISY_BOARD.value  # 2, fs=125Hz (native, NOT 250)\n" +
         "    raise ValueError(f'unknown mode: {mode}; expected synthetic|cyton')\n" +
+        "\n" +
+        "def expected_fs(mode):\n" +
+        "    # Authoritative: BrainFlow API. SYNTHETIC=250, CYTON_DAISY=125.\n" +
+        "    return float(BoardShim.get_sampling_rate(board_id_for(mode)))\n" +
         "\n" +
         "def capture(mode, serial_port, duration_s):\n" +
         "    if not HAVE_BRAINFLOW:\n" +
@@ -156,9 +172,11 @@ fn _write_helper() {
         "        print('selftest=skip'); print('DONE'); return\n" +
         "    out = capture('synthetic', '', 10.0)\n" +
         "    eeg = np.array(out['raw_arrays'], dtype=np.float32)\n" +
+        "    fs_expected = expected_fs('synthetic')\n" +
+        "    min_frames = int(0.95 * fs_expected * 10)\n" +
         "    assert eeg.shape[0] == 16, f'channel count != 16: {eeg.shape[0]}'\n" +
-        "    assert eeg.shape[1] >= 2400, f'frame count too low: {eeg.shape[1]} (expected ~2500)'\n" +
-        "    assert out['sample_rate'] == 250.0, f'sample rate != 250: {out[\"sample_rate\"]}'\n" +
+        "    assert eeg.shape[1] >= min_frames, f'frame count too low: {eeg.shape[1]} (expected ~{int(fs_expected*10)})'\n" +
+        "    assert out['sample_rate'] == fs_expected, f'sample rate != {fs_expected}: {out[\"sample_rate\"]}'\n" +
         "    per_ch_std = [float(np.std(eeg[i])) for i in range(16)]\n" +
         "    nonzero = sum(1 for s in per_ch_std if s > 0.0)\n" +
         "    assert nonzero >= 14, f'too few nonzero channels: {nonzero}/16'\n" +
