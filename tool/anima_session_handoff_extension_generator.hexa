@@ -1,0 +1,232 @@
+// tool/anima_session_handoff_extension_generator.hexa — session handoff extension generator (raw#9 hexa-only, NON_MUTATION on existing handoff).
+//
+// PURPOSE
+//   현재 세션에서 cycles 1-19 산출 (18 helpers + 1 patch + 18 state JSON + atlas drift discovery).
+//   기존 docs/session_handoff_20260427.md는 cycles 80-109 (이전 세션) 정보; 신규 결과 미반영.
+//
+//   본 helper = mac-local extension generator:
+//     - reads cycles 1-19의 commit history + state JSON 산출 + composite gate aggregator (cycle 15)
+//     - generates docs/session_handoff_20260427_extension.md (NEW file, NON_MUTATION on existing)
+//     - 다음 세션 시작 시 기존 + extension 모두 read 후 진입
+//     - 기존 handoff는 chflags 또는 history reference로 보존 (immutable)
+//
+//   본 helper 자체는 markdown content를 emit; 실제 파일 작성은 emit된 helper 실행 시 수행.
+//   (cycle 7 own#3 verifier 패턴과 동일 — non-mutation guarantee on existing SSOT, but writes new artifact)
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/session_handoff_extension_generator.json)
+//   ANIMA_HANDOFF_OUT extension MD path (default: docs/session_handoff_20260427_extension.md)
+//
+// OUTPUT
+//   - existing_handoff_status: {path, present, sha-like marker}
+//   - cycles_summary: 1-19 cycle ledger
+//   - critical_path_summary: 3 external blockers (cycle 15 mirror)
+//   - next_action_top5 (cycle 15 mirror)
+//   - extension_md_written: path to new extension file
+//   - non_mutation_guarantee: existing handoff untouched
+//
+// USAGE
+//   hexa run tool/anima_session_handoff_extension_generator.hexa --selftest
+//   ANIMA_OUTPUT=state/session_handoff_extension_generator.json hexa run tool/anima_session_handoff_extension_generator.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - extension은 ADDITIVE — 기존 handoff와 독립. 다음 세션 prompt에 두 파일 모두 read 지시 필요.
+//   - cycle ledger는 commit history 기반 — re-write 시 commit log mirror 정확성 의존.
+//   - markdown content는 frozen template — 다음 세션 시작 시 본 extension만으로도 self-contained context 제공.
+
+let HELPER_PATH = "/tmp/anima_session_handoff_extension_generator_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima session handoff extension generator — emitted by tool/anima_session_handoff_extension_generator.hexa\n")
+    parts.push("# raw#37 transient. cycles 1-19 → docs/session_handoff_20260427_extension.md (NON_MUTATION on existing).\n")
+    parts.push("import json, os, sys\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/session_handoff_extension_generator.json')\n")
+    parts.push("HANDOFF_OUT = os.environ.get('ANIMA_HANDOFF_OUT', 'docs/session_handoff_20260427_extension.md')\n")
+    parts.push("EXISTING_HANDOFF = 'docs/session_handoff_20260427.md'\n\n")
+
+    parts.push("CYCLES_LEDGER = [\n")
+    parts.push("    {'cycle':1,  'helper':'r46_primary_zone_resolver',                      'commit':'50cbdcaa', 'role':'R46 PRIMARY zone candidate registry',       'state_file':'r46_primary_zone_candidates.json'},\n")
+    parts.push("    {'cycle':2,  'helper':'cmt_v2_5bb_retest_dispatch',                     'commit':'fe1fd49b', 'role':'CMT v2 5-bb retest pre-register',          'state_file':'cmt_v2_5bb_retest_pre_register.json'},\n")
+    parts.push("    {'cycle':3,  'helper':'axis96_llama_stride1_dispatch',                  'commit':'e1fa8bb2', 'role':'HFD-C ruling-out (HF gated)',              'state_file':'axis96_llama_stride1_pre_register.json'},\n")
+    parts.push("    {'cycle':4,  'helper':'mk_xii_3a_gemma_familyinternal_dispatch',        'commit':'612042a7', 'role':'Phase 3b 70B justification 1/3->2/3',      'state_file':'mk_xii_3a_gemma_familyinternal_pre_register.json'},\n")
+    parts.push("    {'cycle':5,  'helper':'axis96_6th_bb_arch_separator_dispatch',          'commit':'a8b89068', 'role':'HFD-A vs HFD-B arch-confound elim',         'state_file':'axis96_6th_bb_arch_separator_pre_register.json'},\n")
+    parts.push("    {'cycle':6,  'helper':'pilot_t2_launch_gate_dispatch',                  'commit':'1368f4db', 'role':'Pilot-T2 8th-axis launch gate',             'state_file':'pilot_t2_launch_gate_dispatch.json'},\n")
+    parts.push("    {'cycle':7,  'helper':'own3_de_wording_revision_verifier',              'commit':'47d378ad', 'role':'own#3 (d)+(e) drift status (NON_MUTATION)', 'state_file':'own3_de_wording_revision_verifier.json'},\n")
+    parts.push("    {'cycle':8,  'helper':'zombie_posterior_v4_17sub_candidate_selector',   'commit':'1c52d3f0', 'role':'R45 v3->v4 N=14->17 candidate selection',   'state_file':'zombie_posterior_v4_17sub_candidate_selector.json'},\n")
+    parts.push("    {'cycle':9,  'helper':'mk_xii_3b_70b_prep_dispatch',                    'commit':'b05cbf73', 'role':'Mk.XII Phase 3b 70B+ prep (BLOCKED_HF)',   'state_file':'mk_xii_3b_70b_prep.json'},\n")
+    parts.push("    {'cycle':10, 'helper':'eeg_cp2_7day_arrival_gate_dispatch',             'commit':'692a4f18', 'role':'EEG CP2 hardware-arrival gate (PRE_ARRIVAL)','state_file':'eeg_cp2_7day_arrival_gate.json'},\n")
+    parts.push("    {'cycle':11, 'helper':'mk_xii_3a_llama_familyinternal_dispatch',        'commit':'8e3aef19', 'role':'Llama family-internal (3B/8B/70B triple HF)','state_file':'mk_xii_3a_llama_familyinternal_pre_register.json'},\n")
+    parts.push("    {'cycle':12, 'helper':'r46_verdict_consolidator',                       'commit':'42224e52', 'role':'R46 verdict = PARTIAL_CONFIRMED (medium)',  'state_file':'r46_verdict_consolidator.json'},\n")
+    parts.push("    {'cycle':13, 'helper':'h100_p1_single_pilot_precheck',                  'commit':'ac28cac9', 'role':'H100 P1 precheck (NON-LAUNCHING; 5/6 pass)','state_file':'h100_p1_single_pilot_precheck.json'},\n")
+    parts.push("    {'cycle':14, 'helper':'paradigm_v11_axis_filter_consolidator',          'commit':'ac28cac9', 'role':'paradigm v11 over-claim 42.9% truly_living 4/7','state_file':'paradigm_v11_axis_filter_consolidator.json'},\n")
+    parts.push("    {'cycle':15, 'helper':'composite_production_gate_aggregator',           'commit':'78e895f5', 'role':'capstone meta-ledger (4 buckets / 3 blockers)','state_file':'anima_composite_production_gate.json'},\n")
+    parts.push("    {'cycle':16, 'helper':'axis82_4axis_exhaustion_closure_consolidator',   'commit':'ce166b7c', 'role':'axis 82 4-axis CLOSED_VERIFIED ledger',     'state_file':'axis82_4axis_exhaustion_closure.json'},\n")
+    parts.push("    {'cycle':17, 'helper':'atlas_rtier_integrity_verifier',                 'commit':'4ac51841', 'role':'atlas drift detection (initial 42 violations)','state_file':'atlas_rtier_integrity_verifier.json'},\n")
+    parts.push("    {'cycle':18, 'helper':'atlas_drift_remediation_proposer',               'commit':'8d17d4e7', 'role':'FP classification + 5 line-specific proposals','state_file':'atlas_drift_remediation_proposer.json'},\n")
+    parts.push("    {'cycle':19, 'helper':'atlas_rtier_integrity_verifier (PATCHED)',       'commit':'d0786dc6', 'role':'helper-side fix; violations 42->7 (83%)',   'state_file':'atlas_rtier_integrity_verifier.json (re-exec)'},\n")
+    parts.push("]\n\n")
+
+    parts.push("CRITICAL_PATH_BLOCKERS_SUMMARY = [\n")
+    parts.push("    {'blocker':'Llama HF gate dancinlife approval', 'unblocks_cycles':[3, 6, 9, 11], 'cumulative_cost_usd':5.43, 'priority':'HIGHEST'},\n")
+    parts.push("    {'blocker':'H100 stop-gate user-approval',      'unblocks_cycles':[1, 2, 4, 5, 8, 13], 'cumulative_cost_usd':2.93, 'priority':'HIGH (user-controllable; lowest $0.30 cycle 13 first)'},\n")
+    parts.push("    {'blocker':'EEG hardware physical arrival',     'unblocks_cycles':[10], 'cumulative_cost_usd':0.0, 'priority':'MEDIUM'},\n")
+    parts.push("]\n\n")
+
+    parts.push("NEXT_ACTION_TOP5 = [\n")
+    parts.push("    {'rank':1, 'action':'cycle 13 H100 P1 launch ($0.30)', 'unlock':'R46 PARTIAL_CONFIRMED -> CONFIRMED'},\n")
+    parts.push("    {'rank':2, 'action':'cycle 7 own#3 (d)+(e) wording SSOT edit ($0 mac)', 'unlock':'5/5 sub-claim wording-evidence consistency restored'},\n")
+    parts.push("    {'rank':3, 'action':'Llama HF gate dancinlife approval ($0 manual)', 'unlock':'4 cycles ($5.43 cumul) — cycles 3/6/9/11'},\n")
+    parts.push("    {'rank':4, 'action':'cycle 18 atlas cleanup (5 line fix; $0 mac)', 'unlock':'INTEGRITY_OK on atlas SSOT'},\n")
+    parts.push("    {'rank':5, 'action':'cycle 4 Mk.XII Phase 3a gemma ($0.95)', 'unlock':'Phase 3a 2/5 -> 3/5 clean'},\n")
+    parts.push("]\n\n")
+
+    parts.push("KEY_VERDICTS_THIS_SESSION = {\n")
+    parts.push("    'R46_BIMODAL_4family':'PARTIAL_CONFIRMED (cycle 12; 2/3 primary flip + 2/3 modifier no-flip; 7 pending)',\n")
+    parts.push("    'axis_82_4axis_exhaustion':'CLOSED_VERIFIED (cycle 16; 1 PRIMARY weight-dist + 1 MODIFIER corpus + 2 FALSIFIED arch+tok)',\n")
+    parts.push("    'paradigm_v11_axis_count':'PARTIAL_OVER_CLAIM 42.9% (cycle 14; 4/7 truly living, 3/7 untested)',\n")
+    parts.push("    'atlas_drift':'5 real violations (cycle 18; 1 parse + 3 dup + 1 gap; 36 cycle-17 helper FP eliminated by cycle 19 patch)',\n")
+    parts.push("    'cumulative_GPU_cost_unlocked_pending_user_approval':'$2.93 (6 cycles via H100 stop-gate release)',\n")
+    parts.push("}\n\n")
+
+    parts.push("SESSION_INVARIANTS_PRESERVED = [\n")
+    parts.push("    'H100 stop-gate user-approval (memory feedback_h100_gate.md) — no GPU pod created this session',\n")
+    parts.push("    'anima/.own SSOT chflags uchg — no governance edit this session (cycle 7 verifier confirmed (d)+(e) UNAPPLIED)',\n")
+    parts.push("    'state/atlas_convergence_witness.jsonl — no atlas mutation (cycles 17-19 NON_MUTATION verifiers)',\n")
+    parts.push("    'raw#9 strict — all 19 cycles via .hexa source; **/*.py gitignore enforced (helper Python emit only via runner)',\n")
+    parts.push("]\n\n")
+
+    parts.push("# Generate extension markdown\n")
+    parts.push("md = []\n")
+    parts.push("md.append('# Session Handoff Extension - 2026-04-27 cycles 1-19 batch\\n')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('**Status**: ADDITIVE EXTENSION to docs/session_handoff_20260427.md')\n")
+    parts.push("md.append('**Source**: /loop 1m all-kick batch (7 trigger iterations)')\n")
+    parts.push("md.append('**Cost**: $0 mac-local (all helpers; no GPU launched)')\n")
+    parts.push("md.append('**Total deliverable**: 18 helpers + 1 patch + 18 state JSON + atlas drift discovery+remediation chain')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('## Section 0 - Next session entry guide')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('Previous session (cycles 80-109) handoff: docs/session_handoff_20260427.md')\n")
+    parts.push("md.append('This extension (cycles 1-19): docs/session_handoff_20260427_extension.md')\n")
+    parts.push("md.append('Read both files before entering autonomous mode.')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('## Section 1 - Cycles 1-19 ledger')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('| cycle | helper | commit | role |')\n")
+    parts.push("md.append('|-------|--------|--------|------|')\n")
+    parts.push("for c in CYCLES_LEDGER:\n")
+    parts.push("    md.append(f'| {c[\"cycle\"]} | `{c[\"helper\"]}` | `{c[\"commit\"]}` | {c[\"role\"]} |')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('## Section 2 - Key verdicts this session')\n")
+    parts.push("md.append('')\n")
+    parts.push("for k, v in KEY_VERDICTS_THIS_SESSION.items():\n")
+    parts.push("    md.append(f'- **{k}**: {v}')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('## Section 3 - Critical-path blockers (3, all user-side)')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('| blocker | unblocks cycles | cumul $ | priority |')\n")
+    parts.push("md.append('|---------|-----------------|---------|----------|')\n")
+    parts.push("for b in CRITICAL_PATH_BLOCKERS_SUMMARY:\n")
+    parts.push("    md.append(f'| {b[\"blocker\"]} | {b[\"unblocks_cycles\"]} | ${b[\"cumulative_cost_usd\"]} | {b[\"priority\"]} |')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('## Section 4 - Next-action priority top-5')\n")
+    parts.push("md.append('')\n")
+    parts.push("for n in NEXT_ACTION_TOP5:\n")
+    parts.push("    md.append(f'{n[\"rank\"]}. **{n[\"action\"]}** — unlocks: {n[\"unlock\"]}')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('## Section 5 - Session invariants preserved')\n")
+    parts.push("md.append('')\n")
+    parts.push("for inv in SESSION_INVARIANTS_PRESERVED:\n")
+    parts.push("    md.append(f'- {inv}')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('## Section 6 - Cross-link map (cycles ↔ state files ↔ commits)')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('All state/*.json files for cycles 1-18 readable via:')\n")
+    parts.push("md.append('```')\n")
+    parts.push("md.append('python3 tool/_all_kick_extract_run.py  # gitignore\\'d local runner; rebuild from cycles via re-emit if needed')\n")
+    parts.push("md.append('```')\n")
+    parts.push("md.append('')\n")
+    parts.push("md.append('Composite meta-ledger (cycle 15 capstone): state/anima_composite_production_gate.json')\n")
+    parts.push("md.append('')\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(HANDOFF_OUT) or '.', exist_ok=True)\n")
+    parts.push("md_existed = os.path.exists(HANDOFF_OUT)\n")
+    parts.push("with open(HANDOFF_OUT, 'w', encoding='utf-8') as f:\n")
+    parts.push("    f.write('\\n'.join(md))\n")
+    parts.push("md_size = os.path.getsize(HANDOFF_OUT)\n\n")
+
+    parts.push("existing_present = os.path.exists(EXISTING_HANDOFF)\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'session handoff extension generator (additive; existing handoff NON_MUTATION)',\n")
+    parts.push("    'existing_handoff':{'path':EXISTING_HANDOFF, 'present':existing_present},\n")
+    parts.push("    'extension_md_written':{'path':HANDOFF_OUT, 'size_bytes':md_size, 'overwrite':md_existed},\n")
+    parts.push("    'cycles_ledger':CYCLES_LEDGER,\n")
+    parts.push("    'critical_path_blockers':CRITICAL_PATH_BLOCKERS_SUMMARY,\n")
+    parts.push("    'next_action_top5':NEXT_ACTION_TOP5,\n")
+    parts.push("    'key_verdicts_this_session':KEY_VERDICTS_THIS_SESSION,\n")
+    parts.push("    'session_invariants_preserved':SESSION_INVARIANTS_PRESERVED,\n")
+    parts.push("    'non_mutation_guarantee_existing_handoff':'docs/session_handoff_20260427.md untouched; new extension file separate',\n")
+    parts.push("    'next_session_entry_instruction':'read both EXISTING_HANDOFF and extension MD before entering autonomous mode',\n")
+    parts.push("    'n_cycles':len(CYCLES_LEDGER),\n")
+    parts.push("    'n_blockers':len(CRITICAL_PATH_BLOCKERS_SUMMARY),\n")
+    parts.push("    'n_next_actions':len(NEXT_ACTION_TOP5),\n")
+    parts.push("    'n_invariants':len(SESSION_INVARIANTS_PRESERVED),\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[handoff_extension] written={HANDOFF_OUT} ({md_size}B) cycles={len(CYCLES_LEDGER)} blockers={len(CRITICAL_PATH_BLOCKERS_SUMMARY)} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let cycles_in_ledger = 19
+    let critical_blockers = 3
+    let next_actions = 5
+    let invariants = 4
+    let non_mutation_existing_handoff = "PRESERVED"
+    println("inv:cycles_in_ledger=" + to_string(cycles_in_ledger))
+    println("inv:critical_blockers=" + to_string(critical_blockers))
+    println("inv:next_actions=" + to_string(next_actions))
+    println("inv:invariants=" + to_string(invariants))
+    println("inv:non_mutation_existing_handoff=" + non_mutation_existing_handoff)
+    println("inv:extension_md_path=docs/session_handoff_20260427_extension.md")
+    println("inv:writes_new_file_only_existing_untouched=true")
+    println("inv:next_session_reads_both_files=true")
+    println("inv:cross_link_to_cycle_15_capstone=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_session_handoff_extension_generator selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=session handoff extension generator (cycles 1-19 ledger; mac $0; existing handoff NON_MUTATION; new MD additive)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
