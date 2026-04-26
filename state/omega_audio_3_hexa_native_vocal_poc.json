@@ -1,0 +1,76 @@
+{
+  "cycle": "omega-audio-3",
+  "axis": "hexa-native vocal organ POC (no python/numpy/scipy)",
+  "timestamp": "2026-04-26",
+  "philosophy_alignment": "session constraint: hexa-only; restoring anima_audio.hexa header line 28's 'python+numpy/scipy 에 위임' delegation to a hexa-native path. POC = single-tone sinusoid (vs python's bandlimited additive sawtooth). Algorithm parity is partial (timbre differs); structural parity (24kHz mono int16 PCM, 44-byte WAV header) is exact and byte-identical to python output.",
+  "hexa_lang_additions": [],
+  "hexa_lang_additions_note": "ZERO additions to hexa-lang/self/runtime.c or hexa-lang/self/hexa_full.hexa. All required primitives already exist and are used directly: sin/cos (runtime.c:3785-3786 + hexa_full.hexa:13993-14000), floor (runtime.c:3753 + hexa_full.hexa:13954), write_bytes / rt_write_bytes_v (runtime.c:3510 + hexa_full.hexa:12803), time_ms (runtime.c:6186 + hexa_full.hexa:11691). No host interp rebuild was performed.",
+  "vocal_hexa_implementation": {
+    "location": "/Users/ghost/core/anima/anima-speak/anima_audio.hexa",
+    "function": "vocal_hexa(freq_hz: float, gain: float, ms: int) -> string",
+    "approx_line_range": "272-380",
+    "loc_added_total": 91,
+    "helpers_added": ["_u16le(b)", "_u32le(b)", "_wav_header(sr, n_samples)"],
+    "algorithm": "single-tone sine: y[t] = gain * sin(2*pi*hz*t/SR), 10ms hann ramps on edges, clamp [-1,1], int16 = floor(round-to-int via floor(y*32767+0.5)), little-endian. WAV: 44-byte RIFF/fmt/data header constructed by _wav_header() + N*2 byte PCM data appended via .push(). Single write_bytes(path, list<int>) call emits binary atomically (no exec/printf, no shell quoting).",
+    "key_bug_found_and_fixed": "Initial implementation used round() builtin which returns TAG_FLOAT in interp dispatch (hexa_full.hexa:13967). Subsequent bitwise-AND (`s & 0xFF`) silently returned 0 on float operand → 4844-byte WAV with ALL ZERO data section. Fix: use floor(y * 32767.0 + 0.5) which returns TAG_INT (hexa_full.hexa:13955), then bitwise ops behave correctly. Verified WAV now contains real 440Hz sine: peak=16384, freq=443.8Hz (ZC-counted), zero-crossings match python reference exactly.",
+    "deviation_from_python_vocal": "python vocal() uses bandlimited additive sawtooth (N harmonics ≈ 27 for 440Hz at 24kHz Nyquist). hexa POC uses single sine. Spectral content differs (single tone vs harmonic stack). Sawtooth would require N harmonics × 2400 samples × per-iter sin in interpreted hexa loop → N×27 cost increase, prohibitive without native codegen."
+  },
+  "side_by_side": {
+    "python_vocal_440_500": {
+      "wav_bytes": 4844,
+      "warm_mean_ms": 21,
+      "warm_runs_observed_ms": [19, 23, 21],
+      "peak_amplitude": 18703,
+      "freq_estimated_hz": 443.8,
+      "zero_crossings_mid": 71
+    },
+    "hexa_vocal_440_500": {
+      "wav_bytes": 4844,
+      "warm_mean_ms": null,
+      "warm_runs_observed_ms": [],
+      "cold_call_wall_time_s": "~1.3 (single call from bench, sanity round)",
+      "subsequent_call_wall_time_s": ">240 (hung — interp scaling issue, see blockers)",
+      "peak_amplitude": 16384,
+      "freq_estimated_hz": 443.8,
+      "zero_crossings_mid": 71,
+      "matches_python_perceptually": "PARTIAL — same fundamental frequency (443.8Hz, identical ZC count), same 100ms duration, same 24kHz sr/16-bit mono envelope. TIMBRE DIFFERS: hexa = pure sine (no harmonics, single peak at 440Hz in spectrum); python = bandlimited sawtooth (rich harmonic stack 1×, 2×, 3×, ... up to Nyquist). Both will sound like a 'tone at A4' but listener will perceive sine as 'flute-like' vs sawtooth as 'buzzy/saw-like'.",
+      "header_byte_identical_to_python": true,
+      "header_hexdump_match": "RIFF e412 0000 WAVE fmt[10000000 01000100 c05d0000 80bb0000 02001000] data c0120000 — byte-for-byte identical first 44 bytes vs python wave.open output."
+    }
+  },
+  "speedup_vs_python_worker": "DEFERRED — bench did not capture warm-loop hexa numbers. Cold sanity call was ~1.3s wall (vs python warm 21ms = 60x slower at minimum). Bench process hung indefinitely on second/third hexa call, indicating interpreter scaling pathology (suspected: array_store accumulation in array_push_inplace path, or quadratic GC behavior on repeated 4844-element list builds). Practical conclusion: hexa-only vocal is 60-200x slower than python worker on the interpreter; FULL python worker elimination is NOT viable today without native codegen.",
+  "blockers_for_full_cutover": [
+    "INTERPRETER SCALING PATHOLOGY: First vocal_hexa call takes ~1.3s; subsequent calls in a single hexa-script lifetime hang for >4 minutes with growing CPU. Probable root causes: (a) array_store monotonic growth (M4-fix at hexa_full.hexa:17499 disabled freelist reclamation), (b) refcount-driven COW alloc churn during 4800 .push() per call, (c) cumulative GC pressure. write_bytes() itself is fast (t48_write_bytes_binary 8192-byte test passes), the hot loop is the bottleneck.",
+    "ALGORITHM PARITY GAP: POC uses pure sine; python vocal() is bandlimited sawtooth. Sawtooth in hexa requires N=27 inner harmonic loop × 2400 outer sample loop = 64800 sin() calls per vocal call. At interp ~1ms/sin estimate, ~64s per call. Native codegen (rt_sin direct call) would make this ~1ms.",
+    "FILE_SIZE() BUILTIN BUG (incidental): The interpreter's file_size() dispatch (hexa_full.hexa:10606) uses read_file().len which truncates at first NULL byte → reports 6 for the WAV (NULL at offset 6). Workaround: use pfs_file_size() or _file_bytes() from anima_audio (both shell out to wc -c). Filing as a separate ω-stdlib follow-up.",
+    "breath_hexa() needs PRNG (Gaussian/uniform) + IIR butter+sosfilt — no equivalent in stdlib yet.",
+    "pipe_hexa() needs IIR lfilter (2-pole resonator cascade) — implementable in pure hexa state machine; per-sample state.",
+    "vocal_lf_hexa() needs Liljencrants-Fant pulse model (exp + sin segments) + 8th-order Butterworth — feasible in pure hexa, again per-sample loop perf."
+  ],
+  "next_cycles_recommended": [
+    "ω-audio-4 (URGENT): native codegen path for vocal_hexa via codegen_c2 — eliminate interpreter overhead; expect <1ms per call (vs python worker 21ms = 21x faster), making cutover viable.",
+    "ω-audio-5: investigate interpreter array_store scaling pathology (why subsequent vocal_hexa calls hang). Likely a hexa-lang bug worth fixing for any hot inner-loop user code.",
+    "ω-audio-6: bandlimited sawtooth vocal_hexa upgrade once native codegen lands (algorithm parity with python).",
+    "ω-audio-7: breath_hexa (needs rng_gauss + butter_sos hexa-lang stdlib additions).",
+    "ω-audio-8: pipe_hexa (IIR cascade — pure hexa, implementable today on top of vocal_hexa).",
+    "ω-audio-9: vocal_lf_hexa (LF glottal pulse).",
+    "ω-stdlib-3: fix file_size() interp dispatch to route to rt_file_size (stat-based) instead of read_file+len."
+  ],
+  "rollback": "vocal_hexa is parallel-only; existing vocal()/_run_py path is fully untouched. Remove vocal_hexa() + _u16le/_u32le/_wav_header helpers from anima_audio.hexa (lines ~272-380) to fully revert. No hexa-lang changes were made → no host interp rebuild needed → no risk to other consumers.",
+  "files_touched": [
+    "/Users/ghost/core/anima/anima-speak/anima_audio.hexa (added vocal_hexa() + _u16le/_u32le/_wav_header helpers, ~91 LOC, lines ~272-380)"
+  ],
+  "files_NOT_touched": [
+    "/Users/ghost/core/hexa-lang/self/runtime.c (no new primitives needed)",
+    "/Users/ghost/core/hexa-lang/self/hexa_full.hexa (no new bindings needed)",
+    "/Users/ghost/core/anima/anima-speak/anima_audio.hexa::_run_py (legacy worker path preserved)",
+    "/Users/ghost/core/anima/anima-speak/anima_audio.hexa::vocal (legacy python sawtooth preserved)",
+    "/Users/ghost/core/anima/anima-speak/anima_audio.hexa::breath/pipe/vocal_lf/pipe3/pipe_glide (deferred to follow-on)"
+  ],
+  "verification_artifacts": [
+    "/tmp/anima_audio_1777175061116739000.wav — python vocal(440,0.5,100), 4844 bytes, peak=18703 (sawtooth)",
+    "/tmp/anima_audio_1777175062370677000.wav — vocal_hexa(440,0.5,100) cold sanity call, 4844 bytes, peak=16384 (sine)",
+    "/tmp/vocal_hexa_91377584.wav — standalone vocal_hexa POC output, byte-identical header to python, real sine data verified by /tmp/wav_verify.py"
+  ],
+  "verification_command": "python3 /tmp/wav_verify.py /tmp/anima_audio_1777175062370677000.wav  →  peak=16384 freq=443.8Hz ZC=71 (matches python freq exactly)"
+}

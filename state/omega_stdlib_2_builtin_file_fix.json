@@ -1,0 +1,75 @@
+{
+  "cycle": "omega-stdlib-2",
+  "axis": "fix builtin file_size + file_exists semantics in runtime.c",
+  "timestamp": "2026-04-26",
+  "trigger": "ω-stdlib-1 discovered builtin reads entire file + returns -1 on missing (shadowed portable_fs)",
+  "before": {
+    "file_size_impl": "fopen(p,'rb') + fseeko(SEEK_END) + ftello — opens FD unnecessarily, returns -1 on missing/error, behaviour on directory is platform-dependent (BSD fopen on dir returns FD, fseek/ftell may give garbage)",
+    "file_exists_impl": "access(p, F_OK) == 0 — true for ANY entry (directory, symlink-to-dir, socket, FIFO, char/block device), not just regular files",
+    "interp_dispatch_note": "self/hexa_full.hexa:10606 (`file_size` interp dispatch) ALSO bypasses builtin and does `len(read_file(p))` — that's the multi-GB-fatal path; left for a follow-on cycle since constraint limits this session to runtime.c only",
+    "bugs": [
+      "B1: rt_file_size returns -1 on missing — mismatches portable_fs.hexa (pfs_file_size returns 0)",
+      "B2: rt_file_size opens FD just for size — wasteful + platform-fragile on directories",
+      "B3: rt_file_exists uses access(F_OK) so it returns true for directories, contradicting pfs_file_exists which is `test -f` (regular files only)",
+      "B4: hexa_full.hexa interp dispatch for `file_size` reads whole file (out of scope for this cycle's edit-only-runtime.c constraint)"
+    ]
+  },
+  "after": {
+    "file_size_impl": "stat(p,&st); if fail → 0; if !S_ISREG → 0; else (int64_t)st.st_size — pure metadata, O(1), missing→0, dir→0",
+    "file_exists_impl": "stat(p,&st); if fail → false; else S_ISREG(st.st_mode) — only true for regular files, missing/dir/socket → false"
+  },
+  "files_modified": [
+    {
+      "path": "/Users/ghost/core/hexa-lang/self/runtime.c",
+      "loc_delta": "+22 / -10 (net +12 incl. comments + sys/stat.h include)",
+      "summary": "Added <sys/stat.h>; rewrote rt_file_exists (lines ~3467-3482) to stat()+S_ISREG; rewrote rt_file_size (lines ~3656-3677) to stat()-only metadata read; preserved rt_ ABI signatures, no consumer changes."
+    }
+  ],
+  "selftest": {
+    "host_runner": "HEXA_RESOLVER_NO_REROUTE=1 /Users/ghost/core/hexa-lang/hexa /Users/ghost/core/anima/tool/_omega_stdlib_2_selftest.hexa",
+    "small_file": {
+      "path": "/Users/ghost/core/anima/tool/_omega_stdlib_2_selftest.hexa",
+      "builtin_file_size": 3705,
+      "pfs_file_size": 3705,
+      "builtin_file_exists": true,
+      "pfs_file_exists": true,
+      "parity": "MATCH"
+    },
+    "missing_path": {
+      "path": "/Users/ghost/core/anima/tool/_omega_stdlib_2_DOES_NOT_EXIST_xyz.hexa",
+      "builtin_file_size": 0,
+      "pfs_file_size": 0,
+      "builtin_file_exists": false,
+      "pfs_file_exists": false,
+      "parity": "MATCH (was MISMATCH before fix: builtin returned -1, pfs returned 0)"
+    },
+    "directory_path": {
+      "path": "/Users/ghost/core/anima/tool",
+      "builtin_file_size": 0,
+      "pfs_file_size": 0,
+      "builtin_file_exists": false,
+      "pfs_file_exists": false,
+      "parity": "MATCH (was MISMATCH before fix: builtin file_exists returned true via access(F_OK), pfs returned false via test -f)"
+    },
+    "large_file_o1_probe": {
+      "path": "/Users/ghost/core/.filter-repo-backup-current-20260409-014517/nexus.tar.gz",
+      "size_bytes": 1550254477,
+      "file_size_ms": 0,
+      "file_exists_ms": 0,
+      "note": "1.55 GB file — confirmed O(1) latency. Pre-fix interp dispatch (hexa_full.hexa) would have allocated 1.55 GB into RAM via read_file(); old runtime.c fopen+fseek path would at minimum have opened an FD."
+    },
+    "result": "PASS"
+  },
+  "host_rebuild": {
+    "command": "cd /Users/ghost/core/hexa-lang && HEXA_RESOLVER_NO_REROUTE=1 ./hexa tool/build_interp.hexa",
+    "result": "OK -> /Users/ghost/core/hexa-lang/build/hexa_interp.real (2,763,264 bytes); shim /Users/ghost/core/hexa-lang/build/hexa_interp -> hexa_interp.real intact (per ω-toolchain-1)",
+    "smoke": "build_interp internal smoke OK; selftest .hexa script subsequently PASSED via host interp"
+  },
+  "parity_with_portable_fs": "MATCH on all three tested cases (small file, missing path, directory). Builtin and pfs_ now return identical values for size (0/n) and existence (true/false) given the same input class. The pfs_* layer is therefore no longer load-bearing for these two functions — kept as legacy/optional aliases per the constraint to leave consumers unchanged this cycle.",
+  "selftest_artifacts": [
+    "/Users/ghost/core/anima/tool/_omega_stdlib_2_selftest.hexa",
+    "/Users/ghost/core/anima/tool/_omega_stdlib_2_largefile_probe.hexa"
+  ],
+  "next_step_optional": "(A) deprecate pfs_* aliases — portable_fs.hexa could re-export the builtins as no-op wrappers (or callers migrate back to bare file_size/file_exists). (B) fix the hexa_full.hexa:10606 interp `file_size` dispatch which still reads the whole file via read_file(); replace with a direct call to the new rt_file_size (would close B4). Both deferred to user.",
+  "rollback": "git checkout /Users/ghost/core/hexa-lang/self/runtime.c && cd /Users/ghost/core/hexa-lang && HEXA_RESOLVER_NO_REROUTE=1 ./hexa tool/build_interp.hexa  # restores fopen+fseek file_size and access(F_OK) file_exists. Pre-edit binary also preserved at build/hexa_interp.bak.omega-toolchain-1_20260426 for fast revert."
+}

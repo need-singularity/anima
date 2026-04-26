@@ -270,6 +270,122 @@ fn vocal(freq_hz: float, gain: float, ms: int) -> string {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  ω-audio-3 (2026-04-26) — vocal_hexa: hexa-native vocal organ
+//
+//  POC parallel to vocal(). NO python, NO numpy, NO scipy, NO heredoc.
+//  Pure hexa: sin/cos primitives + write_bytes for binary WAV emission.
+//
+//  Algorithm: simple sinusoid (POC scope). Bandlimited additive
+//  sawtooth deferred to follow-on (would require N harmonics × 2400
+//  samples in interpreted hexa, perf may dominate).
+//    y[t] = gain * sin(2π * hz * t / SR)
+//    int16 = clamp(round(y * 32767), [-32768, 32767])
+//
+//  WAV: 44-byte RIFF header + N×2 byte int16 LE PCM data.
+// ═══════════════════════════════════════════════════════════════
+
+fn _u16le(b: int) {
+    return [b & 0xFF, (b >> 8) & 0xFF]
+}
+
+fn _u32le(b: int) {
+    return [b & 0xFF, (b >> 8) & 0xFF, (b >> 16) & 0xFF, (b >> 24) & 0xFF]
+}
+
+fn _wav_header(sr: int, n_samples: int) {
+    // 16-bit mono PCM. block_align=2, byte_rate=sr*2.
+    let data_bytes = n_samples * 2
+    let chunk_size = 36 + data_bytes
+    let mut h = []
+    // "RIFF"
+    h.push(0x52); h.push(0x49); h.push(0x46); h.push(0x46)
+    // ChunkSize (LE u32) = 36 + data_bytes
+    let cs = _u32le(chunk_size)
+    h.push(cs[0]); h.push(cs[1]); h.push(cs[2]); h.push(cs[3])
+    // "WAVE"
+    h.push(0x57); h.push(0x41); h.push(0x56); h.push(0x45)
+    // "fmt "
+    h.push(0x66); h.push(0x6D); h.push(0x74); h.push(0x20)
+    // Subchunk1Size = 16
+    h.push(16); h.push(0); h.push(0); h.push(0)
+    // AudioFormat = 1 (PCM)
+    h.push(1); h.push(0)
+    // NumChannels = 1
+    h.push(1); h.push(0)
+    // SampleRate
+    let sr_b = _u32le(sr)
+    h.push(sr_b[0]); h.push(sr_b[1]); h.push(sr_b[2]); h.push(sr_b[3])
+    // ByteRate = sr * 2
+    let br_b = _u32le(sr * 2)
+    h.push(br_b[0]); h.push(br_b[1]); h.push(br_b[2]); h.push(br_b[3])
+    // BlockAlign = 2
+    h.push(2); h.push(0)
+    // BitsPerSample = 16
+    h.push(16); h.push(0)
+    // "data"
+    h.push(0x64); h.push(0x61); h.push(0x74); h.push(0x61)
+    // Subchunk2Size = data_bytes
+    let db_b = _u32le(data_bytes)
+    h.push(db_b[0]); h.push(db_b[1]); h.push(db_b[2]); h.push(db_b[3])
+    return h
+}
+
+fn vocal_hexa(freq_hz: float, gain: float, ms: int) -> string {
+    let path = _new_path()
+    // Clamp inputs (mirror vocal() semantics).
+    let mut hz = freq_hz
+    let nyq = (SR + 0.0) / 2.0 - 1.0
+    if hz < 20.0 { hz = 20.0 }
+    if hz > nyq { hz = nyq }
+    let mut g = gain
+    if g < 0.0 { g = 0.0 }
+    if g > 1.0 { g = 1.0 }
+    let mut n = (SR * ms) / 1000
+    if n < 1 { n = 1 }
+    // Build WAV header.
+    let mut bytes = _wav_header(SR, n)
+    // Per-sample synthesis: y = g * sin(2π * hz * t / SR), int16 LE.
+    let two_pi_hz_over_sr = 2.0 * 3.141592653589793 * hz / (SR + 0.0)
+    // 10ms hann ramp (mirror vocal() envelope), capped at n/2.
+    let mut k = (SR + 0) / 100  // 10ms = SR/100 samples
+    if k > n / 2 { k = n / 2 }
+    let mut i = 0
+    while i < n {
+        let t = i + 0.0
+        let mut y = g * sin(two_pi_hz_over_sr * t)
+        // Hann ramp on edges.
+        if k > 0 {
+            if i < k {
+                let r = 0.5 * (1.0 - cos(3.141592653589793 * (i + 0.0) / (k - 1 + 0.0)))
+                y = y * r
+            }
+            let tail = n - i - 1
+            if tail < k {
+                let r = 0.5 * (1.0 - cos(3.141592653589793 * (tail + 0.0) / (k - 1 + 0.0)))
+                y = y * r
+            }
+        }
+        // clamp [-1, 1] → int16. Use floor(y*32767+0.5) to force int (round()
+        // returns float in interp dispatch; subsequent bitwise ops would silently
+        // 0-out on float operands).
+        if y > 1.0 { y = 1.0 }
+        if y < 0.0 - 1.0 { y = 0.0 - 1.0 }
+        let mut s = floor(y * 32767.0 + 0.5)
+        if s > 32767 { s = 32767 }
+        if s < 0 - 32768 { s = 0 - 32768 }
+        // little-endian 2-byte signed → unsigned bytes
+        let mut u = s
+        if u < 0 { u = u + 65536 }
+        bytes.push(u & 0xFF)
+        bytes.push((u >> 8) & 0xFF)
+        i = i + 1
+    }
+    write_bytes(path, bytes)
+    if _file_bytes(path) < WAV_MIN_BYTES { return "" }
+    return path
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Source organ 2 — breath (난류, aperiodic)
 //    band_lo / band_hi : 대역통과 Hz. 무성음/마찰음 원천.
 //    gain : 음량 [0, 1].
