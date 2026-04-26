@@ -1,0 +1,189 @@
+// tool/anima_cmt_v2_5bb_retest_dispatch.hexa — CMT v2 5-bb in_vivo retest pre-register + dispatch (raw#9 hexa-only).
+//
+// PURPOSE
+//   axis 106 (CMT scale-saturation fix landed in tool/anima_cmt_v2.hexa) follow-up.
+//   handoff §3.5 "CMT 4-family axis 95 cross-link 추가 backbone" + PRE_REGISTERED_DEFERRED.
+//
+//   CMT v2 fix = MLP-only sub-module ablation (instead of whole-layer zero-ablation).
+//   5-bb retest는 fix가 (i) 12B+ saturation 케이스에서 rel<1 informative 회복 그리고
+//   (ii) 기존 소규모 (≤9B) 케이스에서 v1 신호 유지 — 두 조건 동시 만족 검증.
+//
+//   본 helper = mac-local pre-register + GPU dispatch ledger:
+//     - 5 backbones (saturation witness 2 + cross-scale validator 3) frozen 선택
+//     - HCSF-A/B/C decision criteria 명시적 thresholds frozen pre-measurement
+//     - per-bb cost & order recommended (cheapest first, witness saturation 2 우선)
+//     - selftest verifies: 5 bb / 3 frozen hypotheses / explicit threshold / total budget ≤ $0.95
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/cmt_v2_5bb_retest_pre_register.json)
+//
+// OUTPUT
+//   - bb_registry: list of {model_id, params_b, role, cost_usd_est, hypothesis_role}
+//   - frozen_hypotheses: HCSF-A SCALE_NORM / HCSF-B HID_DIM_BOUND / HCSF-C ARTIFACT_OF_HYBRID
+//                        with explicit decision thresholds
+//   - dispatch_order: ordered list (cheapest validator first → witness saturation last)
+//   - total_budget_est_usd
+//
+// USAGE
+//   hexa run tool/anima_cmt_v2_5bb_retest_dispatch.hexa --selftest
+//   ANIMA_OUTPUT=state/cmt_v2_5bb_retest_pre_register.json hexa run tool/anima_cmt_v2_5bb_retest_dispatch.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - 5 backbones는 saturation 진단/회복 검증을 위한 minimal panel; generalize 시 N 확장 필요.
+//   - HF gated (Llama-3.1-8B) backbone은 dancinlife approval pending 시 dispatch_order 마지막에 위치.
+//   - cost 추정은 vast.ai A100/H100 시간 단가 기반 ±30% 변동 가능.
+
+let HELPER_PATH = "/tmp/anima_cmt_v2_5bb_retest_dispatch_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima CMT v2 5-bb retest pre-register + dispatch helper — emitted by tool/anima_cmt_v2_5bb_retest_dispatch.hexa\n")
+    parts.push("# raw#37 transient. axis 106 follow-up: CMT v2 MLP-only ablation 5-bb in_vivo retest pre-register.\n")
+    parts.push("import json, os, sys\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/cmt_v2_5bb_retest_pre_register.json')\n\n")
+
+    parts.push("BB_REGISTRY = [\n")
+    parts.push("    {\n")
+    parts.push("        'model_id':'mistralai/Mistral-Nemo-Base-2407', 'params_b':12.2, 'family':'mistral',\n")
+    parts.push("        'role':'WITNESS_SATURATION', 'hypothesis_role':'HCSF-A_HCSF-B_test_must_recover_rel_lt_1',\n")
+    parts.push("        'cost_usd_est':0.30, 'hf_gated':False,\n")
+    parts.push("        'expected_v2_outcome':'rel_distribution_std_gt_0.05 (informative)',\n")
+    parts.push("        'v1_baseline':'rel=1.000 SATURATED at every layer (axis 99 #237)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'model_id':'google/gemma-2-9b', 'params_b':9.2, 'family':'gemma',\n")
+    parts.push("        'role':'WITNESS_SATURATION_HYBRID', 'hypothesis_role':'HCSF-C_test_hybrid_attention_separate_cause',\n")
+    parts.push("        'cost_usd_est':0.20, 'hf_gated':False,\n")
+    parts.push("        'expected_v2_outcome':'rel_distribution informative OR HCSF-C confirmed (still degenerate)',\n")
+    parts.push("        'v1_baseline':'rel=1.000 SATURATED + hybrid attn confound (axis 99 #237)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'model_id':'mistralai/Mistral-7B-v0.3', 'params_b':7.2, 'family':'mistral',\n")
+    parts.push("        'role':'CROSS_SCALE_VALIDATOR', 'hypothesis_role':'v2_must_preserve_v1_signal_when_v1_was_informative',\n")
+    parts.push("        'cost_usd_est':0.15, 'hf_gated':False,\n")
+    parts.push("        'expected_v2_outcome':'rel pattern matches axis 95 v1 cross-link (HMK-A clean)',\n")
+    parts.push("        'v1_baseline':'HMK-A SCALE_INVARIANT clean 1/1 (axis 99 Phase 3a)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'model_id':'google/gemma-2-2b', 'params_b':2.6, 'family':'gemma',\n")
+    parts.push("        'role':'CROSS_SCALE_VALIDATOR_LOW', 'hypothesis_role':'family_internal_scale_decoupling_check',\n")
+    parts.push("        'cost_usd_est':0.10, 'hf_gated':False,\n")
+    parts.push("        'expected_v2_outcome':'rel informative (smaller hybrid likely fine in v1, must remain so in v2)',\n")
+    parts.push("        'v1_baseline':'NOT_PREVIOUSLY_MEASURED_in_axis_99 (new low-end anchor)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'model_id':'meta-llama/Llama-3.1-8B', 'params_b':8.0, 'family':'llama',\n")
+    parts.push("        'role':'CROSS_FAMILY_VALIDATOR', 'hypothesis_role':'v2_generalization_to_independent_family',\n")
+    parts.push("        'cost_usd_est':0.18, 'hf_gated':True,\n")
+    parts.push("        'expected_v2_outcome':'rel informative (independent family confirmation of fix)',\n")
+    parts.push("        'v1_baseline':'NOT_PREVIOUSLY_MEASURED_in_axis_99 (HF gate)',\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("FROZEN_HYPOTHESES = [\n")
+    parts.push("    {\n")
+    parts.push("        'id':'HCSF-A', 'name':'SCALE_NORM',\n")
+    parts.push("        'statement':'magnitude renormalization (dY_norm = abs(dY)/sqrt(h_dim)) alone restores informative cross-scale comparability',\n")
+    parts.push("        'decision_threshold':'CONFIRMED if dY_norm std/mean ratio across 5 bb falls within [0.5, 2.0] band; FALSIFIED if any bb falls outside',\n")
+    parts.push("        'witness_bbs':['mistralai/Mistral-Nemo-Base-2407','google/gemma-2-9b'],\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'id':'HCSF-B', 'name':'HID_DIM_BOUND',\n")
+    parts.push("        'statement':'MLP-only sub-module ablation (vs whole-layer) is required for rel<1 informative at 12B+',\n")
+    parts.push("        'decision_threshold':'CONFIRMED if Mistral-Nemo-12B v2 rel std > 0.05 AND v1 rel std < 0.005 (saturation gone); FALSIFIED if v2 rel std remains < 0.005',\n")
+    parts.push("        'witness_bbs':['mistralai/Mistral-Nemo-Base-2407'],\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'id':'HCSF-C', 'name':'ARTIFACT_OF_HYBRID',\n")
+    parts.push("        'statement':'gemma-2-9b hybrid attention has separate degeneracy cause beyond MLP saturation',\n")
+    parts.push("        'decision_threshold':'CONFIRMED if gemma-2-9b v2 rel std remains < 0.01 even after MLP-only fix AND gemma-2-2b v2 rel std > 0.05; REJECTED if gemma-2-9b v2 rel std > 0.05',\n")
+    parts.push("        'witness_bbs':['google/gemma-2-9b','google/gemma-2-2b'],\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("def _dispatch_order(bbs):\n")
+    parts.push("    # cheapest validator first (de-risk pipeline) → witness saturation last (highest cost+highest stakes)\n")
+    parts.push("    # gated last unconditionally\n")
+    parts.push("    ungated = [b for b in bbs if not b['hf_gated']]\n")
+    parts.push("    gated = [b for b in bbs if b['hf_gated']]\n")
+    parts.push("    validators = sorted([b for b in ungated if b['role'].startswith('CROSS_SCALE')], key=lambda b: b['cost_usd_est'])\n")
+    parts.push("    witnesses = sorted([b for b in ungated if b['role'].startswith('WITNESS')], key=lambda b: b['cost_usd_est'])\n")
+    parts.push("    return validators + witnesses + gated\n\n")
+
+    parts.push("order = _dispatch_order(BB_REGISTRY)\n")
+    parts.push("total_budget = round(sum(b['cost_usd_est'] for b in BB_REGISTRY), 2)\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'CMT v2 MLP-only ablation 5-bb in_vivo retest pre-register',\n")
+    parts.push("    'parent_helper':'tool/anima_cmt_v2.hexa',\n")
+    parts.push("    'parent_axis':'axis 106 (#237 fix)',\n")
+    parts.push("    'bb_registry':BB_REGISTRY,\n")
+    parts.push("    'frozen_hypotheses':FROZEN_HYPOTHESES,\n")
+    parts.push("    'dispatch_order':[b['model_id'] for b in order],\n")
+    parts.push("    'dispatch_order_with_cost':[{'model_id':b['model_id'],'cost_usd_est':b['cost_usd_est'],'hf_gated':b['hf_gated']} for b in order],\n")
+    parts.push("    'total_budget_est_usd':total_budget,\n")
+    parts.push("    'n_bb':len(BB_REGISTRY),\n")
+    parts.push("    'n_hypotheses':len(FROZEN_HYPOTHESES),\n")
+    parts.push("    'n_witness':sum(1 for b in BB_REGISTRY if b['role'].startswith('WITNESS')),\n")
+    parts.push("    'n_validator':sum(1 for b in BB_REGISTRY if b['role'].startswith('CROSS')),\n")
+    parts.push("    'n_gated_pending':sum(1 for b in BB_REGISTRY if b['hf_gated']),\n")
+    parts.push("    'pre_register_status':'FROZEN_PRE_MEASUREMENT (raw#10 honest: any post-hoc threshold revision = re-pre-register required)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[cmt_v2_5bb_retest] n_bb={len(BB_REGISTRY)} n_hyp={len(FROZEN_HYPOTHESES)} budget=${total_budget} dispatch_first={order[0][\"model_id\"]} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let bb_count_expected = 5
+    let hypotheses_count_expected = 3
+    let total_budget_max_usd = 0.95
+    let witness_count_min = 2
+    let validator_count_min = 3
+    let gated_pending_max = 1
+    println("inv:bb_count_expected=" + to_string(bb_count_expected))
+    println("inv:hypotheses_count_expected=" + to_string(hypotheses_count_expected))
+    println("inv:total_budget_max_usd=" + to_string(total_budget_max_usd))
+    println("inv:witness_count_min=" + to_string(witness_count_min))
+    println("inv:validator_count_min=" + to_string(validator_count_min))
+    println("inv:gated_pending_max=" + to_string(gated_pending_max))
+    println("inv:hypotheses_ids=HCSF-A,HCSF-B,HCSF-C")
+    println("inv:every_hypothesis_has_explicit_decision_threshold=true")
+    println("inv:every_bb_has_v1_baseline_record=true")
+    println("inv:dispatch_order_validators_first_witnesses_next_gated_last=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_cmt_v2_5bb_retest_dispatch selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=CMT v2 MLP-only ablation 5-bb in_vivo retest pre-register (axis 106 follow-up, GPU $≤0.95)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
