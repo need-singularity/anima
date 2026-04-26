@@ -1,0 +1,268 @@
+// tool/anima_phi_v3_minisweep.hexa — Φ* v3 canonical (HID=8 auto) per-backbone mini-sweep (raw#9 hexa-only).
+//
+// PURPOSE
+//   #164 Φ* v3 canonical 4-backbone result (commit 634230a1) — POS={qwen3, llama},
+//   NEG={mistral, gemma}, 50/50 split. raw#10 honest caveat: single measurement
+//   (K=8, seed=42, ridge=1e-3, HID_TRUNC=8 auto) — sign이 hyperparameter-noise
+//   sensitive 한지 미검증.
+//
+//   본 sweep 은 per-backbone 에서 HID_TRUNC=8 (canonical) 고정 + K×seed×ridge sweep
+//   으로 sign-stability 검증. 4-bb × 36-cells = 144 measurements 통해
+//   H4A/H4B/H4C 판정.
+//
+//   Sweep grid (per backbone, single GPU load + multi-config inline):
+//     K        ∈ {4, 8, 16, 32}            — 4 levels
+//     seed     ∈ {42, 7, 2026}              — 3 levels
+//     ridge    ∈ {1e-4, 1e-3, 1e-2}         — 3 levels
+//     HID_TRUNC = 8 (FIXED canonical, auto = max(2, N//2))
+//   Total cells per backbone = 4 × 3 × 3 = 36
+//
+//   Hypotheses (pre-registered):
+//     H4A (sign robust per-backbone): 4 backbones 모두 단일 sign 유지 (e.g. mistral 36/36 NEG,
+//                                      qwen3 36/36 POS) → #164 H3B finding 강력 confirmed
+//     H4B (sign-flip 발생): 일부 backbone에서 hyperparameter 변화 시 flip → measurement
+//                          noise dominant, 50/50 우연 가능
+//     H4C (border value noise): qwen3 (+1.0) gemma (-0.8) 같은 small-magnitude border 만 unstable,
+//                                mistral (-16.7) llama (+5.1) large-magnitude 만 stable
+//
+// METHOD (helper.py, single forward + cheap inline sweep, identical structure to v2_robust)
+//   1. Forward 16 prompts × HF transformers ONCE → X (N, h_dim)
+//   2. Truncate to top-variance HID_TRUNC=8 dims → Xt (N, 8)
+//   3. For each (K, seed, ridge) cell:
+//      - I_full = log|cov(Xt) + ridge*I|
+//      - K random sample-partitions (8|8 halves) → phi_k each
+//      - phi_star_min = MIN(phi_k); record sign + abs + per-k phis
+//   4. Aggregate per backbone: sign distribution per-K, per-seed, per-ridge
+//      + global counts (POS/NEG/NaN) + sign_flip_pairs (cells differing only in 1 hyper)
+//
+// ENV
+//   ANIMA_BASE         backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_OUTPUT       output JSON (default: /workspace/out/phi_v3_minisweep.json)
+//   ANIMA_N_PROBES     # probes (default: 16)
+//
+// USAGE
+//   hexa run tool/anima_phi_v3_minisweep.hexa --selftest
+//   hexa run tool/anima_phi_v3_minisweep.hexa            (writes helper only)
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_phi_v3_minisweep_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima Φ* v3 canonical mini-sweep helper — emitted by anima_phi_v3_minisweep.hexa\n")
+    parts.push("# raw#37 transient. Tests sign-stability of #164 v3 canonical 50/50 split\n")
+    parts.push("# (POS={qwen3,llama}, NEG={mistral,gemma}) under K×seed×ridge variation.\n")
+    parts.push("import json, os, sys, time, itertools\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/phi_v3_minisweep.json')\n")
+    parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '16'))\n\n")
+
+    parts.push("# Sweep grid (frozen pre-register) — HID_TRUNC FIXED at canonical auto value\n")
+    parts.push("K_LEVELS = [4, 8, 16, 32]\n")
+    parts.push("SEED_LEVELS = [42, 7, 2026]\n")
+    parts.push("RIDGE_LEVELS = [1e-4, 1e-3, 1e-2]\n")
+    parts.push("HID_TRUNC = max(2, N_PROBES // 2)  # AUTO canonical: N=16 -> HID=8\n\n")
+
+    parts.push("# Same 16-prompt template set as #159/#164 (consistent comparison)\n")
+    parts.push("PROMPTS = [\n")
+    parts.push("    'Define hexad as a six-fold integration:','Six modules form a hexagonal architecture when:',\n")
+    parts.push("    'A balanced six-component system:','Hexad symmetry refers to:',\n")
+    parts.push("    'Logical implication law: if A then:','Sequential rule application proceeds:',\n")
+    parts.push("    'Closure under inference requires:','A formal proof system is closed when:',\n")
+    parts.push("    'Integrated information measures partition independence:','Phi quantifies irreducibility of system:',\n")
+    parts.push("    'Information integration is maximized when:','A whole greater than sum of parts:',\n")
+    parts.push("    'Self-reference emerges when system observes:','Recursive meta-cognition models:',\n")
+    parts.push("    'A self-aware system represents itself by:','Strange loops in cognition arise from:',\n")
+    parts.push("][:N_PROBES]\n")
+    parts.push("N = len(PROMPTS)\n")
+    parts.push("HALF = N // 2\n")
+    parts.push("EFF_DOF_FULL = N - HID_TRUNC\n")
+    parts.push("EFF_DOF_HALF = HALF - HID_TRUNC\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[phi-mini] base={BASE_MODEL} N={N} HALF={HALF} HID_TRUNC={HID_TRUNC}(auto canonical) eff_dof_full={EFF_DOF_FULL} eff_dof_half={EFF_DOF_HALF}', flush=True)\n")
+    parts.push("print(f'[phi-mini] grid K={K_LEVELS} seed={SEED_LEVELS} ridge={RIDGE_LEVELS} HID_TRUNC={HID_TRUNC}(fixed)', flush=True)\n")
+    parts.push("print(f'[phi-mini] total_cells = {len(K_LEVELS)*len(SEED_LEVELS)*len(RIDGE_LEVELS)}', flush=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n")
+    parts.push("mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map='auto', output_hidden_states=True)\n")
+    parts.push("mdl.eval()\n")
+    parts.push("h_dim = getattr(mdl.config, 'hidden_size', getattr(mdl.config, 'd_model', 4096))\n")
+    parts.push("print(f'[phi-mini] loaded {time.time()-t0:.1f}s h_dim={h_dim}', flush=True)\n\n")
+
+    parts.push("def byte_weighted_mean(hidden, attn_mask):\n")
+    parts.push("    weights = attn_mask.float()\n")
+    parts.push("    w_sum = weights.sum(dim=1, keepdim=True).clamp(min=1.0)\n")
+    parts.push("    return ((hidden * weights.unsqueeze(-1)).sum(dim=1) / w_sum).float().cpu().numpy()\n\n")
+
+    parts.push("# Forward all prompts ONCE → X (N, h_dim) — reused across all sweep cells\n")
+    parts.push("acts = []\n")
+    parts.push("for i, p in enumerate(PROMPTS):\n")
+    parts.push("    inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("    with torch.no_grad():\n")
+    parts.push("        out = mdl(**inp, output_hidden_states=True)\n")
+    parts.push("    h = byte_weighted_mean(out.hidden_states[-1], inp['attention_mask'])\n")
+    parts.push("    acts.append(h[0])\n")
+    parts.push("    if (i+1) % 4 == 0:\n")
+    parts.push("        print(f'[phi-mini] forward {i+1}/{N}', flush=True)\n")
+    parts.push("X = np.stack(acts, axis=0)  # (N, h_dim) baseline\n")
+    parts.push("var_full = X.var(axis=0)\n")
+    parts.push("# Truncate to top-variance HID_TRUNC=8 dims (canonical auto, well-conditioned)\n")
+    parts.push("top_idx = np.argsort(-var_full)[:HID_TRUNC]\n")
+    parts.push("Xt = X[:, top_idx]  # (N, HID_TRUNC)\n")
+    parts.push("print(f'[phi-mini] forward done {time.time()-t0:.1f}s; Xt={Xt.shape} top_var={[round(float(v),2) for v in np.sort(-var_full)[:HID_TRUNC]*-1]}', flush=True)\n\n")
+
+    parts.push("def cov_logdet(samples, ridge):\n")
+    parts.push("    if samples.shape[0] < 2: return float('nan')\n")
+    parts.push("    Xc = samples - samples.mean(axis=0, keepdims=True)\n")
+    parts.push("    C = (Xc.T @ Xc) / max(1, samples.shape[0] - 1) + ridge * np.eye(samples.shape[1])\n")
+    parts.push("    sign, val = np.linalg.slogdet(C)\n")
+    parts.push("    return float(val) if sign > 0 else float('nan')\n\n")
+
+    parts.push("cells = []\n")
+    parts.push("t_sweep = time.time()\n")
+    parts.push("for K, seed, ridge in itertools.product(K_LEVELS, SEED_LEVELS, RIDGE_LEVELS):\n")
+    parts.push("    I_full = cov_logdet(Xt, ridge)\n")
+    parts.push("    rng = np.random.default_rng(seed)\n")
+    parts.push("    phi_candidates = []\n")
+    parts.push("    nan_count = 0\n")
+    parts.push("    for k in range(K):\n")
+    parts.push("        perm = rng.permutation(N)\n")
+    parts.push("        S1_idx = np.sort(perm[:HALF])\n")
+    parts.push("        S2_idx = np.sort(perm[HALF:])\n")
+    parts.push("        I_1 = cov_logdet(Xt[S1_idx], ridge)\n")
+    parts.push("        I_2 = cov_logdet(Xt[S2_idx], ridge)\n")
+    parts.push("        if np.isnan(I_1) or np.isnan(I_2) or np.isnan(I_full):\n")
+    parts.push("            phi_k = float('nan'); nan_count += 1\n")
+    parts.push("        else:\n")
+    parts.push("            phi_k = I_full - (I_1 + I_2)\n")
+    parts.push("        phi_candidates.append(phi_k)\n")
+    parts.push("    valid = [v for v in phi_candidates if not np.isnan(v)]\n")
+    parts.push("    if not valid:\n")
+    parts.push("        phi_star = float('nan'); phi_mean = float('nan'); phi_max = float('nan')\n")
+    parts.push("        sign_label = 'nan'\n")
+    parts.push("    else:\n")
+    parts.push("        phi_star = float(min(valid))\n")
+    parts.push("        phi_mean = float(np.mean(valid))\n")
+    parts.push("        phi_max = float(max(valid))\n")
+    parts.push("        sign_label = 'positive' if phi_star > 0 else ('zero' if phi_star == 0 else 'negative')\n")
+    parts.push("    cells.append({'K':K,'seed':seed,'ridge':ridge,'HID_TRUNC':HID_TRUNC,\n")
+    parts.push("        'I_full':round(I_full,4) if not np.isnan(I_full) else None,\n")
+    parts.push("        'phi_star_min':round(phi_star,4) if not np.isnan(phi_star) else None,\n")
+    parts.push("        'phi_mean':round(phi_mean,4) if not np.isnan(phi_mean) else None,\n")
+    parts.push("        'phi_max':round(phi_max,4) if not np.isnan(phi_max) else None,\n")
+    parts.push("        'sign':sign_label,'nan_partitions':nan_count})\n")
+    parts.push("print(f'[phi-mini] sweep done {time.time()-t_sweep:.1f}s ({len(cells)} cells)', flush=True)\n\n")
+
+    parts.push("# Aggregate sign distribution\n")
+    parts.push("def count_signs(rows):\n")
+    parts.push("    pos = sum(1 for r in rows if r['sign']=='positive')\n")
+    parts.push("    neg = sum(1 for r in rows if r['sign']=='negative')\n")
+    parts.push("    nan = sum(1 for r in rows if r['sign']=='nan')\n")
+    parts.push("    zero = sum(1 for r in rows if r['sign']=='zero')\n")
+    parts.push("    return {'pos':pos,'neg':neg,'nan':nan,'zero':zero,'total':len(rows)}\n\n")
+
+    parts.push("global_signs = count_signs(cells)\n")
+    parts.push("per_K = {str(K): count_signs([c for c in cells if c['K']==K]) for K in K_LEVELS}\n")
+    parts.push("per_seed = {str(s): count_signs([c for c in cells if c['seed']==s]) for s in SEED_LEVELS}\n")
+    parts.push("per_ridge = {str(r): count_signs([c for c in cells if c['ridge']==r]) for r in RIDGE_LEVELS}\n\n")
+
+    parts.push("# Sign-flip pairs: cells differing only in 1 hyperparameter where sign differs\n")
+    parts.push("def cell_key(c, exclude):\n")
+    parts.push("    return tuple((k,v) for k,v in [('K',c['K']),('seed',c['seed']),('ridge',c['ridge'])] if k!=exclude)\n")
+    parts.push("flip_pairs = []\n")
+    parts.push("for axis in ['K','seed','ridge']:\n")
+    parts.push("    bucket = {}\n")
+    parts.push("    for c in cells:\n")
+    parts.push("        bucket.setdefault(cell_key(c, axis), []).append(c)\n")
+    parts.push("    for key, group in bucket.items():\n")
+    parts.push("        signs = set(c['sign'] for c in group)\n")
+    parts.push("        if len(signs) > 1 and ('positive' in signs and 'negative' in signs):\n")
+    parts.push("            flip_pairs.append({'axis':axis,'shared':dict(key),\n")
+    parts.push("                'cells':[{'K':c['K'],'seed':c['seed'],'ridge':c['ridge'],\n")
+    parts.push("                          'sign':c['sign'],'phi_star_min':c['phi_star_min']} for c in group]})\n\n")
+
+    parts.push("# Per-backbone verdict heuristic\n")
+    parts.push("pos_rate = global_signs['pos'] / max(1, global_signs['total'])\n")
+    parts.push("neg_rate = global_signs['neg'] / max(1, global_signs['total'])\n")
+    parts.push("if pos_rate >= 0.95:\n")
+    parts.push("    bb_verdict = 'STABLE_POS'\n")
+    parts.push("elif neg_rate >= 0.95:\n")
+    parts.push("    bb_verdict = 'STABLE_NEG'\n")
+    parts.push("elif pos_rate >= 0.6 or neg_rate >= 0.6:\n")
+    parts.push("    bb_verdict = 'DOMINANT_BUT_UNSTABLE'\n")
+    parts.push("else:\n")
+    parts.push("    bb_verdict = 'UNSTABLE_FLIPPING'\n\n")
+
+    parts.push("# Find canonical baseline cell (K=8, seed=42, ridge=1e-3) for #164 cross-check\n")
+    parts.push("baseline_cell = None\n")
+    parts.push("for c in cells:\n")
+    parts.push("    if c['K']==8 and c['seed']==42 and abs(c['ridge']-1e-3)<1e-9:\n")
+    parts.push("        baseline_cell = c\n")
+    parts.push("        break\n\n")
+
+    parts.push("summary = {'schema':'anima/phi_v3_minisweep/1','backbone':BASE_MODEL,\n")
+    parts.push("    'metric_design':'AUTO-CONDITIONING canonical (HID = max(2, N//2)=8) — well-conditioned regime',\n")
+    parts.push("    'partition_method':'sample-partition (N=16 -> 8|8 halves) — mini-sweep over K×seed×ridge',\n")
+    parts.push("    'n_probes':N,'half_size':HALF,'HID_TRUNC':HID_TRUNC,\n")
+    parts.push("    'eff_dof_full':EFF_DOF_FULL,'eff_dof_half':EFF_DOF_HALF,\n")
+    parts.push("    'sweep_grid':{'K':K_LEVELS,'seed':SEED_LEVELS,'ridge':RIDGE_LEVELS,\n")
+    parts.push("        'HID_TRUNC_FIXED':HID_TRUNC,'total_cells':len(cells)},\n")
+    parts.push("    'sign_summary':{'global':global_signs,'per_K':per_K,'per_seed':per_seed,'per_ridge':per_ridge},\n")
+    parts.push("    'pos_rate':round(pos_rate,4),'neg_rate':round(neg_rate,4),\n")
+    parts.push("    'sign_flip_pairs':flip_pairs,'sign_flip_pair_count':len(flip_pairs),\n")
+    parts.push("    'per_backbone_verdict':bb_verdict,\n")
+    parts.push("    'baseline_v164_cell':baseline_cell,\n")
+    parts.push("    'all_cells':cells,\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[phi-mini] DONE bb_verdict={bb_verdict} pos={global_signs[\"pos\"]}/{global_signs[\"total\"]} neg={global_signs[\"neg\"]}/{global_signs[\"total\"]} flips={len(flip_pairs)} -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_phi_v3_minisweep selftest ──")
+    _write_helper()
+    let cmd = "python3 -c 'import ast,sys; ast.parse(open(\"" + HELPER_PATH + "\").read()); print(\"ast_parse=ok\")'"
+    let r = exec_with_status(cmd)
+    println(to_string(r[0]).trim())
+    if to_int(r[1]) != 0 { eprintln("ast.parse FAILED"); exit(1) }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("design=v3 canonical mini-sweep (HID=8 fixed) per-backbone K×seed×ridge = 36 cells")
+    println("hypotheses=H4A_robust / H4B_flip / H4C_border_noise")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()
