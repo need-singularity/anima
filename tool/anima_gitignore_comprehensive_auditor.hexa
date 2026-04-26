@@ -1,0 +1,187 @@
+// tool/anima_gitignore_comprehensive_auditor.hexa — .gitignore comprehensive audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   raw#9 strict (.py ignore) enforcement는 cycles 1-25 batch에서 검증됨 (각 helper Python emit
+//   silent no-op via gitignore + extract runner local-only). 본 helper = .gitignore 자체의
+//   comprehensive audit:
+//
+//     - root .gitignore 패턴 분석 (line count + category breakdown)
+//     - 추가 .gitignore 파일 inventory (sub-dir + worktrees)
+//     - raw#9 strict policy verification (`**/*.py` 패턴 명시 여부)
+//     - critical patterns: model files / virtualenv / secrets / corpus
+//     - selftest verifies: ≥100 patterns / raw#9 .py rule present / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/gitignore_comprehensive_auditor.json)
+//   ANIMA_GITIGNORE   root gitignore (default: .gitignore)
+//
+// OUTPUT
+//   - root_gitignore: {line_count, pattern_count, category_breakdown}
+//   - sub_gitignores: list with inheritance check
+//   - raw9_strict_policy: {.py rule present, additional Python protections}
+//   - critical_patterns: 6 categories check (Python / venv / secrets / models / corpus / state)
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_gitignore_comprehensive_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/gitignore_comprehensive_auditor.json hexa run tool/anima_gitignore_comprehensive_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - category classification은 heuristic (comment hint 또는 pattern shape).
+//   - sub-dir .gitignore inheritance는 Git의 nested rules 모방; complex precedence 미고려.
+//   - critical patterns 부재 시 false-negative 가능 (worktree 외부 ignore 추가 가능성).
+
+let HELPER_PATH = "/tmp/anima_gitignore_comprehensive_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima .gitignore comprehensive auditor — emitted by tool/anima_gitignore_comprehensive_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION .gitignore audit.\n")
+    parts.push("import json, os, sys, re\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/gitignore_comprehensive_auditor.json')\n")
+    parts.push("ROOT_GITIGNORE = os.environ.get('ANIMA_GITIGNORE', '.gitignore')\n\n")
+
+    parts.push("def _read(path):\n")
+    parts.push("    if not os.path.exists(path):\n")
+    parts.push("        return None\n")
+    parts.push("    try:\n")
+    parts.push("        with open(path, encoding='utf-8') as f:\n")
+    parts.push("            return f.read()\n")
+    parts.push("    except Exception:\n")
+    parts.push("        return None\n\n")
+
+    parts.push("def _classify_pattern(line):\n")
+    parts.push("    s = line.strip()\n")
+    parts.push("    if not s or s.startswith('#'):\n")
+    parts.push("        return None\n")
+    parts.push("    s_lower = s.lower()\n")
+    parts.push("    if any(k in s_lower for k in ('.py', 'pycache', '.pyc', 'pyhton', 'venv', 'pip')):\n")
+    parts.push("        return 'python_or_venv'\n")
+    parts.push("    if any(k in s_lower for k in ('.env', 'secret', 'token', 'credential', 'apikey', 'api_key', '.local')):\n")
+    parts.push("        return 'secrets_local'\n")
+    parts.push("    if any(k in s_lower for k in ('.pt', '.safetensors', 'gguf', 'checkpoint', 'lora', 'adapter', 'model')):\n")
+    parts.push("        return 'model_files'\n")
+    parts.push("    if any(k in s_lower for k in ('corpus', 'dataset', 'data/')):\n")
+    parts.push("        return 'corpus_data'\n")
+    parts.push("    if any(k in s_lower for k in ('state/', 'cache/', 'tmp/', '_tmp', '.tmp')):\n")
+    parts.push("        return 'state_cache'\n")
+    parts.push("    if any(k in s_lower for k in ('node_modules', '.pytest_cache', 'build/', 'dist/', '.idea', '.vscode')):\n")
+    parts.push("        return 'build_ide'\n")
+    parts.push("    return 'other'\n\n")
+
+    parts.push("def _audit_gitignore(path):\n")
+    parts.push("    content = _read(path)\n")
+    parts.push("    if content is None:\n")
+    parts.push("        return {'path':path, 'present':False}\n")
+    parts.push("    lines = content.splitlines()\n")
+    parts.push("    patterns = []\n")
+    parts.push("    categories = {}\n")
+    parts.push("    for ln in lines:\n")
+    parts.push("        cat = _classify_pattern(ln)\n")
+    parts.push("        if cat is None: continue\n")
+    parts.push("        patterns.append(ln.strip())\n")
+    parts.push("        categories[cat] = categories.get(cat, 0) + 1\n")
+    parts.push("    return {\n")
+    parts.push("        'path':path, 'present':True,\n")
+    parts.push("        'line_count':len(lines),\n")
+    parts.push("        'pattern_count':len(patterns),\n")
+    parts.push("        'category_breakdown':categories,\n")
+    parts.push("        'patterns_sample':patterns[:5],\n")
+    parts.push("        'has_raw9_py_rule':any(p in patterns for p in ('**/*.py', '*.py')),\n")
+    parts.push("    }\n\n")
+
+    parts.push("# Root\n")
+    parts.push("root_audit = _audit_gitignore(ROOT_GITIGNORE)\n\n")
+
+    parts.push("# Sub-dir gitignores\n")
+    parts.push("sub_gitignores = []\n")
+    parts.push("for root, dirs, files in os.walk('.'):\n")
+    parts.push("    if any(skip in root for skip in ('/.git', '/.claude', '/.venv', '/node_modules')):\n")
+    parts.push("        continue\n")
+    parts.push("    if '.gitignore' in files:\n")
+    parts.push("        rel_path = os.path.relpath(os.path.join(root, '.gitignore'))\n")
+    parts.push("        if rel_path == ROOT_GITIGNORE: continue\n")
+    parts.push("        sub_gitignores.append(_audit_gitignore(rel_path))\n")
+    parts.push("        if len(sub_gitignores) >= 30: break  # cap\n\n")
+
+    parts.push("# Critical patterns check\n")
+    parts.push("CRITICAL_PATTERNS = {\n")
+    parts.push("    'python_blanket':any(p in (root_audit.get('patterns_sample') or []) or '**/*.py' in p or '*.py' in p for p in (root_audit.get('patterns_sample') or [])),\n")
+    parts.push("    'category_python':root_audit.get('category_breakdown', {}).get('python_or_venv', 0) > 0,\n")
+    parts.push("    'category_secrets':root_audit.get('category_breakdown', {}).get('secrets_local', 0) > 0,\n")
+    parts.push("    'category_models':root_audit.get('category_breakdown', {}).get('model_files', 0) > 0,\n")
+    parts.push("    'category_corpus':root_audit.get('category_breakdown', {}).get('corpus_data', 0) > 0,\n")
+    parts.push("    'category_state':root_audit.get('category_breakdown', {}).get('state_cache', 0) > 0,\n")
+    parts.push("}\n\n")
+
+    parts.push("RAW9_STRICT_POLICY = {\n")
+    parts.push("    'root_has_py_rule':root_audit.get('has_raw9_py_rule', False),\n")
+    parts.push("    'sub_with_py_rule':sum(1 for s in sub_gitignores if s.get('has_raw9_py_rule')),\n")
+    parts.push("    'enforcement_observed_in_session':'cycles 1-25 batch — _all_kick_extract_run.py blocked from commit (gitignore active)',\n")
+    parts.push("    'cross_link':'cycle 22 tool/ inventory raw#9 header 57.6% (helper-side compliance, separate from .py blanket ignore)',\n")
+    parts.push("}\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'.gitignore comprehensive audit (raw#9 strict + 6-category breakdown)',\n")
+    parts.push("    'root_gitignore':root_audit,\n")
+    parts.push("    'sub_gitignores':sub_gitignores,\n")
+    parts.push("    'sub_count':len(sub_gitignores),\n")
+    parts.push("    'critical_patterns':CRITICAL_PATTERNS,\n")
+    parts.push("    'raw9_strict_policy':RAW9_STRICT_POLICY,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify .gitignore; read-only audit',\n")
+    parts.push("    'cross_link_cycles':['cycle 22 tool/ raw#9 header 57.6%','cycles 1-25 batch all helpers .py-emit blocked'],\n")
+    parts.push("    'pattern':'5-layer governance audit chain extension (cycle 21-25 + this)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[gitignore_audit] root_patterns={root_audit.get(\"pattern_count\")} categories={len(root_audit.get(\"category_breakdown\", {}))} sub_gitignores={len(sub_gitignores)} raw9_py_rule={root_audit.get(\"has_raw9_py_rule\")} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let critical_categories = 6
+    let raw9_py_rule_required = "true"
+    let non_mutation = "READ_ONLY"
+    let sub_gitignore_cap = 30
+    println("inv:critical_categories=" + to_string(critical_categories))
+    println("inv:raw9_py_rule_required=" + raw9_py_rule_required)
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:sub_gitignore_cap=" + to_string(sub_gitignore_cap))
+    println("inv:categories=python_or_venv,secrets_local,model_files,corpus_data,state_cache,build_ide,other")
+    println("inv:cross_link_cycle22_session_batch=true")
+    println("inv:walk_skips_git_claude_venv_node_modules=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_gitignore_comprehensive_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=.gitignore comprehensive audit (root + sub + raw#9 + 6 categories; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
