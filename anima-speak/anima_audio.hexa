@@ -876,6 +876,141 @@ fn pipe_hexa(in_path: string, f1: float, f2: float, q: float) -> string {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  ω-audio-7 — notch_hexa (RBJ 2-zero biquad notch, hexa-native)
+//
+//  Closes Ω-B FAIL_no_zero (omega_audio_extended_baseline.json).
+//  pipe_hexa is all-pole — zeros stuck at z=0, so it cannot model the
+//  transmission zero a side-branch (nasal cavity) creates. notch_hexa
+//  is the cascade-zero-only filter; placed AFTER pipe(), it carves a
+//  true antiresonance into the spectrum, enabling /m/, /n/, /ŋ/, /l/.
+//
+//  RBJ notch (Audio EQ Cookbook):
+//    omega   = 2π·hz / SR
+//    Q       = hz / width        (bandwidth in Hz form; mirrors breath_hexa)
+//    alpha   = sin(omega) / (2·Q)
+//    b0 =  1,           b1 = -2·cos(omega), b2 =  1
+//    a0 =  1 + alpha,   a1 = -2·cos(omega), a2 =  1 - alpha
+//    normalize: divide all b/a by a0
+//    y[n] = b0·x[n] + b1·x[n-1] + b2·x[n-2] - a1·y[n-1] - a2·y[n-2]
+//
+//  The biquad's TWO complex zeros (on the unit circle at e^±jω) produce
+//  the transmission zero. Pole pair sits just inside (radius ≈ 1-alpha)
+//  so the band outside [hz±width/2] passes ~unattenuated.
+//
+//  Cost: ~5 mul + 4 add per sample → ~50µs/sample at SR=24kHz × 100ms
+//  ≈ 240ms compute (synthesis-pure; no python).
+// ═══════════════════════════════════════════════════════════════
+
+fn notch_hexa(in_path: string, notch_hz: float, width_hz: float) -> string {
+    if len(in_path) == 0 { return "" }
+    if _file_bytes(in_path) < WAV_MIN_BYTES { return "" }
+    let out = _new_path()
+
+    let parsed = _read_wav_int16_le(in_path)
+    if len(parsed) < 3 { return "" }
+    let n = parsed[0]
+    let sr2 = parsed[1]
+    if n < 1 { return "" }
+
+    // Clamp inputs (mirrors pipe_hexa / breath_hexa guards).
+    let nyq = (sr2 + 0.0) / 2.0 - 1.0
+    let mut hz = notch_hz
+    if hz < 20.0 { hz = 20.0 }
+    if hz > nyq { hz = nyq }
+    let mut bw = width_hz
+    if bw < 10.0 { bw = 10.0 }
+    if bw > nyq { bw = nyq }
+    let mut q = hz / bw
+    if q < 0.5 { q = 0.5 }
+    if q > 30.0 { q = 30.0 }
+
+    // RBJ biquad notch coefficients (normalized by a0).
+    let pi_v = 3.141592653589793
+    let omega = 2.0 * pi_v * hz / (sr2 + 0.0)
+    let cos_w = cos(omega)
+    let sin_w = sin(omega)
+    let alpha = sin_w / (2.0 * q)
+    let a0 = 1.0 + alpha
+    let b0 = 1.0 / a0
+    let b1 = (0.0 - 2.0) * cos_w / a0
+    let b2 = 1.0 / a0
+    let a1 = (0.0 - 2.0) * cos_w / a0
+    let a2 = (1.0 - alpha) / a0
+
+    // Direct-form-I biquad pass. Track peak for normalization.
+    let mut x1 = 0.0
+    let mut x2 = 0.0
+    let mut y1 = 0.0
+    let mut y2 = 0.0
+    let mut buf = []
+    let mut peak = 0.000000001
+    let mut i = 0
+    while i < n {
+        let xs = parsed[2 + i]
+        let ys = b0 * xs + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2 = x1; x1 = xs
+        y2 = y1; y1 = ys
+        buf.push(ys)
+        let mut ay = ys
+        if ay < 0.0 { ay = 0.0 - ay }
+        if ay > peak { peak = ay }
+        i = i + 1
+    }
+
+    // ω-audio-6 redo: array_alloc(44+2n) + indexed-write (interp-4 backed).
+    let data_bytes = n * 2
+    let chunk_size = 36 + data_bytes
+    let total = 44 + data_bytes
+    let mut bytes = array_alloc(total)
+    bytes[0] = 0x52; bytes[1] = 0x49; bytes[2] = 0x46; bytes[3] = 0x46
+    bytes[4] = chunk_size & 0xFF
+    bytes[5] = (chunk_size >> 8) & 0xFF
+    bytes[6] = (chunk_size >> 16) & 0xFF
+    bytes[7] = (chunk_size >> 24) & 0xFF
+    bytes[8] = 0x57; bytes[9] = 0x41; bytes[10] = 0x56; bytes[11] = 0x45
+    bytes[12] = 0x66; bytes[13] = 0x6D; bytes[14] = 0x74; bytes[15] = 0x20
+    bytes[16] = 16; bytes[17] = 0; bytes[18] = 0; bytes[19] = 0
+    bytes[20] = 1; bytes[21] = 0
+    bytes[22] = 1; bytes[23] = 0
+    bytes[24] = sr2 & 0xFF
+    bytes[25] = (sr2 >> 8) & 0xFF
+    bytes[26] = (sr2 >> 16) & 0xFF
+    bytes[27] = (sr2 >> 24) & 0xFF
+    let br_b = sr2 * 2
+    bytes[28] = br_b & 0xFF
+    bytes[29] = (br_b >> 8) & 0xFF
+    bytes[30] = (br_b >> 16) & 0xFF
+    bytes[31] = (br_b >> 24) & 0xFF
+    bytes[32] = 2; bytes[33] = 0
+    bytes[34] = 16; bytes[35] = 0
+    bytes[36] = 0x64; bytes[37] = 0x61; bytes[38] = 0x74; bytes[39] = 0x61
+    bytes[40] = data_bytes & 0xFF
+    bytes[41] = (data_bytes >> 8) & 0xFF
+    bytes[42] = (data_bytes >> 16) & 0xFF
+    bytes[43] = (data_bytes >> 24) & 0xFF
+    let scale = 0.9 / peak
+    let mut j = 0
+    let mut off = 44
+    while j < n {
+        let mut y = buf[j] * scale
+        if y > 1.0 { y = 1.0 }
+        if y < 0.0 - 1.0 { y = 0.0 - 1.0 }
+        let mut s = floor(y * 32767.0 + 0.5)
+        if s > 32767 { s = 32767 }
+        if s < 0 - 32768 { s = 0 - 32768 }
+        let mut u = s
+        if u < 0 { u = u + 65536 }
+        bytes[off] = u & 0xFF
+        bytes[off + 1] = (u >> 8) & 0xFF
+        off = off + 2
+        j = j + 1
+    }
+    write_bytes(out, bytes)
+    if _file_bytes(out) < WAV_MIN_BYTES { return "" }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  ω-audio-3 redo — vocal_lf_hexa (Liljencrants-Fant glottal pulse)
 //
 //  Hexa-native parallel to vocal_lf(). Mirrors python LF approximation:
@@ -1250,6 +1385,28 @@ fn pipe_glide(in_path: string, f1a: float, f2a: float, f1b: float, f2b: float, q
     let _ = _run_py(code)
     if _file_bytes(out) < WAV_MIN_BYTES { return "" }
     return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Filter organ 4 — notch (RBJ 2-zero biquad transmission zero)
+//    in_path  : 입력 WAV (e.g. pipe(vocal(...), F1, F2) — voiced /m/, /n/).
+//    notch_hz : antiresonance center Hz (nasal: 700-1500).
+//    width_hz : notch bandwidth Hz (100-400 typical).
+//
+//  Closes Ω-B FAIL_no_zero — pipe()'s all-pole filter cannot place a
+//  transmission zero off the origin. notch() composes AFTER pipe() to
+//  carve a true antiresonance, enabling /m/ /n/ /ŋ/ /l/ as first-class.
+//  Hexa-only when ANIMA_AUDIO_HEXA_NATIVE != "0" (no python fallback).
+// ═══════════════════════════════════════════════════════════════
+
+fn notch(in_path: string, notch_hz: float, width_hz: float) -> string {
+    // Hexa-native by default. Per session: hexa-only synthesis path.
+    // No python heredoc fallback — ω-audio-7 introduces this organ
+    // exclusively in the hexa-native track (analytic limit closure).
+    if env("ANIMA_AUDIO_HEXA_NATIVE") != "0" {
+        return notch_hexa(in_path, notch_hz, width_hz)
+    }
+    return notch_hexa(in_path, notch_hz, width_hz)
 }
 
 // ═══════════════════════════════════════════════════════════════
