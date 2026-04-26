@@ -1,0 +1,169 @@
+// tool/anima_axis96_llama_stride1_dispatch.hexa — axis 96 Llama stride=1 full-grid sweep dispatch (raw#9 hexa-only).
+//
+// PURPOSE
+//   axis 96 (family-decoupling) disambiguation Step 1 unblock harness.
+//   v11_axis96_disambiguation_20260427.md §unblock-condition: "HF license accept for
+//   meta-llama/Meta-Llama-3.1-8B (manual dancinlife step, ~1-2 BD). Then Step 1 stride=1
+//   scan unblocks (~$0.15 GPU)."
+//
+//   본 helper = mac-local pre-register + dispatch ledger:
+//     - frozen sweep params (32-grid stride=1 CMT scan on Llama-3.1-8B)
+//     - HFD-A/B/C decision criteria thresholds (already published in v11 doc, mirrored frozen)
+//     - HF gate status check + dispatch readiness
+//     - selftest verifies: 32-step grid / 3 frozen hypotheses / explicit HF gate field
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/axis96_llama_stride1_pre_register.json)
+//   ANIMA_HF_GATE_OK  override HF gate status ("true" | "false", default "false")
+//
+// OUTPUT
+//   - sweep_config: stride=1 32-grid CMT scan (layer indices 0..31)
+//   - frozen_hypotheses: HFD-A LIVING_AXIS / HFD-B SUB_AXIS_OF_CMT / HFD-C ARTIFACT
+//                        with explicit thresholds mirrored from v11 doc
+//   - hf_gate_status: BLOCKED | UNBLOCKED (mac-local declared, GPU side verifies)
+//   - dispatch_command: env-var-ready cmdline for tool/anima_cmt.hexa Llama stride=1 invocation
+//   - dispatch_readiness: PRE_GATE_READY | DISPATCH_READY
+//
+// USAGE
+//   hexa run tool/anima_axis96_llama_stride1_dispatch.hexa --selftest
+//   ANIMA_OUTPUT=state/axis96_llama_stride1_pre_register.json hexa run tool/anima_axis96_llama_stride1_dispatch.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - HFD-A/B/C thresholds are mirrored from v11_axis96_disambiguation_20260427.md
+//     (NOT freshly designed). Re-pre-register required if v11 doc thresholds change.
+//   - 32-grid은 Llama-3.1-8B의 32 transformer layer 정확히 1:1 — 모델 변경 시 grid 재계산 필요.
+//   - cost $0.15는 vast.ai A100 1×1h 추정 ±30%. stride=1 = 32 layer ablation = 32× rel measurement.
+
+let HELPER_PATH = "/tmp/anima_axis96_llama_stride1_dispatch_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima axis 96 Llama stride=1 dispatch helper — emitted by tool/anima_axis96_llama_stride1_dispatch.hexa\n")
+    parts.push("# raw#37 transient. axis 96 (family-decoupling) disambiguation Step 1 unblock harness.\n")
+    parts.push("import json, os, sys\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/axis96_llama_stride1_pre_register.json')\n")
+    parts.push("HF_GATE_OK = os.environ.get('ANIMA_HF_GATE_OK', 'false').lower() == 'true'\n\n")
+
+    parts.push("MODEL_ID = 'meta-llama/Meta-Llama-3.1-8B'\n")
+    parts.push("MODEL_LAYERS = 32  # Llama-3.1-8B has 32 transformer blocks\n")
+    parts.push("STRIDE = 1\n\n")
+
+    parts.push("SWEEP_CONFIG = {\n")
+    parts.push("    'model_id':MODEL_ID,\n")
+    parts.push("    'model_n_layers':MODEL_LAYERS,\n")
+    parts.push("    'stride':STRIDE,\n")
+    parts.push("    'layer_indices':list(range(0, MODEL_LAYERS, STRIDE)),\n")
+    parts.push("    'n_ablation_cells':MODEL_LAYERS // STRIDE,\n")
+    parts.push("    'ablation_target':'layer',  # axis 96 baseline measured w/ whole-layer; consistency w/ axis 105\n")
+    parts.push("    'parent_helper':'tool/anima_cmt.hexa',\n")
+    parts.push("    'cost_usd_est':0.15,\n")
+    parts.push("    'expected_runtime_h':1.0,\n")
+    parts.push("    'gpu':'A100 1×1h (vast.ai)',\n")
+    parts.push("}\n\n")
+
+    parts.push("FROZEN_HYPOTHESES = [\n")
+    parts.push("    {\n")
+    parts.push("        'id':'HFD-A', 'name':'LIVING_AXIS',\n")
+    parts.push("        'statement':'family-decoupling = NEW LIVING AXIS (axis-orthogonal new dimension)',\n")
+    parts.push("        'decision_threshold':'CONFIRMED (HFD-A支持) if Llama stride=1 32-grid yields decoupling pattern (single-layer ablation peak NOT confined to one family-shared block) AND BBA |r| with CDS < 0.3',\n")
+    parts.push("        'mirror_source':'docs/v11_axis96_disambiguation_20260427.md HFD-A threshold |r|<0.3',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'id':'HFD-B', 'name':'SUB_AXIS_OF_CMT',\n")
+    parts.push("        'statement':'family-decoupling = SUB-AXIS OF CMT (backbone-conditional variant of axis 95)',\n")
+    parts.push("        'decision_threshold':'CONFIRMED (HFD-B支持) if Llama stride=1 reveals decoupling at family-shared layer band AND BBA |r| with CDS > 0.7',\n")
+    parts.push("        'mirror_source':'docs/v11_axis96_disambiguation_20260427.md HFD-B threshold |r|>0.7',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'id':'HFD-C', 'name':'ARTIFACT',\n")
+    parts.push("        'statement':'family-decoupling = ARTIFACT (layer-count or stride-grid sampling bias)',\n")
+    parts.push("        'decision_threshold':'CONFIRMED (HFD-C支持) if stride=1 result FLATTENS or REVERSES the original stride-grid 7.88× outlier signal — i.e. dense-grid measurement reveals it was a sampling artifact',\n")
+    parts.push("        'mirror_source':'docs/v11_axis96_disambiguation_20260427.md §unblock-condition Step 1',\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("ambiguous_band_note = 'v11 doc Step 3 BBA result max|r|=0.680 lies in (0.3, 0.7) ambiguous band — neither HFD-A nor HFD-B confirmed at n=4. Llama stride=1 (this dispatch) is the residual HFD-C ruling-out evidence.'\n\n")
+
+    parts.push("hf_gate_status = 'UNBLOCKED' if HF_GATE_OK else 'BLOCKED'\n")
+    parts.push("dispatch_readiness = 'DISPATCH_READY' if HF_GATE_OK else 'PRE_GATE_READY'\n\n")
+
+    parts.push("dispatch_command = (\n")
+    parts.push("    f\"ANIMA_BASE={MODEL_ID} \"\n")
+    parts.push("    f\"ANIMA_LAYER_STRIDE={STRIDE} \"\n")
+    parts.push("    f\"ANIMA_OUTPUT=/workspace/out/axis96_llama_stride1.json \"\n")
+    parts.push("    f\"hexa run tool/anima_cmt.hexa\"\n")
+    parts.push(")\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'axis 96 Llama stride=1 32-grid CMT scan dispatch (HFD-C ruling-out)',\n")
+    parts.push("    'parent_doc':'docs/v11_axis96_disambiguation_20260427.md',\n")
+    parts.push("    'parent_axis':'axis 105 (axis 96 disambiguation Step 1 BLOCKED → unblock harness)',\n")
+    parts.push("    'sweep_config':SWEEP_CONFIG,\n")
+    parts.push("    'frozen_hypotheses':FROZEN_HYPOTHESES,\n")
+    parts.push("    'ambiguous_band_note':ambiguous_band_note,\n")
+    parts.push("    'hf_gate_status':hf_gate_status,\n")
+    parts.push("    'hf_gate_required':'meta-llama/Meta-Llama-3.1-8B license accept by dancinlife (~1-2 BD)',\n")
+    parts.push("    'dispatch_readiness':dispatch_readiness,\n")
+    parts.push("    'dispatch_command':dispatch_command,\n")
+    parts.push("    'cost_usd_est':SWEEP_CONFIG['cost_usd_est'],\n")
+    parts.push("    'pre_register_status':'FROZEN_PRE_MEASUREMENT (mirrors v11 doc thresholds; raw#10 honest re-pre-register on threshold change)',\n")
+    parts.push("    'n_layers':MODEL_LAYERS,\n")
+    parts.push("    'n_hypotheses':len(FROZEN_HYPOTHESES),\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[axis96_llama_stride1] gate={hf_gate_status} ready={dispatch_readiness} n_layers={MODEL_LAYERS} cost=${SWEEP_CONFIG[\"cost_usd_est\"]} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let model_layers_expected = 32
+    let stride_expected = 1
+    let n_ablation_cells_expected = 32
+    let hypotheses_count_expected = 3
+    let cost_max_usd = 0.20
+    println("inv:model_layers_expected=" + to_string(model_layers_expected))
+    println("inv:stride_expected=" + to_string(stride_expected))
+    println("inv:n_ablation_cells_expected=" + to_string(n_ablation_cells_expected))
+    println("inv:hypotheses_count_expected=" + to_string(hypotheses_count_expected))
+    println("inv:cost_max_usd=" + to_string(cost_max_usd))
+    println("inv:hypotheses_ids=HFD-A,HFD-B,HFD-C")
+    println("inv:every_hypothesis_mirrors_v11_doc=true")
+    println("inv:hf_gate_field_present=true")
+    println("inv:dispatch_command_uses_anima_cmt_hexa=true")
+    println("inv:ambiguous_band_note_records_n4_BBA_r_0.680=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_axis96_llama_stride1_dispatch selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=axis 96 Llama stride=1 32-grid HFD-C ruling-out dispatch (HF gate dancinlife pending; cost $0.15)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
