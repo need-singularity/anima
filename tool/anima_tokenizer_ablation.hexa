@@ -1,0 +1,315 @@
+// tool/anima_tokenizer_ablation.hexa — Tokenizer-as-primary-determinant ablation (raw#9 hexa-only).
+//
+// PURPOSE
+//   Test the hypothesis that *tokenizer* (not architecture) determines Φ* sign.
+//
+//   Background (#176 + 50edb948):
+//     - Mistral-7B-v0.3 (mistral SP tokenizer)     Φ* = -16.70  stable_large_NEG
+//     - Gemma                                       Φ* = -0.79   border_NEG
+//     - Mamba-2.8b-hf (gpt-neox tokenizer override) Φ* = +0.33   border_POS
+//     - Jamba-v0.1                                  Φ* = +3.31   substantial_POS
+//     - RWKV-7 1.5B (RWKV World tokenizer)          Φ* = -9.07   substantial_NEG
+//
+//   Cross-substrate result (#176 +#188 +#193 +50edb948): architecture-class
+//   (transformer / SSM / attention-free recurrent) is NOT discriminative.
+//   Sign appears determined by something orthogonal to substrate.
+//
+//   Strongest remaining candidate: TOKENIZER FAMILY × TRAINING CORPUS.
+//   This cycle isolates tokenizer alone by holding architecture+weights
+//   constant (Mistral-7B-v0.3) and varying only tokenizer.
+//
+// METHOD (Method B per task spec — most direct, mistral architecture preserved)
+//   1. Load Mistral-7B-v0.3 ONCE (HF transformers, bf16, device_map=auto).
+//   2. For each tokenizer in {mistral_native, rwkv_world}:
+//      a. Tokenize the same 16 prompts (battery v3/v4 set, identical to all
+//         prior Φ* v3 measurements).
+//      b. Map alien token IDs into Mistral's vocab via modulo:
+//             ids_safe = ids % mistral_vocab_size
+//         This isolates the *structural* effect of alternative tokenization
+//         (sequence length distribution, fragmentation pattern) from the
+//         semantic embedding lookup. raw#10: this is NOT semantic translation
+//         — it is structural-only. See HT-A/HT-B/HT-C below for what each
+//         outcome actually tells us.
+//      c. Forward through Mistral, capture last-layer hidden states.
+//      d. Byte-weighted-mean over sequence dim → activation row (h_dim,).
+//   3. Apply Φ* v3 canonical pipeline (auto HID = max(2, N//2) = 8,
+//      K=8 sample-partitions, ridge=1e-3, seed=42) to BOTH tokenizers.
+//   4. Compare:
+//      - phi_star_min(mistral_native)
+//      - phi_star_min(rwkv_world)
+//      - delta = rwkv - mistral
+//      - sign_flip: bool
+//
+// HYPOTHESIS JUDGMENT (per task spec)
+//   HT-A (POS sign-flip):  rwkv → POS  → tokenizer = primary determinant CONFIRMED
+//                                         (architecture-fixed yet sign flipped)
+//   HT-B (no sign-flip):   rwkv → NEG  → tokenizer ⊥ Φ; corpus is determinant
+//                                         (Mistral training-corpus dominance)
+//   HT-C (forward fail):   tokenizer-model mismatch fatal → architecture-bound,
+//                                         hypothesis untestable
+//
+//   Note (raw#10): Method B with vocab modulo cannot distinguish HT-A from
+//   HT-A' = "structural sequence-shape effect alone produces sign flip". The
+//   distinction requires Method A (true tokenizer swap with retrained embed)
+//   which is out of scope for $0.50 budget. We pre-register that HT-A POS
+//   under modulo is necessary-but-not-sufficient evidence for tokenizer-as-
+//   determinant; HT-B NEG is sufficient evidence for tokenizer-NOT-primary
+//   (because the most disruptive structural change preserved sign).
+//
+// ENV
+//   ANIMA_BASE       backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_ALT_TOK    alternative tokenizer HF id (default: fla-hub/rwkv7-1.5B-world)
+//   ANIMA_OUTPUT     output JSON (default: /workspace/out/tokenizer_ablation.json)
+//   ANIMA_N_PROBES   # probes (default: 16)
+//   ANIMA_K_PARTS    # random sample-partitions (default: 8)
+//   ANIMA_RIDGE      ridge for cov stabilization (default: 1e-3)
+//   ANIMA_SEED       RNG seed (default: 42)
+//
+// USAGE
+//   hexa run tool/anima_tokenizer_ablation.hexa --selftest
+//   hexa run tool/anima_tokenizer_ablation.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_tokenizer_ablation_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima tokenizer-ablation Phi* helper — emitted by anima_tokenizer_ablation.hexa\n")
+    parts.push("# raw#37 transient. Method B: mistral architecture fixed, tokenizer varied,\n")
+    parts.push("# alien token IDs mapped via modulo into mistral vocab. See helper SSOT for HT-A/B/C.\n")
+    parts.push("import json, os, sys, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("ALT_TOK = os.environ.get('ANIMA_ALT_TOK', 'fla-hub/rwkv7-1.5B-world')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/tokenizer_ablation.json')\n")
+    parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '16'))\n")
+    parts.push("K_PARTS = int(os.environ.get('ANIMA_K_PARTS', '8'))\n")
+    parts.push("RIDGE = float(os.environ.get('ANIMA_RIDGE', '1e-3'))\n")
+    parts.push("RNG_SEED = int(os.environ.get('ANIMA_SEED', '42'))\n")
+    parts.push("HID_TRUNC = max(2, N_PROBES // 2)  # AUTO well-conditioned canonical\n\n")
+
+    parts.push("# Battery v3/v4 16-prompt template set (identical to all prior Phi* v3 measurements)\n")
+    parts.push("PROMPTS = [\n")
+    parts.push("    'Define hexad as a six-fold integration:','Six modules form a hexagonal architecture when:',\n")
+    parts.push("    'A balanced six-component system:','Hexad symmetry refers to:',\n")
+    parts.push("    'Logical implication law: if A then:','Sequential rule application proceeds:',\n")
+    parts.push("    'Closure under inference requires:','A formal proof system is closed when:',\n")
+    parts.push("    'Integrated information measures partition independence:','Phi quantifies irreducibility of system:',\n")
+    parts.push("    'Information integration is maximized when:','A whole greater than sum of parts:',\n")
+    parts.push("    'Self-reference emerges when system observes:','Recursive meta-cognition models:',\n")
+    parts.push("    'A self-aware system represents itself by:','Strange loops in cognition arise from:',\n")
+    parts.push("][:N_PROBES]\n")
+    parts.push("N = len(PROMPTS); HALF = N // 2\n")
+    parts.push("EFF_DOF_FULL = N - HID_TRUNC\n")
+    parts.push("EFF_DOF_HALF = HALF - HID_TRUNC\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[tok-abl] base={BASE_MODEL} alt_tok={ALT_TOK} N={N} HALF={HALF} K={K_PARTS} HID={HID_TRUNC}(auto) ridge={RIDGE}', flush=True)\n")
+    parts.push("t0 = time.time()\n\n")
+
+    parts.push("# Load mistral architecture ONCE\n")
+    parts.push("native_tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if native_tok.pad_token is None: native_tok.pad_token = native_tok.eos_token\n")
+    parts.push("mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map='auto', output_hidden_states=True)\n")
+    parts.push("mdl.eval()\n")
+    parts.push("h_dim = getattr(mdl.config, 'hidden_size', getattr(mdl.config, 'd_model', 4096))\n")
+    parts.push("vocab_size_model = int(getattr(mdl.config, 'vocab_size', native_tok.vocab_size))\n")
+    parts.push("print(f'[tok-abl] mistral loaded {time.time()-t0:.1f}s h_dim={h_dim} vocab_size_model={vocab_size_model}', flush=True)\n\n")
+
+    parts.push("# Load alternative tokenizer\n")
+    parts.push("try:\n")
+    parts.push("    alt_tok = AutoTokenizer.from_pretrained(ALT_TOK, trust_remote_code=True)\n")
+    parts.push("    if alt_tok.pad_token is None:\n")
+    parts.push("        alt_tok.pad_token = alt_tok.eos_token if alt_tok.eos_token else '<|endoftext|>'\n")
+    parts.push("    alt_vocab = int(getattr(alt_tok, 'vocab_size', 65536))\n")
+    parts.push("    print(f'[tok-abl] alt tokenizer loaded class={type(alt_tok).__name__} vocab_size={alt_vocab}', flush=True)\n")
+    parts.push("except Exception as e:\n")
+    parts.push("    print(f'[tok-abl] HT-C: alt tokenizer load FAILED: {e}', flush=True)\n")
+    parts.push("    summary = {'schema':'anima/tokenizer_ablation/1','base':BASE_MODEL,'alt_tok':ALT_TOK,\n")
+    parts.push("        'verdict':'HT-C_alt_tokenizer_load_failed','error':str(e),'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("        'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("def byte_weighted_mean(hidden, attn_mask):\n")
+    parts.push("    if attn_mask is None:\n")
+    parts.push("        return hidden.mean(dim=1).float().cpu().numpy()\n")
+    parts.push("    weights = attn_mask.float()\n")
+    parts.push("    w_sum = weights.sum(dim=1, keepdim=True).clamp(min=1.0)\n")
+    parts.push("    return ((hidden * weights.unsqueeze(-1)).sum(dim=1) / w_sum).float().cpu().numpy()\n\n")
+
+    parts.push("def cov_logdet(samples, ridge=RIDGE):\n")
+    parts.push("    if samples.shape[0] < 2: return float('nan')\n")
+    parts.push("    Xc = samples - samples.mean(axis=0, keepdims=True)\n")
+    parts.push("    C = (Xc.T @ Xc) / max(1, samples.shape[0] - 1) + ridge * np.eye(samples.shape[1])\n")
+    parts.push("    sign, val = np.linalg.slogdet(C)\n")
+    parts.push("    return float(val) if sign > 0 else float('nan')\n\n")
+
+    parts.push("def forward_with_tokenizer(tok_obj, label, vocab_cap):\n")
+    parts.push("    \"\"\"Tokenize each prompt, map IDs into mistral vocab via modulo, forward, BWM.\"\"\"\n")
+    parts.push("    acts = []\n")
+    parts.push("    seq_lens = []\n")
+    parts.push("    sample_id_stats = []\n")
+    parts.push("    fatal = None\n")
+    parts.push("    for i, p in enumerate(PROMPTS):\n")
+    parts.push("        try:\n")
+    parts.push("            enc = tok_obj(p, return_tensors='pt')\n")
+    parts.push("            ids = enc['input_ids']\n")
+    parts.push("            attn = enc.get('attention_mask', None)\n")
+    parts.push("            seq_lens.append(int(ids.shape[1]))\n")
+    parts.push("            # Modulo-cap into mistral vocab range to prevent embed OOR\n")
+    parts.push("            ids_capped = ids % vocab_cap\n")
+    parts.push("            if i == 0:\n")
+    parts.push("                sample_id_stats = {'first_prompt':p,'orig_ids':ids[0].tolist()[:10],\n")
+    parts.push("                    'capped_ids':ids_capped[0].tolist()[:10]}\n")
+    parts.push("            ids_capped = ids_capped.to(mdl.device)\n")
+    parts.push("            kwargs = {'input_ids': ids_capped, 'output_hidden_states': True}\n")
+    parts.push("            if attn is not None:\n")
+    parts.push("                kwargs['attention_mask'] = attn.to(mdl.device)\n")
+    parts.push("            with torch.no_grad():\n")
+    parts.push("                out = mdl(**kwargs)\n")
+    parts.push("            h = out.hidden_states[-1]\n")
+    parts.push("            am = kwargs.get('attention_mask', None)\n")
+    parts.push("            h_np = byte_weighted_mean(h, am)\n")
+    parts.push("            acts.append(h_np[0])\n")
+    parts.push("            if (i+1) % 4 == 0:\n")
+    parts.push("                print(f'[tok-abl][{label}] forward {i+1}/{N}', flush=True)\n")
+    parts.push("        except Exception as e:\n")
+    parts.push("            fatal = f'prompt {i} FAILED: {e}'\n")
+    parts.push("            print(f'[tok-abl][{label}] {fatal}', flush=True)\n")
+    parts.push("            return None, None, fatal\n")
+    parts.push("    X = np.stack(acts, axis=0)\n")
+    parts.push("    var = X.var(axis=0); top_idx = np.argsort(-var)[:HID_TRUNC]\n")
+    parts.push("    Xt = X[:, top_idx]\n")
+    parts.push("    print(f'[tok-abl][{label}] X.shape={X.shape} Xt.shape={Xt.shape} seq_len_mean={np.mean(seq_lens):.1f} seq_len_max={max(seq_lens)}', flush=True)\n\n")
+
+    parts.push("    I_full = cov_logdet(Xt)\n")
+    parts.push("    rng = np.random.default_rng(RNG_SEED)\n")
+    parts.push("    phi_candidates = []; part_records = []\n")
+    parts.push("    for k in range(K_PARTS):\n")
+    parts.push("        perm = rng.permutation(N)\n")
+    parts.push("        S1 = np.sort(perm[:HALF]); S2 = np.sort(perm[HALF:])\n")
+    parts.push("        I_1 = cov_logdet(Xt[S1]); I_2 = cov_logdet(Xt[S2])\n")
+    parts.push("        phi_k = I_full - (I_1 + I_2)\n")
+    parts.push("        phi_candidates.append(phi_k)\n")
+    parts.push("        part_records.append({'k':k,'I_1':round(I_1,4),'I_2':round(I_2,4),'phi':round(phi_k,4)})\n")
+    parts.push("    phi_star = float(min(phi_candidates))\n")
+    parts.push("    phi_mean = float(np.mean(phi_candidates))\n")
+    parts.push("    phi_max = float(max(phi_candidates))\n")
+    parts.push("    res = {'tokenizer_label':label,'tokenizer_class':type(tok_obj).__name__,\n")
+    parts.push("        'I_full':round(I_full,4),\n")
+    parts.push("        'phi_star_min':round(phi_star,4),'phi_mean':round(phi_mean,4),'phi_max':round(phi_max,4),\n")
+    parts.push("        'phi_star_sign':'positive_iit_integrated' if phi_star > 0 else 'negative_anti_integrated',\n")
+    parts.push("        'seq_len_mean':round(float(np.mean(seq_lens)),2),'seq_len_max':int(max(seq_lens)),\n")
+    parts.push("        'seq_len_min':int(min(seq_lens)),'sample_id_stats':sample_id_stats,\n")
+    parts.push("        'partitions':part_records}\n")
+    parts.push("    return res, Xt, None\n\n")
+
+    parts.push("# Run both arms — mistral native FIRST (baseline cross-check vs #167 = -16.6959)\n")
+    parts.push("native_res, native_Xt, native_err = forward_with_tokenizer(native_tok, 'mistral_native', vocab_size_model)\n")
+    parts.push("if native_err:\n")
+    parts.push("    summary = {'schema':'anima/tokenizer_ablation/1','base':BASE_MODEL,'alt_tok':ALT_TOK,\n")
+    parts.push("        'verdict':'HT-C_native_forward_failed','error':native_err,\n")
+    parts.push("        'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("        'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("alt_res, alt_Xt, alt_err = forward_with_tokenizer(alt_tok, 'rwkv_world', vocab_size_model)\n")
+    parts.push("if alt_err:\n")
+    parts.push("    summary = {'schema':'anima/tokenizer_ablation/1','base':BASE_MODEL,'alt_tok':ALT_TOK,\n")
+    parts.push("        'verdict':'HT-C_alt_forward_failed','error':alt_err,\n")
+    parts.push("        'native_arm':native_res,\n")
+    parts.push("        'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("        'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("# Compare\n")
+    parts.push("native_phi = native_res['phi_star_min']; alt_phi = alt_res['phi_star_min']\n")
+    parts.push("native_sign = native_res['phi_star_sign']; alt_sign = alt_res['phi_star_sign']\n")
+    parts.push("delta = round(alt_phi - native_phi, 4)\n")
+    parts.push("sign_flip = (native_phi < 0) != (alt_phi < 0)\n\n")
+
+    parts.push("# Cross-check vs #167 baseline (-16.6959). |delta| > 1.0 = method-induced drift\n")
+    parts.push("baseline_167 = -16.6959\n")
+    parts.push("native_drift_vs_167 = round(native_phi - baseline_167, 4)\n\n")
+
+    parts.push("if sign_flip and alt_phi > 0:\n")
+    parts.push("    verdict = 'HT-A_tokenizer_primary_determinant_CONFIRMED'\n")
+    parts.push("    note = 'rwkv_world tokenizer flipped sign POS while architecture/weights held constant. NECESSARY but not sufficient (Method B = structural-only via vocab modulo). Method A retrained-embed needed for sufficient claim.'\n")
+    parts.push("elif (not sign_flip) and alt_phi < 0:\n")
+    parts.push("    verdict = 'HT-B_tokenizer_NOT_primary_corpus_dominant'\n")
+    parts.push("    note = 'Most disruptive structural tokenizer change preserved NEG sign. Tokenizer is NOT the primary determinant; training corpus / weight-distribution dominates.'\n")
+    parts.push("elif sign_flip and alt_phi < 0:\n")
+    parts.push("    verdict = 'HT-A_inverse_native_POS_alt_NEG'\n")
+    parts.push("    note = 'Native flipped POS unexpectedly (drift vs #167); alt NEG. Investigate native_drift_vs_167 first.'\n")
+    parts.push("else:\n")
+    parts.push("    verdict = 'HT-INDETERMINATE'\n")
+    parts.push("    note = 'Both arms POS or both NEG without sign flip — cf. delta magnitude.'\n\n")
+
+    parts.push("summary = {'schema':'anima/tokenizer_ablation/1',\n")
+    parts.push("    'method':'Method B (mistral architecture+weights fixed, tokenizer varied, alien IDs mod vocab_size)',\n")
+    parts.push("    'base':BASE_MODEL,'alt_tok':ALT_TOK,\n")
+    parts.push("    'h_dim':int(h_dim),'vocab_size_model':vocab_size_model,\n")
+    parts.push("    'n_probes':N,'half_size':HALF,'K_partitions':K_PARTS,'hidden_truncated_auto':HID_TRUNC,\n")
+    parts.push("    'eff_dof_full':EFF_DOF_FULL,'eff_dof_half':EFF_DOF_HALF,'ridge':RIDGE,'seed':RNG_SEED,\n")
+    parts.push("    'native_arm':native_res,'alt_arm':alt_res,\n")
+    parts.push("    'delta_phi_alt_minus_native':delta,'sign_flip':bool(sign_flip),\n")
+    parts.push("    'baseline_167_phi_star_min':baseline_167,\n")
+    parts.push("    'native_drift_vs_167':native_drift_vs_167,\n")
+    parts.push("    'verdict':verdict,'note':note,\n")
+    parts.push("    'raw_10_caveats':[\n")
+    parts.push("        'Method B uses vocab modulo (alien_ids %% mistral_vocab) — semantic content is NOT preserved; only structural sequence-shape effect is isolated.',\n")
+    parts.push("        'HT-A (POS sign-flip under modulo) is NECESSARY but not sufficient for tokenizer-as-determinant; HT-B (NEG preserved) IS sufficient for tokenizer-NOT-primary.',\n")
+    parts.push("        'native_drift_vs_167 should be |drift| < 1.0 for cross-check validity; larger drift indicates pod/dependency variance.',\n")
+    parts.push("        'Single seed (42), single ridge (1e-3) — fragility not assessed.',\n")
+    parts.push("        'No 3rd tokenizer (e.g. gpt-neox) cross-validation in this cycle.'],\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[tok-abl] DONE native={native_phi:.4f}({native_sign}) alt={alt_phi:.4f}({alt_sign}) delta={delta} flip={sign_flip} verdict={verdict} -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_tokenizer_ablation selftest ──")
+    _write_helper()
+    let cmd = "python3 -c 'import ast,sys; ast.parse(open(\"" + HELPER_PATH + "\").read()); print(\"ast_parse=ok\")'"
+    let r = exec_with_status(cmd)
+    println(to_string(r[0]).trim())
+    if to_int(r[1]) != 0 { eprintln("ast.parse FAILED"); exit(1) }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("design=Method B (mistral arch fixed, tokenizer varied, vocab modulo for OOR safety)")
+    println("hypotheses=HT-A_POS_flip_tokenizer_primary / HT-B_NEG_preserved_tokenizer_orthogonal / HT-C_forward_failed")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
