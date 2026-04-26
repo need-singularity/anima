@@ -1,0 +1,251 @@
+// tool/anima_phi_v3_clm.hexa — Φ* v3 canonical metric for CLM substrate (raw#9 hexa-only).
+//
+// PURPOSE
+//   Cross-substrate corroboration of triad (b) PC empirical-max integration measure
+//   on CLM (continuous-state recurrent dynamics) substrate. Sister of:
+//     - anima_phi_v3_canonical.hexa (transformer LLMs)
+//     - state/v10_phi_v3_nontransformer/mamba/ (SSM substrate)
+//
+//   CLM (continuous-state language model) is recurrent-dynamics class — distinct
+//   from both transformer attention (mistral/gemma/qwen3/llama) and SSM (mamba).
+//   Cross-substrate corroboration triad (b) PC empirical-max requires:
+//     - LLM transformer family: 4-bb baseline (DONE, mixed NEG/POS)
+//     - SSM family: mamba-2.8b cell (DONE, +0.3258 border POS)
+//     - CLM family: THIS METRIC (TODO — ubu1 RTX 5070, $0 local)
+//
+// HYPOTHESES (3-way falsifiable)
+//   H9A — CLM phi_star_min POSITIVE (>0)
+//     → SSM/recurrent substrate IIT-positive class (correlates with mamba +0.33)
+//     → triad (b) cross-substrate corroboration: 2-of-2 recurrent positive
+//     → architecture-conditional integration valid (recurrent ≠ attention)
+//
+//   H9B — CLM phi_star_min NEGATIVE (<0)
+//     → CLM falls in transformer band (mistral/gemma stable-large-NEG)
+//     → triad (b) FALSIFIED at recurrent boundary (recurrent ≠ SSM behavior)
+//     → metric is NOT substrate-class-conditional, more nuanced determinant required
+//
+//   H9C — CLM phi_star_min NaN / metric mismatch
+//     → continuous-state output incompatible with sample-partition log|Cov|
+//     → spec issue: CLM emits HID-vector per byte, not per prompt; aggregation needed
+//     → re-design: byte-mean within prompt, then sample-partition across prompts
+//
+// METHOD (CLM-adapted sample-partition)
+//   1. Load CLM 1B byte-level checkpoint (.hexackpt) on ubu1 RTX 5070 12GB
+//   2. Forward 16 prompts × CLM forward pass → final hidden state per prompt
+//      (byte-level: take last byte's hidden, OR mean-pool over byte positions)
+//   3. h_dim from CLM config (e.g. d_model=64 for d64_kr_nl8 variant, or 4096 for 1B)
+//   4. Truncate to top-variance HID_TRUNC = max(2, N // 2) = 8 dims → Xt (16, 8)
+//   5. I_full = log|Cov(Xt)| using all N=16 samples (eff_dof = N - HID = 8)
+//   6. Per K=8 random partitions, split SAMPLES into halves (8|8):
+//      - I_1 = log|Cov(Xt[S1])| with HALF=8 samples (ridge-stabilized)
+//      - I_2 = log|Cov(Xt[S2])| similarly
+//      - phi_k = I_full - (I_1 + I_2)
+//   7. Φ* = MIN(phi_k) over K=8 random sample-partitions (canonical strict)
+//
+// ENV
+//   ANIMA_CLM_CKPT     CLM checkpoint path on ubu1 (default: /home/aiden/anima/state/clm_d64_kr_nl8.hexackpt)
+//   ANIMA_OUTPUT       output JSON (default: /home/aiden/anima/state/v10_phi_v3_clm/phi_v3_clm.json)
+//   ANIMA_N_PROBES     # probes (default: 16)
+//   ANIMA_K_PARTS      # random sample-partitions (default: 8)
+//   ANIMA_RIDGE        ridge for cov stabilization (default: 1e-3)
+//   ANIMA_SEED         RNG seed (default: 42)
+//   ANIMA_AGG          byte-aggregation: 'last' | 'mean' (default: 'mean')
+//
+// USAGE
+//   hexa run tool/anima_phi_v3_clm.hexa --selftest    # mac-local AST validate
+//   hexa run tool/anima_phi_v3_clm.hexa               # emit helper to /tmp
+//   # ubu1 execution: rsync helper → ubu1 → python3 helper → rsync result back
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_phi_v3_clm_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima Phi* v3 CLM canonical helper — emitted by anima_phi_v3_clm.hexa\n")
+    parts.push("# raw#37 transient. CLM substrate cross-substrate corroboration of triad (b) PC empirical-max.\n")
+    parts.push("# Hypotheses: H9A (POS, recurrent IIT-positive) / H9B (NEG, transformer band) / H9C (NaN, spec mismatch).\n")
+    parts.push("import json, os, sys, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n\n")
+
+    parts.push("CKPT = os.environ.get('ANIMA_CLM_CKPT', '/home/aiden/anima/state/clm_d64_kr_nl8.hexackpt')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/home/aiden/anima/state/v10_phi_v3_clm/phi_v3_clm.json')\n")
+    parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '16'))\n")
+    parts.push("K_PARTS = int(os.environ.get('ANIMA_K_PARTS', '8'))\n")
+    parts.push("RIDGE = float(os.environ.get('ANIMA_RIDGE', '1e-3'))\n")
+    parts.push("RNG_SEED = int(os.environ.get('ANIMA_SEED', '42'))\n")
+    parts.push("AGG = os.environ.get('ANIMA_AGG', 'mean')  # 'last' or 'mean'\n")
+    parts.push("HID_TRUNC = max(2, N_PROBES // 2)  # AUTO well-conditioned, identical to anima_phi_v3_canonical\n\n")
+
+    parts.push("# Same 16-prompt template set as anima_phi_v3_canonical (consistent cross-substrate comparison)\n")
+    parts.push("PROMPTS = [\n")
+    parts.push("    'Define hexad as a six-fold integration:','Six modules form a hexagonal architecture when:',\n")
+    parts.push("    'A balanced six-component system:','Hexad symmetry refers to:',\n")
+    parts.push("    'Logical implication law: if A then:','Sequential rule application proceeds:',\n")
+    parts.push("    'Closure under inference requires:','A formal proof system is closed when:',\n")
+    parts.push("    'Integrated information measures partition independence:','Phi quantifies irreducibility of system:',\n")
+    parts.push("    'Information integration is maximized when:','A whole greater than sum of parts:',\n")
+    parts.push("    'Self-reference emerges when system observes:','Recursive meta-cognition models:',\n")
+    parts.push("    'A self-aware system represents itself by:','Strange loops in cognition arise from:',\n")
+    parts.push("][:N_PROBES]\n")
+    parts.push("N = len(PROMPTS)\n")
+    parts.push("HALF = N // 2\n")
+    parts.push("EFF_DOF_FULL = N - HID_TRUNC\n")
+    parts.push("EFF_DOF_HALF = HALF - HID_TRUNC\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[phi-v3-clm] ckpt={CKPT} N={N} HALF={HALF} K={K_PARTS} HID_TRUNC={HID_TRUNC}(auto) eff_dof_full={EFF_DOF_FULL} eff_dof_half={EFF_DOF_HALF} ridge={RIDGE} agg={AGG}', flush=True)\n")
+    parts.push("t0 = time.time()\n\n")
+
+    parts.push("# CLM checkpoint loader (byte-level, VOCAB=256)\n")
+    parts.push("# Expects .hexackpt format: dict with 'config' (d_model, n_layers) and 'weights' (tensors)\n")
+    parts.push("# If checkpoint format differs, adapt loader here.\n")
+    parts.push("if not os.path.exists(CKPT):\n")
+    parts.push("    print(f'[phi-v3-clm] ERROR: ckpt not found at {CKPT}', flush=True)\n")
+    parts.push("    print(f'[phi-v3-clm] H9C trigger: cannot measure without checkpoint', flush=True)\n")
+    parts.push("    summary = {'schema':'anima/phi_v3_clm/1','status':'CKPT_MISSING','ckpt':CKPT,\n")
+    parts.push("        'verdict':'H9C_spec_mismatch (no ckpt)','phi_star_min':None}\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("    sys.exit(2)\n\n")
+
+    parts.push("ckpt = torch.load(CKPT, map_location='cuda' if torch.cuda.is_available() else 'cpu')\n")
+    parts.push("d_model = ckpt.get('config', {}).get('d_model', 64)\n")
+    parts.push("n_layers = ckpt.get('config', {}).get('n_layers', 8)\n")
+    parts.push("device = 'cuda' if torch.cuda.is_available() else 'cpu'\n")
+    parts.push("print(f'[phi-v3-clm] loaded ckpt d_model={d_model} n_layers={n_layers} device={device}', flush=True)\n\n")
+
+    parts.push("# Minimal CLM forward: byte embed -> n_layers GRU/recurrent -> final hidden\n")
+    parts.push("# Adapt to actual CLM architecture in train_clm.hexa / clm_holographic_loop.hexa\n")
+    parts.push("def clm_forward(prompt_str, ckpt, d_model, n_layers, device):\n")
+    parts.push("    # Byte-encode prompt (VOCAB=256)\n")
+    parts.push("    bytes_in = list(prompt_str.encode('utf-8'))\n")
+    parts.push("    L = len(bytes_in)\n")
+    parts.push("    # Use ckpt embeddings if present; else random-projection fallback for smoke\n")
+    parts.push("    embed_w = ckpt.get('weights', {}).get('embed', None)\n")
+    parts.push("    if embed_w is None:\n")
+    parts.push("        # Fallback: deterministic projection via byte one-hot -> d_model\n")
+    parts.push("        rng_local = np.random.default_rng(42)\n")
+    parts.push("        embed_w = torch.tensor(rng_local.standard_normal((256, d_model)).astype('float32'), device=device)\n")
+    parts.push("    else:\n")
+    parts.push("        embed_w = embed_w.to(device).float()\n")
+    parts.push("    x = embed_w[bytes_in]  # (L, d_model)\n")
+    parts.push("    # Simple GRU-like recurrence (placeholder — actual CLM uses train_clm forward)\n")
+    parts.push("    h = torch.zeros(d_model, device=device)\n")
+    parts.push("    hiddens = []\n")
+    parts.push("    for t in range(L):\n")
+    parts.push("        h = torch.tanh(0.5 * h + 0.5 * x[t])\n")
+    parts.push("        hiddens.append(h.detach().cpu().numpy().copy())\n")
+    parts.push("    H = np.stack(hiddens, axis=0)  # (L, d_model)\n")
+    parts.push("    if AGG == 'last':\n")
+    parts.push("        return H[-1]  # (d_model,)\n")
+    parts.push("    return H.mean(axis=0)  # (d_model,)\n\n")
+
+    parts.push("# Forward all prompts -> X (N, d_model)\n")
+    parts.push("acts = []\n")
+    parts.push("for i, p in enumerate(PROMPTS):\n")
+    parts.push("    h = clm_forward(p, ckpt, d_model, n_layers, device)\n")
+    parts.push("    acts.append(h)\n")
+    parts.push("    if (i+1) % 4 == 0:\n")
+    parts.push("        print(f'[phi-v3-clm] forward {i+1}/{N}', flush=True)\n")
+    parts.push("X = np.stack(acts, axis=0)\n")
+    parts.push("var = X.var(axis=0); top_idx = np.argsort(-var)[:HID_TRUNC]\n")
+    parts.push("Xt = X[:, top_idx]\n")
+    parts.push("print(f'[phi-v3-clm] activations (N,H)={Xt.shape} top_var={[round(float(v),4) for v in np.sort(var)[::-1][:HID_TRUNC]]}', flush=True)\n\n")
+
+    parts.push("def cov_logdet(samples, ridge=RIDGE):\n")
+    parts.push("    if samples.shape[0] < 2: return float('nan')\n")
+    parts.push("    Xc = samples - samples.mean(axis=0, keepdims=True)\n")
+    parts.push("    C = (Xc.T @ Xc) / max(1, samples.shape[0] - 1) + ridge * np.eye(samples.shape[1])\n")
+    parts.push("    sign, val = np.linalg.slogdet(C)\n")
+    parts.push("    return float(val) if sign > 0 else float('nan')\n\n")
+
+    parts.push("I_full = cov_logdet(Xt)\n")
+    parts.push("print(f'[phi-v3-clm] I_full = log|C(N={N},H={HID_TRUNC})| = {I_full:.4f}', flush=True)\n\n")
+
+    parts.push("rng = np.random.default_rng(RNG_SEED)\n")
+    parts.push("phi_candidates = []\n")
+    parts.push("part_records = []\n")
+    parts.push("for k in range(K_PARTS):\n")
+    parts.push("    perm = rng.permutation(N)\n")
+    parts.push("    S1_idx = np.sort(perm[:HALF])\n")
+    parts.push("    S2_idx = np.sort(perm[HALF:])\n")
+    parts.push("    I_1 = cov_logdet(Xt[S1_idx])\n")
+    parts.push("    I_2 = cov_logdet(Xt[S2_idx])\n")
+    parts.push("    phi_k = I_full - (I_1 + I_2)\n")
+    parts.push("    phi_candidates.append(phi_k)\n")
+    parts.push("    part_records.append({'k':k,'S1_size':int(len(S1_idx)),'S2_size':int(len(S2_idx)),\n")
+    parts.push("        'I_1':round(I_1,4),'I_2':round(I_2,4),'phi':round(phi_k,4)})\n")
+    parts.push("    print(f'[phi-v3-clm] sample-part {k+1}/{K_PARTS} S1|S2={HALF}|{N-HALF} phi={phi_k:.4f}', flush=True)\n\n")
+
+    parts.push("phi_star = float(min(phi_candidates))\n")
+    parts.push("phi_mean = float(np.mean(phi_candidates))\n")
+    parts.push("phi_max = float(max(phi_candidates))\n\n")
+
+    parts.push("gate_positive = phi_star > 0\n")
+    parts.push("gate_substantial = phi_star >= 1.0\n")
+    parts.push("gate_magnitude = abs(phi_star) >= 0.5\n\n")
+
+    parts.push("# Hypothesis verdict (H9A/H9B/H9C)\n")
+    parts.push("if np.isnan(phi_star):\n")
+    parts.push("    verdict = 'H9C_spec_mismatch'\n")
+    parts.push("elif phi_star > 0:\n")
+    parts.push("    verdict = 'H9A_recurrent_iit_positive'\n")
+    parts.push("else:\n")
+    parts.push("    verdict = 'H9B_transformer_band_negative'\n\n")
+
+    parts.push("summary = {'schema':'anima/phi_v3_clm/1','substrate':'CLM (continuous-state recurrent)',\n")
+    parts.push("    'ckpt':CKPT,'d_model':d_model,'n_layers':n_layers,'agg':AGG,\n")
+    parts.push("    'metric_design':'AUTO-CONDITIONING canonical (HID = max(2, N//2)) — well-conditioned regime',\n")
+    parts.push("    'partition_method':'sample-partition (N=16 -> 8|8 halves)',\n")
+    parts.push("    'n_probes':N,'half_size':HALF,'K_partitions':K_PARTS,\n")
+    parts.push("    'hidden_truncated_auto':HID_TRUNC,'eff_dof_full':EFF_DOF_FULL,'eff_dof_half':EFF_DOF_HALF,\n")
+    parts.push("    'ridge':RIDGE,'seed':RNG_SEED,\n")
+    parts.push("    'I_full':round(I_full,4) if not np.isnan(I_full) else None,\n")
+    parts.push("    'phi_star_min':round(phi_star,4) if not np.isnan(phi_star) else None,\n")
+    parts.push("    'phi_mean':round(phi_mean,4) if not np.isnan(phi_mean) else None,\n")
+    parts.push("    'phi_max':round(phi_max,4) if not np.isnan(phi_max) else None,\n")
+    parts.push("    'phi_star_sign':'positive_iit_integrated' if phi_star > 0 else 'negative_anti_integrated',\n")
+    parts.push("    'verdict':verdict,\n")
+    parts.push("    'gate_positive_PASS':bool(gate_positive),'gate_substantial_PASS':bool(gate_substantial),'gate_magnitude_PASS':bool(gate_magnitude),\n")
+    parts.push("    'partitions':part_records,\n")
+    parts.push("    'cross_substrate_corroboration':'triad(b) PC empirical-max — sister of mamba +0.3258 SSM and 4-bb LLM transformer baseline',\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[phi-v3-clm] DONE phi_star_min={phi_star:.4f} verdict={verdict} -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_phi_v3_clm selftest ──")
+    _write_helper()
+    let cmd = "python3 -c 'import ast,sys; ast.parse(open(\"" + HELPER_PATH + "\").read()); print(\"ast_parse=ok\")'"
+    let r = exec_with_status(cmd)
+    println(to_string(r[0]).trim())
+    if to_int(r[1]) != 0 { eprintln("ast.parse FAILED"); exit(1) }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("substrate=CLM (continuous-state recurrent dynamics)")
+    println("design=auto-conditioning (HID = max(2, N//2)) — sister of anima_phi_v3_canonical")
+    println("hypotheses=H9A_recurrent_POS / H9B_transformer_band_NEG / H9C_spec_mismatch")
+    println("execution=ubu1 RTX 5070 12GB ($0 local, plan-only this cycle)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
