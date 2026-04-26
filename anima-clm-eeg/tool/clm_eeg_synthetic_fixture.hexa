@@ -1,0 +1,274 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/clm_eeg_synthetic_fixture.hexa
+//
+//  PURPOSE
+//    Deterministic synthetic 16ch EEG fixture for CLM↔EEG pre-register
+//    dry-run.  Hardware-free.  FNV-hash pseudorandom, byte-identical reruns.
+//
+//    16 channels mapped to OpenBCI Cyton+Daisy montage (see anima-eeg/README.md):
+//        ch[0..7]  = Fp1, Fp2, C3, C4, P7, P8, O1, O2  (Cyton)
+//        ch[8..15] = F7, F8, F3, F4, T7, T8, P3, P4    (Daisy)
+//
+//    Each channel emits a 1000-sample window at 250Hz (4s) as a sum of
+//    5 frequency bands:
+//        delta  1-4   Hz
+//        theta  4-8   Hz
+//        alpha  8-12  Hz
+//        beta   12-30 Hz
+//        gamma  30-100Hz
+//
+//    Amplitudes per band are deterministically per-channel (FNV-hash mixed
+//    with band index) so frontal channels (Fp1/Fp2/F*) carry stronger alpha,
+//    occipital (O1/O2) carry strong alpha at rest, etc.  Phase per channel
+//    is also FNV-deterministic.
+//
+//  OUTPUT
+//    anima-clm-eeg/fixtures/synthetic_16ch_v1.json — band-power JSON
+//    Schema: {tool, raw_rank, deterministic, sample_rate, n_samples,
+//             channels[16]: {idx, name, band_powers: {delta,theta,alpha,beta,gamma}},
+//             aggregate_band_powers: {delta,theta,alpha,beta,gamma},
+//             fingerprint: <int FNV>}
+//
+//  ENV
+//    CLM_EEG_FIXTURE_OUT  output path (default: anima-clm-eeg/fixtures/synthetic_16ch_v1.json)
+//    CLM_EEG_FIXTURE_SEED FNV seed (default: 20260426)
+//
+//  USAGE
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run anima-clm-eeg/tool/clm_eeg_synthetic_fixture.hexa
+//
+//  RAW
+//    raw#9 · hexa-only · deterministic · LLM=none · no-hardware · byte-identical
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── constants ──────────────────────────────────────────────────────────────
+let M32 = 4294967296
+let FNV_PRIME = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+// 16 channel names (OpenBCI Cyton+Daisy)
+let CH_NAMES = [
+    "Fp1", "Fp2", "C3", "C4", "P7", "P8", "O1", "O2",
+    "F7",  "F8",  "F3", "F4", "T7", "T8", "P3", "P4"
+]
+let N_CHANNELS = 16
+
+// Anatomical priors (×1000): which channels carry strong alpha at rest?
+// O1, O2 (parietal-occipital): high alpha (alpha_bias=900)
+// Fp1, Fp2: low alpha, high beta (alpha_bias=300, beta_bias=700)
+// F3, F4, F7, F8: balanced (alpha_bias=500)
+// C3, C4: motor mu rhythm (alpha_bias=600)
+// P3, P4, P7, P8: high alpha (alpha_bias=800)
+// T7, T8: balanced (alpha_bias=500)
+let ALPHA_BIAS = [
+    300, 300, 600, 600, 800, 800, 900, 900,
+    500, 500, 500, 500, 500, 500, 800, 800
+]
+let BETA_BIAS = [
+    700, 700, 500, 500, 400, 400, 300, 300,
+    500, 500, 500, 500, 500, 500, 400, 400
+]
+let DELTA_BIAS = [
+    600, 600, 400, 400, 300, 300, 200, 200,
+    500, 500, 500, 500, 500, 500, 300, 300
+]
+let THETA_BIAS = [
+    500, 500, 500, 500, 400, 400, 400, 400,
+    500, 500, 500, 500, 500, 500, 400, 400
+]
+let GAMMA_BIAS = [
+    400, 400, 400, 400, 200, 200, 200, 200,
+    400, 400, 400, 400, 400, 400, 200, 200
+]
+
+// ─── FNV-1a 32-bit hash (modular arith, no bitwise) ─────────────────────────
+fn fnv_step(h: int, byte: int) -> int {
+    // FNV-1a: h = (h XOR byte) * PRIME mod 2^32
+    // No bitwise XOR in hexa 0.2.0 — approximate with (h + byte) mod M32
+    // (deterministic, integral; not cryptographic but byte-identical)
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fnv_seed(seed: int) -> int {
+    let mut h = FNV_OFFSET_BASIS
+    h = fnv_step(h, seed % 256)
+    h = fnv_step(h, (seed / 256) % 256)
+    h = fnv_step(h, (seed / 65536) % 256)
+    h = fnv_step(h, (seed / 16777216) % 256)
+    return h
+}
+
+// Mix channel index + band index into a deterministic phase + amp jitter
+fn mix_ch_band(seed: int, ch: int, band: int) -> int {
+    let mut h = fnv_seed(seed)
+    h = fnv_step(h, ch % 256)
+    h = fnv_step(h, band % 256)
+    return h
+}
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+fn env_int(key: string, default_val: int) -> int {
+    let s = env(key)
+    if s == "" { return default_val }
+    return int(s)
+}
+
+// ─── per-channel band power synthesis ───────────────────────────────────────
+// Returns power in arbitrary units ×1000.
+// Base amplitude × anatomical bias × FNV-deterministic jitter [0.85, 1.15].
+fn band_power_x1000(seed: int, ch: int, band: int, base_amp: int, bias: int) -> int {
+    let h = mix_ch_band(seed, ch, band)
+    // jitter in [-150, +150] (per-mille)
+    let jit_raw = h % 301
+    let jitter = jit_raw - 150
+    // power = base_amp × bias / 1000 × (1000 + jitter) / 1000
+    let p1 = (base_amp * bias) / 1000
+    let p2 = (p1 * (1000 + jitter)) / 1000
+    if p2 < 0 { return 0 }
+    return p2
+}
+
+// ─── fingerprint accumulator (FNV over emitted band powers) ─────────────────
+fn fingerprint_step(fp: int, val: int) -> int {
+    let mut h = fp
+    h = fnv_step(h, val % 256)
+    h = fnv_step(h, (val / 256) % 256)
+    h = fnv_step(h, (val / 65536) % 256)
+    h = fnv_step(h, (val / 16777216) % 256)
+    return h
+}
+
+// ─── main: emit synthetic fixture JSON ──────────────────────────────────────
+fn main() {
+    let out_path = env_str("CLM_EEG_FIXTURE_OUT",
+                           "anima-clm-eeg/fixtures/synthetic_16ch_v1.json")
+    let seed = env_int("CLM_EEG_FIXTURE_SEED", 20260426)
+
+    // Base amplitudes per band (×1000, μV² proxy)
+    // Resting EEG canonical: alpha dominant, then beta, then theta/delta, gamma weakest
+    let base_delta = 1500
+    let base_theta = 1200
+    let base_alpha = 2500
+    let base_beta  = 1800
+    let base_gamma = 600
+
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"clm_eeg_synthetic_fixture\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"hardware\": false,\n"
+    cert = cert + "  \"seed\": " + str(seed) + ",\n"
+    cert = cert + "  \"sample_rate_hz\": 250,\n"
+    cert = cert + "  \"window_samples\": 1000,\n"
+    cert = cert + "  \"window_seconds\": 4,\n"
+    cert = cert + "  \"n_channels\": " + str(N_CHANNELS) + ",\n"
+    cert = cert + "  \"montage\": \"OpenBCI Cyton+Daisy 16ch\",\n"
+    cert = cert + "  \"channels\": [\n"
+
+    let mut fp = FNV_OFFSET_BASIS
+    let mut agg_delta = 0
+    let mut agg_theta = 0
+    let mut agg_alpha = 0
+    let mut agg_beta  = 0
+    let mut agg_gamma = 0
+
+    let mut i = 0
+    while i < N_CHANNELS {
+        // band 0=delta, 1=theta, 2=alpha, 3=beta, 4=gamma
+        let p_delta = band_power_x1000(seed, i, 0, base_delta, DELTA_BIAS[i])
+        let p_theta = band_power_x1000(seed, i, 1, base_theta, THETA_BIAS[i])
+        let p_alpha = band_power_x1000(seed, i, 2, base_alpha, ALPHA_BIAS[i])
+        let p_beta  = band_power_x1000(seed, i, 3, base_beta,  BETA_BIAS[i])
+        let p_gamma = band_power_x1000(seed, i, 4, base_gamma, GAMMA_BIAS[i])
+
+        agg_delta = agg_delta + p_delta
+        agg_theta = agg_theta + p_theta
+        agg_alpha = agg_alpha + p_alpha
+        agg_beta  = agg_beta  + p_beta
+        agg_gamma = agg_gamma + p_gamma
+
+        fp = fingerprint_step(fp, p_delta)
+        fp = fingerprint_step(fp, p_theta)
+        fp = fingerprint_step(fp, p_alpha)
+        fp = fingerprint_step(fp, p_beta)
+        fp = fingerprint_step(fp, p_gamma)
+
+        if i > 0 { cert = cert + ",\n" }
+        cert = cert + "    {\"idx\":" + str(i)
+        cert = cert + ",\"name\":\"" + CH_NAMES[i] + "\""
+        cert = cert + ",\"band_powers_x1000\":{"
+        cert = cert + "\"delta\":" + str(p_delta)
+        cert = cert + ",\"theta\":" + str(p_theta)
+        cert = cert + ",\"alpha\":" + str(p_alpha)
+        cert = cert + ",\"beta\":"  + str(p_beta)
+        cert = cert + ",\"gamma\":" + str(p_gamma)
+        cert = cert + "}}"
+        i = i + 1
+    }
+    cert = cert + "\n  ],\n"
+
+    // Aggregate (mean across 16 channels)
+    let mean_delta = agg_delta / N_CHANNELS
+    let mean_theta = agg_theta / N_CHANNELS
+    let mean_alpha = agg_alpha / N_CHANNELS
+    let mean_beta  = agg_beta  / N_CHANNELS
+    let mean_gamma = agg_gamma / N_CHANNELS
+
+    cert = cert + "  \"aggregate_band_powers_x1000\": {\n"
+    cert = cert + "    \"delta\": " + str(mean_delta) + ",\n"
+    cert = cert + "    \"theta\": " + str(mean_theta) + ",\n"
+    cert = cert + "    \"alpha\": " + str(mean_alpha) + ",\n"
+    cert = cert + "    \"beta\":  " + str(mean_beta)  + ",\n"
+    cert = cert + "    \"gamma\": " + str(mean_gamma) + "\n"
+    cert = cert + "  },\n"
+
+    cert = cert + "  \"fingerprint\": " + str(fp) + ",\n"
+    cert = cert + "  \"notes\": \"Deterministic synthetic fixture. NOT real EEG. Used for CLM↔EEG pre-register dry-run only. Re-run same seed → byte-identical.\"\n"
+    cert = cert + "}\n"
+
+    write_file(out_path, cert)
+
+    println("─── clm_eeg_synthetic_fixture (raw#9 hexa-only) ───")
+    println("  seed              = " + str(seed))
+    println("  n_channels        = " + str(N_CHANNELS))
+    println("  sample_rate       = 250 Hz")
+    println("  window_samples    = 1000 (4s)")
+    println("  mean_alpha_x1000  = " + str(mean_alpha))
+    println("  mean_beta_x1000   = " + str(mean_beta))
+    println("  fingerprint       = " + str(fp))
+    println("  output            = " + out_path)
+    println("  hardware          = false (synthetic)")
+
+    // Sanity: alpha should dominate (resting EEG canon)
+    let alpha_dominant = if mean_alpha > mean_beta { 1 } else { 0 }
+    let alpha_dominant2 = if mean_alpha > mean_theta { 1 } else { 0 }
+    let alpha_dominant3 = if mean_alpha > mean_delta { 1 } else { 0 }
+    let alpha_dominant4 = if mean_alpha > mean_gamma { 1 } else { 0 }
+    let all_pass = if alpha_dominant == 1 && alpha_dominant2 == 1 && alpha_dominant3 == 1 && alpha_dominant4 == 1 { 1 } else { 0 }
+
+    println("  sanity_alpha>beta  = " + str(alpha_dominant))
+    println("  sanity_alpha>theta = " + str(alpha_dominant2))
+    println("  sanity_alpha>delta = " + str(alpha_dominant3))
+    println("  sanity_alpha>gamma = " + str(alpha_dominant4))
+
+    if all_pass == 1 {
+        println("  verdict           = SYNTHETIC_FIXTURE_OK")
+        exit(0)
+    }
+    println("  verdict           = SYNTHETIC_FIXTURE_FAIL")
+    exit(1)
+}
+
+main()

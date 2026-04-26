@@ -1,0 +1,184 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-hci-research/tool/hci_substrate_smoke.hexa
+//
+//  PURPOSE  (HCI Path B — 4-falsifier composite chain)
+//    F1+F2 (functor) + F3 (adversarial) + F4 (substrate) verdicts 를 read,
+//    composite verdict 산출:
+//      HCI_SUBSTRATE_VERIFIED  iff  F1 ∧ F2 ∧ F3 ∧ F4
+//
+//  PRECONDITIONS (반드시 먼저 run)
+//    - state/hci_functor_falsifier_v1.json
+//    - state/hci_adversarial_flip_v1.json
+//    - state/hci_substrate_probe_v1.json
+//
+//  RAW#9
+//    pure hexa · jq 미사용 · self-contained substring scan
+//    (기존 hci_smoke 와 별개로 4-falsifier composite 이며 hci_smoke 와 공존)
+//
+//  OUTPUT
+//    state/hci_substrate_smoke_v1.json
+// ════════════════════════════════════════════════════════════════════════════
+
+let FUNCTOR_PATH   = "anima-hci-research/state/hci_functor_falsifier_v1.json"
+let ADVERS_PATH    = "anima-hci-research/state/hci_adversarial_flip_v1.json"
+let SUBSTRATE_PATH = "anima-hci-research/state/hci_substrate_probe_v1.json"
+let OUT_PATH       = "anima-hci-research/state/hci_substrate_smoke_v1.json"
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+fn now_stamp() -> string { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+
+fn find_bool(content: string, key: string) -> bool {
+    let needle_t = "\"" + key + "\": true"
+    let needle_f = "\"" + key + "\": false"
+    if content.contains(needle_t) { return true }
+    if content.contains(needle_f) { return false }
+    return false
+}
+
+fn find_string(content: string, key: string) -> string {
+    let probe = "\"" + key + "\": \""
+    let idx = content.index_of(probe)
+    if idx < 0 { return "" }
+    let start = idx + len(probe)
+    let rest = content.substring(start, len(content))
+    let end = rest.index_of("\"")
+    if end < 0 { return "" }
+    return rest.substring(0, end)
+}
+
+fn main() {
+    println("[hci_substrate_smoke] HCI Path B 4-falsifier composite chain")
+    println("  read: " + FUNCTOR_PATH)
+    println("  read: " + ADVERS_PATH)
+    println("  read: " + SUBSTRATE_PATH)
+    println("")
+
+    if !file_exists(FUNCTOR_PATH) {
+        println("[hci_substrate_smoke] FATAL: missing functor falsifier state — run hci_functor_falsifier.hexa first")
+        exit(2)
+    }
+    if !file_exists(ADVERS_PATH) {
+        println("[hci_substrate_smoke] FATAL: missing adversarial flip state — run hci_adversarial_flip.hexa first")
+        exit(2)
+    }
+    if !file_exists(SUBSTRATE_PATH) {
+        println("[hci_substrate_smoke] FATAL: missing substrate probe state — run hci_substrate_probe.hexa first")
+        exit(2)
+    }
+
+    let func_json = read_file(FUNCTOR_PATH)
+    let adv_json  = read_file(ADVERS_PATH)
+    let sub_json  = read_file(SUBSTRATE_PATH)
+
+    // ─── F1+F2 (functor) ─────────────────────────────────────────────────
+    let f1_pass = find_bool(func_json, "f1_pass")
+    let f2_pass = find_bool(func_json, "f2_pass")
+    let f1_neg  = find_bool(func_json, "f1_neg_detects")
+    let f2_neg  = find_bool(func_json, "f2_neg_detects")
+    let func_verdict = find_string(func_json, "composite_verdict")
+
+    // ─── F3 (adversarial) ────────────────────────────────────────────────
+    let baseline_ok = find_bool(adv_json, "baseline_both_closed")
+    let revert_ok   = find_bool(adv_json, "revert_ok")
+    let f3_verdict  = find_string(adv_json, "f3_verdict")
+    let s1_bidir    = find_bool(adv_json, "bidirectional")
+    let s2_marker   = "\"s2_leaky\""
+    let s2_idx      = adv_json.index_of(s2_marker)
+    let s2_bidir    = if s2_idx >= 0 {
+        find_bool(adv_json.substring(s2_idx, len(adv_json)), "bidirectional")
+    } else { false }
+
+    // ─── F4 (substrate) ──────────────────────────────────────────────────
+    let f4_pass     = find_bool(sub_json, "f4_pass")
+    let f4_verdict  = find_string(sub_json, "f4_verdict")
+    // For finer reporting, parse positive composite + negative detect bools
+    // (both must be true for a healthy F4, but f4_pass already ANDs them).
+    let pos_marker  = "\"positive\""
+    let neg_marker  = "\"negative\""
+    let pos_idx     = sub_json.index_of(pos_marker)
+    let neg_idx     = sub_json.index_of(neg_marker)
+    let pos_composite = if pos_idx >= 0 && neg_idx > pos_idx {
+        find_bool(sub_json.substring(pos_idx, neg_idx), "composite_pass")
+    } else { false }
+    let neg_detects = if neg_idx >= 0 {
+        find_bool(sub_json.substring(neg_idx, len(sub_json)), "detects_failure")
+    } else { false }
+
+    println("=== F1+F2 from functor falsifier ===")
+    println("  f1_pass         = " + bool_s(f1_pass))
+    println("  f2_pass         = " + bool_s(f2_pass))
+    println("  f1_neg_detects  = " + bool_s(f1_neg))
+    println("  f2_neg_detects  = " + bool_s(f2_neg))
+    println("  func_verdict    = " + func_verdict)
+    println("")
+
+    println("=== F3 from adversarial flip ===")
+    println("  baseline_ok     = " + bool_s(baseline_ok))
+    println("  s1_bidir flip   = " + bool_s(s1_bidir))
+    println("  s2_bidir flip   = " + bool_s(s2_bidir))
+    println("  revert_ok       = " + bool_s(revert_ok))
+    println("  f3_verdict      = " + f3_verdict)
+    println("")
+
+    println("=== F4 from substrate probe ===")
+    println("  pos_composite   = " + bool_s(pos_composite))
+    println("  neg_detects     = " + bool_s(neg_detects))
+    println("  f4_verdict      = " + f4_verdict)
+    println("")
+
+    // ─── composite verdict ────────────────────────────────────────────────
+    let f1_ok = f1_pass && f1_neg
+    let f2_ok = f2_pass && f2_neg
+    let f3_ok = baseline_ok && s1_bidir && s2_bidir && revert_ok
+    let f4_ok = f4_pass && pos_composite && neg_detects
+    let composite = f1_ok && f2_ok && f3_ok && f4_ok
+    let verdict = if composite { "HCI_SUBSTRATE_VERIFIED" } else { "HCI_SUBSTRATE_FAIL" }
+
+    println("=== composite chain (F1∧F2∧F3∧F4) ===")
+    println("  F1 ok = " + bool_s(f1_ok))
+    println("  F2 ok = " + bool_s(f2_ok))
+    println("  F3 ok = " + bool_s(f3_ok))
+    println("  F4 ok = " + bool_s(f4_ok))
+    println("  HCI substrate verdict = " + verdict)
+    println("")
+
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima/hci_substrate_smoke/1\",\n"
+    out = out + "  \"schema_version\": 1,\n"
+    out = out + "  \"verifier_type\": \"hci_substrate_smoke\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"source\": \"anima-hci-research/tool/hci_substrate_smoke.hexa\",\n"
+    out = out + "  \"inputs\": [\n"
+    out = out + "    \"" + FUNCTOR_PATH + "\",\n"
+    out = out + "    \"" + ADVERS_PATH + "\",\n"
+    out = out + "    \"" + SUBSTRATE_PATH + "\"\n"
+    out = out + "  ],\n"
+    out = out + "  \"f1_ok\": " + bool_s(f1_ok) + ",\n"
+    out = out + "  \"f2_ok\": " + bool_s(f2_ok) + ",\n"
+    out = out + "  \"f3_ok\": " + bool_s(f3_ok) + ",\n"
+    out = out + "  \"f4_ok\": " + bool_s(f4_ok) + ",\n"
+    out = out + "  \"f1_pass\": " + bool_s(f1_pass) + ",\n"
+    out = out + "  \"f2_pass\": " + bool_s(f2_pass) + ",\n"
+    out = out + "  \"f1_neg_detects\": " + bool_s(f1_neg) + ",\n"
+    out = out + "  \"f2_neg_detects\": " + bool_s(f2_neg) + ",\n"
+    out = out + "  \"baseline_both_closed\": " + bool_s(baseline_ok) + ",\n"
+    out = out + "  \"s1_bidirectional\": " + bool_s(s1_bidir) + ",\n"
+    out = out + "  \"s2_bidirectional\": " + bool_s(s2_bidir) + ",\n"
+    out = out + "  \"revert_ok\": " + bool_s(revert_ok) + ",\n"
+    out = out + "  \"f4_pass\": " + bool_s(f4_pass) + ",\n"
+    out = out + "  \"f4_pos_composite\": " + bool_s(pos_composite) + ",\n"
+    out = out + "  \"f4_neg_detects\": " + bool_s(neg_detects) + ",\n"
+    out = out + "  \"functor_verdict\": \"" + func_verdict + "\",\n"
+    out = out + "  \"f3_verdict\": \"" + f3_verdict + "\",\n"
+    out = out + "  \"f4_verdict\": \"" + f4_verdict + "\",\n"
+    out = out + "  \"hci_substrate_verdict\": \"" + verdict + "\"\n"
+    out = out + "}\n"
+    write_file(OUT_PATH, out)
+    println("  wrote: " + OUT_PATH)
+
+    if verdict == "HCI_SUBSTRATE_VERIFIED" { exit(0) }
+    exit(1)
+}
+
+main()

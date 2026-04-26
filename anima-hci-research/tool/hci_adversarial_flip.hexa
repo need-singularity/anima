@@ -1,0 +1,237 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-hci-research/tool/hci_adversarial_flip.hexa
+//
+//  PURPOSE  (HCI Path B — Q3 F3 양방향 adversarial robustness)
+//    Verify that adversarial perturbations (phantom 7th axis injection,
+//    leaky cross-axis morphism injection) cause SIMULTANEOUS verdict flip
+//    on BOTH the edu side AND the Hexad side.  This is the bidirectional
+//    falsification signal — if only one side flips, the bijection is not
+//    a faithful functor (it leaks structural information).
+//
+//  ATTACK MODELS
+//    S1 — phantom 7-axis G inserted on edu side
+//         Expected: edu non-emptiness invariant held BUT cardinality breaks
+//         from 6 to 7 → axis-count axiom violated.
+//         Hexad side counterpart: phantom_dir_injection (root entry)
+//         Expected: closure verdict flips CLOSED → LEAKY/INCOMPLETE.
+//         Bidirectional flip = F3 detection works.
+//
+//    S2 — leaky morphism inserted (edu A → Hexad "phantom" target)
+//         Expected: edu axis count unchanged, but the morphism set has
+//         a target outside the 6-cat → composition closure axiom violated.
+//         Hexad side counterpart: leaky_morphism in audit.
+//         Bidirectional flip = F3 detection works.
+//
+//  POSITIVE BASELINE
+//    Without injection: both sides VERIFIED, no flip.
+//
+//  RESULT
+//    Robust = (S1 detects on both sides) AND (S2 detects on both sides)
+//             AND (positive baseline holds without flip).
+//
+//  OUTPUT
+//    state/hci_adversarial_flip_v1.json
+//
+//  CONSTRAINTS
+//    raw#9 strict · pure hexa · deterministic · zero LLM
+// ════════════════════════════════════════════════════════════════════════════
+
+let M32 = 4294967296
+let POLY_PRIME = 2654435761
+let POLY_SEED = 1
+let MORPH_SALT = 7919
+
+let LABEL_TABLE = ["A", "B", "C", "D", "E", "F", "d", "s", "c", "m", "e", "w", "G", "phantom"]
+let LABEL_HASH  = [101, 211, 307, 401, 503, 601, 701, 809, 907, 1009, 1103, 1213, 1301, 1409]
+
+fn label_hash(name: string) -> int {
+    let mut i = 0
+    while i < len(LABEL_TABLE) {
+        if LABEL_TABLE[i] == name { return LABEL_HASH[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn poly_step(h: int, v: int) -> int {
+    let mut x = h * POLY_PRIME
+    x = x + v
+    x = x % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn morph_hash(src: string, tgt: string) -> int {
+    let h1 = poly_step(POLY_SEED, label_hash(src))
+    let h2 = poly_step(h1, label_hash(tgt))
+    return poly_step(h2, MORPH_SALT)
+}
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+fn now_stamp() -> string { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+
+fn str_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + xs[i] + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+
+// ─── side-aware closure check ───────────────────────────────────────────────
+//
+// We model both sides with a 6-axis whitelist + 6 morphism table.
+// "Closure" holds iff:
+//   (a) axes count == 6
+//   (b) all morphism src ∈ whitelist
+//   (c) all morphism tgt ∈ whitelist
+//
+// Adversarial injections perturb the lists; we recompute closure and
+// observe verdict flip.
+
+struct ClosureState {
+    n_axes:        int,
+    n_morphs:      int,
+    n_morph_src_ok: int,
+    n_morph_tgt_ok: int,
+    closed:         bool
+}
+
+fn compute_closure(axes: list, morph_src: list, morph_tgt: list) -> ClosureState {
+    let n_axes = len(axes)
+    let n_morphs = len(morph_src)
+    let mut n_src_ok = 0
+    let mut n_tgt_ok = 0
+    let mut i = 0
+    while i < n_morphs {
+        let mut found_src = false
+        let mut found_tgt = false
+        let mut j = 0
+        while j < n_axes {
+            if axes[j] == morph_src[i] { found_src = true }
+            if axes[j] == morph_tgt[i] { found_tgt = true }
+            j = j + 1
+        }
+        if found_src { n_src_ok = n_src_ok + 1 }
+        if found_tgt { n_tgt_ok = n_tgt_ok + 1 }
+        i = i + 1
+    }
+    let cardinality_ok = n_axes == 6
+    let composition_closed = (n_src_ok == n_morphs) && (n_tgt_ok == n_morphs)
+    let closed = cardinality_ok && composition_closed
+    return ClosureState {
+        n_axes: n_axes,
+        n_morphs: n_morphs,
+        n_morph_src_ok: n_src_ok,
+        n_morph_tgt_ok: n_tgt_ok,
+        closed: closed
+    }
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    println("[hci_adversarial_flip] HCI Path B Q3 — F3 bidirectional robustness")
+    println("  attack S1: phantom 7-axis G inserted")
+    println("  attack S2: leaky morphism injected (target outside 6-cat)")
+    println("")
+
+    // ─── baseline (no injection) ────────────────────────────────────────
+    let edu_axes_0 = ["A", "B", "C", "D", "E", "F"]
+    let hex_axes_0 = ["d", "s", "c", "m", "e", "w"]
+
+    // edu morphisms (mirror of Hexad bridges via C9 inverse-bijection)
+    let edu_src_0 = ["A", "F", "F", "D", "D", "B"]
+    let edu_tgt_0 = ["F", "C", "C", "C", "B", "B"]
+    let hex_src_0 = ["d", "w", "w", "m", "m", "s"]
+    let hex_tgt_0 = ["w", "c", "c", "c", "s", "s"]
+
+    let edu_baseline = compute_closure(edu_axes_0, edu_src_0, edu_tgt_0)
+    let hex_baseline = compute_closure(hex_axes_0, hex_src_0, hex_tgt_0)
+    let baseline_both_closed = edu_baseline.closed && hex_baseline.closed
+
+    println("=== baseline (no injection) ===")
+    println("  edu  closed = " + bool_s(edu_baseline.closed) + " (axes=" + str(edu_baseline.n_axes) + ", morphs=" + str(edu_baseline.n_morphs) + ")")
+    println("  hex  closed = " + bool_s(hex_baseline.closed) + " (axes=" + str(hex_baseline.n_axes) + ", morphs=" + str(hex_baseline.n_morphs) + ")")
+    println("  both_closed = " + bool_s(baseline_both_closed))
+    println("")
+
+    // ─── attack S1: phantom axis G + phantom Hexad cat "phantom" ────────
+    let edu_axes_s1 = ["A", "B", "C", "D", "E", "F", "G"]
+    let hex_axes_s1 = ["d", "s", "c", "m", "e", "w", "phantom"]
+    let edu_s1 = compute_closure(edu_axes_s1, edu_src_0, edu_tgt_0)
+    let hex_s1 = compute_closure(hex_axes_s1, hex_src_0, hex_tgt_0)
+    // Verdict flip: was CLOSED, now must NOT be CLOSED on cardinality grounds
+    let edu_s1_flipped = !edu_s1.closed
+    let hex_s1_flipped = !hex_s1.closed
+    let s1_bidirectional = edu_s1_flipped && hex_s1_flipped
+
+    println("=== attack S1: phantom axis ===")
+    println("  edu  closed = " + bool_s(edu_s1.closed) + " (flipped? = " + bool_s(edu_s1_flipped) + ")")
+    println("  hex  closed = " + bool_s(hex_s1.closed) + " (flipped? = " + bool_s(hex_s1_flipped) + ")")
+    println("  bidirectional flip = " + bool_s(s1_bidirectional))
+    println("")
+
+    // ─── attack S2: leaky morphism (target outside 6-cat) ───────────────
+    // edu: A → G (G not in axes whitelist)  ; hex: d → phantom
+    let edu_src_s2 = ["A", "F", "F", "D", "D", "B", "A"]
+    let edu_tgt_s2 = ["F", "C", "C", "C", "B", "B", "G"]
+    let hex_src_s2 = ["d", "w", "w", "m", "m", "s", "d"]
+    let hex_tgt_s2 = ["w", "c", "c", "c", "s", "s", "phantom"]
+
+    let edu_s2 = compute_closure(edu_axes_0, edu_src_s2, edu_tgt_s2)
+    let hex_s2 = compute_closure(hex_axes_0, hex_src_s2, hex_tgt_s2)
+    let edu_s2_flipped = !edu_s2.closed
+    let hex_s2_flipped = !hex_s2.closed
+    let s2_bidirectional = edu_s2_flipped && hex_s2_flipped
+
+    println("=== attack S2: leaky morphism ===")
+    println("  edu  closed = " + bool_s(edu_s2.closed) + " (flipped? = " + bool_s(edu_s2_flipped) + ")")
+    println("  hex  closed = " + bool_s(hex_s2.closed) + " (flipped? = " + bool_s(hex_s2_flipped) + ")")
+    println("  bidirectional flip = " + bool_s(s2_bidirectional))
+    println("")
+
+    // ─── revert check (baseline restored after S1, S2 removed) ──────────
+    let revert_state = compute_closure(edu_axes_0, edu_src_0, edu_tgt_0)
+    let revert_ok = revert_state.closed && (revert_state.n_axes == edu_baseline.n_axes)
+
+    println("=== revert (post-attack) ===")
+    println("  edu  closed = " + bool_s(revert_state.closed) + " (no residue? = " + bool_s(revert_ok) + ")")
+    println("")
+
+    let f3_robust = baseline_both_closed && s1_bidirectional && s2_bidirectional && revert_ok
+    let verdict = if f3_robust { "F3_ROBUST" } else { "F3_FAIL" }
+    println("=== verdict = " + verdict + " ===")
+
+    // ─── JSON emit ───────────────────────────────────────────────────────
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima/hci_adversarial_flip/1\",\n"
+    out = out + "  \"schema_version\": 1,\n"
+    out = out + "  \"verifier_type\": \"hci_adversarial_flip\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"source\": \"anima-hci-research/tool/hci_adversarial_flip.hexa\",\n"
+    out = out + "  \"baseline_both_closed\": " + bool_s(baseline_both_closed) + ",\n"
+    out = out + "  \"s1_phantom\": {\n"
+    out = out + "    \"edu_flipped\": " + bool_s(edu_s1_flipped) + ",\n"
+    out = out + "    \"hex_flipped\": " + bool_s(hex_s1_flipped) + ",\n"
+    out = out + "    \"bidirectional\": " + bool_s(s1_bidirectional) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"s2_leaky\": {\n"
+    out = out + "    \"edu_flipped\": " + bool_s(edu_s2_flipped) + ",\n"
+    out = out + "    \"hex_flipped\": " + bool_s(hex_s2_flipped) + ",\n"
+    out = out + "    \"bidirectional\": " + bool_s(s2_bidirectional) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"revert_ok\": " + bool_s(revert_ok) + ",\n"
+    out = out + "  \"f3_verdict\": \"" + verdict + "\"\n"
+    out = out + "}\n"
+    write_file("anima-hci-research/state/hci_adversarial_flip_v1.json", out)
+    println("  wrote: anima-hci-research/state/hci_adversarial_flip_v1.json")
+
+    if verdict == "F3_ROBUST" { exit(0) }
+    exit(1)
+}
+
+main()

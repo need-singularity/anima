@@ -1,0 +1,475 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/clm_eeg_p3_gcg_pre_register.hexa
+//
+//  PURPOSE
+//    Pre-register the falsifier for P3 GCG (Granger Causality Gate)
+//    (omega_cycle_alm_free_paradigms_20260426.md §4 P3).
+//
+//    HYPOTHESIS
+//      EEG P3b component (~300ms post-stimulus, parietal max) Granger-causes
+//      CLM hidden-state activity at layers 25-30, AND the causality is
+//      unidirectional (CLM→EEG direction is at most half as strong as
+//      EEG→CLM).  This rejects the "EEG and CLM are merely correlated by
+//      shared input" null hypothesis.
+//
+//    PRE-REGISTERED CRITERIA (frozen, this file IS the SSOT)
+//      C1.  GC F-stat (EEG→CLM at layer 25-30) ≥ 4.0  (×100 = 400)
+//      C2.  Unidirectional ratio: F(EEG→CLM) / F(CLM→EEG) ≥ 2.0  (×100 = 200)
+//      Verdict P3.PASS = (C1 AND C2)
+//
+//    ANY post-hoc threshold change ⇒ v2 bump (no silent edit).
+//
+//  DRY-RUN (synthetic fixture, hardware-free)
+//    Reads anima-clm-eeg/fixtures/synthetic_16ch_v1.json.  Computes a
+//    deterministic GC F-stat proxy via the residual-variance ratio of an
+//    AR(1) model:
+//
+//      F_proxy(X→Y) = (RSS_restricted - RSS_full) / (RSS_full / df)
+//
+//    where:
+//      * RSS_restricted = AR(1) of Y on Y_lag1 only      (no X term)
+//      * RSS_full       = AR(1) of Y on (Y_lag1, X_lag1) (X term included)
+//      * df             = n - 2 (degrees of freedom)
+//
+//    "X" = parietal channels' α-power (P3, P4, P7, P8) = EEG-side
+//    "Y" = a deterministic CLM-hidden-state proxy synthesized from frontal
+//          α-powers (Fp1, Fp2, F3, F4) — represents layer 25-30 in synth.
+//
+//    The proxy is integer-arithmetic only (no FFT, no real Welch).  Real
+//    Granger causality (statsmodels) replaces this in post-arrival D+5.
+//
+//  OUTPUT
+//    state/clm_eeg_p3_gcg_pre_register.json
+//
+//  ENV
+//    CLM_EEG_P3_OUT       output JSON path
+//    CLM_EEG_FIXTURE_PATH input fixture
+//
+//  USAGE
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run anima-clm-eeg/tool/clm_eeg_p3_gcg_pre_register.hexa
+//
+//  RAW
+//    raw#9 · hexa-only · deterministic · LLM=none · pre-register-frozen
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── frozen criteria (pre-registered, this file = SSOT) ─────────────────────
+let GC_F_MIN_X100         = 400   // C1: F-stat (EEG→CLM) ≥ 4.0
+let UNIDIR_RATIO_MIN_X100 = 200   // C2: F(EEG→CLM)/F(CLM→EEG) ≥ 2.0
+
+// ─── constants ──────────────────────────────────────────────────────────────
+let M32 = 4294967296
+let FNV_PRIME = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+// Parietal channel indices (P7=4, P8=5, O1=6, O2=7, P3=14, P4=15)
+// We use P7,P8,P3,P4 as the "EEG P3b parietal max" proxy.
+// Frontal channel indices (Fp1=0, Fp2=1, F3=10, F4=11) as "CLM layer 25-30".
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+// ─── string scan ────────────────────────────────────────────────────────────
+fn find_in_str(s: string, needle: string) -> int {
+    let n = len(s)
+    let m = len(needle)
+    if m <= 0 { return 0 }
+    if n < m { return -1 }
+    let mut i = 0
+    while i <= n - m {
+        let mut j = 0
+        let mut ok = 1
+        while j < m {
+            if s[i + j] != needle[j] {
+                ok = 0
+                j = m
+            }
+            j = j + 1
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_digit_ch(c: string) -> int {
+    if c == "0" { return 1 }
+    if c == "1" { return 1 }
+    if c == "2" { return 1 }
+    if c == "3" { return 1 }
+    if c == "4" { return 1 }
+    if c == "5" { return 1 }
+    if c == "6" { return 1 }
+    if c == "7" { return 1 }
+    if c == "8" { return 1 }
+    if c == "9" { return 1 }
+    return 0
+}
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+// Extract per-channel alpha (mirrors P2 logic; bounded by aggregate marker)
+fn extract_alpha_per_channel(s: string, alphas: list) -> int {
+    let n = len(s)
+    let agg_pos = find_in_str(s, "aggregate_band_powers")
+    let bound = if agg_pos < 0 { n } else { agg_pos }
+    let dq = "\""
+    let ca = "a"
+    let cl = "l"
+    let cp = "p"
+    let ch = "h"
+    let cc = ":"
+    let mut count = 0
+    let mut i = 0
+    while i + 8 <= bound {
+        let c0 = s[i]
+        if c0 == dq {
+            let c1 = s[i + 1]
+            let c2 = s[i + 2]
+            let c3 = s[i + 3]
+            let c4 = s[i + 4]
+            let c5 = s[i + 5]
+            let c6 = s[i + 6]
+            let c7 = s[i + 7]
+            if c1 == ca && c2 == cl && c3 == cp && c4 == ch && c5 == ca && c6 == dq && c7 == cc {
+                let mut p = i + 8
+                while p < bound {
+                    let cs = s[p]
+                    if is_digit_ch(cs) == 1 {
+                        let mut v = 0
+                        while p < bound {
+                            let cd = s[p]
+                            if is_digit_ch(cd) == 1 {
+                                v = v * 10 + digit_val(cd)
+                                p = p + 1
+                            } else {
+                                p = bound + 1
+                            }
+                        }
+                        alphas.push(v)
+                        count = count + 1
+                        i = i + 8
+                        p = bound + 1
+                    } else {
+                        p = p + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ─── synthesize 16-sample series from per-channel α subset (deterministic) ──
+//   We treat the channel-subset α-powers as the seed of a 16-sample mini
+//   time-series.  For richer AR dynamics we generate samples by repeated
+//   rotation through the subset (length 4 → length 16).  Deterministic.
+fn build_series(idxs: list, n_idx: int, alphas: list, out: list) -> int {
+    let target_len = 16
+    let mut k = 0
+    while k < target_len {
+        let pick = idxs[k % n_idx]
+        out.push(alphas[pick])
+        k = k + 1
+    }
+    return target_len
+}
+
+// ─── synthesize CLM-side series with explicit lag-1 dependence on EEG ───────
+//   Hypothesis claim under test: EEG → CLM with lag-1.  To make the
+//   synthetic dry-run testable, the CLM series is constructed as a noisy
+//   lag-1 echo of the EEG series (alpha-mixed CLM intrinsic + 60% EEG_lag1).
+//   This is the FALSIFIABLE direction encoded into the synthesis: a real
+//   measurement that fails to show this relation despite frozen thresholds
+//   would falsify the post-arrival hypothesis.
+fn build_clm_lagged(eeg_series: list, clm_intrinsic: list, n: int, out: list) -> int {
+    // out[0] = clm_intrinsic[0]
+    out.push(clm_intrinsic[0])
+    let mut t = 1
+    while t < n {
+        // 40% intrinsic + 60% EEG_lag1, integer fp
+        let v = (clm_intrinsic[t] * 400 + eeg_series[t - 1] * 600) / 1000
+        out.push(v)
+        t = t + 1
+    }
+    return n
+}
+
+// ─── AR(1) residual sum-of-squares (RSS) ────────────────────────────────────
+//   Restricted: y_t = β · y_{t-1}  →  β = Σ y_t·y_{t-1} / Σ y_{t-1}²
+//   Returns RSS_x1000 (×1000 scale).  All ints.
+fn rss_restricted_x1000(y: list, n: int) -> int {
+    if n < 2 { return 0 }
+    let mut num = 0
+    let mut den = 0
+    let mut t = 1
+    while t < n {
+        num = num + y[t] * y[t - 1]
+        den = den + y[t - 1] * y[t - 1]
+        t = t + 1
+    }
+    if den <= 0 { return 0 }
+    // β_x1000 = (num × 1000) / den
+    let beta_x1000 = (num * 1000) / den
+    let mut rss = 0
+    let mut t2 = 1
+    while t2 < n {
+        let pred = (beta_x1000 * y[t2 - 1]) / 1000
+        let r = y[t2] - pred
+        rss = rss + r * r
+        t2 = t2 + 1
+    }
+    return rss
+}
+
+// ─── AR(1) full RSS with exogenous regressor x_lag1 ─────────────────────────
+//   y_t = β1 · y_{t-1} + β2 · x_{t-1}
+//   Closed form for 2-regressor LS using normal equations (integer fp).
+//     [a b][β1]   [p]
+//     [b c][β2] = [q]
+//   a = Σ y_lag · y_lag
+//   b = Σ y_lag · x_lag
+//   c = Σ x_lag · x_lag
+//   p = Σ y_t · y_lag
+//   q = Σ y_t · x_lag
+//   det = a·c − b·b
+//   β1 = (c·p − b·q) / det
+//   β2 = (a·q − b·p) / det
+fn rss_full_x1000(y: list, x: list, n: int) -> int {
+    if n < 2 { return 0 }
+    let mut a = 0
+    let mut b = 0
+    let mut c = 0
+    let mut p = 0
+    let mut q = 0
+    let mut t = 1
+    while t < n {
+        let yl = y[t - 1]
+        let xl = x[t - 1]
+        let yt = y[t]
+        a = a + yl * yl
+        b = b + yl * xl
+        c = c + xl * xl
+        p = p + yt * yl
+        q = q + yt * xl
+        t = t + 1
+    }
+    let det = a * c - b * b
+    if det <= 0 { return rss_restricted_x1000(y, n) }
+    // β scaled by 1000 to keep integer fp
+    let beta1_x1000 = ((c * p - b * q) * 1000) / det
+    let beta2_x1000 = ((a * q - b * p) * 1000) / det
+    let mut rss = 0
+    let mut t2 = 1
+    while t2 < n {
+        let pred = (beta1_x1000 * y[t2 - 1] + beta2_x1000 * x[t2 - 1]) / 1000
+        let r = y[t2] - pred
+        rss = rss + r * r
+        t2 = t2 + 1
+    }
+    return rss
+}
+
+// ─── F-stat proxy (×100) ────────────────────────────────────────────────────
+//   F = ((RSS_r - RSS_f) / m) / (RSS_f / (n - k - 1))
+//   Here: m = 1 (one extra regressor), k = 2 (intercept-less 2-regressor),
+//   df = n - 2.  Returns F × 100.
+fn f_stat_x100(rss_r: int, rss_f: int, n: int) -> int {
+    if rss_f <= 0 { return 0 }
+    let df = n - 2
+    if df <= 0 { return 0 }
+    let diff = rss_r - rss_f
+    if diff <= 0 { return 0 }
+    // F = diff / (rss_f / df)  =  diff × df / rss_f
+    let f_x100 = (diff * df * 100) / rss_f
+    if f_x100 < 0 { return 0 }
+    return f_x100
+}
+
+// ─── fingerprint (FNV-style) ────────────────────────────────────────────────
+fn fnv_step(h: int, byte: int) -> int {
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fingerprint_step(fp: int, val: int) -> int {
+    let mut h = fp
+    h = fnv_step(h, val % 256)
+    h = fnv_step(h, (val / 256) % 256)
+    h = fnv_step(h, (val / 65536) % 256)
+    h = fnv_step(h, (val / 16777216) % 256)
+    return h
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    let fixture_path = env_str("CLM_EEG_FIXTURE_PATH",
+                               "anima-clm-eeg/fixtures/synthetic_16ch_v1.json")
+    let out_path = env_str("CLM_EEG_P3_OUT",
+                           "state/clm_eeg_p3_gcg_pre_register.json")
+
+    let fixture = read_file(fixture_path)
+    let fixture_len = len(fixture)
+
+    // ── extract per-channel α powers ──────────────────────────────────────
+    let mut alphas = []
+    let n_alpha = extract_alpha_per_channel(fixture, alphas)
+
+    // Need 16 channels for the index map (fail gracefully otherwise)
+    if n_alpha < 16 {
+        println("ERROR: expected 16 channels, got " + str(n_alpha))
+        exit(1)
+    }
+
+    // EEG-side parietal: P7=4, P8=5, P3=14, P4=15
+    let mut eeg_idx = []
+    eeg_idx.push(4)
+    eeg_idx.push(5)
+    eeg_idx.push(14)
+    eeg_idx.push(15)
+    // CLM-side frontal: Fp1=0, Fp2=1, F3=10, F4=11
+    let mut clm_idx = []
+    clm_idx.push(0)
+    clm_idx.push(1)
+    clm_idx.push(10)
+    clm_idx.push(11)
+
+    let mut eeg_series = []
+    let n_eeg = build_series(eeg_idx, 4, alphas, eeg_series)
+    let mut clm_intrinsic = []
+    let n_clm_intr = build_series(clm_idx, 4, alphas, clm_intrinsic)
+    // CLM observed = lag-1 echo of EEG mixed with 40% CLM intrinsic
+    // (encodes the falsifiable EEG→CLM directional dependence into synth)
+    let mut clm_series = []
+    let n_clm = build_clm_lagged(eeg_series, clm_intrinsic, n_eeg, clm_series)
+
+    // EEG → CLM:  y = clm_series, x = eeg_series
+    let rss_r_eeg2clm = rss_restricted_x1000(clm_series, n_clm)
+    let rss_f_eeg2clm = rss_full_x1000(clm_series, eeg_series, n_clm)
+    let f_eeg2clm_x100 = f_stat_x100(rss_r_eeg2clm, rss_f_eeg2clm, n_clm)
+
+    // CLM → EEG:  y = eeg_series, x = clm_series
+    let rss_r_clm2eeg = rss_restricted_x1000(eeg_series, n_eeg)
+    let rss_f_clm2eeg = rss_full_x1000(eeg_series, clm_series, n_eeg)
+    let f_clm2eeg_x100 = f_stat_x100(rss_r_clm2eeg, rss_f_clm2eeg, n_eeg)
+
+    // unidirectional ratio = F(EEG→CLM) / F(CLM→EEG), ×100 scale
+    //   (F values already ×100; ratio = F1×100/F2 ; we want × 100 of true ratio
+    //    so ratio_x100 = (F1_x100 × 100) / F2_x100  if F2_x100 > 0)
+    let ratio_x100 = if f_clm2eeg_x100 > 0 {
+        (f_eeg2clm_x100 * 100) / f_clm2eeg_x100
+    } else {
+        // CLM→EEG = 0 ⇒ infinite unidirectional, treat as 100000 (cap)
+        100000
+    }
+
+    // fingerprint
+    let mut fp = FNV_OFFSET_BASIS
+    let mut k = 0
+    while k < n_eeg {
+        fp = fingerprint_step(fp, eeg_series[k])
+        fp = fingerprint_step(fp, clm_series[k])
+        k = k + 1
+    }
+    fp = fingerprint_step(fp, f_eeg2clm_x100)
+    fp = fingerprint_step(fp, f_clm2eeg_x100)
+    fp = fingerprint_step(fp, ratio_x100)
+
+    // ── apply frozen criteria ──────────────────────────────────────────────
+    let c1_pass = if f_eeg2clm_x100 >= GC_F_MIN_X100 { 1 } else { 0 }
+    let c2_pass = if ratio_x100 >= UNIDIR_RATIO_MIN_X100 { 1 } else { 0 }
+    let p3_pass = if c1_pass == 1 && c2_pass == 1 { 1 } else { 0 }
+
+    // ── emit cert ──────────────────────────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"clm_eeg_p3_gcg_pre_register\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"pre_register_frozen\": true,\n"
+    cert = cert + "  \"frozen_at\": \"2026-04-26\",\n"
+    cert = cert + "  \"hypothesis\": \"EEG P3b parietal Granger-causes CLM layer 25-30; unidirectional (EEG→CLM ≥ 2× CLM→EEG)\",\n"
+    cert = cert + "  \"criteria\": {\n"
+    cert = cert + "    \"C1_gc_f_min_x100\": " + str(GC_F_MIN_X100) + ",\n"
+    cert = cert + "    \"C2_unidir_ratio_min_x100\": " + str(UNIDIR_RATIO_MIN_X100) + ",\n"
+    cert = cert + "    \"verdict_rule\": \"P3.PASS = (F(EEG→CLM) >= C1) AND (ratio >= C2)\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"dry_run\": {\n"
+    cert = cert + "    \"fixture_path\": \"" + fixture_path + "\",\n"
+    cert = cert + "    \"fixture_bytes\": " + str(fixture_len) + ",\n"
+    cert = cert + "    \"n_channels_extracted\": " + str(n_alpha) + ",\n"
+    cert = cert + "    \"eeg_channels\": [\"P7\",\"P8\",\"P3\",\"P4\"],\n"
+    cert = cert + "    \"clm_channels\": [\"Fp1\",\"Fp2\",\"F3\",\"F4\"],\n"
+    cert = cert + "    \"series_length\": " + str(n_eeg) + ",\n"
+    cert = cert + "    \"rss_restricted_eeg2clm\": " + str(rss_r_eeg2clm) + ",\n"
+    cert = cert + "    \"rss_full_eeg2clm\": " + str(rss_f_eeg2clm) + ",\n"
+    cert = cert + "    \"rss_restricted_clm2eeg\": " + str(rss_r_clm2eeg) + ",\n"
+    cert = cert + "    \"rss_full_clm2eeg\": " + str(rss_f_clm2eeg) + ",\n"
+    cert = cert + "    \"f_eeg_to_clm_x100\": " + str(f_eeg2clm_x100) + ",\n"
+    cert = cert + "    \"f_clm_to_eeg_x100\": " + str(f_clm2eeg_x100) + ",\n"
+    cert = cert + "    \"unidir_ratio_x100\": " + str(ratio_x100) + ",\n"
+    cert = cert + "    \"fingerprint\": " + str(fp) + ",\n"
+    cert = cert + "    \"C1_pass\": " + str(c1_pass) + ",\n"
+    cert = cert + "    \"C2_pass\": " + str(c2_pass) + ",\n"
+    cert = cert + "    \"p3_dry_run_pass\": " + str(p3_pass) + ",\n"
+    cert = cert + "    \"classification\": \"NOT_VERIFIED_SYNTHETIC\",\n"
+    cert = cert + "    \"note\": \"AR(1) RSS-ratio F-stat proxy. Real Granger causality (statsmodels grangercausalitytests with VAR pre-whitening) replaces in D+5.\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"post_arrival_workflow\": {\n"
+    cert = cert + "    \"day\": \"D+5\",\n"
+    cert = cert + "    \"input\": \"anima-eeg P3b ERP epochs (parietal, 250-450ms post-stim) + CLM hidden-state trace layers 25-30\",\n"
+    cert = cert + "    \"clm_substrate\": \"edu/cell/lagrangian/l_ix_integrator.hexa V_sync hidden trace at layer-equivalent depth\",\n"
+    cert = cert + "    \"replace\": \"this AR(1) proxy with VAR(p)+grangercausalitytests; pick p via BIC; bootstrap CI 1000 reps\",\n"
+    cert = cert + "    \"verdict_rule\": \"identical (frozen criteria above)\"\n"
+    cert = cert + "  }\n"
+    cert = cert + "}\n"
+    write_file(out_path, cert)
+
+    println("─── clm_eeg_p3_gcg_pre_register (raw#9 hexa-only) ───")
+    println("  C1 gc_f_min_x100         = " + str(GC_F_MIN_X100))
+    println("  C2 unidir_ratio_min_x100 = " + str(UNIDIR_RATIO_MIN_X100))
+    println("  fixture                  = " + fixture_path)
+    println("  n_channels_extracted     = " + str(n_alpha))
+    println("  series_length            = " + str(n_eeg))
+    println("  rss_r_eeg2clm            = " + str(rss_r_eeg2clm))
+    println("  rss_f_eeg2clm            = " + str(rss_f_eeg2clm))
+    println("  f_eeg_to_clm_x100        = " + str(f_eeg2clm_x100))
+    println("  f_clm_to_eeg_x100        = " + str(f_clm2eeg_x100))
+    println("  unidir_ratio_x100        = " + str(ratio_x100))
+    println("  fingerprint              = " + str(fp))
+    println("  C1_pass                  = " + str(c1_pass))
+    println("  C2_pass                  = " + str(c2_pass))
+    println("  p3_dry_run_pass          = " + str(p3_pass))
+    println("  classification           = NOT_VERIFIED_SYNTHETIC")
+    println("  output                   = " + out_path)
+
+    if p3_pass == 1 {
+        println("  verdict                  = P3_DRY_RUN_PASS")
+        exit(0)
+    }
+    println("  verdict                  = P3_DRY_RUN_FAIL")
+    exit(1)
+}
+
+main()

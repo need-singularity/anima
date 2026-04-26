@@ -1,0 +1,789 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-cpgd-research/tool/cpgd_condition_sweep.hexa
+//  Path C (Q4 generalization) — G4 boundary: condition-number sweep
+//
+//  PURPOSE
+//    Sweep cond_proxy ∈ {1, 10, 100, 1000} 4-level. For each level run CPGD
+//    closed-form init + 100-step monotone descent. Verify G4 (cond-conditioned
+//    monotone) frontier — at which condition number does CPGD G2 break?
+//
+//  FROZEN GATES (from README.md — DO NOT relax)
+//    G1: closed-form init residual ≤ EPS_PROJ_LEVEL (cond-scaled, see below)
+//    G2: 100-step monotone descent — total_violations (cos < 0.5) == 0
+//    G3: 2 sequential runs sha256(payload) byte-identical
+//    G4: cond-conditioned monotone — pass at cond ∈ {1, 10, 100}, honest verdict
+//        at cond=1000
+//
+//  CONDITION-LEVEL CONSTRUCTION
+//    Level 1 (cond≈1)    : near-orthonormal FNV basis (random R^DIM, K<DIM)
+//    Level 2 (cond≈10)   : FNV basis multiplied by row-scale [1,2,4,8]
+//    Level 3 (cond≈100)  : FNV + heavy off-diagonal correlation (mix v_0 into v_1..v_K)
+//    Level 4 (cond≈1000) : Level 3 + tighter mixing coefficient (boundary)
+//
+//  PASS criteria
+//    cond=1, 10, 100 — must PASS G1+G2+G3
+//    cond=1000 — honest verdict (PASS or FAIL with explanation)
+//    Result documents G4 boundary.
+//
+//  OUTPUT: anima-cpgd-research/state/cpgd_condition_sweep_v1.json
+//  raw#9 strict · hexa-only · deterministic · LLM=none · CPU-only · $0
+// ════════════════════════════════════════════════════════════════════════════
+
+let OUT_PATH       = "anima-cpgd-research/state/cpgd_condition_sweep_v1.json"
+let DIM            = 8
+let TPL_COUNT      = 4
+let STEP_COUNT     = 100
+let DEFAULT_LR     = 0.001
+let GRAD_SEED      = 20260426
+let INIT_SEED      = 20260426
+let GRAD_SCALE     = 1.0
+let COS_FLOOR      = 0.5
+let EPS_IDEM       = 0.00001
+let EPS_PROJ       = 0.0001
+
+let FNV_OFFSET = 2166136261
+let FNV_PRIME  = 16777619
+let FNV_MOD    = 4294967296
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let n = _str(env("NEXUS"))
+    if n != "" { return n }
+    let gt = _str(exec("git rev-parse --show-toplevel")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut j = 0
+    while j < 40 {
+        y = 0.5 * (y + x / y)
+        j = j + 1
+    }
+    return y
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_dot(a: array, b: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let n = len(a)
+    while i < n {
+        s = s + to_float(a[i]) * to_float(b[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(a: array) -> float {
+    return sqrt_newton(vec_dot(a, a))
+}
+
+fn vec_scale(a: array, s: float) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = push(out, to_float(a[i]) * s)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_sub(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = push(out, to_float(a[i]) - to_float(b[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_add(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = push(out, to_float(a[i]) + to_float(b[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// ─── FNV-1a ────────────────────────────────────────────────────────────────
+
+fn fnv_step(h: int, b: int) -> int {
+    let mixed = (h + b) % FNV_MOD
+    return (mixed * FNV_PRIME) % FNV_MOD
+}
+
+fn fnv_seed_to_floats(seed: int, count: int) -> array {
+    let mut h = (FNV_OFFSET + seed) % FNV_MOD
+    let mut out = []
+    let mut i = 0
+    while i < count {
+        let b1 = (i * 31 + 7) % 256
+        let b2 = (i * 17 + 11) % 256
+        let b3 = (i * 53 + 23) % 256
+        let b4 = (i * 89 + 41) % 256
+        h = fnv_step(h, b1)
+        h = fnv_step(h, b2)
+        h = fnv_step(h, b3)
+        h = fnv_step(h, b4)
+        let frac = to_float(h % 1000000) / 1000000.0
+        let val  = 2.0 * frac - 1.0
+        out = push(out, val)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── condition-level basis builders ────────────────────────────────────────
+
+fn build_basis_level1() -> array {
+    // cond≈1 — pure FNV random rows, K=4 in DIM=8 (effectively well-conditioned)
+    let mut V = []
+    let mut i = 0
+    while i < TPL_COUNT {
+        let seed = 20260426 + i * 1000003
+        let row = fnv_seed_to_floats(seed, DIM)
+        V = push(V, row)
+        i = i + 1
+    }
+    return V
+}
+
+fn build_basis_level2() -> array {
+    // cond≈10 — FNV basis row-scaled by [1, 2, 4, 8]
+    let V0 = build_basis_level1()
+    let mut V = []
+    let mut i = 0
+    while i < TPL_COUNT {
+        let s = if i == 0 { 1.0 } else if i == 1 { 2.0 } else if i == 2 { 4.0 } else { 8.0 }
+        V = push(V, vec_scale(V0[i], s))
+        i = i + 1
+    }
+    return V
+}
+
+fn build_basis_level3() -> array {
+    // cond≈100 — FNV + off-diagonal correlation (mix v_0 into others, alpha=0.95)
+    let V0 = build_basis_level1()
+    let alpha = 0.95
+    let mut V = []
+    V = push(V, V0[0])
+    let mut i = 1
+    while i < TPL_COUNT {
+        let mixed = vec_add(vec_scale(V0[0], alpha), vec_scale(V0[i], 1.0 - alpha))
+        V = push(V, mixed)
+        i = i + 1
+    }
+    return V
+}
+
+fn build_basis_level4() -> array {
+    // cond≈1000 — Level 3 with tighter mixing alpha=0.995 (boundary)
+    let V0 = build_basis_level1()
+    let alpha = 0.995
+    let mut V = []
+    V = push(V, V0[0])
+    let mut i = 1
+    while i < TPL_COUNT {
+        let mixed = vec_add(vec_scale(V0[0], alpha), vec_scale(V0[i], 1.0 - alpha))
+        V = push(V, mixed)
+        i = i + 1
+    }
+    return V
+}
+
+fn build_basis_for_level(level: int) -> array {
+    if level == 1 { return build_basis_level1() }
+    if level == 2 { return build_basis_level2() }
+    if level == 3 { return build_basis_level3() }
+    return build_basis_level4()
+}
+
+// ─── Gram-Schmidt ──────────────────────────────────────────────────────────
+
+fn gram_schmidt(V_raw: array) -> array {
+    let n = len(V_raw)
+    let mut Q = []
+    let mut i = 0
+    while i < n {
+        let v = V_raw[i]
+        let mut u = []
+        let mut k = 0
+        while k < DIM {
+            u = push(u, to_float(v[k]))
+            k = k + 1
+        }
+        let mut j = 0
+        while j < len(Q) {
+            let qj = Q[j]
+            let proj_coef = vec_dot(u, qj)
+            let proj_vec  = vec_scale(qj, proj_coef)
+            u = vec_sub(u, proj_vec)
+            j = j + 1
+        }
+        let nrm = vec_norm(u)
+        if nrm < 0.000001 {
+            let mut z = []
+            let mut zk = 0
+            while zk < DIM {
+                z = push(z, 0.0)
+                zk = zk + 1
+            }
+            Q = push(Q, z)
+        } else {
+            let u_norm = vec_scale(u, 1.0 / nrm)
+            Q = push(Q, u_norm)
+        }
+        i = i + 1
+    }
+    return Q
+}
+
+fn detect_rank_deficient(Q: array) -> bool {
+    let n = len(Q)
+    let mut i = 0
+    while i < n {
+        if vec_norm(Q[i]) < 0.000001 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn estimate_condition_proxy(V_raw: array) -> float {
+    let n = len(V_raw)
+    let mut max_norm = 0.0
+    let mut min_norm = 1.0e30
+    let mut i = 0
+    while i < n {
+        let nrm = vec_norm(V_raw[i])
+        if nrm > max_norm { max_norm = nrm }
+        if nrm < min_norm && nrm > 0.0 { min_norm = nrm }
+        i = i + 1
+    }
+    if min_norm <= 0.0 || min_norm > 1.0e29 { return 1.0e30 }
+    let mut max_offdiag = 0.0
+    let mut a = 0
+    while a < n {
+        let mut b = 0
+        while b < n {
+            if a != b {
+                let ip = fabs(vec_dot(V_raw[a], V_raw[b]))
+                let scale = vec_norm(V_raw[a]) * vec_norm(V_raw[b])
+                let normed = if scale > 0.0 { ip / scale } else { 0.0 }
+                if normed > max_offdiag { max_offdiag = normed }
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    let ratio = max_norm / min_norm
+    let offdiag_factor = if max_offdiag < 0.999 { 1.0 / (1.0 - max_offdiag) } else { 1000.0 }
+    return ratio * offdiag_factor
+}
+
+// ─── linear algebra ────────────────────────────────────────────────────────
+
+fn build_projector(eigenvecs: array) -> array {
+    let n = len(eigenvecs)
+    let mut P = []
+    let mut a = 0
+    while a < DIM {
+        let mut row = []
+        let mut b = 0
+        while b < DIM {
+            let mut s = 0.0
+            let mut k = 0
+            while k < n {
+                let v = eigenvecs[k]
+                s = s + to_float(v[a]) * to_float(v[b])
+                k = k + 1
+            }
+            row = push(row, s)
+            b = b + 1
+        }
+        P = push(P, row)
+        a = a + 1
+    }
+    return P
+}
+
+fn verify_projector_idempotent(P: array) -> bool {
+    let mut max_delta = 0.0
+    let mut a = 0
+    while a < DIM {
+        let mut b = 0
+        while b < DIM {
+            let mut s = 0.0
+            let mut k = 0
+            while k < DIM {
+                s = s + to_float(P[a][k]) * to_float(P[k][b])
+                k = k + 1
+            }
+            let d = fabs(s - to_float(P[a][b]))
+            if d > max_delta { max_delta = d }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return max_delta < EPS_IDEM
+}
+
+// ─── deterministic RNG ─────────────────────────────────────────────────────
+
+fn lcg_next(state_arr: array) -> float {
+    let mut s = to_int(state_arr[0])
+    s = (s * 1103515245 + 12345) % 2147483648
+    state_arr[0] = s
+    return to_float(s % 1000000) / 1000000.0
+}
+
+fn randn_pair(state_arr: array) -> array {
+    let u1_raw = lcg_next(state_arr)
+    let u1 = if u1_raw < 0.000001 { 0.000001 } else { u1_raw }
+    let u2 = lcg_next(state_arr)
+    let r = sqrt_newton(0.0 - 2.0 * log(u1))
+    let theta = 2.0 * 3.141592653589793 * u2
+    let z1 = r * cos(theta)
+    let z2 = r * sin(theta)
+    return [z1, z2]
+}
+
+fn rand_matrix(rows: int, cols: int, state_arr: array) -> array {
+    let mut M = []
+    let mut i = 0
+    while i < rows {
+        let mut row = []
+        let mut j = 0
+        while j < cols {
+            let pair = randn_pair(state_arr)
+            row = push(row, to_float(pair[0]) * GRAD_SCALE)
+            j = j + 1
+            if j < cols {
+                row = push(row, to_float(pair[1]) * GRAD_SCALE)
+                j = j + 1
+            }
+        }
+        M = push(M, row)
+        i = i + 1
+    }
+    return M
+}
+
+fn matmul_right(G: array, P: array) -> array {
+    let rows = len(G)
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        let g = G[i]
+        let mut new_row = []
+        let mut b = 0
+        while b < DIM {
+            let mut s = 0.0
+            let mut a = 0
+            while a < DIM {
+                s = s + to_float(g[a]) * to_float(P[a][b])
+                a = a + 1
+            }
+            new_row = push(new_row, s)
+            b = b + 1
+        }
+        out = push(out, new_row)
+        i = i + 1
+    }
+    return out
+}
+
+fn gradient_step(W: array, grad_raw: array, P_S: array, lr: float) -> array {
+    let grad_proj = matmul_right(grad_raw, P_S)
+    let rows = len(W)
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        let w = W[i]
+        let g = grad_proj[i]
+        let mut new_row = []
+        let mut j = 0
+        while j < DIM {
+            new_row = push(new_row, to_float(w[j]) - lr * to_float(g[j]))
+            j = j + 1
+        }
+        out = push(out, new_row)
+        i = i + 1
+    }
+    return out
+}
+
+fn row_cosines(W: array, eigenvecs: array) -> array {
+    let n = len(W)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let w = W[i]
+        let v = eigenvecs[i]
+        let nw = vec_norm(w)
+        let nv = vec_norm(v)
+        let denom = nw * nv
+        let c = if denom > 0.0 { vec_dot(w, v) / denom } else { 0.0 }
+        out = push(out, c)
+        i = i + 1
+    }
+    return out
+}
+
+fn projection_residual(W: array, P_S: array) -> float {
+    let n = len(W)
+    let mut max_res = 0.0
+    let mut i = 0
+    while i < n {
+        let w = W[i]
+        let mut pw = []
+        let mut a = 0
+        while a < DIM {
+            let mut s = 0.0
+            let mut b = 0
+            while b < DIM {
+                s = s + to_float(P_S[a][b]) * to_float(w[b])
+                b = b + 1
+            }
+            pw = push(pw, s)
+            a = a + 1
+        }
+        let mut diff_norm_sq = 0.0
+        let mut k = 0
+        while k < DIM {
+            let d = to_float(w[k]) - to_float(pw[k])
+            diff_norm_sq = diff_norm_sq + d * d
+            k = k + 1
+        }
+        let res = sqrt_newton(diff_norm_sq)
+        if res > max_res { max_res = res }
+        i = i + 1
+    }
+    return max_res
+}
+
+// ─── orchestration: per-level run ─────────────────────────────────────────
+
+// Returns:
+//  [global_min, max_drift, total_violations, init_residual, cond_proxy,
+//   idem_ok, init_cos_ok, rank_def, all_above]
+fn dry_run_level(V_raw: array, lr: float) -> array {
+    let cond_proxy = estimate_condition_proxy(V_raw)
+    let V_orth = gram_schmidt(V_raw)
+    let rank_def = detect_rank_deficient(V_orth)
+
+    if rank_def {
+        return [0.0, 1.0, STEP_COUNT * TPL_COUNT, 1.0e30, cond_proxy,
+                false, false, true, false]
+    }
+
+    let P_S = build_projector(V_orth)
+    let idem_ok = verify_projector_idempotent(P_S)
+
+    let mut W = []
+    let mut r = 0
+    while r < TPL_COUNT {
+        let v = V_orth[r]
+        let mut row = []
+        let mut jj = 0
+        while jj < DIM {
+            row = push(row, to_float(v[jj]))
+            jj = jj + 1
+        }
+        W = push(W, row)
+        r = r + 1
+    }
+
+    let init_residual = projection_residual(W, P_S)
+    let c_init = row_cosines(W, V_orth)
+    let mut init_cos_ok = true
+    let mut ii = 0
+    while ii < TPL_COUNT {
+        let ci = to_float(c_init[ii])
+        if fabs(ci - 1.0) > 1e-6 { init_cos_ok = false }
+        ii = ii + 1
+    }
+
+    let state_arr = [GRAD_SEED]
+    let mut max_drift = 0.0
+    let mut all_above = true
+    let mut total_violations = 0
+    let mut global_min = 1.0
+    let mut step = 0
+    while step < STEP_COUNT {
+        let grad = rand_matrix(TPL_COUNT, DIM, state_arr)
+        W = gradient_step(W, grad, P_S, lr)
+        let cs = row_cosines(W, V_orth)
+        let mut i = 0
+        while i < TPL_COUNT {
+            let c = to_float(cs[i])
+            if c < global_min { global_min = c }
+            let drift = fabs(1.0 - c)
+            if drift > max_drift { max_drift = drift }
+            if c < COS_FLOOR {
+                all_above = false
+                total_violations = total_violations + 1
+            }
+            i = i + 1
+        }
+        step = step + 1
+    }
+
+    return [global_min, max_drift, total_violations, init_residual, cond_proxy,
+            idem_ok, init_cos_ok, false, all_above]
+}
+
+// ─── canonical payload ────────────────────────────────────────────────────
+
+fn level_canon(level: int, r: array) -> string {
+    let global_min   = to_float(r[0])
+    let max_drift    = to_float(r[1])
+    let total_viol   = to_int(r[2])
+    let init_res     = to_float(r[3])
+    let cond_proxy   = to_float(r[4])
+    let idem_ok      = to_bool(r[5])
+    let init_cos_ok  = to_bool(r[6])
+    let rank_def     = to_bool(r[7])
+    let all_above    = to_bool(r[8])
+    let mut s = "level=" + to_string(level) + "|"
+    s = s + "cond=" + to_string(cond_proxy) + "|"
+    s = s + "init_res=" + to_string(init_res) + "|"
+    s = s + "idem=" + (if idem_ok { "true" } else { "false" }) + "|"
+    s = s + "init_cos_ok=" + (if init_cos_ok { "true" } else { "false" }) + "|"
+    s = s + "rank_def=" + (if rank_def { "true" } else { "false" }) + "|"
+    s = s + "all_above=" + (if all_above { "true" } else { "false" }) + "|"
+    s = s + "total_viol=" + to_string(total_viol) + "|"
+    s = s + "gmin=" + to_string(global_min) + "|"
+    s = s + "max_drift=" + to_string(max_drift)
+    return s
+}
+
+fn sha256_of_string(s: string) -> string {
+    let tmp = "/tmp/cpgd_cond_sha_" + to_string(len(s)) + ".txt"
+    write_file(tmp, s)
+    let r = _str(exec("shasum -a 256 " + tmp + " | awk '{print $1}'")).trim()
+    let _ = exec("rm -f " + tmp)
+    return r
+}
+
+// ─── verdict per level ────────────────────────────────────────────────────
+
+fn level_verdict(r: array, level: int) -> string {
+    let total_viol   = to_int(r[2])
+    let init_res     = to_float(r[3])
+    let init_cos_ok  = to_bool(r[6])
+    let rank_def     = to_bool(r[7])
+    let all_above    = to_bool(r[8])
+    if rank_def { return "RANK_DEFICIENT" }
+    let g1 = (init_res < EPS_PROJ) && init_cos_ok
+    let g2 = all_above && (total_viol == 0)
+    if g1 && g2 { return "PASS" }
+    if g2 && !g1 { return "G1_FAIL" }
+    if g1 && !g2 { return "G2_FAIL" }
+    return "FAIL"
+}
+
+// ─── 2-run determinism aggregation ────────────────────────────────────────
+
+fn run_all_levels() -> array {
+    let mut results = []
+    let mut canon_concat = "cpgd_condition_sweep_v1|"
+    let mut level = 1
+    while level <= 4 {
+        let V = build_basis_for_level(level)
+        let r = dry_run_level(V, DEFAULT_LR)
+        let canon = level_canon(level, r)
+        canon_concat = canon_concat + "[" + canon + "]"
+        results = push(results, r)
+        level = level + 1
+    }
+    let sha = sha256_of_string(canon_concat)
+    return [sha, results, canon_concat]
+}
+
+// ─── negative falsify: pathological zero-vec basis ───────────────────────
+
+fn negative_falsify() -> bool {
+    let mut V = []
+    let mut i = 0
+    while i < TPL_COUNT {
+        let mut row = []
+        let mut j = 0
+        while j < DIM {
+            row = push(row, 0.0)
+            j = j + 1
+        }
+        V = push(V, row)
+        i = i + 1
+    }
+    let r = dry_run_level(V, DEFAULT_LR)
+    let rank_def = to_bool(r[7])
+    return rank_def
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut mode = "full"
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--selftest" { mode = "selftest" }
+        if a == "--help"     { mode = "help" }
+        k = k + 1
+    }
+
+    if mode == "help" {
+        println("usage:")
+        println("  hexa run anima-cpgd-research/tool/cpgd_condition_sweep.hexa")
+        println("  hexa run anima-cpgd-research/tool/cpgd_condition_sweep.hexa --selftest")
+        return
+    }
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  cpgd_condition_sweep.hexa — Path C Q4 Task 2")
+    println("  Sweep cond_proxy ∈ {1, 10, 100, 1000} 4-level boundary")
+    println("  raw#9 strict · hexa-only · deterministic · LLM=none")
+    println("════════════════════════════════════════════════════════════════")
+
+    let root = resolve_root()
+    let out_path = root + "/" + OUT_PATH
+
+    println("[cond] ── positive run (4-level sweep) ──")
+    let agg1 = run_all_levels()
+    let sha1 = _str(agg1[0])
+    let results = agg1[1]
+
+    println("[cond] run1=" + sha1)
+    let agg2 = run_all_levels()
+    let sha2 = _str(agg2[0])
+    println("[cond] run2=" + sha2)
+    let byte_id = (sha1 != "" && sha1 == sha2)
+
+    println("[cond] ── negative falsify (zero-vec basis) ──")
+    let neg_ok = negative_falsify()
+    println("[cond] negative_falsify_caught=" + (if neg_ok { "true" } else { "false" }))
+
+    // Per-level analysis
+    let mut all_required_pass = true   // levels 1, 2, 3 must PASS
+    let mut level_verdicts = []
+    let mut level = 1
+    while level <= 4 {
+        let r = results[level - 1]
+        let v = level_verdict(r, level)
+        level_verdicts = push(level_verdicts, v)
+        let cond_proxy = to_float(r[4])
+        let init_res   = to_float(r[3])
+        let total_viol = to_int(r[2])
+        let global_min = to_float(r[0])
+        println("[cond] level=" + to_string(level) +
+                " cond_proxy=" + to_string(cond_proxy) +
+                " init_res=" + to_string(init_res) +
+                " total_viol=" + to_string(total_viol) +
+                " gmin=" + to_string(global_min) +
+                " verdict=" + v)
+        if level <= 3 {
+            if v != "PASS" { all_required_pass = false }
+        }
+        level = level + 1
+    }
+
+    let g3_pass = byte_id
+    let sweep_verified = all_required_pass && g3_pass && neg_ok
+
+    println("[cond] G3_byte_identical=" + (if g3_pass { "true" } else { "false" }))
+    println("[cond] required_levels_1_2_3_pass=" + (if all_required_pass { "true" } else { "false" }))
+    println("[cond] verdict=" + (if sweep_verified { "COND_SWEEP_GENERALIZED" } else { "COND_SWEEP_FAIL" }))
+
+    // ─── emit JSON ─────────────────────────────────────────────────────────
+    let mut j = "{\n"
+    j = j + "  \"schema_version\": \"1\",\n"
+    j = j + "  \"slug\": \"cpgd-condition-sweep-v1\",\n"
+    j = j + "  \"title\": \"Path C Q4 Task 2 — CPGD G4 boundary condition-number sweep\",\n"
+    j = j + "  \"created\": \"2026-04-26\",\n"
+    j = j + "  \"path\": \"C\",\n"
+    j = j + "  \"raw_strict\": \"raw#9 hexa-only deterministic no_python no_llm\",\n"
+    j = j + "  \"tool\": \"anima-cpgd-research/tool/cpgd_condition_sweep.hexa\",\n"
+    j = j + "  \"depends_on\": [\"anima-cpgd-research/tool/cpgd_anarbitrary_falsifier.hexa\"],\n"
+    j = j + "  \"step_count\": " + to_string(STEP_COUNT) + ",\n"
+    j = j + "  \"template_count\": " + to_string(TPL_COUNT) + ",\n"
+    j = j + "  \"dim\": " + to_string(DIM) + ",\n"
+    j = j + "  \"lr\": " + to_string(DEFAULT_LR) + ",\n"
+    j = j + "  \"cos_floor\": " + to_string(COS_FLOOR) + ",\n"
+    j = j + "  \"eps_proj\": " + to_string(EPS_PROJ) + ",\n"
+    j = j + "  \"levels\": [\n"
+    let mut li = 1
+    while li <= 4 {
+        let r = results[li - 1]
+        let v = level_verdicts[li - 1]
+        let global_min = to_float(r[0])
+        let max_drift  = to_float(r[1])
+        let total_viol = to_int(r[2])
+        let init_res   = to_float(r[3])
+        let cond_proxy = to_float(r[4])
+        let idem_ok    = to_bool(r[5])
+        let init_cos_ok = to_bool(r[6])
+        let rank_def   = to_bool(r[7])
+        let all_above  = to_bool(r[8])
+        j = j + "    {\n"
+        j = j + "      \"level\": " + to_string(li) + ",\n"
+        j = j + "      \"cond_proxy\": " + to_string(cond_proxy) + ",\n"
+        j = j + "      \"init_residual\": " + to_string(init_res) + ",\n"
+        j = j + "      \"projector_idempotent\": " + (if idem_ok { "true" } else { "false" }) + ",\n"
+        j = j + "      \"init_unit_cosine_ok\": " + (if init_cos_ok { "true" } else { "false" }) + ",\n"
+        j = j + "      \"rank_deficient\": " + (if rank_def { "true" } else { "false" }) + ",\n"
+        j = j + "      \"all_above\": " + (if all_above { "true" } else { "false" }) + ",\n"
+        j = j + "      \"total_violations\": " + to_string(total_viol) + ",\n"
+        j = j + "      \"global_min_cos\": " + to_string(global_min) + ",\n"
+        j = j + "      \"max_cos_drift\": " + to_string(max_drift) + ",\n"
+        j = j + "      \"verdict\": \"" + _str(v) + "\"\n"
+        j = j + "    }" + (if li < 4 { "," } else { "" }) + "\n"
+        li = li + 1
+    }
+    j = j + "  ],\n"
+    j = j + "  \"selftest_2run\": {\n"
+    j = j + "    \"run1_sha\": \"" + sha1 + "\",\n"
+    j = j + "    \"run2_sha\": \"" + sha2 + "\",\n"
+    j = j + "    \"byte_identical\": " + (if byte_id { "true" } else { "false" }) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"frozen_gates\": {\n"
+    j = j + "    \"required_levels_1_2_3_pass\": " + (if all_required_pass { "true" } else { "false" }) + ",\n"
+    j = j + "    \"G3_byte_identical\": " + (if g3_pass { "true" } else { "false" }) + ",\n"
+    j = j + "    \"level_4_honest_verdict\": \"" + _str(level_verdicts[3]) + "\"\n"
+    j = j + "  },\n"
+    j = j + "  \"negative_falsify_caught_pathological\": " + (if neg_ok { "true" } else { "false" }) + ",\n"
+    j = j + "  \"verdict\": \"" + (if sweep_verified { "COND_SWEEP_GENERALIZED" } else { "COND_SWEEP_FAIL" }) + "\"\n"
+    j = j + "}\n"
+    write_file(out_path, j)
+    println("[cond] wrote " + OUT_PATH)
+
+    if mode == "selftest" {
+        if sweep_verified { exit(0) } else { exit(1) }
+    }
+}
+
+main()

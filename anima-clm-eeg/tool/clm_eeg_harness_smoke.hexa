@@ -1,0 +1,256 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/clm_eeg_harness_smoke.hexa
+//
+//  PURPOSE
+//    End-to-end chain integration test.  Reads the three pre-register
+//    emitted JSON state files (P1 LZ, P2 TLR, P3 GCG) and aggregates
+//    their dry-run verdicts into a composite HARNESS_OK / HARNESS_FAIL.
+//
+//    HARNESS_OK rule
+//      ≥ 2 of 3 pre-register pilots show p<n>_dry_run_pass = 1
+//
+//    NOT a re-execution: relies on the upstream tool runs having already
+//    emitted state/clm_eeg_p<n>_*.json.  The intent is a single harness-
+//    level pulse-check that the chain wires up end-to-end with byte-
+//    identical determinism.
+//
+//  USAGE
+//    # 1. Re-emit all three (idempotent, byte-identical):
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run anima-clm-eeg/tool/clm_eeg_synthetic_fixture.hexa
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run anima-clm-eeg/tool/clm_eeg_p1_lz_pre_register.hexa
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run anima-clm-eeg/tool/clm_eeg_p2_tlr_pre_register.hexa
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run anima-clm-eeg/tool/clm_eeg_p3_gcg_pre_register.hexa
+//    # 2. Run harness:
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run anima-clm-eeg/tool/clm_eeg_harness_smoke.hexa --selftest
+//
+//  OUTPUT
+//    state/clm_eeg_harness_smoke.json
+//
+//  ENV
+//    CLM_EEG_HARNESS_OUT  output JSON path
+//    CLM_EEG_P1_PATH      P1 emitted JSON (default: state/clm_eeg_p1_lz_pre_register.json)
+//    CLM_EEG_P2_PATH      P2 emitted JSON (default: state/clm_eeg_p2_tlr_pre_register.json)
+//    CLM_EEG_P3_PATH      P3 emitted JSON (default: state/clm_eeg_p3_gcg_pre_register.json)
+//
+//  RAW
+//    raw#9 · hexa-only · deterministic · LLM=none · pure-aggregator
+// ════════════════════════════════════════════════════════════════════════════
+
+let M32 = 4294967296
+let FNV_PRIME = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+// ─── string scan ────────────────────────────────────────────────────────────
+fn find_in_str(s: string, needle: string) -> int {
+    let n = len(s)
+    let m = len(needle)
+    if m <= 0 { return 0 }
+    if n < m { return -1 }
+    let mut i = 0
+    while i <= n - m {
+        let mut j = 0
+        let mut ok = 1
+        while j < m {
+            if s[i + j] != needle[j] {
+                ok = 0
+                j = m
+            }
+            j = j + 1
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_digit_ch(c: string) -> int {
+    if c == "0" { return 1 }
+    if c == "1" { return 1 }
+    if c == "2" { return 1 }
+    if c == "3" { return 1 }
+    if c == "4" { return 1 }
+    if c == "5" { return 1 }
+    if c == "6" { return 1 }
+    if c == "7" { return 1 }
+    if c == "8" { return 1 }
+    if c == "9" { return 1 }
+    return 0
+}
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+// Extract first non-negative integer following the FIRST occurrence of <key>.
+// Returns -1 if not found.
+fn extract_int_after_key(s: string, key: string) -> int {
+    let pos = find_in_str(s, key)
+    if pos < 0 { return -1 }
+    let n = len(s)
+    let m = len(key)
+    let mut p = pos + m
+    while p < n {
+        let c = s[p]
+        if is_digit_ch(c) == 1 {
+            let mut v = 0
+            while p < n {
+                let cd = s[p]
+                if is_digit_ch(cd) == 1 {
+                    v = v * 10 + digit_val(cd)
+                    p = p + 1
+                } else {
+                    return v
+                }
+            }
+            return v
+        }
+        p = p + 1
+    }
+    return -1
+}
+
+// ─── fingerprint (FNV-style) ────────────────────────────────────────────────
+fn fnv_step(h: int, byte: int) -> int {
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fingerprint_step(fp: int, val: int) -> int {
+    let mut h = fp
+    h = fnv_step(h, val % 256)
+    h = fnv_step(h, (val / 256) % 256)
+    h = fnv_step(h, (val / 65536) % 256)
+    h = fnv_step(h, (val / 16777216) % 256)
+    return h
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    let p1_path = env_str("CLM_EEG_P1_PATH", "state/clm_eeg_p1_lz_pre_register.json")
+    let p2_path = env_str("CLM_EEG_P2_PATH", "state/clm_eeg_p2_tlr_pre_register.json")
+    let p3_path = env_str("CLM_EEG_P3_PATH", "state/clm_eeg_p3_gcg_pre_register.json")
+    let out_path = env_str("CLM_EEG_HARNESS_OUT", "state/clm_eeg_harness_smoke.json")
+
+    // Read all three pre-register JSON files
+    let p1_json = read_file(p1_path)
+    let p2_json = read_file(p2_path)
+    let p3_json = read_file(p3_path)
+
+    let p1_len = len(p1_json)
+    let p2_len = len(p2_json)
+    let p3_len = len(p3_json)
+
+    // Each upstream cert exposes "p<n>_dry_run_pass": 0/1
+    let p1_pass = extract_int_after_key(p1_json, "\"p1_dry_run_pass\":")
+    let p2_pass = extract_int_after_key(p2_json, "\"p2_dry_run_pass\":")
+    let p3_pass = extract_int_after_key(p3_json, "\"p3_dry_run_pass\":")
+
+    let p1_norm = if p1_pass == 1 { 1 } else { 0 }
+    let p2_norm = if p2_pass == 1 { 1 } else { 0 }
+    let p3_norm = if p3_pass == 1 { 1 } else { 0 }
+    let pass_count = p1_norm + p2_norm + p3_norm
+
+    // Composite verdict: HARNESS_OK iff ≥ 2/3 PASS
+    let harness_ok = if pass_count >= 2 { 1 } else { 0 }
+
+    // Aggregate fingerprint over upstream byte-lengths + verdicts
+    let mut fp = FNV_OFFSET_BASIS
+    fp = fingerprint_step(fp, p1_len)
+    fp = fingerprint_step(fp, p2_len)
+    fp = fingerprint_step(fp, p3_len)
+    fp = fingerprint_step(fp, p1_norm)
+    fp = fingerprint_step(fp, p2_norm)
+    fp = fingerprint_step(fp, p3_norm)
+
+    // Also fingerprint each upstream's own fingerprint (chained provenance)
+    let p1_fp = extract_int_after_key(p1_json, "\"fingerprint\":")
+    let p2_fp = extract_int_after_key(p2_json, "\"fingerprint\":")
+    let p3_fp = extract_int_after_key(p3_json, "\"fingerprint\":")
+    if p1_fp >= 0 { fp = fingerprint_step(fp, p1_fp) }
+    if p2_fp >= 0 { fp = fingerprint_step(fp, p2_fp) }
+    if p3_fp >= 0 { fp = fingerprint_step(fp, p3_fp) }
+
+    // ── emit cert ──────────────────────────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"clm_eeg_harness_smoke\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"composite_rule\": \"HARNESS_OK iff (p1_pass + p2_pass + p3_pass) >= 2\",\n"
+    cert = cert + "  \"upstream\": {\n"
+    cert = cert + "    \"p1\": {\n"
+    cert = cert + "      \"path\": \"" + p1_path + "\",\n"
+    cert = cert + "      \"bytes\": " + str(p1_len) + ",\n"
+    cert = cert + "      \"dry_run_pass\": " + str(p1_norm) + ",\n"
+    cert = cert + "      \"fingerprint\": " + str(p1_fp) + "\n"
+    cert = cert + "    },\n"
+    cert = cert + "    \"p2\": {\n"
+    cert = cert + "      \"path\": \"" + p2_path + "\",\n"
+    cert = cert + "      \"bytes\": " + str(p2_len) + ",\n"
+    cert = cert + "      \"dry_run_pass\": " + str(p2_norm) + ",\n"
+    cert = cert + "      \"fingerprint\": " + str(p2_fp) + "\n"
+    cert = cert + "    },\n"
+    cert = cert + "    \"p3\": {\n"
+    cert = cert + "      \"path\": \"" + p3_path + "\",\n"
+    cert = cert + "      \"bytes\": " + str(p3_len) + ",\n"
+    cert = cert + "      \"dry_run_pass\": " + str(p3_norm) + ",\n"
+    cert = cert + "      \"fingerprint\": " + str(p3_fp) + "\n"
+    cert = cert + "    }\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"composite\": {\n"
+    cert = cert + "    \"pass_count\": " + str(pass_count) + ",\n"
+    cert = cert + "    \"required\": 2,\n"
+    cert = cert + "    \"harness_ok\": " + str(harness_ok) + ",\n"
+    cert = cert + "    \"chained_fingerprint\": " + str(fp) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"note\": \"Synthetic dry-run aggregation only. Post-arrival D+1/D+3/D+5 re-runs replace upstream JSONs; rerun this harness for live composite verdict.\"\n"
+    cert = cert + "}\n"
+    write_file(out_path, cert)
+
+    println("─── clm_eeg_harness_smoke (raw#9 hexa-only) ───")
+    println("  p1_path                = " + p1_path)
+    println("  p1_bytes               = " + str(p1_len))
+    println("  p1_dry_run_pass        = " + str(p1_norm))
+    println("  p2_path                = " + p2_path)
+    println("  p2_bytes               = " + str(p2_len))
+    println("  p2_dry_run_pass        = " + str(p2_norm))
+    println("  p3_path                = " + p3_path)
+    println("  p3_bytes               = " + str(p3_len))
+    println("  p3_dry_run_pass        = " + str(p3_norm))
+    println("  composite_pass_count   = " + str(pass_count))
+    println("  composite_required     = 2")
+    println("  harness_ok             = " + str(harness_ok))
+    println("  chained_fingerprint    = " + str(fp))
+    println("  output                 = " + out_path)
+
+    if harness_ok == 1 {
+        println("  verdict                = HARNESS_OK")
+        exit(0)
+    }
+    println("  verdict                = HARNESS_FAIL")
+    exit(1)
+}
+
+main()

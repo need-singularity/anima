@@ -1,20 +1,295 @@
-// transplant_eeg_verify.hexa — EEG-based transplant quality verification
-// 6 metrics: Lempel-Ziv, Hurst, PSD slope, autocorrelation, criticality, distribution
+// anima-eeg/transplant_eeg_verify.hexa
+// raw#9 hexa-only strict · raw#10 honest · raw#11 snake_case
+// Spec doc: anima-eeg/MIGRATION_PLAN.md §5 (Phase 3 Tier-2 FULL consumer)
+//
+// PURPOSE
+//   Consumes 6-metric brain-likeness scores for {donor, recipient, transplant}
+//   and computes preservation pct + pass count. Pure numerical / structural
+//   consumer: caller supplies pre-validated metric tuples. Real EEG ingest
+//   belongs to validate_consciousness.hexa (separate module).
+//
+//   6 metrics per subject:
+//     m1 = lz_complexity     (Lempel-Ziv normalized)
+//     m2 = hurst_exponent    (long-range correlation)
+//     m3 = psd_slope         (1/f^alpha exponent, signed)
+//     m4 = autocorr_decay    (timescale)
+//     m5 = critical_exponent (avalanche distribution)
+//     m6 = distribution_match (KL or hist similarity)
+//
+//   brain_likeness = mean of 6 (each component must be in [0,1] post-cal)
+//
+// OUTPUT
+//   donor_brainlike, recipient_brainlike, transplant_brainlike,
+//   preservation_pct (transplant / max(donor, recipient)),
+//   metrics_passed   (count of |delta| < alpha across 6 metrics)
+//
+// raw10_honest: this module does NOT compute the 6 metrics from raw EEG.
+//               It assumes caller has already produced them via
+//               validate_consciousness. Pure ratio + count.
+//
+// USAGE
+//   hexa run anima-eeg/transplant_eeg_verify.hexa --selftest
 
-struct TransplantVerifyResult {
-    donor_brainlike: float,
-    recipient_brainlike: float,
-    transplant_brainlike: float,
-    preservation_pct: float,
-    metrics_passed: i32
+let SCHEMA = "anima-eeg/transplant_eeg_verify/1"
+
+let DEFAULT_ALPHA       = 0.05      // tolerance for "metric preserved"
+let MAX_BRAINLIKE       = 1.0
+let MIN_BRAINLIKE       = 0.0
+let EPSILON_DIV         = 0.000001  // floor for division
+
+// ════════════════════════════════════════════════════════════════════
+// Output globals
+// ════════════════════════════════════════════════════════════════════
+
+let g_donor_brainlike      = 0.0
+let g_recipient_brainlike  = 0.0
+let g_transplant_brainlike = 0.0
+let g_preservation_pct     = 0.0
+let g_metrics_passed       = 0
+let g_alpha_used           = 0.05
+
+// ════════════════════════════════════════════════════════════════════
+// Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
 }
 
-fn verify_transplant(donor_path: string, recipient_path: string, alpha: float) -> TransplantVerifyResult {
-    print("verifying transplant: " + donor_path + " -> " + recipient_path)
-    return TransplantVerifyResult(0.0, 0.0, 0.0, 0.0, 0)
+fn clamp_f(v: float, lo: float, hi: float) -> float {
+    let mut out = v
+    if out < lo { out = lo }
+    if out > hi { out = hi }
+    return out
 }
 
-fn batch_verify(donor_path: string, recipients_dir: string) -> i32 {
-    print("batch verify: " + donor_path + " -> " + recipients_dir)
-    return 0
+fn safe_div(a: float, b: float) -> float {
+    let mut bb = b
+    if abs_f(bb) < EPSILON_DIV {
+        if bb < 0.0 { bb = 0.0 - EPSILON_DIV } else { bb = EPSILON_DIV }
+    }
+    return a / bb
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Brain-likeness from 6 metrics (mean of clamped components)
+// ════════════════════════════════════════════════════════════════════
+
+fn brainlike_from_six(m1: float, m2: float, m3: float, m4: float, m5: float, m6: float) -> float {
+    let c1 = clamp_f(m1, MIN_BRAINLIKE, MAX_BRAINLIKE)
+    let c2 = clamp_f(m2, MIN_BRAINLIKE, MAX_BRAINLIKE)
+    let c3 = clamp_f(m3, MIN_BRAINLIKE, MAX_BRAINLIKE)
+    let c4 = clamp_f(m4, MIN_BRAINLIKE, MAX_BRAINLIKE)
+    let c5 = clamp_f(m5, MIN_BRAINLIKE, MAX_BRAINLIKE)
+    let c6 = clamp_f(m6, MIN_BRAINLIKE, MAX_BRAINLIKE)
+    return (c1 + c2 + c3 + c4 + c5 + c6) / 6.0
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Pass count: |donor_metric - transplant_metric| < alpha
+// ════════════════════════════════════════════════════════════════════
+
+fn count_metrics_passed(
+    d1: float, d2: float, d3: float, d4: float, d5: float, d6: float,
+    t1: float, t2: float, t3: float, t4: float, t5: float, t6: float,
+    alpha: float
+) -> int {
+    let mut n = 0
+    if abs_f(d1 - t1) < alpha { n = n + 1 }
+    if abs_f(d2 - t2) < alpha { n = n + 1 }
+    if abs_f(d3 - t3) < alpha { n = n + 1 }
+    if abs_f(d4 - t4) < alpha { n = n + 1 }
+    if abs_f(d5 - t5) < alpha { n = n + 1 }
+    if abs_f(d6 - t6) < alpha { n = n + 1 }
+    return n
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Full pipeline
+// ════════════════════════════════════════════════════════════════════
+
+fn verify_transplant_metrics(
+    d1: float, d2: float, d3: float, d4: float, d5: float, d6: float,
+    r1: float, r2: float, r3: float, r4: float, r5: float, r6: float,
+    t1: float, t2: float, t3: float, t4: float, t5: float, t6: float,
+    alpha: float
+) {
+    g_alpha_used           = alpha
+    g_donor_brainlike      = brainlike_from_six(d1, d2, d3, d4, d5, d6)
+    g_recipient_brainlike  = brainlike_from_six(r1, r2, r3, r4, r5, r6)
+    g_transplant_brainlike = brainlike_from_six(t1, t2, t3, t4, t5, t6)
+
+    // preservation = transplant / max(donor, recipient)
+    let mut denom = g_donor_brainlike
+    if g_recipient_brainlike > denom { denom = g_recipient_brainlike }
+    g_preservation_pct = safe_div(g_transplant_brainlike, denom)
+
+    g_metrics_passed = count_metrics_passed(d1,d2,d3,d4,d5,d6, t1,t2,t3,t4,t5,t6, alpha)
+}
+
+// Convenience overload: defaults
+fn verify_default(
+    d1: float, d2: float, d3: float, d4: float, d5: float, d6: float,
+    r1: float, r2: float, r3: float, r4: float, r5: float, r6: float,
+    t1: float, t2: float, t3: float, t4: float, t5: float, t6: float
+) {
+    verify_transplant_metrics(d1,d2,d3,d4,d5,d6, r1,r2,r3,r4,r5,r6, t1,t2,t3,t4,t5,t6, DEFAULT_ALPHA)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// KV emit
+// ════════════════════════════════════════════════════════════════════
+
+fn emit_kv() {
+    println("donor_brainlike=" + to_string(g_donor_brainlike))
+    println("recipient_brainlike=" + to_string(g_recipient_brainlike))
+    println("transplant_brainlike=" + to_string(g_transplant_brainlike))
+    println("preservation_pct=" + to_string(g_preservation_pct))
+    println("metrics_passed=" + to_string(g_metrics_passed))
+    println("alpha=" + to_string(g_alpha_used))
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Self-tests
+// ════════════════════════════════════════════════════════════════════
+
+fn assert_true(cond: bool, label: string) -> bool {
+    if cond { println("  PASS: " + label) } else { println("  FAIL: " + label) }
+    return cond
+}
+
+fn run_tests() -> int {
+    let mut pass = 0
+    let mut fail = 0
+
+    println("=== transplant_eeg_verify raw#9 self-tests ===")
+
+    // T1: brainlike from 6 ones -> 1.0
+    println("[T1] brainlike(1,1,1,1,1,1) == 1.0")
+    let b_max = brainlike_from_six(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    let ok1 = assert_true(abs_f(b_max - 1.0) < 0.00001, "max brainlike == 1.0")
+    if ok1 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T2: brainlike from 6 zeros -> 0.0
+    println("[T2] brainlike(0,0,0,0,0,0) == 0.0")
+    let b_min = brainlike_from_six(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    let ok2 = assert_true(abs_f(b_min) < 0.00001, "min brainlike == 0.0")
+    if ok2 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T3: brainlike clamps out-of-range (negative + >1)
+    println("[T3] clamp out-of-range")
+    let b_clamp = brainlike_from_six(-0.5, 1.5, 0.5, 0.5, 0.5, 0.5)
+    // -0.5 -> 0, 1.5 -> 1; rest 0.5 each. mean = (0+1+0.5+0.5+0.5+0.5)/6 = 3/6 = 0.5
+    let ok3 = assert_true(abs_f(b_clamp - 0.5) < 0.00001, "clamped mean == 0.5")
+    if ok3 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T4: identical donor/transplant -> all 6 pass + preservation == 1
+    println("[T4] identical donor/transplant")
+    verify_default(0.8, 0.7, 0.6, 0.5, 0.4, 0.3,
+                   0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+                   0.8, 0.7, 0.6, 0.5, 0.4, 0.3)
+    let ok4a = assert_true(g_metrics_passed == 6, "metrics_passed == 6")
+    let ok4b = assert_true(abs_f(g_donor_brainlike - g_transplant_brainlike) < 0.00001, "brainlike equal")
+    let ok4c = assert_true(g_preservation_pct >= 1.0 - 0.001, "preservation >= 1.0")
+    if ok4a && ok4b && ok4c { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T5: completely different transplant -> 0 pass, low preservation
+    println("[T5] divergent transplant")
+    verify_default(0.9, 0.9, 0.9, 0.9, 0.9, 0.9,
+                   0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+                   0.1, 0.1, 0.1, 0.1, 0.1, 0.1)
+    let ok5a = assert_true(g_metrics_passed == 0, "metrics_passed == 0 for divergent")
+    let ok5b = assert_true(g_preservation_pct < 0.3, "preservation < 0.3")
+    if ok5a && ok5b { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T6: alpha tolerance — alpha=0.5 makes all loose passes match
+    println("[T6] alpha tolerance loose")
+    verify_transplant_metrics(0.6, 0.6, 0.6, 0.6, 0.6, 0.6,
+                              0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+                              0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+                              0.2)
+    // |0.6 - 0.5| = 0.1 < 0.2 -> all 6 pass
+    let ok6 = assert_true(g_metrics_passed == 6, "loose alpha -> 6 pass")
+    if ok6 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T7: alpha tolerance tight — same metrics but alpha=0.05
+    println("[T7] alpha tolerance tight")
+    verify_transplant_metrics(0.6, 0.6, 0.6, 0.6, 0.6, 0.6,
+                              0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+                              0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+                              0.05)
+    // |0.6 - 0.5| = 0.1 > 0.05 -> 0 pass
+    let ok7 = assert_true(g_metrics_passed == 0, "tight alpha -> 0 pass")
+    if ok7 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T8: deterministic idempotence
+    println("[T8] deterministic idempotence")
+    verify_default(0.5, 0.6, 0.7, 0.4, 0.3, 0.8,
+                   0.4, 0.5, 0.6, 0.3, 0.2, 0.7,
+                   0.45, 0.55, 0.65, 0.35, 0.25, 0.75)
+    let p1 = g_preservation_pct
+    let m1 = g_metrics_passed
+    verify_default(0.5, 0.6, 0.7, 0.4, 0.3, 0.8,
+                   0.4, 0.5, 0.6, 0.3, 0.2, 0.7,
+                   0.45, 0.55, 0.65, 0.35, 0.25, 0.75)
+    let ok8a = assert_true(abs_f(p1 - g_preservation_pct) < 0.00001, "preservation idempotent")
+    let ok8b = assert_true(m1 == g_metrics_passed, "metrics_passed idempotent")
+    if ok8a && ok8b { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T9: negative falsification — zero/zero division safety
+    println("[T9] negative: zero brainlike denominator")
+    verify_default(0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                   0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+    // safe_div(0.5, 0.0) -> 0.5 / EPSILON_DIV = very large but finite
+    let ok9 = assert_true(g_preservation_pct > 100.0, "div-by-near-zero saturates large finite")
+    if ok9 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("")
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL out of " + to_string(pass + fail))
+    return fail
+}
+
+// ════════════════════════════════════════════════════════════════════
+// CLI entry point
+// ════════════════════════════════════════════════════════════════════
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 1
+    while i < len(av) {
+        if av[i] == "--selftest" { selftest = true }
+        i = i + 1
+    }
+
+    if !selftest {
+        println("usage: hexa run anima-eeg/transplant_eeg_verify.hexa --selftest")
+        println("ABORT: real-EEG ingest requires validate_consciousness Phase 3 + WRAPPER ingest; raw#9 strict no-fallback policy.")
+        exit(2)
+    }
+
+    println("── transplant_eeg_verify raw#9 selftest ──")
+    println("schema=" + SCHEMA)
+    println("raw10_honest=ratio_consumer_only_no_raw_eeg_ingest")
+    println("")
+
+    // Demonstration emit (mid-fidelity transplant)
+    verify_default(0.7, 0.6, 0.5, 0.6, 0.7, 0.5,
+                   0.4, 0.4, 0.4, 0.4, 0.4, 0.4,
+                   0.65, 0.58, 0.48, 0.58, 0.68, 0.48)
+    emit_kv()
+    println("")
+
+    let fails = run_tests()
+    if fails != 0 {
+        println("selftest=fail")
+        eprintln("selftest FAILED: " + to_string(fails) + " test(s) failed")
+        exit(1)
+    }
+    println("selftest=ok")
+    println("DONE")
+}
+
+main()

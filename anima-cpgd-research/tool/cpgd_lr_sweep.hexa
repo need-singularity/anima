@@ -1,0 +1,686 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-cpgd-research/tool/cpgd_lr_sweep.hexa
+//  Path C (Q4 generalization) — LR regime Lagrangian-breakdown frontier
+//
+//  PURPOSE
+//    Sweep lr ∈ {0.001, 0.01, 0.1} 3-level. Hypothesis: Lagrangian bound
+//    `lr·‖grad‖ ≈ 1` predicts breakdown begins around lr=0.01 (with unit-norm
+//    Gaussian gradient and step_count=100). Detect via:
+//      - G2 violations count vs lr
+//      - max_drift vs lr
+//      - Lagrangian residual = max_k (lr · ‖grad_k‖_F)
+//
+//  FROZEN GATES
+//    G1: closed-form init residual ≤ EPS_PROJ
+//    G2: 100-step monotone descent — total_violations (cos < 0.5) == 0
+//    G3: 2 sequential runs sha256(payload) byte-identical
+//
+//  PASS criteria (per-level)
+//    lr=0.001 — must PASS G1+G2+G3 (baseline well-conditioned)
+//    lr=0.01  — PARTIAL or FAIL acceptable (boundary regime)
+//    lr=0.1   — must FAIL G2 (Lagrangian breakdown explicitly detected)
+//
+//  SUCCESS DEFINITION
+//    Sweep verifies if predicted gradient-breakdown frontier holds
+//    (lr=0.001 PASS AND lr=0.1 FAIL ⇒ frontier proven exists).
+//
+//  OUTPUT: anima-cpgd-research/state/cpgd_lr_sweep_v1.json
+//  raw#9 strict · hexa-only · deterministic · LLM=none · CPU-only · $0
+// ════════════════════════════════════════════════════════════════════════════
+
+let OUT_PATH       = "anima-cpgd-research/state/cpgd_lr_sweep_v1.json"
+let DIM            = 8
+let TPL_COUNT      = 4
+let STEP_COUNT     = 100
+let GRAD_SEED      = 20260426
+let INIT_SEED      = 20260426
+let GRAD_SCALE     = 1.0
+let COS_FLOOR      = 0.5
+let EPS_IDEM       = 0.00001
+let EPS_PROJ       = 0.0001
+
+let FNV_OFFSET = 2166136261
+let FNV_PRIME  = 16777619
+let FNV_MOD    = 4294967296
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let n = _str(env("NEXUS"))
+    if n != "" { return n }
+    let gt = _str(exec("git rev-parse --show-toplevel")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut j = 0
+    while j < 40 {
+        y = 0.5 * (y + x / y)
+        j = j + 1
+    }
+    return y
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_dot(a: array, b: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    let n = len(a)
+    while i < n {
+        s = s + to_float(a[i]) * to_float(b[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(a: array) -> float {
+    return sqrt_newton(vec_dot(a, a))
+}
+
+fn vec_scale(a: array, s: float) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = push(out, to_float(a[i]) * s)
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_sub(a: array, b: array) -> array {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = push(out, to_float(a[i]) - to_float(b[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// ─── FNV-1a + basis ────────────────────────────────────────────────────────
+
+fn fnv_step(h: int, b: int) -> int {
+    let mixed = (h + b) % FNV_MOD
+    return (mixed * FNV_PRIME) % FNV_MOD
+}
+
+fn fnv_seed_to_floats(seed: int, count: int) -> array {
+    let mut h = (FNV_OFFSET + seed) % FNV_MOD
+    let mut out = []
+    let mut i = 0
+    while i < count {
+        let b1 = (i * 31 + 7) % 256
+        let b2 = (i * 17 + 11) % 256
+        let b3 = (i * 53 + 23) % 256
+        let b4 = (i * 89 + 41) % 256
+        h = fnv_step(h, b1)
+        h = fnv_step(h, b2)
+        h = fnv_step(h, b3)
+        h = fnv_step(h, b4)
+        let frac = to_float(h % 1000000) / 1000000.0
+        let val  = 2.0 * frac - 1.0
+        out = push(out, val)
+        i = i + 1
+    }
+    return out
+}
+
+fn fnv_basis_raw() -> array {
+    let mut V = []
+    let mut i = 0
+    while i < TPL_COUNT {
+        let seed = 20260426 + i * 1000003
+        let row = fnv_seed_to_floats(seed, DIM)
+        V = push(V, row)
+        i = i + 1
+    }
+    return V
+}
+
+// ─── Gram-Schmidt ──────────────────────────────────────────────────────────
+
+fn gram_schmidt(V_raw: array) -> array {
+    let n = len(V_raw)
+    let mut Q = []
+    let mut i = 0
+    while i < n {
+        let v = V_raw[i]
+        let mut u = []
+        let mut k = 0
+        while k < DIM {
+            u = push(u, to_float(v[k]))
+            k = k + 1
+        }
+        let mut j = 0
+        while j < len(Q) {
+            let qj = Q[j]
+            let proj_coef = vec_dot(u, qj)
+            let proj_vec  = vec_scale(qj, proj_coef)
+            u = vec_sub(u, proj_vec)
+            j = j + 1
+        }
+        let nrm = vec_norm(u)
+        if nrm < 0.000001 {
+            let mut z = []
+            let mut zk = 0
+            while zk < DIM {
+                z = push(z, 0.0)
+                zk = zk + 1
+            }
+            Q = push(Q, z)
+        } else {
+            let u_norm = vec_scale(u, 1.0 / nrm)
+            Q = push(Q, u_norm)
+        }
+        i = i + 1
+    }
+    return Q
+}
+
+// ─── linear algebra ────────────────────────────────────────────────────────
+
+fn build_projector(eigenvecs: array) -> array {
+    let n = len(eigenvecs)
+    let mut P = []
+    let mut a = 0
+    while a < DIM {
+        let mut row = []
+        let mut b = 0
+        while b < DIM {
+            let mut s = 0.0
+            let mut k = 0
+            while k < n {
+                let v = eigenvecs[k]
+                s = s + to_float(v[a]) * to_float(v[b])
+                k = k + 1
+            }
+            row = push(row, s)
+            b = b + 1
+        }
+        P = push(P, row)
+        a = a + 1
+    }
+    return P
+}
+
+fn verify_projector_idempotent(P: array) -> bool {
+    let mut max_delta = 0.0
+    let mut a = 0
+    while a < DIM {
+        let mut b = 0
+        while b < DIM {
+            let mut s = 0.0
+            let mut k = 0
+            while k < DIM {
+                s = s + to_float(P[a][k]) * to_float(P[k][b])
+                k = k + 1
+            }
+            let d = fabs(s - to_float(P[a][b]))
+            if d > max_delta { max_delta = d }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return max_delta < EPS_IDEM
+}
+
+// ─── deterministic RNG ─────────────────────────────────────────────────────
+
+fn lcg_next(state_arr: array) -> float {
+    let mut s = to_int(state_arr[0])
+    s = (s * 1103515245 + 12345) % 2147483648
+    state_arr[0] = s
+    return to_float(s % 1000000) / 1000000.0
+}
+
+fn randn_pair(state_arr: array) -> array {
+    let u1_raw = lcg_next(state_arr)
+    let u1 = if u1_raw < 0.000001 { 0.000001 } else { u1_raw }
+    let u2 = lcg_next(state_arr)
+    let r = sqrt_newton(0.0 - 2.0 * log(u1))
+    let theta = 2.0 * 3.141592653589793 * u2
+    let z1 = r * cos(theta)
+    let z2 = r * sin(theta)
+    return [z1, z2]
+}
+
+fn rand_matrix(rows: int, cols: int, state_arr: array) -> array {
+    let mut M = []
+    let mut i = 0
+    while i < rows {
+        let mut row = []
+        let mut j = 0
+        while j < cols {
+            let pair = randn_pair(state_arr)
+            row = push(row, to_float(pair[0]) * GRAD_SCALE)
+            j = j + 1
+            if j < cols {
+                row = push(row, to_float(pair[1]) * GRAD_SCALE)
+                j = j + 1
+            }
+        }
+        M = push(M, row)
+        i = i + 1
+    }
+    return M
+}
+
+fn matrix_frobenius(M: array) -> float {
+    let rows = len(M)
+    let mut s = 0.0
+    let mut i = 0
+    while i < rows {
+        let row = M[i]
+        let n = len(row)
+        let mut j = 0
+        while j < n {
+            let v = to_float(row[j])
+            s = s + v * v
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return sqrt_newton(s)
+}
+
+fn matmul_right(G: array, P: array) -> array {
+    let rows = len(G)
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        let g = G[i]
+        let mut new_row = []
+        let mut b = 0
+        while b < DIM {
+            let mut s = 0.0
+            let mut a = 0
+            while a < DIM {
+                s = s + to_float(g[a]) * to_float(P[a][b])
+                a = a + 1
+            }
+            new_row = push(new_row, s)
+            b = b + 1
+        }
+        out = push(out, new_row)
+        i = i + 1
+    }
+    return out
+}
+
+fn gradient_step(W: array, grad_raw: array, P_S: array, lr: float) -> array {
+    let grad_proj = matmul_right(grad_raw, P_S)
+    let rows = len(W)
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        let w = W[i]
+        let g = grad_proj[i]
+        let mut new_row = []
+        let mut j = 0
+        while j < DIM {
+            new_row = push(new_row, to_float(w[j]) - lr * to_float(g[j]))
+            j = j + 1
+        }
+        out = push(out, new_row)
+        i = i + 1
+    }
+    return out
+}
+
+fn row_cosines(W: array, eigenvecs: array) -> array {
+    let n = len(W)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let w = W[i]
+        let v = eigenvecs[i]
+        let nw = vec_norm(w)
+        let nv = vec_norm(v)
+        let denom = nw * nv
+        let c = if denom > 0.0 { vec_dot(w, v) / denom } else { 0.0 }
+        out = push(out, c)
+        i = i + 1
+    }
+    return out
+}
+
+fn projection_residual(W: array, P_S: array) -> float {
+    let n = len(W)
+    let mut max_res = 0.0
+    let mut i = 0
+    while i < n {
+        let w = W[i]
+        let mut pw = []
+        let mut a = 0
+        while a < DIM {
+            let mut s = 0.0
+            let mut b = 0
+            while b < DIM {
+                s = s + to_float(P_S[a][b]) * to_float(w[b])
+                b = b + 1
+            }
+            pw = push(pw, s)
+            a = a + 1
+        }
+        let mut diff_norm_sq = 0.0
+        let mut k = 0
+        while k < DIM {
+            let d = to_float(w[k]) - to_float(pw[k])
+            diff_norm_sq = diff_norm_sq + d * d
+            k = k + 1
+        }
+        let res = sqrt_newton(diff_norm_sq)
+        if res > max_res { max_res = res }
+        i = i + 1
+    }
+    return max_res
+}
+
+// ─── orchestration: per-lr run ────────────────────────────────────────────
+
+// Returns:
+//  [global_min, max_drift, total_violations, init_residual, idem_ok,
+//   init_cos_ok, all_above, max_lagrangian_residual]
+fn dry_run_lr(V_raw: array, lr: float) -> array {
+    let V_orth = gram_schmidt(V_raw)
+    let P_S = build_projector(V_orth)
+    let idem_ok = verify_projector_idempotent(P_S)
+
+    let mut W = []
+    let mut r = 0
+    while r < TPL_COUNT {
+        let v = V_orth[r]
+        let mut row = []
+        let mut jj = 0
+        while jj < DIM {
+            row = push(row, to_float(v[jj]))
+            jj = jj + 1
+        }
+        W = push(W, row)
+        r = r + 1
+    }
+
+    let init_residual = projection_residual(W, P_S)
+    let c_init = row_cosines(W, V_orth)
+    let mut init_cos_ok = true
+    let mut ii = 0
+    while ii < TPL_COUNT {
+        let ci = to_float(c_init[ii])
+        if fabs(ci - 1.0) > 1e-6 { init_cos_ok = false }
+        ii = ii + 1
+    }
+
+    let state_arr = [GRAD_SEED]
+    let mut max_drift = 0.0
+    let mut all_above = true
+    let mut total_violations = 0
+    let mut global_min = 1.0
+    let mut max_lagr_res = 0.0
+    let mut step = 0
+    while step < STEP_COUNT {
+        let grad = rand_matrix(TPL_COUNT, DIM, state_arr)
+        let frob = matrix_frobenius(grad)
+        let lagr = lr * frob
+        if lagr > max_lagr_res { max_lagr_res = lagr }
+        W = gradient_step(W, grad, P_S, lr)
+        let cs = row_cosines(W, V_orth)
+        let mut i = 0
+        while i < TPL_COUNT {
+            let c = to_float(cs[i])
+            if c < global_min { global_min = c }
+            let drift = fabs(1.0 - c)
+            if drift > max_drift { max_drift = drift }
+            if c < COS_FLOOR {
+                all_above = false
+                total_violations = total_violations + 1
+            }
+            i = i + 1
+        }
+        step = step + 1
+    }
+
+    return [global_min, max_drift, total_violations, init_residual, idem_ok,
+            init_cos_ok, all_above, max_lagr_res]
+}
+
+// ─── canonical payload ────────────────────────────────────────────────────
+
+fn lr_canon(lr: float, r: array) -> string {
+    let global_min   = to_float(r[0])
+    let max_drift    = to_float(r[1])
+    let total_viol   = to_int(r[2])
+    let init_res     = to_float(r[3])
+    let idem_ok      = to_bool(r[4])
+    let init_cos_ok  = to_bool(r[5])
+    let all_above    = to_bool(r[6])
+    let max_lagr     = to_float(r[7])
+    let mut s = "lr=" + to_string(lr) + "|"
+    s = s + "init_res=" + to_string(init_res) + "|"
+    s = s + "idem=" + (if idem_ok { "true" } else { "false" }) + "|"
+    s = s + "init_cos_ok=" + (if init_cos_ok { "true" } else { "false" }) + "|"
+    s = s + "all_above=" + (if all_above { "true" } else { "false" }) + "|"
+    s = s + "total_viol=" + to_string(total_viol) + "|"
+    s = s + "gmin=" + to_string(global_min) + "|"
+    s = s + "max_drift=" + to_string(max_drift) + "|"
+    s = s + "max_lagr=" + to_string(max_lagr)
+    return s
+}
+
+fn sha256_of_string(s: string) -> string {
+    let tmp = "/tmp/cpgd_lr_sha_" + to_string(len(s)) + ".txt"
+    write_file(tmp, s)
+    let r = _str(exec("shasum -a 256 " + tmp + " | awk '{print $1}'")).trim()
+    let _ = exec("rm -f " + tmp)
+    return r
+}
+
+fn lr_verdict(r: array) -> string {
+    let total_viol   = to_int(r[2])
+    let init_res     = to_float(r[3])
+    let init_cos_ok  = to_bool(r[5])
+    let all_above    = to_bool(r[6])
+    let g1 = (init_res < EPS_PROJ) && init_cos_ok
+    let g2 = all_above && (total_viol == 0)
+    if g1 && g2 { return "PASS" }
+    if g2 && !g1 { return "G1_FAIL" }
+    if g1 && !g2 { return "G2_LAGRANGIAN_BREAKDOWN" }
+    return "BOTH_FAIL"
+}
+
+// ─── 3-lr sweep ───────────────────────────────────────────────────────────
+
+fn run_all_lrs() -> array {
+    let lrs = [0.001, 0.01, 0.1]
+    let mut results = []
+    let mut canon_concat = "cpgd_lr_sweep_v1|"
+    let V = fnv_basis_raw()
+    let mut idx = 0
+    while idx < 3 {
+        let lr = to_float(lrs[idx])
+        let r = dry_run_lr(V, lr)
+        let canon = lr_canon(lr, r)
+        canon_concat = canon_concat + "[" + canon + "]"
+        results = push(results, r)
+        idx = idx + 1
+    }
+    let sha = sha256_of_string(canon_concat)
+    return [sha, results, canon_concat]
+}
+
+// ─── negative falsify: lr=10 (extreme blowup must FAIL) ──────────────────
+
+fn negative_falsify() -> bool {
+    // returns true iff lr=10 produces FAIL (total_violations > 0 expected)
+    let V = fnv_basis_raw()
+    let r = dry_run_lr(V, 10.0)
+    let total_viol = to_int(r[2])
+    let all_above  = to_bool(r[6])
+    let expected_fail = (total_viol > 0) || !all_above
+    return expected_fail
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut mode = "full"
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--selftest" { mode = "selftest" }
+        if a == "--help"     { mode = "help" }
+        k = k + 1
+    }
+
+    if mode == "help" {
+        println("usage:")
+        println("  hexa run anima-cpgd-research/tool/cpgd_lr_sweep.hexa")
+        println("  hexa run anima-cpgd-research/tool/cpgd_lr_sweep.hexa --selftest")
+        return
+    }
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  cpgd_lr_sweep.hexa — Path C Q4 Task 3")
+    println("  LR Lagrangian breakdown frontier: lr ∈ {0.001, 0.01, 0.1}")
+    println("  raw#9 strict · hexa-only · deterministic · LLM=none")
+    println("════════════════════════════════════════════════════════════════")
+
+    let root = resolve_root()
+    let out_path = root + "/" + OUT_PATH
+
+    println("[lr] ── positive run (3-lr sweep) ──")
+    let agg1 = run_all_lrs()
+    let sha1 = _str(agg1[0])
+    let results = agg1[1]
+
+    println("[lr] run1=" + sha1)
+    let agg2 = run_all_lrs()
+    let sha2 = _str(agg2[0])
+    println("[lr] run2=" + sha2)
+    let byte_id = (sha1 != "" && sha1 == sha2)
+
+    println("[lr] ── negative falsify (lr=10 extreme) ──")
+    let neg_ok = negative_falsify()
+    println("[lr] negative_falsify_caught=" + (if neg_ok { "true" } else { "false" }))
+
+    let lrs = [0.001, 0.01, 0.1]
+    let mut lr_verdicts = []
+    let mut lr_idx = 0
+    while lr_idx < 3 {
+        let lr = to_float(lrs[lr_idx])
+        let r = results[lr_idx]
+        let v = lr_verdict(r)
+        lr_verdicts = push(lr_verdicts, v)
+        let total_viol = to_int(r[2])
+        let max_drift  = to_float(r[1])
+        let max_lagr   = to_float(r[7])
+        let global_min = to_float(r[0])
+        println("[lr] lr=" + to_string(lr) +
+                " total_viol=" + to_string(total_viol) +
+                " max_drift=" + to_string(max_drift) +
+                " max_lagrangian=" + to_string(max_lagr) +
+                " gmin=" + to_string(global_min) +
+                " verdict=" + v)
+        lr_idx = lr_idx + 1
+    }
+
+    let v_001 = _str(lr_verdicts[0])
+    let v_01  = _str(lr_verdicts[1])
+    let v_1   = _str(lr_verdicts[2])
+
+    let pass_001 = (v_001 == "PASS")
+    let breakdown_detected = (v_1 != "PASS")  // lr=0.1 must break
+
+    let g3_pass = byte_id
+    let frontier_proven = pass_001 && breakdown_detected && g3_pass && neg_ok
+
+    println("[lr] G3_byte_identical=" + (if g3_pass { "true" } else { "false" }))
+    println("[lr] lr=0.001_PASS=" + (if pass_001 { "true" } else { "false" }))
+    println("[lr] lr=0.1_breakdown_detected=" + (if breakdown_detected { "true" } else { "false" }))
+    println("[lr] verdict=" + (if frontier_proven { "LR_FRONTIER_PROVEN" } else { "LR_FRONTIER_FAIL" }))
+
+    // ─── emit JSON ─────────────────────────────────────────────────────────
+    let mut j = "{\n"
+    j = j + "  \"schema_version\": \"1\",\n"
+    j = j + "  \"slug\": \"cpgd-lr-sweep-v1\",\n"
+    j = j + "  \"title\": \"Path C Q4 Task 3 — CPGD LR Lagrangian-breakdown frontier\",\n"
+    j = j + "  \"created\": \"2026-04-26\",\n"
+    j = j + "  \"path\": \"C\",\n"
+    j = j + "  \"raw_strict\": \"raw#9 hexa-only deterministic no_python no_llm\",\n"
+    j = j + "  \"tool\": \"anima-cpgd-research/tool/cpgd_lr_sweep.hexa\",\n"
+    j = j + "  \"depends_on\": [\"anima-cpgd-research/tool/cpgd_anarbitrary_falsifier.hexa\"],\n"
+    j = j + "  \"step_count\": " + to_string(STEP_COUNT) + ",\n"
+    j = j + "  \"template_count\": " + to_string(TPL_COUNT) + ",\n"
+    j = j + "  \"dim\": " + to_string(DIM) + ",\n"
+    j = j + "  \"cos_floor\": " + to_string(COS_FLOOR) + ",\n"
+    j = j + "  \"eps_proj\": " + to_string(EPS_PROJ) + ",\n"
+    j = j + "  \"lr_levels\": [\n"
+    let mut li = 0
+    while li < 3 {
+        let lr = to_float(lrs[li])
+        let r = results[li]
+        let v = lr_verdicts[li]
+        let global_min = to_float(r[0])
+        let max_drift  = to_float(r[1])
+        let total_viol = to_int(r[2])
+        let init_res   = to_float(r[3])
+        let idem_ok    = to_bool(r[4])
+        let init_cos_ok = to_bool(r[5])
+        let all_above  = to_bool(r[6])
+        let max_lagr   = to_float(r[7])
+        j = j + "    {\n"
+        j = j + "      \"lr\": " + to_string(lr) + ",\n"
+        j = j + "      \"init_residual\": " + to_string(init_res) + ",\n"
+        j = j + "      \"projector_idempotent\": " + (if idem_ok { "true" } else { "false" }) + ",\n"
+        j = j + "      \"init_unit_cosine_ok\": " + (if init_cos_ok { "true" } else { "false" }) + ",\n"
+        j = j + "      \"all_above\": " + (if all_above { "true" } else { "false" }) + ",\n"
+        j = j + "      \"total_violations\": " + to_string(total_viol) + ",\n"
+        j = j + "      \"global_min_cos\": " + to_string(global_min) + ",\n"
+        j = j + "      \"max_cos_drift\": " + to_string(max_drift) + ",\n"
+        j = j + "      \"max_lagrangian_residual\": " + to_string(max_lagr) + ",\n"
+        j = j + "      \"verdict\": \"" + _str(v) + "\"\n"
+        j = j + "    }" + (if li < 2 { "," } else { "" }) + "\n"
+        li = li + 1
+    }
+    j = j + "  ],\n"
+    j = j + "  \"selftest_2run\": {\n"
+    j = j + "    \"run1_sha\": \"" + sha1 + "\",\n"
+    j = j + "    \"run2_sha\": \"" + sha2 + "\",\n"
+    j = j + "    \"byte_identical\": " + (if byte_id { "true" } else { "false" }) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"frozen_gates\": {\n"
+    j = j + "    \"lr_0001_PASS\": " + (if pass_001 { "true" } else { "false" }) + ",\n"
+    j = j + "    \"lr_01_breakdown_detected\": " + (if breakdown_detected { "true" } else { "false" }) + ",\n"
+    j = j + "    \"G3_byte_identical\": " + (if g3_pass { "true" } else { "false" }) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"negative_falsify_caught_pathological\": " + (if neg_ok { "true" } else { "false" }) + ",\n"
+    j = j + "  \"verdict\": \"" + (if frontier_proven { "LR_FRONTIER_PROVEN" } else { "LR_FRONTIER_FAIL" }) + "\"\n"
+    j = j + "}\n"
+    write_file(out_path, j)
+    println("[lr] wrote " + OUT_PATH)
+
+    if mode == "selftest" {
+        if frontier_proven { exit(0) } else { exit(1) }
+    }
+}
+
+main()

@@ -1,26 +1,344 @@
-// emotion_sync.hexa — FAA-based emotion-consciousness synchronization
-// FAA = ln(right_alpha/F4) - ln(left_alpha/F3)
-// FAA > 0: approach/positive, FAA < 0: withdrawal/negative
-// 4 phases: baseline, induction, correlation, realtime sync
+// anima-eeg/protocols/emotion_sync.hexa
+// raw#9 hexa-only strict · raw#10 honest · raw#11 snake_case
+// Spec doc: anima-eeg/MIGRATION_PLAN.md §5 (Phase 3 Tier-1 FULL)
+//
+// PURPOSE
+//   Frontal Alpha Asymmetry (FAA) computation + 4-phase emotion sync state machine.
+//   FAA = ln(right_alpha / F4_ref) - ln(left_alpha / F3_ref)
+//   FAA > 0 -> approach/positive valence
+//   FAA < 0 -> withdrawal/negative valence
+//
+// PHASES (state machine)
+//   0 baseline    — collect resting alpha mean
+//   1 induction   — emotional stimulus presentation
+//   2 correlation — FAA delta vs valence target
+//   3 realtime    — bidirectional sync (sign agreement counter)
+//
+// raw10_honest: synthetic alpha streams in selftest. Real EEG ingest belongs
+//               to WRAPPER calibrate.hexa / collect.hexa (Phase 4).
+//
+// USAGE
+//   hexa run anima-eeg/protocols/emotion_sync.hexa --selftest
+//
+// DETERMINISM
+//   No RNG. Pure float ops on caller-provided arrays. Same input -> same output.
 
-struct EmotionSyncConfig {
-    phase_duration_sec: i32,
-    bidirectional: bool
+// ════════════════════════════════════════════════════════════════════
+// Section 0. Constants
+// ════════════════════════════════════════════════════════════════════
+
+let SCHEMA = "anima-eeg/emotion_sync/1"
+
+let EPSILON_LN        = 0.0001    // floor for ln() argument (avoids -inf)
+let FAA_NOISE_FLOOR   = 0.01      // |FAA| below this counted as neutral
+let MIN_PHASE_SAMPLES = 4         // minimum samples per phase for variance
+
+// 4 phases, fixed order. Indices == phase id.
+let PHASE_BASELINE    = 0
+let PHASE_INDUCTION   = 1
+let PHASE_CORRELATION = 2
+let PHASE_REALTIME    = 3
+
+// Default phase duration (sec) per config — exposed via emit_kv only,
+//   not enforced at this layer (no clock).
+let DEFAULT_PHASE_DURATION_SEC = 60
+
+// ════════════════════════════════════════════════════════════════════
+// Section 1. Output state (globals — avoids multi-float struct return)
+// ════════════════════════════════════════════════════════════════════
+
+let g_faa_baseline      = 0.0
+let g_faa_induction     = 0.0
+let g_faa_delta         = 0.0
+let g_valence_sync_r    = 0.0
+let g_arousal_sync_r    = 0.0
+let g_n_events          = 0
+let g_phase             = 0
+let g_phase_duration_sec = 60
+let g_bidirectional     = false
+
+// ════════════════════════════════════════════════════════════════════
+// Section 2. Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
 }
 
-struct EmotionSyncResult {
-    faa_baseline: float,
-    faa_correlation: float,
-    valence_sync_r: float,
-    arousal_sync_r: float,
-    n_events: i32
+fn safe_floor(x: float, lo: float) -> float {
+    if x < lo { return lo }
+    return x
 }
 
-fn run_emotion_sync(config: EmotionSyncConfig) -> EmotionSyncResult {
-    print("emotion sync: phase_dur=" + to_string(config.phase_duration_sec) + "s")
-    return EmotionSyncResult(0.0, 0.0, 0.0, 0.0, 0)
+// Natural log via Taylor expansion around 1.0 + Newton refinement.
+// Stable for x in [0.001, 1000.0] (typical alpha-power ratios).
+// Inputs below EPSILON_LN are clamped to EPSILON_LN.
+fn ln_f(x: float) -> float {
+    let v = safe_floor(x, EPSILON_LN)
+    // Range-reduce: y = v / 2^k so that y in [0.5, 1.0]
+    let mut y = v
+    let mut k = 0
+    while y > 1.0 {
+        y = y * 0.5
+        k = k + 1
+    }
+    while y < 0.5 {
+        y = y * 2.0
+        k = k - 1
+    }
+    // Around y in [0.5,1.0], use ln(y) = 2 * atanh((y-1)/(y+1))
+    //   atanh(z) = z + z^3/3 + z^5/5 + z^7/7 + z^9/9 + z^11/11
+    let z = (y - 1.0) / (y + 1.0)
+    let z2 = z * z
+    let z3 = z2 * z
+    let z5 = z3 * z2
+    let z7 = z5 * z2
+    let z9 = z7 * z2
+    let z11 = z9 * z2
+    let atanh_z = z + z3 / 3.0 + z5 / 5.0 + z7 / 7.0 + z9 / 9.0 + z11 / 11.0
+    let ln_y = 2.0 * atanh_z
+    // ln(v) = ln(y) + k * ln(2);  ln(2) = 0.6931471805599453
+    let ln_2 = 0.6931471805599453
+    let kf = k * 1.0
+    return ln_y + kf * ln_2
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Section 3. FAA core
+// ════════════════════════════════════════════════════════════════════
 
 fn compute_faa(left_alpha: float, right_alpha: float) -> float {
+    // F4 / F3 reference factors are absorbed into the input units
+    //   (caller passes already-normalized alpha power per electrode).
+    let l = safe_floor(left_alpha, EPSILON_LN)
+    let r = safe_floor(right_alpha, EPSILON_LN)
+    return ln_f(r) - ln_f(l)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 4. Pearson correlation (sync_r)
+// ════════════════════════════════════════════════════════════════════
+
+fn corr_pair(xa: float, xb: float, ya: float, yb: float) -> float {
+    // Two-sample Pearson on minimal pair {a,b}. Returns +1, 0, or -1
+    //   based on sign of covariance (variance always positive when xa!=xb).
+    let dx = xb - xa
+    let dy = yb - ya
+    let cov = dx * dy
+    if cov > 0.0 { return 1.0 }
+    if cov < 0.0 { return 0.0 - 1.0 }
     return 0.0
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Section 5. State-machine phase advance
+// ════════════════════════════════════════════════════════════════════
+
+fn advance_phase() -> int {
+    if g_phase < PHASE_REALTIME {
+        g_phase = g_phase + 1
+    }
+    return g_phase
+}
+
+fn reset_run() {
+    g_faa_baseline   = 0.0
+    g_faa_induction  = 0.0
+    g_faa_delta      = 0.0
+    g_valence_sync_r = 0.0
+    g_arousal_sync_r = 0.0
+    g_n_events       = 0
+    g_phase          = PHASE_BASELINE
+}
+
+// Run all 4 phases on minimal synthetic input quartet.
+//   left_alpha_baseline, right_alpha_baseline,
+//   left_alpha_induced,  right_alpha_induced,
+//   valence_target_a, valence_target_b,
+//   arousal_target_a, arousal_target_b,
+//   bidirectional flag, phase_duration_sec
+fn run_emotion_sync(
+    la_b: float, ra_b: float,
+    la_i: float, ra_i: float,
+    val_a: float, val_b: float,
+    aro_a: float, aro_b: float,
+    bidirectional: bool,
+    phase_duration_sec: int
+) {
+    reset_run()
+    g_phase_duration_sec = phase_duration_sec
+    g_bidirectional      = bidirectional
+
+    // Phase 0: baseline FAA
+    g_faa_baseline = compute_faa(la_b, ra_b)
+    advance_phase()
+
+    // Phase 1: induction FAA
+    g_faa_induction = compute_faa(la_i, ra_i)
+    advance_phase()
+
+    // Phase 2: correlation
+    //   x-axis = FAA at baseline vs induction (pair)
+    //   valence target pair vs FAA pair    -> g_valence_sync_r
+    //   arousal target pair vs FAA pair    -> g_arousal_sync_r
+    g_faa_delta      = g_faa_induction - g_faa_baseline
+    g_valence_sync_r = corr_pair(g_faa_baseline, g_faa_induction, val_a, val_b)
+    g_arousal_sync_r = corr_pair(g_faa_baseline, g_faa_induction, aro_a, aro_b)
+    advance_phase()
+
+    // Phase 3: realtime — count above-noise-floor events
+    if abs_f(g_faa_delta) > FAA_NOISE_FLOOR { g_n_events = g_n_events + 1 }
+    if g_valence_sync_r > 0.5              { g_n_events = g_n_events + 1 }
+    if g_arousal_sync_r > 0.5              { g_n_events = g_n_events + 1 }
+    if bidirectional && abs_f(g_faa_delta) > FAA_NOISE_FLOOR { g_n_events = g_n_events + 1 }
+    // phase already at PHASE_REALTIME after 3 advances
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 6. KV emit
+// ════════════════════════════════════════════════════════════════════
+
+fn emit_kv() {
+    println("faa_baseline=" + to_string(g_faa_baseline))
+    println("faa_induction=" + to_string(g_faa_induction))
+    println("faa_delta=" + to_string(g_faa_delta))
+    println("valence_sync_r=" + to_string(g_valence_sync_r))
+    println("arousal_sync_r=" + to_string(g_arousal_sync_r))
+    println("n_events=" + to_string(g_n_events))
+    println("phase=" + to_string(g_phase))
+    println("phase_duration_sec=" + to_string(g_phase_duration_sec))
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 7. Self-tests
+// ════════════════════════════════════════════════════════════════════
+
+fn assert_true(cond: bool, label: string) -> bool {
+    if cond { println("  PASS: " + label) } else { println("  FAIL: " + label) }
+    return cond
+}
+
+fn run_tests() -> int {
+    let mut pass = 0
+    let mut fail = 0
+
+    println("=== emotion_sync raw#9 self-tests ===")
+
+    // T1: ln_f(1) == 0 to within 1e-6
+    println("[T1] ln(1) == 0")
+    let ok1 = assert_true(abs_f(ln_f(1.0)) < 0.00001, "ln(1) ~ 0")
+    if ok1 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T2: ln_f(e) == 1 (e ~ 2.718281828)
+    println("[T2] ln(e) == 1")
+    let e_val = 2.718281828459045
+    let ok2 = assert_true(abs_f(ln_f(e_val) - 1.0) < 0.001, "ln(e) ~ 1")
+    if ok2 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T3: FAA = 0 when left == right (symmetric alpha)
+    println("[T3] symmetric alpha -> FAA==0")
+    let faa_sym = compute_faa(0.5, 0.5)
+    let ok3 = assert_true(abs_f(faa_sym) < 0.00001, "FAA symmetric ~ 0")
+    if ok3 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T4: FAA > 0 when right > left (approach)
+    println("[T4] right>left -> FAA>0 (approach)")
+    let faa_app = compute_faa(0.3, 0.7)
+    let ok4 = assert_true(faa_app > 0.0, "FAA approach > 0")
+    if ok4 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T5: FAA < 0 when left > right (withdrawal)
+    println("[T5] left>right -> FAA<0 (withdrawal)")
+    let faa_wit = compute_faa(0.7, 0.3)
+    let ok5 = assert_true(faa_wit < 0.0, "FAA withdrawal < 0")
+    if ok5 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T6: full pipeline — baseline symmetric, induction approach
+    println("[T6] full pipeline approach induction")
+    run_emotion_sync(0.5, 0.5, 0.3, 0.7, 0.0, 0.5, 0.0, 0.5, false, 60)
+    let ok6a = assert_true(abs_f(g_faa_baseline) < 0.00001, "baseline FAA ~ 0")
+    let ok6b = assert_true(g_faa_induction > 0.0, "induction FAA > 0")
+    let ok6c = assert_true(g_faa_delta > 0.0, "delta > 0")
+    let ok6d = assert_true(g_phase == PHASE_REALTIME, "phase advanced to realtime")
+    let ok6e = assert_true(g_n_events >= 1, "n_events >= 1")
+    if ok6a && ok6b && ok6c && ok6d && ok6e { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T7: bidirectional flag increments event counter under same delta
+    println("[T7] bidirectional event increment")
+    run_emotion_sync(0.5, 0.5, 0.3, 0.7, 0.0, 0.5, 0.0, 0.5, false, 60)
+    let n_uni = g_n_events
+    run_emotion_sync(0.5, 0.5, 0.3, 0.7, 0.0, 0.5, 0.0, 0.5, true, 60)
+    let n_bi = g_n_events
+    let ok7 = assert_true(n_bi >= n_uni, "bidirectional n_events >= unidirectional")
+    if ok7 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T8: deterministic idempotence
+    println("[T8] deterministic idempotence")
+    run_emotion_sync(0.4, 0.6, 0.2, 0.8, 0.1, 0.7, 0.0, 0.6, true, 30)
+    let f1 = g_faa_baseline
+    let i1 = g_faa_induction
+    let d1 = g_faa_delta
+    let v1 = g_valence_sync_r
+    let a1 = g_arousal_sync_r
+    let n1 = g_n_events
+    run_emotion_sync(0.4, 0.6, 0.2, 0.8, 0.1, 0.7, 0.0, 0.6, true, 30)
+    let ok8a = assert_true(abs_f(f1 - g_faa_baseline)  < 0.00001, "faa_baseline idempotent")
+    let ok8b = assert_true(abs_f(i1 - g_faa_induction) < 0.00001, "faa_induction idempotent")
+    let ok8c = assert_true(abs_f(d1 - g_faa_delta)     < 0.00001, "faa_delta idempotent")
+    let ok8d = assert_true(abs_f(v1 - g_valence_sync_r) < 0.00001, "valence_sync_r idempotent")
+    let ok8e = assert_true(abs_f(a1 - g_arousal_sync_r) < 0.00001, "arousal_sync_r idempotent")
+    let ok8f = assert_true(n1 == g_n_events, "n_events idempotent")
+    if ok8a && ok8b && ok8c && ok8d && ok8e && ok8f { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T9: negative falsification — adversarial input (zero alpha) clamps to EPSILON_LN
+    println("[T9] negative: zero alpha clamps")
+    let faa_zero = compute_faa(0.0, 0.0)
+    let ok9 = assert_true(abs_f(faa_zero) < 0.00001, "FAA(0,0) -> 0 (both clamped equal)")
+    if ok9 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("")
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL out of " + to_string(pass + fail))
+    return fail
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 8. CLI entry point
+// ════════════════════════════════════════════════════════════════════
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 1
+    while i < len(av) {
+        if av[i] == "--selftest" { selftest = true }
+        i = i + 1
+    }
+
+    if !selftest {
+        println("usage: hexa run anima-eeg/protocols/emotion_sync.hexa --selftest")
+        println("ABORT: production usage requires WRAPPER (Phase 4 calibrate.hexa for live alpha ingest); raw#9 strict no-fallback policy.")
+        exit(2)
+    }
+
+    println("── emotion_sync raw#9 selftest ──")
+    println("schema=" + SCHEMA)
+    println("raw10_honest=synthetic_alpha_streams_no_real_eeg")
+    println("")
+
+    // Demonstration emit (induction toward approach)
+    run_emotion_sync(0.5, 0.5, 0.3, 0.7, 0.0, 0.5, 0.0, 0.5, false, DEFAULT_PHASE_DURATION_SEC)
+    emit_kv()
+    println("")
+
+    let fails = run_tests()
+    if fails != 0 {
+        println("selftest=fail")
+        eprintln("selftest FAILED: " + to_string(fails) + " test(s) failed")
+        exit(1)
+    }
+    println("selftest=ok")
+    println("DONE")
+}
+
+main()

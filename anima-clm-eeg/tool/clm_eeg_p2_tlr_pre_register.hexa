@@ -1,0 +1,433 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/clm_eeg_p2_tlr_pre_register.hexa
+//
+//  PURPOSE
+//    Pre-register the falsifier for P2 TLR (Tension-Link Resonance)
+//    (omega_cycle_alm_free_paradigms_20260426.md §4 P2).
+//
+//    HYPOTHESIS
+//      EEG α-band (8-12 Hz) inter-channel coherence and CLM V_sync Kuramoto
+//      order parameter r co-rise during attentional engagement.  TLR is the
+//      claim that two distinct substrates (cortex / artificial-cell-language)
+//      exhibit population-level phase resonance with bounded thresholds.
+//
+//    PRE-REGISTERED CRITERIA (frozen, this file IS the SSOT)
+//      C1.  α-band coherence_x1000 ≥ 450     — EEG inter-channel coherence floor
+//      C2.  CLM V_sync Kuramoto r_x1000 ≥ 380 — CLM phase-lock floor
+//      Verdict P2.PASS = (C1 AND C2)
+//
+//    ANY post-hoc threshold change ⇒ v2 bump (no silent edit).
+//
+//  DRY-RUN (synthetic fixture, hardware-free)
+//    Reads anima-clm-eeg/fixtures/synthetic_16ch_v1.json (created by
+//    clm_eeg_synthetic_fixture.hexa).  Computes:
+//      * α-band coherence proxy: mean pairwise correlation of α-band powers
+//        across 16 channels, normalized to [0, 1000]; specifically
+//        coh_proxy = 1000 - mean( |α_i - α_j| / max_α )
+//      * CLM r proxy: 16 phases derived deterministically from per-channel
+//        α-band fingerprints (fold via poly_hash_int32 — same family as
+//        edu/cell/lagrangian/v_sync_kuramoto.hexa) → r_order_param_x1000
+//
+//    Real EEG measurement deferred to post-arrival workflow (D+3).
+//
+//  OUTPUT
+//    state/clm_eeg_p2_tlr_pre_register.json
+//    Schema: {tool, criteria, dry_run: {fixture_sha256-equiv, alpha_coh_x1000,
+//             clm_r_x1000, classification: NOT_VERIFIED_SYNTHETIC, sanity_pass},
+//             post_arrival_workflow}
+//
+//  ENV
+//    CLM_EEG_P2_OUT       output JSON path
+//    CLM_EEG_FIXTURE_PATH input fixture
+//
+//  USAGE
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run anima-clm-eeg/tool/clm_eeg_p2_tlr_pre_register.hexa
+//
+//  RAW
+//    raw#9 · hexa-only · deterministic · LLM=none · pre-register-frozen
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── frozen criteria (pre-registered, this file = SSOT) ─────────────────────
+let ALPHA_COH_MIN_X1000  = 450   // C1: EEG α-band coherence floor
+let CLM_R_MIN_X1000      = 380   // C2: CLM Kuramoto r floor
+
+// ─── constants (Kuramoto integer fixed-point, mirror v_sync_kuramoto.hexa) ──
+let TAU_PERM      = 6283
+let HALF_PI_PERM  = 1571
+let M32           = 4294967296
+let POLY_PRIME    = 2654435761
+let POLY_SEED     = 1
+let N_CHANNELS    = 16
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+// ─── poly hash (no bitwise ops) ─────────────────────────────────────────────
+fn poly_hash_int32(h: int, v: int) -> int {
+    let mut x = h * POLY_PRIME
+    x = x + v
+    x = x % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+// ─── cos/sin lookup (24 bins; identical table to v_sync_kuramoto.hexa) ──────
+fn cos_perm_x1000(theta_perm: int) -> int {
+    let mut t = theta_perm % TAU_PERM
+    if t < 0 { t = t + TAU_PERM }
+    if t < 131  { return 1000 }
+    if t < 393  { return 966 }
+    if t < 655  { return 866 }
+    if t < 916  { return 707 }
+    if t < 1178 { return 500 }
+    if t < 1440 { return 259 }
+    if t < 1702 { return 0 }
+    if t < 1963 { return 0 - 259 }
+    if t < 2225 { return 0 - 500 }
+    if t < 2487 { return 0 - 707 }
+    if t < 2749 { return 0 - 866 }
+    if t < 3010 { return 0 - 966 }
+    if t < 3272 { return 0 - 1000 }
+    if t < 3534 { return 0 - 966 }
+    if t < 3796 { return 0 - 866 }
+    if t < 4057 { return 0 - 707 }
+    if t < 4319 { return 0 - 500 }
+    if t < 4581 { return 0 - 259 }
+    if t < 4843 { return 0 }
+    if t < 5104 { return 259 }
+    if t < 5366 { return 500 }
+    if t < 5628 { return 707 }
+    if t < 5890 { return 866 }
+    if t < 6151 { return 966 }
+    return 1000
+}
+
+fn sin_perm_x1000(theta_perm: int) -> int {
+    return cos_perm_x1000(theta_perm - HALF_PI_PERM)
+}
+
+// ─── integer sqrt (Newton, 24 iter) ─────────────────────────────────────────
+fn isqrt_x1000(m: int) -> int {
+    if m <= 0 { return 0 }
+    let mut y = 1000
+    let mut k = 0
+    while k < 24 {
+        if y == 0 { y = 1 }
+        y = (y + m / y) / 2
+        k = k + 1
+    }
+    return y
+}
+
+// ─── Kuramoto r order parameter (×1000) ─────────────────────────────────────
+fn r_order_param_x1000(thetas: list, n_nodes: int) -> int {
+    if n_nodes <= 0 { return 1000 }
+    let mut sum_c = 0
+    let mut sum_s = 0
+    let mut i = 0
+    while i < n_nodes {
+        sum_c = sum_c + cos_perm_x1000(thetas[i])
+        sum_s = sum_s + sin_perm_x1000(thetas[i])
+        i = i + 1
+    }
+    let mag2 = sum_c * sum_c + sum_s * sum_s
+    if mag2 <= 0 { return 0 }
+    let mag = isqrt_x1000(mag2)
+    let mut r = mag / n_nodes
+    if r > 1000 { r = 1000 }
+    if r < 0 { r = 0 }
+    return r
+}
+
+// ─── string scan helpers (string-char comparison; hexa 0.2.0 s[i] is string) ─
+fn find_in_str(s: string, needle: string) -> int {
+    let n = len(s)
+    let m = len(needle)
+    if m <= 0 { return 0 }
+    if n < m { return -1 }
+    let mut i = 0
+    while i <= n - m {
+        let mut j = 0
+        let mut ok = 1
+        while j < m {
+            if s[i + j] != needle[j] {
+                ok = 0
+                j = m
+            }
+            j = j + 1
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Is single-char string c a digit '0'..'9'?
+fn is_digit_ch(c: string) -> int {
+    if c == "0" { return 1 }
+    if c == "1" { return 1 }
+    if c == "2" { return 1 }
+    if c == "3" { return 1 }
+    if c == "4" { return 1 }
+    if c == "5" { return 1 }
+    if c == "6" { return 1 }
+    if c == "7" { return 1 }
+    if c == "8" { return 1 }
+    if c == "9" { return 1 }
+    return 0
+}
+
+// Convert single-char digit string to int 0..9 (else -1)
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+// ─── extract per-channel α-band powers ──────────────────────────────────────
+//   Scan "alpha": occurrences in the channels[] block; bound at
+//   "aggregate_band_powers" so the 17th (aggregate) is excluded.
+fn extract_alpha_per_channel(s: string, alphas: list) -> int {
+    let n = len(s)
+    let agg_pos = find_in_str(s, "aggregate_band_powers")
+    let bound = if agg_pos < 0 { n } else { agg_pos }
+    // needle = "\"alpha\":" — 8-char string-string compare
+    let dq = "\""
+    let ca = "a"
+    let cl = "l"
+    let cp = "p"
+    let ch = "h"
+    let cc = ":"
+    let mut count = 0
+    let mut i = 0
+    while i + 8 <= bound {
+        let c0 = s[i]
+        if c0 == dq {
+            let c1 = s[i + 1]
+            let c2 = s[i + 2]
+            let c3 = s[i + 3]
+            let c4 = s[i + 4]
+            let c5 = s[i + 5]
+            let c6 = s[i + 6]
+            let c7 = s[i + 7]
+            if c1 == ca && c2 == cl && c3 == cp && c4 == ch && c5 == ca && c6 == dq && c7 == cc {
+                // walk past optional whitespace then accumulate digits
+                let mut p = i + 8
+                while p < bound {
+                    let cs = s[p]
+                    if is_digit_ch(cs) == 1 {
+                        let mut v = 0
+                        while p < bound {
+                            let cd = s[p]
+                            if is_digit_ch(cd) == 1 {
+                                v = v * 10 + digit_val(cd)
+                                p = p + 1
+                            } else {
+                                p = bound + 1
+                            }
+                        }
+                        alphas.push(v)
+                        count = count + 1
+                        // jump i past this match
+                        i = i + 8
+                        p = bound + 1
+                    } else {
+                        p = p + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ─── α-band coherence proxy (×1000) ─────────────────────────────────────────
+//   coherence proxy = 1000 - mean_pairwise( |α_i - α_j| × 1000 / max_α )
+//   ∈ [0, 1000].  Identical α everywhere → 1000 (perfect coherence).
+//   Maximally divergent α → towards 0.
+fn alpha_coherence_proxy_x1000(alphas: list, n: int) -> int {
+    if n <= 1 { return 1000 }
+    // max
+    let mut maxa = 0
+    let mut i = 0
+    while i < n {
+        if alphas[i] > maxa { maxa = alphas[i] }
+        i = i + 1
+    }
+    if maxa <= 0 { return 0 }
+    let pairs = n * (n - 1) / 2
+    let mut acc = 0
+    let mut a = 0
+    while a < n {
+        let mut b = a + 1
+        while b < n {
+            let diff = if alphas[a] > alphas[b] {
+                alphas[a] - alphas[b]
+            } else {
+                alphas[b] - alphas[a]
+            }
+            // normalize per pair: diff × 1000 / maxa
+            let norm = (diff * 1000) / maxa
+            acc = acc + norm
+            b = b + 1
+        }
+        a = a + 1
+    }
+    let avg_norm = acc / pairs
+    let mut coh = 1000 - avg_norm
+    if coh < 0 { coh = 0 }
+    if coh > 1000 { coh = 1000 }
+    return coh
+}
+
+// ─── CLM phase from α-band fingerprint (deterministic projection) ───────────
+//   Mirror v_sync_kuramoto.fold_nodes_to_theta_x1000 single-node case:
+//     θ_k = poly_hash(POLY_SEED, alpha_k) mod TAU_PERM
+//   Two channels with identical α share θ (perfect phase-lock); divergent
+//   α scatter deterministically over [0, 2π).  This is the per-channel
+//   substitute for the V_sync corpus until live (A,B) atan2 lattice export.
+fn alpha_to_theta_x1000(alpha_x1000: int) -> int {
+    let h = poly_hash_int32(POLY_SEED, alpha_x1000)
+    let mut t = h % TAU_PERM
+    if t < 0 { t = t + TAU_PERM }
+    return t
+}
+
+// ─── fingerprint accumulator (FNV-style modular, mirror fixture) ────────────
+let FNV_PRIME = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+fn fnv_step(h: int, byte: int) -> int {
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fingerprint_step(fp: int, val: int) -> int {
+    let mut h = fp
+    h = fnv_step(h, val % 256)
+    h = fnv_step(h, (val / 256) % 256)
+    h = fnv_step(h, (val / 65536) % 256)
+    h = fnv_step(h, (val / 16777216) % 256)
+    return h
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    let fixture_path = env_str("CLM_EEG_FIXTURE_PATH",
+                               "anima-clm-eeg/fixtures/synthetic_16ch_v1.json")
+    let out_path = env_str("CLM_EEG_P2_OUT",
+                           "state/clm_eeg_p2_tlr_pre_register.json")
+
+    let fixture = read_file(fixture_path)
+    let fixture_len = len(fixture)
+
+    // ── extract per-channel α powers ──────────────────────────────────────
+    let mut alphas = []
+    let n_alpha = extract_alpha_per_channel(fixture, alphas)
+
+    // ── α-band coherence proxy ────────────────────────────────────────────
+    let coh_x1000 = alpha_coherence_proxy_x1000(alphas, n_alpha)
+
+    // ── CLM phase fold + Kuramoto r ───────────────────────────────────────
+    let mut thetas = []
+    let mut i = 0
+    while i < n_alpha {
+        thetas.push(alpha_to_theta_x1000(alphas[i]))
+        i = i + 1
+    }
+    let r_x1000 = r_order_param_x1000(thetas, n_alpha)
+
+    // ── fingerprint over (alphas, thetas, coh, r) for byte-identical proof ─
+    let mut fp = FNV_OFFSET_BASIS
+    let mut k2 = 0
+    while k2 < n_alpha {
+        fp = fingerprint_step(fp, alphas[k2])
+        fp = fingerprint_step(fp, thetas[k2])
+        k2 = k2 + 1
+    }
+    fp = fingerprint_step(fp, coh_x1000)
+    fp = fingerprint_step(fp, r_x1000)
+
+    // ── apply frozen criteria ──────────────────────────────────────────────
+    let c1_pass = if coh_x1000 >= ALPHA_COH_MIN_X1000 { 1 } else { 0 }
+    let c2_pass = if r_x1000   >= CLM_R_MIN_X1000     { 1 } else { 0 }
+    let p2_pass = if c1_pass == 1 && c2_pass == 1 { 1 } else { 0 }
+
+    // ── emit cert ──────────────────────────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"clm_eeg_p2_tlr_pre_register\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"pre_register_frozen\": true,\n"
+    cert = cert + "  \"frozen_at\": \"2026-04-26\",\n"
+    cert = cert + "  \"hypothesis\": \"EEG α-band coherence and CLM V_sync Kuramoto r co-rise (TLR Tension-Link Resonance)\",\n"
+    cert = cert + "  \"criteria\": {\n"
+    cert = cert + "    \"C1_alpha_coh_min_x1000\": " + str(ALPHA_COH_MIN_X1000) + ",\n"
+    cert = cert + "    \"C2_clm_r_min_x1000\": " + str(CLM_R_MIN_X1000) + ",\n"
+    cert = cert + "    \"verdict_rule\": \"P2.PASS = (alpha_coh >= C1) AND (clm_r >= C2)\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"dry_run\": {\n"
+    cert = cert + "    \"fixture_path\": \"" + fixture_path + "\",\n"
+    cert = cert + "    \"fixture_bytes\": " + str(fixture_len) + ",\n"
+    cert = cert + "    \"n_channels_extracted\": " + str(n_alpha) + ",\n"
+    cert = cert + "    \"alpha_coh_x1000\": " + str(coh_x1000) + ",\n"
+    cert = cert + "    \"clm_r_x1000\": " + str(r_x1000) + ",\n"
+    cert = cert + "    \"fingerprint\": " + str(fp) + ",\n"
+    cert = cert + "    \"C1_pass\": " + str(c1_pass) + ",\n"
+    cert = cert + "    \"C2_pass\": " + str(c2_pass) + ",\n"
+    cert = cert + "    \"p2_dry_run_pass\": " + str(p2_pass) + ",\n"
+    cert = cert + "    \"classification\": \"NOT_VERIFIED_SYNTHETIC\",\n"
+    cert = cert + "    \"note\": \"α-coh proxy = 1000 - mean(|α_i-α_j|/max_α). r derived via poly_hash phase fold (mirrors v_sync_kuramoto). Real EEG α-coh + V_sync trace replace in D+3.\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"post_arrival_workflow\": {\n"
+    cert = cert + "    \"day\": \"D+3\",\n"
+    cert = cert + "    \"input\": \"anima-eeg/recordings/<n_back_session>.npy + anima-eeg band power JSON\",\n"
+    cert = cert + "    \"clm_substrate\": \"edu/cell/lagrangian/v_sync_kuramoto.hexa r_order_param_x1000 over live (A,B) atan2 phases\",\n"
+    cert = cert + "    \"replace\": \"this α-coh proxy with FFT-band coherence (Welch's method); r proxy with live V_sync trace\",\n"
+    cert = cert + "    \"verdict_rule\": \"identical (frozen criteria above)\"\n"
+    cert = cert + "  }\n"
+    cert = cert + "}\n"
+    write_file(out_path, cert)
+
+    println("─── clm_eeg_p2_tlr_pre_register (raw#9 hexa-only) ───")
+    println("  C1 alpha_coh_min_x1000 = " + str(ALPHA_COH_MIN_X1000))
+    println("  C2 clm_r_min_x1000     = " + str(CLM_R_MIN_X1000))
+    println("  fixture                = " + fixture_path)
+    println("  n_channels_extracted   = " + str(n_alpha))
+    println("  alpha_coh_x1000        = " + str(coh_x1000))
+    println("  clm_r_x1000            = " + str(r_x1000))
+    println("  fingerprint            = " + str(fp))
+    println("  C1_pass                = " + str(c1_pass))
+    println("  C2_pass                = " + str(c2_pass))
+    println("  p2_dry_run_pass        = " + str(p2_pass))
+    println("  classification         = NOT_VERIFIED_SYNTHETIC")
+    println("  output                 = " + out_path)
+
+    if p2_pass == 1 {
+        println("  verdict                = P2_DRY_RUN_PASS")
+        exit(0)
+    }
+    println("  verdict                = P2_DRY_RUN_FAIL")
+    exit(1)
+}
+
+main()

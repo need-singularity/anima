@@ -1,0 +1,315 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-cpgd-research/tool/cpgd_generalization_smoke.hexa
+//  Path C (Q4 generalization) — composite smoke chain
+//
+//  PURPOSE
+//    Aggregate verdicts from:
+//      (a) AN11(b)        — existing edu/lora/cpgd_wrapper_result.json baseline
+//      (b) AN9            — anima-cpgd-research/state/cpgd_an9_falsifier_v1.json
+//      (c) AN-arbitrary   — anima-cpgd-research/state/cpgd_anarbitrary_falsifier_v1.json
+//
+//    Composite verdict:
+//      CPGD_GENERALIZED := all 3 G1+G2+G3 PASS (∧ G4 for AN-arbitrary)
+//
+//  ω-cycle pattern
+//    1. design — 3-target composite spec (this file's frozen criteria)
+//    2. read state JSONs (read-only)
+//    3. evaluate composite gate
+//    4. emit smoke JSON
+//    5. 2-run byte-identical (smoke is deterministic since it reads files)
+//    6. negative-falsify: missing input file ⇒ verdict=COMPOSITE_FAIL
+//
+//  OUTPUT: anima-cpgd-research/state/cpgd_generalization_smoke.json
+//  raw#9 strict · hexa-only · deterministic · LLM=none · CPU-only · $0
+// ════════════════════════════════════════════════════════════════════════════
+
+let OUT_PATH      = "anima-cpgd-research/state/cpgd_generalization_smoke.json"
+let AN11B_PATH    = "state/cpgd_wrapper_result.json"   // existing canonical
+let AN9_PATH      = "anima-cpgd-research/state/cpgd_an9_falsifier_v1.json"
+let ANARB_PATH    = "anima-cpgd-research/state/cpgd_anarbitrary_falsifier_v1.json"
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn resolve_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let n = _str(env("NEXUS"))
+    if n != "" { return n }
+    let gt = _str(exec("git rev-parse --show-toplevel")).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/core/anima"
+}
+
+fn fexists(path: string) -> bool {
+    let probe = _str(exec("stat -f %N " + path)).trim()
+    if probe != "" { return true }
+    let probe2 = _str(exec("stat -c %n " + path)).trim()
+    return probe2 != ""
+}
+
+fn read_safe(path: string) -> string {
+    if !fexists(path) { return "" }
+    return _str(read_file(path))
+}
+
+fn index_of_from(hay: string, needle: string, start: int) -> int {
+    let n = len(hay)
+    if start < 0 { return hay.index_of(needle) }
+    if start >= n { return -1 }
+    let tail = hay.substring(start, n)
+    let idx = tail.index_of(needle)
+    if idx < 0 { return -1 }
+    return start + idx
+}
+
+fn extract_str(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return "" }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return "" }
+    let q1 = index_of_from(blob, "\"", colon + 1)
+    if q1 < 0 { return "" }
+    let q2 = index_of_from(blob, "\"", q1 + 1)
+    if q2 < 0 { return "" }
+    return blob.substring(q1 + 1, q2)
+}
+
+fn extract_bool(blob: string, key: string) -> bool {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return false }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return false }
+    let n = len(blob)
+    let mut i = colon + 1
+    while i < n {
+        let c = blob.substring(i, i + 1)
+        if c == "t" { return true }
+        if c == "f" { return false }
+        if c != " " && c != "\n" && c != "\r" && c != "\t" { return false }
+        i = i + 1
+    }
+    return false
+}
+
+fn extract_int(blob: string, key: string) -> int {
+    let needle = "\"" + key + "\""
+    let k = blob.index_of(needle)
+    if k < 0 { return -1 }
+    let colon = index_of_from(blob, ":", k)
+    if colon < 0 { return -1 }
+    let n = len(blob)
+    let mut i = colon + 1
+    let mut start = -1
+    let mut end = -1
+    while i < n {
+        let cc = blob.substring(i, i + 1)
+        let isdig = (cc == "0" || cc == "1" || cc == "2" || cc == "3" || cc == "4"
+                  || cc == "5" || cc == "6" || cc == "7" || cc == "8" || cc == "9")
+        if isdig && start < 0 { start = i }
+        if !isdig && start >= 0 { end = i; break }
+        i = i + 1
+    }
+    if start < 0 { return -1 }
+    if end < 0 { end = n }
+    return to_int(blob.substring(start, end))
+}
+
+// ─── per-target evaluators ────────────────────────────────────────────────
+
+fn eval_an11b(blob: string) -> array {
+    if blob == "" { return [false, false, false, false, "AN11B_MISSING"] }
+    // existing format from edu/lora/cpgd_wrapper.hexa:
+    //   "all_template_above_0.5": true
+    //   "projector_idempotent": true
+    //   "init_unit_cosine_ok": true (within exit_criteria nested)
+    //   "selftest_3run.byte_identical": true
+    //   "cosines_violating": 0 ⇒ G2
+    let g1 = extract_bool(blob, "init_unit_cosine_ok")
+    let viol = extract_int(blob, "cosines_violating")
+    let g2_a = extract_bool(blob, "all_template_above_0.5")
+    let g2_pass = g2_a && (viol == 0)
+    let g3 = extract_bool(blob, "byte_identical")
+    let verdict = extract_str(blob, "verdict")
+    let pass = g1 && g2_pass && g3 && (verdict == "VERIFIED")
+    let v_label = if pass { "AN11B_GENERALIZED_baseline" } else { "AN11B_FAIL_or_MISSING" }
+    return [g1, g2_pass, g3, pass, v_label]
+}
+
+fn eval_an9(blob: string) -> array {
+    if blob == "" { return [false, false, false, false, "AN9_MISSING"] }
+    let g1 = extract_bool(blob, "G1_init_residual_pass")
+    let g2 = extract_bool(blob, "G2_monotone_no_violation")
+    let g3 = extract_bool(blob, "G3_byte_identical")
+    let verdict = extract_str(blob, "verdict")
+    let pass = g1 && g2 && g3 && (verdict == "AN9_GENERALIZED")
+    let v_label = if pass { "AN9_GENERALIZED" } else { "AN9_FAIL" }
+    return [g1, g2, g3, pass, v_label]
+}
+
+fn eval_anarb(blob: string) -> array {
+    if blob == "" { return [false, false, false, false, false, "ANARB_MISSING"] }
+    let g1 = extract_bool(blob, "G1_init_residual_pass")
+    let g2 = extract_bool(blob, "G2_monotone_no_violation")
+    let g3 = extract_bool(blob, "G3_byte_identical")
+    let g4 = extract_bool(blob, "G4_cond_conditioned_monotone")
+    let verdict = extract_str(blob, "verdict")
+    let pass = g1 && g2 && g3 && g4 && (verdict == "ANARB_GENERALIZED")
+    let v_label = if pass { "ANARB_GENERALIZED" } else { "ANARB_FAIL" }
+    return [g1, g2, g3, g4, pass, v_label]
+}
+
+// ─── canonical payload ────────────────────────────────────────────────────
+
+fn canonical_payload(an11b_pass: bool, an9_pass: bool, anarb_pass: bool,
+                     composite_pass: bool) -> string {
+    let mut s = "cpgd_generalization_smoke_v1|"
+    s = s + "an11b=" + (if an11b_pass { "PASS" } else { "FAIL" }) + "|"
+    s = s + "an9="   + (if an9_pass   { "PASS" } else { "FAIL" }) + "|"
+    s = s + "anarb=" + (if anarb_pass { "PASS" } else { "FAIL" }) + "|"
+    s = s + "composite=" + (if composite_pass { "CPGD_GENERALIZED" } else { "PARTIAL_OR_FAIL" })
+    return s
+}
+
+fn sha256_of_string(s: string) -> string {
+    let tmp = "/tmp/cpgd_smoke_sha_" + to_string(len(s)) + ".txt"
+    write_file(tmp, s)
+    let r = _str(exec("shasum -a 256 " + tmp + " | awk '{print $1}'")).trim()
+    let _ = exec("rm -f " + tmp)
+    return r
+}
+
+// ─── run_once ─────────────────────────────────────────────────────────────
+
+fn run_once(root: string) -> array {
+    let an11b_blob = read_safe(root + "/" + AN11B_PATH)
+    let an9_blob   = read_safe(root + "/" + AN9_PATH)
+    let anarb_blob = read_safe(root + "/" + ANARB_PATH)
+
+    let r_an11 = eval_an11b(an11b_blob)
+    let r_an9  = eval_an9(an9_blob)
+    let r_anarb = eval_anarb(anarb_blob)
+
+    let an11b_pass = to_bool(r_an11[3])
+    let an9_pass   = to_bool(r_an9[3])
+    let anarb_pass = to_bool(r_anarb[4])
+
+    let composite = an11b_pass && an9_pass && anarb_pass
+    let canon = canonical_payload(an11b_pass, an9_pass, anarb_pass, composite)
+    let sha = sha256_of_string(canon)
+    return [sha, an11b_pass, an9_pass, anarb_pass, composite, r_an11, r_an9, r_anarb]
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut mode = "full"
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--selftest" { mode = "selftest" }
+        if a == "--help"     { mode = "help" }
+        k = k + 1
+    }
+
+    if mode == "help" {
+        println("usage:")
+        println("  hexa run anima-cpgd-research/tool/cpgd_generalization_smoke.hexa")
+        println("  hexa run anima-cpgd-research/tool/cpgd_generalization_smoke.hexa --selftest")
+        return
+    }
+
+    println("════════════════════════════════════════════════════════════════")
+    println("  cpgd_generalization_smoke.hexa — Path C Q4 composite chain")
+    println("  AN11(b) baseline + AN9 + AN-arbitrary, deterministic")
+    println("  raw#9 strict · hexa-only · deterministic · LLM=none")
+    println("════════════════════════════════════════════════════════════════")
+
+    let root = resolve_root()
+    let out_path = root + "/" + OUT_PATH
+
+    let r1 = run_once(root)
+    let sha1 = _str(r1[0])
+    let an11b_pass = to_bool(r1[1])
+    let an9_pass   = to_bool(r1[2])
+    let anarb_pass = to_bool(r1[3])
+    let composite  = to_bool(r1[4])
+    let r_an11     = r1[5]
+    let r_an9      = r1[6]
+    let r_anarb    = r1[7]
+
+    let r2 = run_once(root)
+    let sha2 = _str(r2[0])
+    let byte_id = (sha1 != "" && sha1 == sha2)
+
+    println("[smoke] AN11(b) verdict=" + _str(r_an11[4]) + " pass=" + (if an11b_pass { "true" } else { "false" }))
+    println("[smoke] AN9     verdict=" + _str(r_an9[4])  + " pass=" + (if an9_pass   { "true" } else { "false" }))
+    println("[smoke] ANARB   verdict=" + _str(r_anarb[5]) + " pass=" + (if anarb_pass { "true" } else { "false" }))
+    println("[smoke] composite=" + (if composite { "CPGD_GENERALIZED" } else { "PARTIAL_OR_FAIL" }))
+    println("[smoke] run1=" + sha1)
+    println("[smoke] run2=" + sha2)
+    println("[smoke] byte_identical=" + (if byte_id { "true" } else { "false" }))
+
+    let mut j = "{\n"
+    j = j + "  \"schema_version\": \"1\",\n"
+    j = j + "  \"slug\": \"cpgd-generalization-smoke\",\n"
+    j = j + "  \"title\": \"Path C Q4 — CPGD generalization composite (AN11(b) + AN9 + AN-arbitrary)\",\n"
+    j = j + "  \"created\": \"2026-04-26\",\n"
+    j = j + "  \"path\": \"C\",\n"
+    j = j + "  \"raw_strict\": \"raw#9 hexa-only deterministic no_python no_llm\",\n"
+    j = j + "  \"tool\": \"anima-cpgd-research/tool/cpgd_generalization_smoke.hexa\",\n"
+    j = j + "  \"depends_on\": [\n"
+    j = j + "    \"" + AN11B_PATH + "\",\n"
+    j = j + "    \"" + AN9_PATH + "\",\n"
+    j = j + "    \"" + ANARB_PATH + "\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"per_target\": {\n"
+    j = j + "    \"AN11_b\": {\n"
+    j = j + "      \"verdict\": \"" + _str(r_an11[4]) + "\",\n"
+    j = j + "      \"G1_pass\": " + (if to_bool(r_an11[0]) { "true" } else { "false" }) + ",\n"
+    j = j + "      \"G2_pass\": " + (if to_bool(r_an11[1]) { "true" } else { "false" }) + ",\n"
+    j = j + "      \"G3_pass\": " + (if to_bool(r_an11[2]) { "true" } else { "false" }) + ",\n"
+    j = j + "      \"composite_pass\": " + (if an11b_pass { "true" } else { "false" }) + "\n"
+    j = j + "    },\n"
+    j = j + "    \"AN9\": {\n"
+    j = j + "      \"verdict\": \"" + _str(r_an9[4]) + "\",\n"
+    j = j + "      \"G1_pass\": " + (if to_bool(r_an9[0]) { "true" } else { "false" }) + ",\n"
+    j = j + "      \"G2_pass\": " + (if to_bool(r_an9[1]) { "true" } else { "false" }) + ",\n"
+    j = j + "      \"G3_pass\": " + (if to_bool(r_an9[2]) { "true" } else { "false" }) + ",\n"
+    j = j + "      \"composite_pass\": " + (if an9_pass { "true" } else { "false" }) + "\n"
+    j = j + "    },\n"
+    j = j + "    \"AN_arbitrary\": {\n"
+    j = j + "      \"verdict\": \"" + _str(r_anarb[5]) + "\",\n"
+    j = j + "      \"G1_pass\": " + (if to_bool(r_anarb[0]) { "true" } else { "false" }) + ",\n"
+    j = j + "      \"G2_pass\": " + (if to_bool(r_anarb[1]) { "true" } else { "false" }) + ",\n"
+    j = j + "      \"G3_pass\": " + (if to_bool(r_anarb[2]) { "true" } else { "false" }) + ",\n"
+    j = j + "      \"G4_pass\": " + (if to_bool(r_anarb[3]) { "true" } else { "false" }) + ",\n"
+    j = j + "      \"composite_pass\": " + (if anarb_pass { "true" } else { "false" }) + "\n"
+    j = j + "    }\n"
+    j = j + "  },\n"
+    j = j + "  \"selftest_2run\": {\n"
+    j = j + "    \"run1_sha\": \"" + sha1 + "\",\n"
+    j = j + "    \"run2_sha\": \"" + sha2 + "\",\n"
+    j = j + "    \"byte_identical\": " + (if byte_id { "true" } else { "false" }) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"composite_verdict\": \"" + (if composite { "CPGD_GENERALIZED" } else { "PARTIAL_OR_FAIL" }) + "\"\n"
+    j = j + "}\n"
+    write_file(out_path, j)
+    println("[smoke] wrote " + OUT_PATH)
+
+    if mode == "selftest" {
+        if composite && byte_id { exit(0) } else { exit(1) }
+    }
+}
+
+main()

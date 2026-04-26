@@ -1,28 +1,329 @@
-// sleep_protocol.hexa — Sleep stage EEG-Phi comparison
-// Stages: Wake, N1, N2, N3, REM
-// Auto-detects sleep stage from EEG, adjusts consciousness engine params
+// anima-eeg/protocols/sleep_protocol.hexa
+// raw#9 hexa-only strict · raw#10 honest · raw#11 snake_case
+// Spec doc: anima-eeg/MIGRATION_PLAN.md §5 (Phase 3 Tier-1 FULL)
+//
+// PURPOSE
+//   Sleep stage classification from band-power inputs (caller pre-computed).
+//   AASM-inspired threshold rules (simplified, not clinical):
+//
+//     Wake : beta dominant or low total power
+//     N1   : theta > alpha (drowsy onset, low spindle)
+//     N2   : sleep-spindle activity (theta moderate, spindles present)
+//     N3   : delta > 0.5 of total power (slow-wave sleep)
+//     REM  : theta dominant, beta+ alpha activity, low delta
+//
+//   Returns stage label + delta_power + spindle_count + (caller-provided)
+//   phi_mean + duration_sec.
+//
+// raw10_honest: rule-based heuristic, not deep classifier. Caller must
+//               supply band powers from analyze.hexa Welch PSD (Phase 3
+//               module dependency). This file = stage decision only.
+//
+// USAGE
+//   hexa run anima-eeg/protocols/sleep_protocol.hexa --selftest
+//
+// DETERMINISM
+//   No RNG. Pure threshold logic on caller-supplied floats.
 
-struct SleepStageResult {
-    stage: string,
-    delta_power: float,
-    spindle_count: i32,
-    phi_mean: float,
-    duration_sec: float
+let SCHEMA = "anima-eeg/sleep_protocol/1"
+
+// ════════════════════════════════════════════════════════════════════
+// AASM-inspired thresholds (simplified)
+// ════════════════════════════════════════════════════════════════════
+
+let DELTA_N3_THRESHOLD       = 0.50   // delta_pct > this -> N3 candidate
+let THETA_DROWSY_THRESHOLD   = 0.30   // theta_pct > this -> drowsy zone
+let BETA_WAKE_THRESHOLD      = 0.30   // beta_pct > this  -> wake candidate
+let TOTAL_POWER_FLOOR        = 0.001  // below -> Wake (electrode disconnect)
+let SPINDLE_N2_MIN           = 2      // >=2 spindles per epoch -> N2
+let REM_THETA_RATIO          = 1.20   // theta / alpha > 1.20 -> REM-like
+
+// ════════════════════════════════════════════════════════════════════
+// Output globals
+// ════════════════════════════════════════════════════════════════════
+
+let g_stage          = "Wake"
+let g_delta_power    = 0.0
+let g_spindle_count  = 0
+let g_phi_mean       = 0.0
+let g_duration_sec   = 0.0
+let g_total_power    = 0.0
+
+// Aggregate run results
+let g_run_stages       = 0
+let g_run_total_dur    = 0.0
+let g_run_wake_phi     = 0.0
+let g_run_n3_phi       = 0.0
+let g_run_rem_phi      = 0.0
+
+// ════════════════════════════════════════════════════════════════════
+// Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
 }
 
-struct SleepProtocolResult {
-    stages: i32,
-    total_duration: float,
-    wake_phi: float,
-    n3_phi: float,
-    rem_phi: float
+fn safe_div(a: float, b: float) -> float {
+    let mut bb = b
+    if abs_f(bb) < 0.000001 {
+        if bb < 0.0 { bb = 0.0 - 0.000001 } else { bb = 0.000001 }
+    }
+    return a / bb
 }
 
-fn run_sleep_protocol(duration_min: i32, board_type: string) -> SleepProtocolResult {
-    print("sleep protocol: " + to_string(duration_min) + " min")
-    return SleepProtocolResult(0, 0.0, 0.0, 0.0, 0.0)
+// ════════════════════════════════════════════════════════════════════
+// Stage classification
+// ════════════════════════════════════════════════════════════════════
+
+fn detect_sleep_stage_from_bands(
+    delta: float, theta: float, alpha: float, beta: float, gamma: float,
+    spindle_count: int
+) -> string {
+    let total = delta + theta + alpha + beta + gamma
+    g_total_power   = total
+    g_delta_power   = delta
+    g_spindle_count = spindle_count
+
+    // Electrode disconnect / artifact -> Wake (defensive)
+    if total < TOTAL_POWER_FLOOR {
+        g_stage = "Wake"
+        return g_stage
+    }
+
+    let delta_pct = safe_div(delta, total)
+    let theta_pct = safe_div(theta, total)
+    let beta_pct  = safe_div(beta, total)
+    let theta_alpha_ratio = safe_div(theta, alpha)
+
+    // Priority order: N3 > REM > N2 > N1 > Wake
+    if delta_pct > DELTA_N3_THRESHOLD {
+        g_stage = "N3"
+        return g_stage
+    }
+    // REM: high theta dominance over alpha + non-trivial beta
+    if theta_alpha_ratio > REM_THETA_RATIO && beta_pct > 0.10 && delta_pct < 0.30 {
+        g_stage = "REM"
+        return g_stage
+    }
+    // N2: sleep-spindle activity present
+    if spindle_count >= SPINDLE_N2_MIN && theta_pct > 0.15 {
+        g_stage = "N2"
+        return g_stage
+    }
+    // N1: drowsy theta, no spindles, low beta
+    if theta_pct > THETA_DROWSY_THRESHOLD && beta_pct < BETA_WAKE_THRESHOLD {
+        g_stage = "N1"
+        return g_stage
+    }
+    // Default: Wake
+    g_stage = "Wake"
+    return g_stage
 }
 
+// Convenience: legacy single-string interface for backward compat
+//   (caller must already have parsed bands; we just emit Wake on opaque input)
 fn detect_sleep_stage(eeg_window: string) -> string {
-    return "Wake"
+    // raw#9 strict: no parsing of opaque string here. Caller must use
+    //   detect_sleep_stage_from_bands(). This is a defensive placeholder.
+    g_stage = "Wake"
+    return g_stage
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Run aggregation (multi-epoch)
+// ════════════════════════════════════════════════════════════════════
+
+fn reset_run() {
+    g_run_stages      = 0
+    g_run_total_dur   = 0.0
+    g_run_wake_phi    = 0.0
+    g_run_n3_phi      = 0.0
+    g_run_rem_phi     = 0.0
+}
+
+fn append_epoch(stage: string, duration_sec: float, phi_mean: float) {
+    g_run_stages    = g_run_stages + 1
+    g_run_total_dur = g_run_total_dur + duration_sec
+    if stage == "Wake" { g_run_wake_phi = phi_mean }
+    if stage == "N3"   { g_run_n3_phi   = phi_mean }
+    if stage == "REM"  { g_run_rem_phi  = phi_mean }
+}
+
+// Synthetic minimal "run" — 3 epochs (Wake, N3, REM) for selftest
+fn run_sleep_protocol_synthetic(duration_min: int) {
+    reset_run()
+    let dur_each = (duration_min * 60.0) / 3.0
+
+    // Epoch 1: Wake
+    detect_sleep_stage_from_bands(0.05, 0.10, 0.30, 0.45, 0.10, 0)
+    g_phi_mean     = 0.4
+    g_duration_sec = dur_each
+    append_epoch(g_stage, g_duration_sec, g_phi_mean)
+
+    // Epoch 2: N3 (delta dominant)
+    detect_sleep_stage_from_bands(0.70, 0.15, 0.10, 0.04, 0.01, 0)
+    g_phi_mean     = 0.1
+    g_duration_sec = dur_each
+    append_epoch(g_stage, g_duration_sec, g_phi_mean)
+
+    // Epoch 3: REM (theta dominant + beta)
+    detect_sleep_stage_from_bands(0.05, 0.50, 0.20, 0.20, 0.05, 0)
+    g_phi_mean     = 0.6
+    g_duration_sec = dur_each
+    append_epoch(g_stage, g_duration_sec, g_phi_mean)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// KV emit
+// ════════════════════════════════════════════════════════════════════
+
+fn emit_kv() {
+    println("stage=" + g_stage)
+    println("delta_power=" + to_string(g_delta_power))
+    println("spindle_count=" + to_string(g_spindle_count))
+    println("phi_mean=" + to_string(g_phi_mean))
+    println("duration_sec=" + to_string(g_duration_sec))
+    println("total_power=" + to_string(g_total_power))
+}
+
+fn emit_run_kv() {
+    println("run_stages=" + to_string(g_run_stages))
+    println("run_total_dur=" + to_string(g_run_total_dur))
+    println("run_wake_phi=" + to_string(g_run_wake_phi))
+    println("run_n3_phi=" + to_string(g_run_n3_phi))
+    println("run_rem_phi=" + to_string(g_run_rem_phi))
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Self-tests
+// ════════════════════════════════════════════════════════════════════
+
+fn assert_true(cond: bool, label: string) -> bool {
+    if cond { println("  PASS: " + label) } else { println("  FAIL: " + label) }
+    return cond
+}
+
+fn run_tests() -> int {
+    let mut pass = 0
+    let mut fail = 0
+
+    println("=== sleep_protocol raw#9 self-tests ===")
+
+    // T1: high-beta -> Wake
+    println("[T1] high-beta -> Wake")
+    let s1 = detect_sleep_stage_from_bands(0.05, 0.10, 0.20, 0.55, 0.10, 0)
+    let ok1 = assert_true(s1 == "Wake", "stage == Wake")
+    if ok1 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T2: delta dominant -> N3
+    println("[T2] delta dominant -> N3")
+    let s2 = detect_sleep_stage_from_bands(0.70, 0.15, 0.10, 0.04, 0.01, 0)
+    let ok2a = assert_true(s2 == "N3", "stage == N3")
+    let ok2b = assert_true(g_delta_power > 0.5, "delta_power > 0.5")
+    if ok2a && ok2b { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T3: theta dominant + beta + low-delta -> REM
+    println("[T3] theta+beta+low-delta -> REM")
+    let s3 = detect_sleep_stage_from_bands(0.05, 0.50, 0.20, 0.20, 0.05, 0)
+    let ok3 = assert_true(s3 == "REM", "stage == REM")
+    if ok3 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T4: spindle activity -> N2
+    println("[T4] spindle -> N2")
+    let s4 = detect_sleep_stage_from_bands(0.20, 0.25, 0.30, 0.20, 0.05, 3)
+    let ok4a = assert_true(s4 == "N2", "stage == N2")
+    let ok4b = assert_true(g_spindle_count == 3, "spindle_count recorded")
+    if ok4a && ok4b { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T5: drowsy theta no spindle low beta low theta/alpha ratio -> N1
+    //   (theta/alpha = 0.40/0.40 = 1.0 < REM_THETA_RATIO=1.20; beta_pct=0.10 below wake)
+    println("[T5] drowsy theta -> N1")
+    let s5 = detect_sleep_stage_from_bands(0.10, 0.40, 0.40, 0.05, 0.05, 0)
+    let ok5 = assert_true(s5 == "N1", "stage == N1")
+    if ok5 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T6: zero total power -> Wake (electrode disconnect)
+    println("[T6] zero power -> Wake (defensive)")
+    let s6 = detect_sleep_stage_from_bands(0.0, 0.0, 0.0, 0.0, 0.0, 0)
+    let ok6 = assert_true(s6 == "Wake", "stage == Wake on disconnect")
+    if ok6 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T7: synthetic full run produces 3 epochs
+    println("[T7] synthetic run aggregation")
+    run_sleep_protocol_synthetic(30)
+    let ok7a = assert_true(g_run_stages == 3, "3 epochs aggregated")
+    let ok7b = assert_true(g_run_total_dur > 0.0, "total dur > 0")
+    let ok7c = assert_true(abs_f(g_run_n3_phi - 0.1) < 0.0001, "n3 phi recorded")
+    let ok7d = assert_true(abs_f(g_run_rem_phi - 0.6) < 0.0001, "rem phi recorded")
+    let ok7e = assert_true(abs_f(g_run_wake_phi - 0.4) < 0.0001, "wake phi recorded")
+    if ok7a && ok7b && ok7c && ok7d && ok7e { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T8: deterministic idempotence
+    println("[T8] deterministic idempotence")
+    detect_sleep_stage_from_bands(0.30, 0.25, 0.20, 0.15, 0.10, 1)
+    let st1 = g_stage
+    let dp1 = g_delta_power
+    detect_sleep_stage_from_bands(0.30, 0.25, 0.20, 0.15, 0.10, 1)
+    let ok8a = assert_true(st1 == g_stage, "stage idempotent")
+    let ok8b = assert_true(abs_f(dp1 - g_delta_power) < 0.00001, "delta_power idempotent")
+    if ok8a && ok8b { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T9: negative falsification — opaque-string detect returns Wake (raw#9)
+    println("[T9] negative: opaque-string -> Wake (no parse)")
+    let s9 = detect_sleep_stage("opaque_unknown_format")
+    let ok9 = assert_true(s9 == "Wake", "opaque -> Wake (no parse path)")
+    if ok9 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T10: priority — delta_pct > 0.5 wins over spindle count
+    println("[T10] priority N3 over spindle")
+    let s10 = detect_sleep_stage_from_bands(0.65, 0.20, 0.10, 0.04, 0.01, 5)
+    let ok10 = assert_true(s10 == "N3", "N3 priority over N2 spindle")
+    if ok10 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("")
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL out of " + to_string(pass + fail))
+    return fail
+}
+
+// ════════════════════════════════════════════════════════════════════
+// CLI entry point
+// ════════════════════════════════════════════════════════════════════
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 1
+    while i < len(av) {
+        if av[i] == "--selftest" { selftest = true }
+        i = i + 1
+    }
+
+    if !selftest {
+        println("usage: hexa run anima-eeg/protocols/sleep_protocol.hexa --selftest")
+        println("ABORT: live ingest requires WRAPPER calibrate.hexa + analyze.hexa Welch PSD; raw#9 strict no-fallback.")
+        exit(2)
+    }
+
+    println("── sleep_protocol raw#9 selftest ──")
+    println("schema=" + SCHEMA)
+    println("raw10_honest=threshold_rules_no_clinical_classifier_synthetic_bands")
+    println("")
+
+    // Demonstration emit (synthetic 30-min run)
+    run_sleep_protocol_synthetic(30)
+    emit_run_kv()
+    println("")
+
+    let fails = run_tests()
+    if fails != 0 {
+        println("selftest=fail")
+        eprintln("selftest FAILED: " + to_string(fails) + " test(s) failed")
+        exit(1)
+    }
+    println("selftest=ok")
+    println("DONE")
+}
+
+main()
