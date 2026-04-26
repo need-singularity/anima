@@ -1,0 +1,157 @@
+{
+  "cycle": "omega-runner-1",
+  "axis": "TARGETARCH-conditional COPY (multi-stage scratch bridge) + tag GC — eliminate wrong-arch ELF waste from runtime image and prune session tag clutter",
+  "timestamp": "2026-04-26T15:13:08+09:00",
+  "trigger": {
+    "discovered_by": "ω-runner-baseline next_cycles seed list (state/omega_runner_baseline.json)",
+    "root_cause": "Dockerfile previously COPY'd all four ELF pairs (cli + interp × arm64 + x86_64) into /tmp, then the per-arch RUN install step deleted the wrong pair. Layer-based file systems retain the COPY layer bytes regardless of subsequent rm — so each arch image carried ~2.3MB of unreachable wrong-arch ELF.",
+    "noise_signature": "image bloat only (no functional regression)"
+  },
+  "before": {
+    "image": "hexa-runner:latest @ 9a4541a7c55a",
+    "size_virtual_mb": 170,
+    "size_compact_mb": 37.2,
+    "tag_count": 11,
+    "tags": [
+      "hexa-runner:05b72cb3",
+      "hexa-runner:10b38879",
+      "hexa-runner:23021b99",
+      "hexa-runner:4e711d78",
+      "hexa-runner:5bd9f630",
+      "hexa-runner:87916b4c",
+      "hexa-runner:ab8bec13",
+      "hexa-runner:e075b3e8",
+      "hexa-runner:f9ccfa3d",
+      "hexa-runner:latest",
+      "hexa-runner:v5-test"
+    ],
+    "wrong_arch_layer_bytes_per_image": "537kB (cli x86_64 on arm64 image) + 2.1MB (interp x86_64 on arm64 image) ≈ 2.6MB"
+  },
+  "targetarch_copy_change": {
+    "approach": "multi-stage scratch bridge with FROM-alias indirection",
+    "dockerfile_diff_summary": [
+      "ADD: two FROM scratch AS elf-arm64 / elf-amd64 stages, each COPY'ing only its own arch's pair into normalized /cli + /interp paths.",
+      "ADD: FROM elf-${TARGETARCH} AS elf-selected — alias stage that resolves at parse time via buildx's pre-defined TARGETARCH platform-arg.",
+      "REPLACE: the four COPY build/hexa_*_<arch> /tmp/... lines + the case-on-TARGETARCH RUN, with two COPY --from=elf-selected /cli|/interp /tmp/hexa_cli|/tmp/hexa_interp + a single arch-agnostic install RUN."
+    ],
+    "buildx_quirk_encountered": {
+      "problem_1": "COPY --from=elf-${TARGETARCH} did not interpolate at parse time — buildkit treated literal 'elf-${TARGETARCH}' as a Docker Hub image name (error: 'invalid reference format: repository name (library/elf-${TARGETARCH}) must be lowercase'). Confirmed: ARG-in-stage-name is NOT supported for `COPY --from=`.",
+      "problem_2": "Adding `ARG TARGETARCH` at global scope (before any FROM) collapsed TARGETARCH to empty string in `FROM elf-${TARGETARCH}` (error: 'failed to parse stage name elf-'). The platform-arg auto-injection is overridden when the ARG is explicitly redeclared globally with no default.",
+      "fix": "Remove the global `ARG TARGETARCH` declaration entirely. Use buildx's pre-defined TARGETARCH platform-arg directly in `FROM elf-${TARGETARCH} AS elf-selected`. Keep `ARG TARGETARCH` inside the runtime stage only (for downstream RUN visibility, even though no longer needed for the COPY now that --from references the alias).",
+      "lesson": "Platform-args (TARGETOS, TARGETARCH, TARGETPLATFORM, BUILDPLATFORM, etc.) are pre-defined globally by buildx and visible in FROM stage names without explicit ARG declaration — but ARG-redeclaration at global scope WIPES the platform-arg with the user-supplied default (empty)."
+    }
+  },
+  "tag_gc": {
+    "kept": [
+      "hexa-runner:latest (current — 195721083d78, 166MB virtual / 36.2MB compact)",
+      "hexa-runner:94cd2b41 (current sha alias of latest)",
+      "hexa-runner:f9ccfa3d (immediate prior, ω-runner-4 lineage at 170MB / 37.2MB — rollback candidate; matches the live hexa-exec container's image cc74eea6c8cf)"
+    ],
+    "deleted": [
+      "hexa-runner:05b72cb3",
+      "hexa-runner:10b38879",
+      "hexa-runner:23021b99 (image 36d88a310185 deleted — pre-runner-4 stale-ELF version)",
+      "hexa-runner:4e711d78 (image e709e02a2cce deleted — runner-4 build, superseded by f9ccfa3d)",
+      "hexa-runner:5bd9f630",
+      "hexa-runner:87916b4c (image de29583a8a9a deleted — pre-perl-removal experiment at 152MB)",
+      "hexa-runner:ab8bec13 (image 16830cbffaeb deleted — original 236MB / 48.7MB baseline)",
+      "hexa-runner:e075b3e8 (image fe167ea7a358 deleted — required removing stale exited container 50d64287e685 'happy_almeida' first)",
+      "hexa-runner:v5-test (image 9a4541a7c55a deleted — stale alias of pre-runner-1 latest)"
+    ],
+    "containers_removed": ["50d64287e685 happy_almeida (exited 24h ago, was holding e075b3e8)"],
+    "tag_count_after": 3,
+    "docker_disk_usage_before": "16.39GB total / 15.52GB reclaimable (94%)",
+    "docker_disk_usage_after": "16.25GB total / 15.51GB reclaimable (95%)",
+    "disk_freed_estimate_mb": 140,
+    "note": "Most deleted tags shared base layers with the current image (debian:12-slim 108MB, apt RUN 17.5MB), so layer-dedup means actual reclaimed bytes are modest (~140MB from unique layers in 87916b4c, ab8bec13, 5bd9f630/e075b3e8). Primary win is tag-list clarity (11 → 3) — reduces operator confusion during rollback."
+  },
+  "after": {
+    "image": "hexa-runner:latest @ 195721083d78 (also tagged :94cd2b41)",
+    "size_virtual_mb": 166,
+    "size_virtual_bytes": 36178091,
+    "size_compact_mb": 36.2,
+    "layer_breakdown": {
+      "debian_base": "108MB",
+      "apt_layer": "17.5MB (ca-certificates + tini + curl + wget)",
+      "elf_copies": "586kB (/cli arm64) + 1.7MB (/interp arm64) — wrong-arch ELFs absent",
+      "install_run": "2.29MB (install -m 0755 of both ELFs)",
+      "stdlib_copy": "143kB",
+      "module_loader_copy": "41kB",
+      "workdir": "8.19kB"
+    }
+  },
+  "delta": {
+    "virtual_mb_saved": 4,
+    "compact_mb_saved": 1.0,
+    "compact_pct_saved": 2.7,
+    "tag_count_reduced_by": 8,
+    "interpretation": "1.0MB compact save matches expected wrong-arch ELF removal (537kB cli + 2.1MB interp = 2.6MB raw, but layer compression on the install_run RUN step accounts for ~1.6MB of that). The dominant mass remaining is debian:12-slim base (108MB) + apt layer (17.5MB) — no further wins available without distroless/static-base migration."
+  },
+  "smoke_test": {
+    "test_1_version": {
+      "command": "docker run --rm hexa-runner:latest --version",
+      "output": "hexa 0.1.0-dispatch",
+      "rc": 0,
+      "verdict": "PASS"
+    },
+    "test_2_run_script": {
+      "command": "docker run --rm --memory=2g --cpus=2 -v /tmp/runner1_smoke.hexa:/work/runner1_smoke.hexa:ro hexa-runner:latest run /work/runner1_smoke.hexa",
+      "script": "fn main() { println(\"runner-1 smoke ok\") }",
+      "output": "runner-1 smoke ok",
+      "rc": 0,
+      "verdict": "PASS — no shasum/perl noise, tini PID-1 reaping working"
+    },
+    "test_3_e2e_arithmetic": {
+      "command": "docker run --rm --memory=2g --cpus=2 -v /tmp/runner1_e2e.hexa:/work/runner1_e2e.hexa:ro hexa-runner:latest run /work/runner1_e2e.hexa",
+      "script": "while-loop sum of [1,2,3,4,5]",
+      "output": "sum=15",
+      "rc": 0,
+      "verdict": "PASS — interp path operative, len()/str()/index/while all functional"
+    },
+    "test_4_hot_container_unaffected": {
+      "command": "docker exec d9666bb72368 sh -c 'echo HOT-CONTAINER-OLD-IMAGE-OK'",
+      "output": "HOT-CONTAINER-OLD-IMAGE-OK",
+      "verdict": "PASS — live hexa-exec container (cc74eea6c8cf / f9ccfa3d) still functional; rollback path intact"
+    }
+  },
+  "rollback": {
+    "primary_path": "docker tag hexa-runner:f9ccfa3d hexa-runner:latest && docker rm -f hexa-exec (resolver auto-spawns new container on next call from image cc74eea6c8cf)",
+    "secondary_path": "git diff HEAD docker/runner/Dockerfile (Dockerfile change uncommitted per session policy — `git checkout -- docker/runner/Dockerfile` reverts source); rebuild via `hexa tool/build_runner_image.hexa`",
+    "buildx_state": "hexa-runner-builder buildx instance retained; can rebuild any prior tag if Dockerfile reverted. Build cache holds intermediate layers from this cycle (free disk if needed: docker buildx prune -f --builder hexa-runner-builder)."
+  },
+  "next_cycles_seeded": [
+    {
+      "name": "distroless",
+      "rationale": "Largest remaining mass is debian:12-slim base (108MB virtual). Migrating to gcr.io/distroless/static-debian12 (~2MB) or a static musl scratch base would drop virtual size from 166MB → ~25MB. Trade-off: lose curl/wget — bridges that exec('curl …') would break. Mitigation: vendor a minimal curl static binary (~1MB) into the image, or replace curl-based bridges with a hexa-native HTTPS client (deferred to bridge cycle). Estimated saving: 100MB+ virtual.",
+      "blast_radius": "high — affects 7+ bridges (oeis/gw/arxiv/simbad/wikipedia/openalex/uniprot per Dockerfile comment); needs a full bridge_health pass to validate"
+    },
+    {
+      "name": "warm-exec benchmark",
+      "rationale": "Measure cold vs warm container exec latency: `docker run --rm hexa-runner:latest run /work/foo.hexa` (cold spawn ~600ms-1s) vs `docker exec hexa-exec hexa run /work/foo.hexa` (warm ~50-200ms). Quantify the resolver's hot-container reuse benefit so future capacity planning can reason about per-call overhead.",
+      "blast_radius": "low — pure measurement, no Dockerfile/code change"
+    },
+    {
+      "name": "cgroup self-introspection",
+      "rationale": "Bake a tool in the image (or extend self/main.hexa) that reads /sys/fs/cgroup/memory.max + cpu.max + cpu.stat at startup, so workloads can self-report their resource ceiling. Useful for deterministic OOM diagnosis (vs. the current 'SIGKILL with no obvious cause' failure mode). Also enables cgroup-aware self-throttling.",
+      "blast_radius": "low — additive read-only probe; no behaviour change"
+    },
+    {
+      "name": "image-strip + debug-variant split",
+      "rationale": "Current arm64 ELFs are built `with debug_info, not stripped` (per `file` output in build helper) — the `not stripped` flag suggests symbol tables present in the shipped binary. `strip --strip-unneeded` on the Linux ELFs before COPY could shave 100-300kB per binary (2 binaries × 2 arches = ~600kB-1.2MB). Pair with a separate hexa-runner:debug tag that retains symbols for post-mortem.",
+      "blast_radius": "low — behaviour-preserving strip; verify with smoke after"
+    },
+    {
+      "name": "tag GC automation",
+      "rationale": "This cycle GC'd 8 tags manually. A `hexa tool/gc_runner_tags.hexa --keep=2` helper that introspects `docker images hexa-runner` + retains :latest + N most-recent shas would prevent accumulation. Could be run as a post-step inside build_runner_image.hexa.",
+      "blast_radius": "low — operator hygiene"
+    }
+  ],
+  "constraints_honored": {
+    "hexa_only": "Only hexa-as-build-driver was used (./hexa run tool/build_runner_image.hexa). Dockerfile is infrastructure — single permitted edit per session.",
+    "no_linux_elf_rebuild": "Used existing build/hexa_linux_arm64 (575504 bytes), build/hexa_linux_x86_64 (527160 bytes), build/hexa_interp_linux_arm64 (1687856 bytes), build/hexa_interp_linux_x86_64 (2089960 bytes) — all from prior ω-runner-4 rebake.",
+    "no_git_commit": "Dockerfile change uncommitted; staged for caller's review."
+  },
+  "files_touched": [
+    "/Users/ghost/core/hexa-lang/docker/runner/Dockerfile (added scratch bridge stages + alias indirection; replaced 4-COPY+case-RUN block with 2-COPY+install-RUN; ~30 line delta)"
+  ]
+}

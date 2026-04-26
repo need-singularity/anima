@@ -1,0 +1,146 @@
+{
+  "cycle": "omega_audio_3_redo_full_cutover",
+  "axis": "ω-audio-3",
+  "timestamp": "2026-04-26T06:16:56Z",
+  "status": "PASS",
+  "predecessor": {
+    "cycle": "omega_interp_2",
+    "commit": "94cd2b41",
+    "note": "interp-2 hot-path push fix unblocked vocal_hexa (516ms ×5 vs >90s timeout)"
+  },
+  "organs_implemented": [
+    {
+      "name": "vocal_hexa",
+      "status": "PRE-EXISTING (POC from ω-audio-3 phase 1)",
+      "loc": 54,
+      "file": "/Users/ghost/core/anima/anima-speak/anima_audio.hexa",
+      "line": 333
+    },
+    {
+      "name": "breath_hexa",
+      "status": "NEW (this cycle)",
+      "loc": 87,
+      "file": "/Users/ghost/core/anima/anima-speak/anima_audio.hexa",
+      "line": 450
+    },
+    {
+      "name": "pipe_hexa",
+      "status": "NEW (this cycle)",
+      "loc": 81,
+      "file": "/Users/ghost/core/anima/anima-speak/anima_audio.hexa",
+      "line": 550
+    },
+    {
+      "name": "vocal_lf_hexa",
+      "status": "NEW (this cycle)",
+      "loc": 76,
+      "file": "/Users/ghost/core/anima/anima-speak/anima_audio.hexa",
+      "line": 645
+    }
+  ],
+  "helpers_added": [
+    {"name": "_push_int16_le", "loc": 7, "purpose": "append signed int16 LE bytes to a uint8 array"},
+    {"name": "_read_wav_int16_le", "loc": 27, "purpose": "parse 44-byte RIFF header + decode int16 LE PCM into float64 [-1,1]"}
+  ],
+  "total_new_loc": 278,
+  "algorithm_notes": {
+    "vocal_hexa": "y[t] = gain · sin(2π·hz·t/SR) + 10ms hann ramp (unchanged from POC).",
+    "breath_hexa": "Deterministic LCG uniform noise (x = (x*1103515245 + 12345) & 0x7fffffff) → centered to [-1,1] → 2-pole RBJ biquad bandpass at f0=sqrt(lo·hi), Q=f0/(hi-lo): w0=2π·f0/SR, alpha=sin(w0)/(2Q), b0=sin(w0)/2/a0, b1=0, b2=-sin(w0)/2/a0, a1=-2cos(w0)/a0, a2=(1-alpha)/a0. Slope is 12dB/oct (vs 24dB/oct for python's butter(order=4)) — sufficient for fricative/breath aperiodic source.",
+    "pipe_hexa": "EXACT mirror of python pipe() math. Reads input WAV via read_file_bytes (skip 44-byte header, decode int16 LE). Pre-emphasis x[n] = x[n] - 0.97·x[n-1]. Two cascaded Klatt-style 2-pole resonators per formant: bw=max(30,f/q), r=exp(-π·bw/sr), θ=2π·f/sr, A=1-2r·cosθ+r², y[n]=A·x[n]+2r·cosθ·y[n-1]-r²·y[n-2]. Peak-normalize to 0.9, int16 LE.",
+    "vocal_lf_hexa": "EXACT mirror of python vocal_lf() math. T0=1/hz, Tp=0.45, Te=0.60. phase=(t mod T0)/T0 (computed via floor since `%` op on floats unavailable). Three-piece per-period: phase<Tp → sin(π·phase/Tp); phase<Te → cos(π·(phase-Tp)/(2·(Te-Tp))); else → -0.5·exp(-12·(phase-Te)). Peak-normalize, gain scale, 10ms hann ramp."
+  },
+  "cutover_change": {
+    "env_gate": "ANIMA_AUDIO_HEXA_NATIVE",
+    "default": "ON (any value other than literal '0' enables hexa-native)",
+    "opt_out": "ANIMA_AUDIO_HEXA_NATIVE=0 falls back to existing python-worker / spawn-per-call path (unchanged)",
+    "dispatchers_modified": [
+      {"fn": "vocal", "line": 238, "guard": "if env(\"ANIMA_AUDIO_HEXA_NATIVE\") != \"0\" { return vocal_hexa(...) }"},
+      {"fn": "breath", "line": 730, "guard": "if env(\"ANIMA_AUDIO_HEXA_NATIVE\") != \"0\" { return breath_hexa(...) }"},
+      {"fn": "pipe", "line": 775, "guard": "if env(\"ANIMA_AUDIO_HEXA_NATIVE\") != \"0\" { return pipe_hexa(...) }"},
+      {"fn": "vocal_lf", "line": 821, "guard": "if env(\"ANIMA_AUDIO_HEXA_NATIVE\") != \"0\" { return vocal_lf_hexa(...) }"}
+    ],
+    "diff_summary": "5 surgical edits: 1 large insert (3 organs + 2 helpers, 278 LOC) just after vocal_hexa; 4 single-line guard inserts at top of vocal/breath/pipe/vocal_lf entry points. No deletions. No symbol renames (existing python-path bodies remain untouched as the opt-out fallback). Other organ wrappers (pipe3, pipe_glide, mix, etc.) NOT yet hexa-native — they continue to dispatch via _run_py and are out-of-scope for this cycle (entry points to those organs do not yet check ANIMA_AUDIO_HEXA_NATIVE)."
+  },
+  "bench": {
+    "host": "darwin/arm64 (host hexa interp w/ ω-interp-2 patch)",
+    "config": "SR=24000, ms=100 (n=2400 samples) for all per-organ; chain test = vocal_lf(180) → pipe(700,1100,6)",
+    "per_organ_ms": {
+      "hexa_native": {
+        "vocal_hexa_440Hz_100ms": 144,
+        "breath_hexa_2k_4k_100ms": 232,
+        "vocal_lf_hexa_180Hz_100ms": 236,
+        "pipe_hexa_700_1100_q6_on_lf_100ms": 311
+      },
+      "python_worker_warm": {
+        "vocal_440Hz_100ms": 43,
+        "breath_2k_4k_100ms": 43,
+        "vocal_lf_180Hz_100ms": 42,
+        "pipe_700_1100_q6_100ms": 45
+      },
+      "python_worker_cold_first_call": 1247
+    },
+    "chain_total_ms": {
+      "hexa_native_chain": 1037,
+      "python_worker_chain_warm": 287,
+      "python_worker_chain_cold": 1502
+    },
+    "interpretation": "Per-call hexa-native is ~5x slower than warm python-worker (numpy vectorized DSP is fast; interp does per-sample float ops). However hexa-native has zero cold-start cost. For one-shot scripts (typical anima-speak utterance), hexa-native is competitive (1037ms vs 1502ms cold). For long-running anima-speak processes, python-worker warm path remains faster. Cutover default=ON prioritizes correctness/portability/zero-deps over peak warm-path throughput.",
+    "expected_vs_observed": "Initial hypothesis (much faster than worker because no IPC) held only for COLD case. Warm case is dominated by interpreted per-sample loop cost (~96 µs/sample), not IPC. Acceptable trade — absolute numbers (~250ms/100ms-of-audio) still fast enough for non-realtime synthesis pipeline."
+  },
+  "regression": {
+    "smoke_4_organ_byte_check": {
+      "vocal_hexa_100ms": {"bytes": 4844, "expected": 4844, "verdict": "PASS"},
+      "breath_hexa_100ms": {"bytes": 4844, "expected": 4844, "verdict": "PASS"},
+      "vocal_lf_hexa_100ms": {"bytes": 4844, "expected": 4844, "verdict": "PASS"},
+      "pipe_hexa_on_vocal_lf_100ms": {"bytes": 4844, "expected": 4844, "verdict": "PASS"}
+    },
+    "omega_a_subset_byte_check": {
+      "vocal_440Hz_500ms": {"bytes": 24044, "expected": "44+12000*2=24044", "verdict": "PASS"},
+      "breath_2k_4k_200ms": {"bytes": 9644, "expected": "44+4800*2=9644", "verdict": "PASS"},
+      "vocal_180Hz_300ms_for_pipe": {"bytes": 14444, "expected": "44+7200*2=14444", "verdict": "PASS"},
+      "pipe_700_1100_q6_on_180Hz": {"bytes": 14444, "expected": "44+7200*2=14444", "verdict": "PASS"},
+      "elapsed_ms_total": 3434
+    },
+    "frequency_match_fft": {
+      "method": "rfft + Hanning window, peak detection (analyzer = python; per session directive analyzer-only python is allowed, SYNTHESIS is hexa-only)",
+      "vocal_hexa_440": {"target_hz": 440, "measured_peak_hz": 440.0, "verdict": "EXACT"},
+      "vocal_lf_hexa_180": {"target_f0_hz": 180, "measured_peak_hz": 180.0, "harmonic_at_540": true, "verdict": "PASS"},
+      "breath_hexa_2k_4k": {"target_band_hz": [2000, 4000], "measured_peaks_hz": [2325, 2400, 2425, 2915, 2935, 2965], "verdict": "ALL_IN_BAND"},
+      "pipe_hexa_700_1100_on_180Hz": {"target_F1_hz": 700, "F1_observed_hz": "~720", "target_F2_hz": 1100, "F2_observed_hz": "~900 (harmonic-shaped)", "verdict": "F1_LOCK_F2_PROXIMITY", "note": "Formant filter shapes harmonic envelope, not fundamental; matches python pipe() behavior"}
+    }
+  },
+  "python_worker_status": {
+    "state": "RETAINED as opt-out fallback (per session constraint: NO python worker delete this cycle)",
+    "trigger": "ANIMA_AUDIO_HEXA_NATIVE=0",
+    "path": "/Users/ghost/core/hexa-lang/stdlib/anima_audio_worker.py",
+    "next_cycle_proposal": "Once hexa-native organs are exercised through ≥1 full anima-speak production session with no regressions, deprecate worker.py + remove the opt-out env gate. Estimated ω-audio-4."
+  },
+  "verification_artifacts": {
+    "smoke_script": "/tmp/_audio3_smoke.hexa",
+    "py_bench_script": "/tmp/_audio3_bench_py.hexa",
+    "cycle_a_script": "/tmp/_audio3_cycle_a.hexa",
+    "fft_analyzer": "/tmp/_audio3_verify.py",
+    "wav_outputs_kept_in_tmp_for_inspection": true
+  },
+  "next_cycle_recommendations": [
+    "ω-audio-3.5: profile hexa-native breath_hexa/pipe_hexa to find the per-sample hot loop (probably array.push in interp) — could halve elapsed by pre-allocating int array of size n*2 + 44 and using indexed assignment if interp supports it.",
+    "ω-audio-4: cutover the remaining organ wrappers (pipe3, pipe_glide, mix, lpf, hpf, envelope, etc. — ~30 fns) to hexa-native, then delete worker.py + remove the env gate.",
+    "ω-audio-5: consider C-codegen path: codegen_c2 already maps write_bytes→rt_write_bytes; a native-compiled anima_audio.c would eliminate per-sample interp cost entirely (~10x faster than warm python-worker).",
+    "Defer breath_hexa Butterworth-4 (8th-order SOS) until a benchmark shows current 2-pole bandpass is audibly insufficient for fricative class. Likely never — RBJ 12dB/oct skirt is acceptable for breath/aspirate."
+  ],
+  "rollback": {
+    "method_1_disable_via_env": "Run anima-speak with ANIMA_AUDIO_HEXA_NATIVE=0 in environment to immediately revert all 4 organs to the python-worker path. Zero code change required.",
+    "method_2_revert_diffs": "git diff /Users/ghost/core/anima/anima-speak/anima_audio.hexa shows exactly 5 hunks (1 large insert + 4 guard inserts). `git checkout -- /Users/ghost/core/anima/anima-speak/anima_audio.hexa` reverts cleanly.",
+    "method_3_partial": "Remove only the guard line in any one of vocal/breath/pipe/vocal_lf to restore that single organ to python-worker while keeping others on hexa-native.",
+    "blast_radius": "Confined to anima_audio.hexa. No changes to hexa-lang, no changes to anima_audio_worker.py, no docker rebuild, no Linux ELF rebuild, no git commit (per directive)."
+  },
+  "constraints_honored": {
+    "no_docker_rebuild": true,
+    "no_linux_elf_rebuild": true,
+    "no_git_commit": true,
+    "no_python_worker_delete": true,
+    "synthesis_is_hexa_only_in_native_path": true,
+    "analyzer_python_allowed_for_verification_only": true
+  },
+  "biggest_gotcha": "Initial assumption that hexa-native would be MUCH faster than python-worker held only against the COLD worker (1502ms vs 1037ms chain). Against the WARM worker, hexa-native is ~3.6x SLOWER (1037ms vs 287ms) because numpy vectorized DSP crushes per-sample interp loops. Default ON is still correct — it removes a 5-cell python+numpy+scipy dependency, eliminates IPC complexity, and is portable to container builds where python is absent. But the perf framing should be 'competitive with cold worker, slower than warm worker, but always available' rather than 'much faster'. ω-audio-3.5 / ω-audio-5 (native C codegen) will close the warm-path gap."
+}
