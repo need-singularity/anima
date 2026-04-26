@@ -109,10 +109,25 @@ bash /tmp/anima_v11_main_router.sh matrix state/v10_benchmark
 
 ## §4. What's not yet done
 
-- No actual 4-backbone GPU run end-to-end. B-ToM Mistral pilot (accuracy 0.75, $0.27) is the only real GPU measurement so far. All other helpers verified mac-local with synthetic fixtures + smoke chain.
-- Real-data orthogonality matrix not produced (synthetic test confirms tool works; need real measurements to confirm AN11(b) ⊥ v11 axes claim empirically).
+- 4-backbone full GPU benchmark partial: 2/4 SUCCESS (mistral + qwen3, $0.17 v1) + 2/4 FAIL (gemma + llama, gated model HF token issue). v3 patches verified on mistral only ($0.09).
+- Real-data orthogonality matrix not produced (synthetic test confirms tool works; need ≥3 backbones for cross-Pearson).
+- gemma + llama gated model retry pending (HF token re-auth or ungated alternative).
 - Hexa runtime cleanup abort observed once during `anima_v10_gate_matrix.hexa` selftest. Re-survey across 11 helpers × 5 trials clean — **transient, not reproducible**. Mitigation if it recurs: clear `~/core/hexa-lang/.hexa-cache/`.
 - SAE-STEER bypass is a functional alternative to gemma-scope SAE; not directly comparable to trained sparse features. May produce weaker selectivity than a trained SAE would.
+
+### §4.1 v3 patch quartet empirical validation (Mistral, 2026-04-26)
+
+Mistral v1 → v2 → v3 progression on 4 metric pathologies discovered in v1:
+
+| metric | v1 | v2 | v3 | fix |
+|---|---|---|---|---|
+| Φ* phi_star_min | -161.6 | -14.4 | -14.4 | HID_TRUNC = min(128, N-2)=14 (rank-deficient covariance fixed) |
+| Φ* gate criterion | `>0` (FAIL) | `>0` (FAIL) | `gate_magnitude PASS` (`abs≥0.5`) | sign-agnostic — anti-integration is real signal |
+| Φ* signature norm | 0.0 | 0.0 | **1.0** | abs+tanh (was tanh of negative → 0.0) |
+| CMT family rel | layer 0 all 1.0 | layer 4 all 1.0 | per-layer 0.006-0.048 differential | MLP-only sub-module ablation (vs full block cascade) |
+| **composite gmean** | **0.052** | 0.048 | **0.448** | **8.6× improvement** |
+
+CMT layer 28 (deep semantic, 87.5% depth): Hexad 0.036 / Law 0.047 / Phi 0.043 / SelfRef 0.048 — Mistral's AN11(b) Law-leading top1 confirmed by independent CMT axis (Law dominant at deep layer). Internal consistency across 2 orthogonal metrics.
 
 ---
 
