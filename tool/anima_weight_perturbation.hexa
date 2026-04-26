@@ -1,0 +1,238 @@
+// tool/anima_weight_perturbation.hexa — Weight-distribution axis Φ* v3 falsifier (raw#9 hexa-only).
+//
+// PURPOSE
+//   4-axis exhaustion 의 잔존 단일 후보 (d) weight-distribution / pretraining init 가
+//   Φ sign 의 primary determinant 인지 direct test.
+//
+//   Mistral-7B-v0.3 architecture + tokenizer + corpus 모두 고정, weight 만 perturbation
+//   또는 random-init 으로 변경 → Φ sign flip 발생 시 (d) PRIMARY confirmed,
+//   sign preserved 시 (d) FALSIFIED → axis 5+ 추가 탐색.
+//
+//   Baseline: Mistral-7B-v0.3 BASE phi_star_min = -16.6959 NEG (anima/state/v10_phi_v3_canonical/mistral)
+//
+// MODES (ANIMA_PERT_MODE)
+//   hidden_noise_001  — final layer hidden states 에 N(0, 0.01) Gaussian noise 추가
+//   hidden_noise_01   — final layer hidden states 에 N(0, 0.1)  Gaussian noise 추가
+//   hidden_noise_10   — final layer hidden states 에 N(0, 1.0)  Gaussian noise 추가
+//   random_init       — Mistral 7B from-scratch random_init (model.init_weights())
+//
+//   raw#10 honest: hidden_noise_001/01/10 는 weight perturbation 의 first-order proxy
+//   (final-layer activation channel 동치 변화, Σ residual stream level). random_init 만이
+//   진정한 weight-distribution 변경 (모든 layer parameter rescale). HW-A judgment 는 W1.3
+//   또는 W2 sign flip 시에만 valid.
+//
+// METHOD
+//   1. anima_phi_v3_canonical.hexa 와 동일한 16-prompt forward
+//   2. 모드별 perturbation 적용:
+//      - hidden_noise: forward 직후 hidden_states[-1] 에 torch.randn × scale 추가
+//      - random_init: from_pretrained 대신 from_config + model.init_weights()
+//   3. byte-weighted mean → top-variance HID_TRUNC=8 → cov_logdet
+//   4. K=8 random sample-partitions → phi_star_min
+//   5. 출력 schema 동일 + perturbation_mode + perturbation_scale 추가 필드
+//
+// ENV
+//   ANIMA_PERT_MODE       hidden_noise_001 | hidden_noise_01 | hidden_noise_10 | random_init
+//   ANIMA_BASE            backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_OUTPUT          output JSON path
+//   ANIMA_N_PROBES        # probes (default: 16)
+//   ANIMA_K_PARTS         # random sample-partitions (default: 8)
+//   ANIMA_RIDGE           ridge for cov stabilization (default: 1e-3)
+//   ANIMA_SEED            RNG seed for partitions + perturbation (default: 42)
+//
+// USAGE
+//   hexa run tool/anima_weight_perturbation.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_weight_perturbation_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima weight-perturbation Phi* v3 falsifier helper — emitted by anima_weight_perturbation.hexa\n")
+    parts.push("# raw#37 transient. Weight-distribution axis direct test (W1 hidden_noise / W2 random_init).\n")
+    parts.push("import json, os, sys, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("PERT_MODE = os.environ.get('ANIMA_PERT_MODE', 'hidden_noise_01')\n")
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/phi_v3_canonical.json')\n")
+    parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '16'))\n")
+    parts.push("K_PARTS = int(os.environ.get('ANIMA_K_PARTS', '8'))\n")
+    parts.push("RIDGE = float(os.environ.get('ANIMA_RIDGE', '1e-3'))\n")
+    parts.push("RNG_SEED = int(os.environ.get('ANIMA_SEED', '42'))\n")
+    parts.push("HID_TRUNC = max(2, N_PROBES // 2)\n\n")
+
+    parts.push("# Mode -> noise scale mapping\n")
+    parts.push("_NOISE_SCALES = {'hidden_noise_001': 0.01, 'hidden_noise_01': 0.1, 'hidden_noise_10': 1.0}\n")
+    parts.push("if PERT_MODE in _NOISE_SCALES:\n")
+    parts.push("    NOISE_SCALE = _NOISE_SCALES[PERT_MODE]\n")
+    parts.push("    USE_RANDOM_INIT = False\n")
+    parts.push("elif PERT_MODE == 'random_init':\n")
+    parts.push("    NOISE_SCALE = 0.0\n")
+    parts.push("    USE_RANDOM_INIT = True\n")
+    parts.push("else:\n")
+    parts.push("    raise ValueError(f'Unknown ANIMA_PERT_MODE={PERT_MODE!r}; valid: hidden_noise_001|hidden_noise_01|hidden_noise_10|random_init')\n\n")
+
+    parts.push("PROMPTS = [\n")
+    parts.push("    'Define hexad as a six-fold integration:','Six modules form a hexagonal architecture when:',\n")
+    parts.push("    'A balanced six-component system:','Hexad symmetry refers to:',\n")
+    parts.push("    'Logical implication law: if A then:','Sequential rule application proceeds:',\n")
+    parts.push("    'Closure under inference requires:','A formal proof system is closed when:',\n")
+    parts.push("    'Integrated information measures partition independence:','Phi quantifies irreducibility of system:',\n")
+    parts.push("    'Information integration is maximized when:','A whole greater than sum of parts:',\n")
+    parts.push("    'Self-reference emerges when system observes:','Recursive meta-cognition models:',\n")
+    parts.push("    'A self-aware system represents itself by:','Strange loops in cognition arise from:',\n")
+    parts.push("][:N_PROBES]\n")
+    parts.push("N = len(PROMPTS)\n")
+    parts.push("HALF = N // 2\n")
+    parts.push("EFF_DOF_FULL = N - HID_TRUNC\n")
+    parts.push("EFF_DOF_HALF = HALF - HID_TRUNC\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[wt-pert] mode={PERT_MODE} scale={NOISE_SCALE} random_init={USE_RANDOM_INIT} base={BASE_MODEL} N={N} HID={HID_TRUNC} ridge={RIDGE} seed={RNG_SEED}', flush=True)\n")
+    parts.push("t0 = time.time()\n\n")
+
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n\n")
+
+    parts.push("if USE_RANDOM_INIT:\n")
+    parts.push("    print('[wt-pert] random_init mode: from_config + init_weights (no pretraining)', flush=True)\n")
+    parts.push("    cfg = AutoConfig.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("    cfg.torch_dtype = torch.bfloat16\n")
+    parts.push("    torch.manual_seed(RNG_SEED)\n")
+    parts.push("    mdl = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch.bfloat16, trust_remote_code=True)\n")
+    parts.push("    mdl = mdl.to('cuda' if torch.cuda.is_available() else 'cpu')\n")
+    parts.push("else:\n")
+    parts.push("    mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map='auto', output_hidden_states=True)\n")
+    parts.push("mdl.eval()\n")
+    parts.push("h_dim = getattr(mdl.config, 'hidden_size', getattr(mdl.config, 'd_model', 4096))\n")
+    parts.push("print(f'[wt-pert] loaded {time.time()-t0:.1f}s h_dim={h_dim}', flush=True)\n\n")
+
+    parts.push("def byte_weighted_mean(hidden, attn_mask):\n")
+    parts.push("    weights = attn_mask.float()\n")
+    parts.push("    w_sum = weights.sum(dim=1, keepdim=True).clamp(min=1.0)\n")
+    parts.push("    return ((hidden * weights.unsqueeze(-1)).sum(dim=1) / w_sum).float().cpu().numpy()\n\n")
+
+    parts.push("# Forward all prompts; apply hidden noise (W1) AFTER capture if mode is hidden_noise_*\n")
+    parts.push("rng_pert = np.random.default_rng(RNG_SEED + 7919)  # separate seed stream from partition rng\n")
+    parts.push("acts = []\n")
+    parts.push("for i, p in enumerate(PROMPTS):\n")
+    parts.push("    inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("    with torch.no_grad():\n")
+    parts.push("        out = mdl(**inp, output_hidden_states=True)\n")
+    parts.push("    h_last = out.hidden_states[-1]  # (B, T, H)\n")
+    parts.push("    if NOISE_SCALE > 0:\n")
+    parts.push("        # Compute per-prompt activation std for relative noise scaling\n")
+    parts.push("        h_float = h_last.float()\n")
+    parts.push("        act_std = float(h_float.std().item())\n")
+    parts.push("        noise = torch.from_numpy(rng_pert.standard_normal(h_last.shape).astype(np.float32) * NOISE_SCALE * act_std)\n")
+    parts.push("        noise = noise.to(h_float.device).to(h_float.dtype)\n")
+    parts.push("        h_last = (h_float + noise).to(h_last.dtype)\n")
+    parts.push("        if i == 0:\n")
+    parts.push("            print(f'[wt-pert] noise applied: scale={NOISE_SCALE} act_std={act_std:.4f} -> noise_std={NOISE_SCALE*act_std:.4f}', flush=True)\n")
+    parts.push("    h = byte_weighted_mean(h_last, inp['attention_mask'])\n")
+    parts.push("    acts.append(h[0])\n")
+    parts.push("    if (i+1) % 4 == 0:\n")
+    parts.push("        print(f'[wt-pert] forward {i+1}/{N}', flush=True)\n")
+    parts.push("X = np.stack(acts, axis=0)\n")
+    parts.push("var = X.var(axis=0); top_idx = np.argsort(-var)[:HID_TRUNC]\n")
+    parts.push("Xt = X[:, top_idx]\n")
+    parts.push("print(f'[wt-pert] activations (N,H)={Xt.shape} top_var={[round(float(v),2) for v in np.sort(var)[::-1][:HID_TRUNC]]}', flush=True)\n\n")
+
+    parts.push("def cov_logdet(samples, ridge=RIDGE):\n")
+    parts.push("    if samples.shape[0] < 2: return float('nan')\n")
+    parts.push("    Xc = samples - samples.mean(axis=0, keepdims=True)\n")
+    parts.push("    C = (Xc.T @ Xc) / max(1, samples.shape[0] - 1) + ridge * np.eye(samples.shape[1])\n")
+    parts.push("    sign, val = np.linalg.slogdet(C)\n")
+    parts.push("    return float(val) if sign > 0 else float('nan')\n\n")
+
+    parts.push("I_full = cov_logdet(Xt)\n")
+    parts.push("print(f'[wt-pert] I_full = log|C(N={N},H={HID_TRUNC})| = {I_full:.4f}', flush=True)\n\n")
+
+    parts.push("rng_part = np.random.default_rng(RNG_SEED)\n")
+    parts.push("phi_candidates = []\n")
+    parts.push("part_records = []\n")
+    parts.push("for k in range(K_PARTS):\n")
+    parts.push("    perm = rng_part.permutation(N)\n")
+    parts.push("    S1_idx = np.sort(perm[:HALF])\n")
+    parts.push("    S2_idx = np.sort(perm[HALF:])\n")
+    parts.push("    I_1 = cov_logdet(Xt[S1_idx])\n")
+    parts.push("    I_2 = cov_logdet(Xt[S2_idx])\n")
+    parts.push("    phi_k = I_full - (I_1 + I_2)\n")
+    parts.push("    phi_candidates.append(phi_k)\n")
+    parts.push("    part_records.append({'k':k,'S1_size':int(len(S1_idx)),'S2_size':int(len(S2_idx)),\n")
+    parts.push("        'I_1':round(I_1,4),'I_2':round(I_2,4),'phi':round(phi_k,4)})\n")
+    parts.push("    print(f'[wt-pert] sample-part {k+1}/{K_PARTS} phi={phi_k:.4f}', flush=True)\n\n")
+
+    parts.push("phi_star = float(min(phi_candidates))\n")
+    parts.push("phi_mean = float(np.mean(phi_candidates))\n")
+    parts.push("phi_max = float(max(phi_candidates))\n\n")
+
+    parts.push("gate_positive = phi_star > 0\n")
+    parts.push("gate_substantial = phi_star >= 1.0\n")
+    parts.push("gate_magnitude = abs(phi_star) >= 0.5\n\n")
+
+    parts.push("MISTRAL_BASE_PHI_STAR = -16.6959  # anima/state/v10_phi_v3_canonical/mistral baseline\n")
+    parts.push("delta_vs_base = round(phi_star - MISTRAL_BASE_PHI_STAR, 4)\n")
+    parts.push("sign_flip_vs_base = (phi_star > 0) != (MISTRAL_BASE_PHI_STAR > 0)\n\n")
+
+    parts.push("summary = {'schema':'anima/phi_v3_weight_axis/1','backbone':BASE_MODEL,\n")
+    parts.push("    'metric_design':'AUTO-CONDITIONING canonical (HID = max(2, N//2))',\n")
+    parts.push("    'partition_method':'sample-partition (N=16 -> 8|8 halves)',\n")
+    parts.push("    'perturbation_mode':PERT_MODE,'perturbation_scale':NOISE_SCALE,'random_init':USE_RANDOM_INIT,\n")
+    parts.push("    'n_probes':N,'half_size':HALF,'K_partitions':K_PARTS,\n")
+    parts.push("    'hidden_truncated_auto':HID_TRUNC,'eff_dof_full':EFF_DOF_FULL,'eff_dof_half':EFF_DOF_HALF,\n")
+    parts.push("    'ridge':RIDGE,'seed':RNG_SEED,\n")
+    parts.push("    'I_full':round(I_full,4),\n")
+    parts.push("    'phi_star_min':round(phi_star,4),'phi_mean':round(phi_mean,4),'phi_max':round(phi_max,4),\n")
+    parts.push("    'phi_star_sign':'positive_iit_integrated' if phi_star > 0 else 'negative_anti_integrated',\n")
+    parts.push("    'gate_positive_PASS':gate_positive,'gate_substantial_PASS':gate_substantial,'gate_magnitude_PASS':gate_magnitude,\n")
+    parts.push("    'mistral_base_phi_star_baseline':MISTRAL_BASE_PHI_STAR,'delta_vs_base':delta_vs_base,'sign_flip_vs_base':sign_flip_vs_base,\n")
+    parts.push("    'partitions':part_records,\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[wt-pert] DONE phi_star_min={phi_star:.4f} sign_flip_vs_base={sign_flip_vs_base} delta={delta_vs_base:+.4f} -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_weight_perturbation selftest ──")
+    _write_helper()
+    let cmd = "python3 -c 'import ast,sys; ast.parse(open(\"" + HELPER_PATH + "\").read()); print(\"ast_parse=ok\")'"
+    let r = exec_with_status(cmd)
+    println(to_string(r[0]).trim())
+    if to_int(r[1]) != 0 { eprintln("ast.parse FAILED"); exit(1) }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("modes=hidden_noise_001|hidden_noise_01|hidden_noise_10|random_init")
+    println("baseline=mistral-7B-v0.3 phi_star_min=-16.6959 (anima/state/v10_phi_v3_canonical/mistral)")
+    println("hypotheses=HW-A_PRIMARY_confirmed / HW-B_FALSIFIED / HW-C_PARTIAL")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
