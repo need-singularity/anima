@@ -1,0 +1,36 @@
+{
+  "cycle": "omega-bridge-8",
+  "axis": "bridge_health.sh HEXA_BIN container-context resolution",
+  "timestamp": "2026-04-26",
+  "trigger": "ω-bridge-1 measurement (state/omega_bridge_1_post_curl_rebaseline.json) required manual `-e HEXA_BIN=/usr/local/bin/hexa` override on docker exec; without it, default $HOME/core/hexa-lang/hexa wrapper bind-mounted into Linux container ultimately exec's build/hexa.real (Mach-O) → 'Exec format error'.",
+  "root_cause": "tool/bridge_health.sh line 36 hardcoded HEXA_BIN default to $HOME/core/hexa-lang/hexa — that path is the host wrapper that routes through resolver→build/hexa.real (Mach-O Mac binary). Bind-mounted into Linux container, the wrapper still resolves to Mach-O hexa.real which the Linux kernel cannot exec ('Exec format error'). Container ships a native ELF dispatcher at /usr/local/bin/hexa but nothing chose it.",
+  "fix_chosen": "Option A (auto-detect container context). Reasoning: A is the smallest behavioural change that fixes the container case while keeping the host case bit-for-bit identical (host has no /.dockerenv, no HEXA_IN_CONTAINER, host wrapper is +x → falls through to existing default). Option B (always prefer /usr/local/bin/hexa when present) was rejected because /usr/local/bin/hexa could exist on a developer Mac via brew/symlink and would silently bypass the resolver/safety wrapper. Option C (document only) leaves the same trap for the next operator. Detection markers: /.dockerenv (canonical Docker), HEXA_IN_CONTAINER=1 env (explicit override), or wrapper-absent + /usr/local/bin/hexa-present (defensive fallback for non-Docker containers).",
+  "fix_diff_summary": "tool/bridge_health.sh: replace single-line `HEXA_BIN=\"${HEXA_BIN:-$HOME/core/hexa-lang/hexa}\"` with a guarded block that (1) uses host wrapper as `_default_hexa_bin`, (2) if HEXA_BIN unset and (/.dockerenv exists OR HEXA_IN_CONTAINER=1) and /usr/local/bin/hexa is executable → switch default to /usr/local/bin/hexa, (3) defensive: if host wrapper absent but container binary present → use container binary. Explicit HEXA_BIN env always wins. ~14 lines added including comment block citing ω-bridge-8.",
+  "validation": {
+    "host_invocation": {
+      "command": "bash /Users/ghost/core/nexus/tool/bridge_health.sh",
+      "result": "PASS",
+      "evidence": "Banner shows `hexa: /Users/ghost/core/hexa-lang/hexa` (host wrapper, unchanged from pre-fix). First 8 bridges PASS ec=0 (codata, oeis, gw, horizons, arxiv, cmb, nanograv, simbad). No 'Exec format error'. Truncated at 60s timeout — full registry health was already 16/16 measured this session in ω-bridge-1."
+    },
+    "container_invocation": {
+      "command": "docker exec hexa-exec bash -c 'bash /Users/ghost/core/nexus/tool/bridge_health.sh'",
+      "result": "PASS",
+      "evidence": "Banner shows `hexa: /usr/local/bin/hexa` (container ELF binary, auto-detected via /.dockerenv). First 6 bridges PASS ec=0 (codata, oeis, gw, horizons, arxiv, cmb). No 'Exec format error'. NO `-e HEXA_BIN=...` override required on docker exec — fix succeeds."
+    }
+  },
+  "other_at_risk_scripts": [
+    {
+      "path": "tool/atlas_dsl_v2_regression.sh",
+      "line": 50,
+      "pattern": "HEXA_BIN=\"${HEXA:-$HOME/core/hexa-lang/hexa}\"",
+      "risk": "Same Mach-O-in-Linux trap if invoked via docker exec without -e override. Not fixed this cycle (scope: bridge_health.sh only).",
+      "note": "Uses ${HEXA:-...} (different env var name from HEXA_BIN), and adds explicit -x check at line 51 that aborts with helpful message rather than producing 'Exec format error', so failure mode is louder."
+    },
+    {
+      "path": "tool/*.hexa (NEXUS+/bin/hexa or SHARED+/bin/hexa)",
+      "examples": ["dod_gate.hexa:59", "roadmap_dod_bridge.hexa:45", "emergence_score_log.hexa:9", "parallel_scheduler.hexa:37", "consensus_bt_gate.hexa:70", "curiosity.hexa:25", "nexus_growth_daemon.hexa:21", "A7_fusion_expanded.hexa:20", "parallel_dispatch_guard.hexa:39", "discovery_infra.hexa:72", "dream_engine.hexa:27", "commit.hexa:30", "bt_metacog.hexa:24"],
+      "risk": "All use `let HEXA_BIN = NEXUS + \"/bin/hexa\"` pointing to nexus/bin/hexa (not the resolver path). Different binary, different risk profile. Container has nexus bind-mounted so /Users/ghost/core/nexus/bin/hexa would resolve, but only at risk if that path is also a Mach-O wrapper. Out of scope for this cycle."
+    }
+  ],
+  "rollback": "git checkout HEAD -- tool/bridge_health.sh"
+}
