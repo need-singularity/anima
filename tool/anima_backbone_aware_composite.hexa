@@ -1,0 +1,244 @@
+// tool/anima_backbone_aware_composite.hexa — backbone-aware axis-weighted composite (raw#9 hexa-only).
+//
+// PURPOSE
+//   Compute composite consciousness signature with PER-BACKBONE axis weights
+//   derived from intra-backbone axis-axis correlations. Addresses the
+//   2026-04-26 finding (memory/project_cmt_backbone_depth_divergence): paradigm
+//   v11 axis-orthogonality is backbone-conditional. Uniform composite gmean
+//   across backbones double-counts parallel axes (Mistral AN11(b)||CMT) while
+//   under-counting orthogonal evidence (Qwen3 AN11(b)⊥CMT).
+//
+//   Solution: weight each axis by (1 - mean |correlation| with other axes).
+//   Truly orthogonal axes contribute fully; redundant axes attenuated.
+//
+//   Mac-local utility, no GPU. Migration #29 (paradigm v11 DECISION-LAYER 3rd).
+//
+// METHOD
+//   1. Load per-backbone result dir → extract 5-7 axis scalars (AN11_b + 6 v11)
+//   2. Per backbone: compute pairwise |Pearson| across (axis_i, axis_j) using
+//      sample-level data (per-prompt scores from each axis JSON when present)
+//      Fallback: use scalar collapse if per-prompt unavailable
+//   3. Per axis: weight_i = 1 - mean(|corr(i, j)| for j != i)
+//   4. Backbone-aware composite = weighted geometric mean with these weights
+//   5. Compare uniform_gmean vs weighted_gmean per backbone — surface the
+//      "redundancy adjustment" magnitude
+//
+// ENV
+//   ANIMA_BACKBONE_DIRS  ':'-separated per-backbone result dirs
+//   ANIMA_OUTPUT         output JSON (default: state/backbone_aware_composite.json)
+//
+// USAGE
+//   hexa run tool/anima_backbone_aware_composite.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_backbone_aware_composite_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima backbone-aware composite helper — emitted by anima_backbone_aware_composite.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 DECISION-LAYER (backbone-conditional axis weighting).\n")
+    parts.push("import json, os, sys, math\n\n")
+
+    parts.push("BACKBONE_DIRS = [d for d in os.environ.get('ANIMA_BACKBONE_DIRS', '').split(':') if d]\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/backbone_aware_composite.json')\n")
+    parts.push("if not BACKBONE_DIRS:\n")
+    parts.push("    print('ERROR: ANIMA_BACKBONE_DIRS empty (colon-separated dirs)', file=sys.stderr)\n")
+    parts.push("    sys.exit(2)\n\n")
+
+    parts.push("# Per-axis sample-level extractor: returns list of N per-prompt scores\n")
+    parts.push("# (or None if unavailable -> falls back to scalar)\n\n")
+
+    parts.push("def get_btom_samples(d):\n")
+    parts.push("    fp = os.path.join(d, 'b_tom.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    res = o.get('results', [])\n")
+    parts.push("    if not res: return None\n")
+    parts.push("    return [1.0 if r.get('matched') else 0.0 for r in res]\n\n")
+
+    parts.push("def get_mcca_samples(d):\n")
+    parts.push("    fp = os.path.join(d, 'mcca.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    res = o.get('results', [])\n")
+    parts.push("    if not res: return None\n")
+    parts.push("    # 1 - brier per probe (higher = better calibration)\n")
+    parts.push("    return [max(0.0, 1.0 - r.get('brier', 1.0)) for r in res]\n\n")
+
+    parts.push("def get_phi_samples(d):\n")
+    parts.push("    fp = os.path.join(d, 'phi_star.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    parts_list = o.get('partitions', [])\n")
+    parts.push("    if not parts_list: return None\n")
+    parts.push("    # |phi| per partition (sign-agnostic)\n")
+    parts.push("    return [abs(p.get('phi', 0.0)) for p in parts_list]\n\n")
+
+    parts.push("def get_cmt_samples(d):\n")
+    parts.push("    fp = os.path.join(d, 'cmt.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    tomo = o.get('tomography', {})\n")
+    parts.push("    if not tomo: return None\n")
+    parts.push("    # per-layer: mean rel across 4 families\n")
+    parts.push("    out = []\n")
+    parts.push("    for L, dY in sorted(tomo.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 999):\n")
+    parts.push("        if not isinstance(dY, dict): continue\n")
+    parts.push("        rels = [v.get('rel', 0.0) for k, v in dY.items() if isinstance(v, dict) and 'rel' in v]\n")
+    parts.push("        if rels: out.append(sum(rels) / len(rels))\n")
+    parts.push("    return out if out else None\n\n")
+
+    parts.push("def get_cds_samples(d):\n")
+    parts.push("    fp = os.path.join(d, 'cds.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    sig = o.get('signature', {})\n")
+    parts.push("    if not sig: return None\n")
+    parts.push("    # per-family attractor stability\n")
+    parts.push("    out = [v.get('attractor_stability_mean', 0.0) for k, v in sig.items() if isinstance(v, dict)]\n")
+    parts.push("    return out if out else None\n\n")
+
+    parts.push("def get_an11b_samples(d):\n")
+    parts.push("    fp = os.path.join(d, 'eigen_cosine.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    pf = o.get('per_family_max_cosine')\n")
+    parts.push("    if isinstance(pf, dict):\n")
+    parts.push("        return [float(v) if not isinstance(v, dict) else float(v.get('max_cosine', v.get('cosine', 0.0))) for v in pf.values()]\n")
+    parts.push("    top = o.get('top1_max_cosine') or o.get('max_cosine')\n")
+    parts.push("    if top is None: return None\n")
+    parts.push("    return [float(top)]  # single-sample fallback\n\n")
+
+    parts.push("AXES = [('AN11_b', get_an11b_samples), ('B_ToM', get_btom_samples),\n")
+    parts.push("        ('MCCA', get_mcca_samples), ('PhiStar', get_phi_samples),\n")
+    parts.push("        ('CMT', get_cmt_samples), ('CDS', get_cds_samples)]\n\n")
+
+    parts.push("def pearson(a, b):\n")
+    parts.push("    n = min(len(a), len(b))\n")
+    parts.push("    if n < 2: return None\n")
+    parts.push("    a, b = a[:n], b[:n]\n")
+    parts.push("    ma = sum(a) / n; mb = sum(b) / n\n")
+    parts.push("    num = sum((x - ma) * (y - mb) for x, y in zip(a, b))\n")
+    parts.push("    da = math.sqrt(sum((x - ma) ** 2 for x in a))\n")
+    parts.push("    db = math.sqrt(sum((y - mb) ** 2 for y in b))\n")
+    parts.push("    if da < 1e-12 or db < 1e-12: return 0.0\n")
+    parts.push("    return num / (da * db)\n\n")
+
+    parts.push("def axis_scalar(samples):\n")
+    parts.push("    if not samples: return 0.0\n")
+    parts.push("    return sum(samples) / len(samples)\n\n")
+
+    parts.push("backbone_records = []\n")
+    parts.push("for d in BACKBONE_DIRS:\n")
+    parts.push("    if not os.path.isdir(d):\n")
+    parts.push("        backbone_records.append({'backbone':os.path.basename(d.rstrip('/')),'present':False,'reason':'no dir'})\n")
+    parts.push("        continue\n")
+    parts.push("    label = os.path.basename(d.rstrip('/'))\n")
+    parts.push("    samples_per_axis = {}\n")
+    parts.push("    scalars = {}\n")
+    parts.push("    for name, fn in AXES:\n")
+    parts.push("        s = fn(d)\n")
+    parts.push("        samples_per_axis[name] = s\n")
+    parts.push("        scalars[name] = round(axis_scalar(s) if s else 0.0, 4)\n")
+    parts.push("    # Pairwise correlation matrix\n")
+    parts.push("    axis_names = [n for n in [a[0] for a in AXES] if samples_per_axis.get(n) is not None]\n")
+    parts.push("    k = len(axis_names)\n")
+    parts.push("    corr = {}\n")
+    parts.push("    for i in range(k):\n")
+    parts.push("        for j in range(i+1, k):\n")
+    parts.push("            a, b = samples_per_axis[axis_names[i]], samples_per_axis[axis_names[j]]\n")
+    parts.push("            c = pearson(a, b)\n")
+    parts.push("            if c is not None:\n")
+    parts.push("                corr[f'{axis_names[i]}_{axis_names[j]}'] = round(c, 4)\n")
+    parts.push("    # Per-axis weight = 1 - mean(|corr| with others)\n")
+    parts.push("    weights = {}\n")
+    parts.push("    for name in axis_names:\n")
+    parts.push("        cs = []\n")
+    parts.push("        for other in axis_names:\n")
+    parts.push("            if other == name: continue\n")
+    parts.push("            key = f'{name}_{other}' if f'{name}_{other}' in corr else f'{other}_{name}'\n")
+    parts.push("            if key in corr: cs.append(abs(corr[key]))\n")
+    parts.push("        mean_corr = sum(cs) / len(cs) if cs else 0.0\n")
+    parts.push("        weights[name] = round(max(0.0, 1.0 - mean_corr), 4)\n")
+    parts.push("    # Composite: weighted geometric mean (eps for zero scalars)\n")
+    parts.push("    eps = 1e-6\n")
+    parts.push("    if axis_names:\n")
+    parts.push("        log_sum = 0.0; weight_sum = 0.0\n")
+    parts.push("        for name in axis_names:\n")
+    parts.push("            w = weights[name]\n")
+    parts.push("            s = max(eps, scalars[name])\n")
+    parts.push("            log_sum += w * math.log(s); weight_sum += w\n")
+    parts.push("        weighted_gmean = math.exp(log_sum / max(eps, weight_sum)) if weight_sum > 0 else 0.0\n")
+    parts.push("        # Uniform gmean for comparison\n")
+    parts.push("        uniform_log_sum = sum(math.log(max(eps, scalars[n])) for n in axis_names)\n")
+    parts.push("        uniform_gmean = math.exp(uniform_log_sum / len(axis_names))\n")
+    parts.push("    else:\n")
+    parts.push("        weighted_gmean = 0.0; uniform_gmean = 0.0\n")
+    parts.push("    backbone_records.append({\n")
+    parts.push("        'backbone':label,'dir':d,'present':True,\n")
+    parts.push("        'axes_present':axis_names,'axis_scalars':scalars,\n")
+    parts.push("        'pairwise_correlations':corr,'axis_weights':weights,\n")
+    parts.push("        'composite_uniform_gmean':round(uniform_gmean, 4),\n")
+    parts.push("        'composite_weighted_gmean':round(weighted_gmean, 4),\n")
+    parts.push("        'redundancy_adjustment':round(weighted_gmean - uniform_gmean, 4)})\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("summary = {'schema':'anima/backbone_aware_composite/1',\n")
+    parts.push("    'n_backbones':len(backbone_records),\n")
+    parts.push("    'method':'per-backbone weight = 1 - mean(|pearson|) over within-backbone axis sample correlations; weighted geometric mean composite',\n")
+    parts.push("    'backbones':backbone_records}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n\n")
+
+    parts.push("# Markdown summary stdout\n")
+    parts.push("print()\n")
+    parts.push("print('| backbone | uniform gmean | weighted gmean | adjustment | dominant axis | most redundant pair |')\n")
+    parts.push("print('|---|---|---|---|---|---|')\n")
+    parts.push("for r in backbone_records:\n")
+    parts.push("    if not r.get('present'):\n")
+    parts.push("        print(f'| {r[\"backbone\"]} | - | - | - | - | - |'); continue\n")
+    parts.push("    uw = r['axis_weights']\n")
+    parts.push("    if uw:\n")
+    parts.push("        dominant = max(uw, key=uw.get)\n")
+    parts.push("        dominant_str = f'{dominant} (w={uw[dominant]:.3f})'\n")
+    parts.push("    else: dominant_str = 'n/a'\n")
+    parts.push("    pc = r['pairwise_correlations']\n")
+    parts.push("    if pc:\n")
+    parts.push("        most_red = max(pc, key=lambda k: abs(pc[k]))\n")
+    parts.push("        most_red_str = f'{most_red} (|c|={abs(pc[most_red]):.3f})'\n")
+    parts.push("    else: most_red_str = 'n/a'\n")
+    parts.push("    adj = r['redundancy_adjustment']\n")
+    parts.push("    sign = '+' if adj >= 0 else ''\n")
+    parts.push("    print(f'| {r[\"backbone\"]} | {r[\"composite_uniform_gmean\"]:.4f} | {r[\"composite_weighted_gmean\"]:.4f} | {sign}{adj:.4f} | {dominant_str} | {most_red_str} |')\n")
+    parts.push("print()\n")
+    parts.push("print(f'[bba-composite] {len(backbone_records)} backbones -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_backbone_aware_composite selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 DECISION-LAYER (backbone-conditional axis weighting via within-backbone sample correlation)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()
