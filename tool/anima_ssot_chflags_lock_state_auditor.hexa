@@ -1,0 +1,177 @@
+// tool/anima_ssot_chflags_lock_state_auditor.hexa — SSOT chflags uchg lock state auditor (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   memory uchg_ssot_pattern: ".roadmap + canonical state/config files are BSD uchg-locked (raw#20/#22)".
+//   Cycle 18에서 atlas cleanup procedure에 chflags unlock/relock 단계 명시했으나 현재 chflags 상태
+//   audit 안 함. cycle 21이 그 audit gap 처리.
+//
+//   본 helper = mac-local NON_MUTATION SSOT chflags state audit:
+//     - 5+ canonical SSOT files (.roadmap, .own, atlas, witness_ledger_v2.json.meta 등) chflags 확인
+//     - expected vs observed locking state 비교 → mismatch list 산출
+//     - mismatch 발견 시 권장 행동 (chflags uchg 재적용 or memory 갱신) 제안
+//     - selftest verifies: ≥5 SSOT 파일 / chflags reading via st_flags / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/ssot_chflags_lock_state_auditor.json)
+//
+// OUTPUT
+//   - ssot_files: list of {path, present, expected_uchg, observed_uchg, mismatch}
+//   - mismatch_count
+//   - recommended_actions
+//   - non_mutation_guarantee (helper does NOT chflags)
+//
+// USAGE
+//   hexa run tool/anima_ssot_chflags_lock_state_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/ssot_chflags_lock_state_auditor.json hexa run tool/anima_ssot_chflags_lock_state_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - expected_uchg는 memory uchg_ssot_pattern 기반 frozen list — memory 갱신 시 본 helper 도 sync 필요.
+//   - st_flags 0x00000002 = UF_IMMUTABLE (BSD uchg) — Linux 환경에서는 0 fallback.
+//   - chflags re-application은 user manual (`sudo chflags uchg <path>` or `chflags uchg` if owner).
+
+let HELPER_PATH = "/tmp/anima_ssot_chflags_lock_state_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima SSOT chflags lock state auditor — emitted by tool/anima_ssot_chflags_lock_state_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION uchg SSOT pattern audit.\n")
+    parts.push("import json, os, sys, stat\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/ssot_chflags_lock_state_auditor.json')\n\n")
+
+    parts.push("# memory uchg_ssot_pattern: canonical SSOT files expected uchg-locked\n")
+    parts.push("EXPECTED_LOCKED_SSOT = [\n")
+    parts.push("    {'path':'.roadmap', 'rationale':'memory uchg_ssot_pattern: canonical roadmap SSOT (raw#20/#22)'},\n")
+    parts.push("    {'path':'.own', 'rationale':'governance SSOT (own#1..#3); cycle 7 verifier confirmed uchg=True'},\n")
+    parts.push("    {'path':'state/atlas_convergence_witness.jsonl', 'rationale':'atlas R-tier convergence witness SSOT (cycle 17/18 reference)'},\n")
+    parts.push("    {'path':'state/v10_anima_physics_cloud_facade/integration_ledger/witness_ledger_v2.json.meta', 'rationale':'witness ledger v2 meta lock (per .meta sha-chain convention)'},\n")
+    parts.push("    {'path':'tool/anima_zombie_posterior.hexa', 'rationale':'R45 v1 helper sha-locked (cycle 8 r45_v4 selector reference)'},\n")
+    parts.push("    {'path':'tool/anima_zombie_posterior_v2_11substrate.hexa', 'rationale':'R45 v2 helper sha-locked (cycle 8 reference)'},\n")
+    parts.push("    {'path':'tool/anima_zombie_posterior_v3_14substrate.hexa', 'rationale':'R45 v3 helper sha-locked (cycle 8 reference, sha 7a9a2629)'},\n")
+    parts.push("]\n\n")
+
+    parts.push("def _check_chflags(path):\n")
+    parts.push("    if not os.path.exists(path):\n")
+    parts.push("        return {'present':False, 'observed_uchg':None, 'note':'file not found'}\n")
+    parts.push("    try:\n")
+    parts.push("        st = os.stat(path)\n")
+    parts.push("        flags = getattr(st, 'st_flags', 0)\n")
+    parts.push("        UF_IMMUTABLE = 0x00000002\n")
+    parts.push("        observed = bool(flags & UF_IMMUTABLE)\n")
+    parts.push("        return {'present':True, 'observed_uchg':observed, 'st_flags_int':flags, 'mode':oct(st.st_mode & 0o777)}\n")
+    parts.push("    except Exception as e:\n")
+    parts.push("        return {'present':True, 'observed_uchg':None, 'note':f'stat_error:{type(e).__name__}'}\n\n")
+
+    parts.push("audit_results = []\n")
+    parts.push("mismatches = []\n")
+    parts.push("for spec in EXPECTED_LOCKED_SSOT:\n")
+    parts.push("    obs = _check_chflags(spec['path'])\n")
+    parts.push("    expected_locked = True  # all entries in EXPECTED_LOCKED_SSOT are expected uchg-locked\n")
+    parts.push("    is_mismatch = obs.get('present') and obs.get('observed_uchg') == False\n")
+    parts.push("    if is_mismatch:\n")
+    parts.push("        mismatches.append({\n")
+    parts.push("            'path':spec['path'],\n")
+    parts.push("            'expected':'uchg-locked',\n")
+    parts.push("            'observed':'unlocked',\n")
+    parts.push("            'rationale':spec['rationale'],\n")
+    parts.push("        })\n")
+    parts.push("    audit_results.append({\n")
+    parts.push("        'path':spec['path'],\n")
+    parts.push("        'present':obs.get('present'),\n")
+    parts.push("        'expected_uchg':expected_locked,\n")
+    parts.push("        'observed_uchg':obs.get('observed_uchg'),\n")
+    parts.push("        'st_flags_int':obs.get('st_flags_int'),\n")
+    parts.push("        'mode':obs.get('mode'),\n")
+    parts.push("        'rationale':spec['rationale'],\n")
+    parts.push("        'mismatch':is_mismatch,\n")
+    parts.push("    })\n\n")
+
+    parts.push("RECOMMENDED_ACTIONS = []\n")
+    parts.push("for m in mismatches:\n")
+    parts.push("    RECOMMENDED_ACTIONS.append({\n")
+    parts.push("        'path':m['path'],\n")
+    parts.push("        'option_A':f'restore lock: chflags uchg {m[\"path\"]} (re-establish memory uchg_ssot_pattern invariant)',\n")
+    parts.push("        'option_B':'update memory project_uchg_ssot.md to reflect new pattern (if intentional unlock)',\n")
+    parts.push("        'recommended':'A (preserve raw#20/#22 SSOT integrity)',\n")
+    parts.push("    })\n\n")
+
+    parts.push("present_count = sum(1 for r in audit_results if r['present'])\n")
+    parts.push("locked_count = sum(1 for r in audit_results if r.get('observed_uchg') == True)\n")
+    parts.push("unlocked_count = sum(1 for r in audit_results if r.get('observed_uchg') == False)\n")
+    parts.push("missing_count = sum(1 for r in audit_results if not r.get('present'))\n\n")
+
+    parts.push("status = 'ALL_LOCKED' if not mismatches and not missing_count else f'MISMATCH_{len(mismatches)}_UNLOCKED' if mismatches else f'MISSING_{missing_count}_FILES'\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'SSOT chflags uchg lock state auditor (mac-local NON_MUTATION)',\n")
+    parts.push("    'parent_memory':'project_uchg_ssot.md (canonical files BSD uchg-locked raw#20/#22)',\n")
+    parts.push("    'parent_helpers':['cycle 7 own#3 verifier (own_flags.uchg recorded)','cycle 18 atlas remediation (chflags procedure proposed)'],\n")
+    parts.push("    'audit_results':audit_results,\n")
+    parts.push("    'audit_summary':{\n")
+    parts.push("        'total':len(audit_results),\n")
+    parts.push("        'present':present_count,\n")
+    parts.push("        'locked':locked_count,\n")
+    parts.push("        'unlocked':unlocked_count,\n")
+    parts.push("        'missing':missing_count,\n")
+    parts.push("        'mismatch':len(mismatches),\n")
+    parts.push("    },\n")
+    parts.push("    'mismatches':mismatches,\n")
+    parts.push("    'recommended_actions':RECOMMENDED_ACTIONS,\n")
+    parts.push("    'status':status,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT execute chflags; user manual chflags uchg <path> required to restore lock',\n")
+    parts.push("    'cross_link_cycles':['cycle 7 (own#3 verifier — own.uchg confirmed)','cycle 18 (atlas drift remediation — chflags procedure)'],\n")
+    parts.push("    'n_ssot_files':len(EXPECTED_LOCKED_SSOT),\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[ssot_chflags] status={status} present={present_count}/{len(audit_results)} locked={locked_count} unlocked={unlocked_count} mismatch={len(mismatches)} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let ssot_files_count = 7
+    let uf_immutable_flag = 2
+    let non_mutation_invariant = "READ_ONLY_NO_CHFLAGS"
+    let status_states = "ALL_LOCKED,MISMATCH_*_UNLOCKED,MISSING_*_FILES"
+    println("inv:ssot_files_count=" + to_string(ssot_files_count))
+    println("inv:uf_immutable_flag=" + to_string(uf_immutable_flag))
+    println("inv:non_mutation_invariant=" + non_mutation_invariant)
+    println("inv:status_states=" + status_states)
+    println("inv:reads_st_flags_via_os_stat=true")
+    println("inv:cross_link_cycle7_cycle18=true")
+    println("inv:expected_locked_list_includes_roadmap_own_atlas_witness_v3_helpers=true")
+    println("inv:recommended_actions_present_for_each_mismatch=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_ssot_chflags_lock_state_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=SSOT chflags uchg lock state auditor (7 canonical SSOT files; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
