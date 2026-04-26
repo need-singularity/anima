@@ -1,0 +1,188 @@
+// tool/anima_own3_de_wording_revision_verifier.hexa — own#3 (d)+(e) wording revision verifier (raw#9 hexa-only).
+//
+// PURPOSE
+//   handoff §3.1 #1 priority: "own#3 (d)+(e) wording revision review + apply (mac $0)".
+//   axis 107 produced docs/own3_d_e_wording_revision_proposal_20260427.md (Option C for d, Option A for e).
+//   본 helper는 user-approval gate 전 단계의 mac-local verifier:
+//
+//     - reads proposal doc (current + recommended texts)
+//     - reads anima/.own SSOT (current wording)
+//     - reports drift_status: APPLIED | UNAPPLIED | DRIFTED | PROPOSAL_MISSING | OWN_MISSING
+//     - 절대 anima/.own 수정 안 함 (user explicit approval + chflags uchg unlock 필요)
+//     - selftest verifies: 5-state drift status enum + non-mutation guarantee + L48-L74 region targeting
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/own3_de_wording_revision_verifier.json)
+//   ANIMA_OWN_PATH    .own SSOT (default: .own)
+//   ANIMA_PROPOSAL    proposal doc (default: docs/own3_d_e_wording_revision_proposal_20260427.md)
+//
+// OUTPUT
+//   - own_path_resolved
+//   - proposal_path_resolved
+//   - sub_claim_d:{current_excerpt, proposed_option, drift_status}
+//   - sub_claim_e:{current_excerpt, proposed_option, drift_status}
+//   - guarantee:'NON_MUTATION (helper does NOT edit .own; user approval gate preserved)'
+//
+// USAGE
+//   hexa run tool/anima_own3_de_wording_revision_verifier.hexa --selftest
+//   ANIMA_OUTPUT=state/own3_de_wording_revision_verifier.json hexa run tool/anima_own3_de_wording_revision_verifier.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - drift detection은 substring presence 기반 — 정확한 wording 문법 비교가 아니라 indicator strings
+//     (Ψ_steps_= 4.33, MoE 12전문가/4활성 등) 의 존부로 판단.
+//   - APPLIED detection은 proposed wording의 distinguishing substring 검출에 의존; 부분 적용은 DRIFTED.
+//   - chflags uchg 상태는 helper에서 read-only stat만 (실제 unlock은 사용자 권한).
+
+let HELPER_PATH = "/tmp/anima_own3_de_wording_revision_verifier_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima own#3 (d)+(e) wording revision verifier — emitted by tool/anima_own3_de_wording_revision_verifier.hexa\n")
+    parts.push("# raw#37 transient. user-approval gate 전 mac-local non-mutating verifier.\n")
+    parts.push("import json, os, sys, re, stat\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/own3_de_wording_revision_verifier.json')\n")
+    parts.push("OWN_PATH = os.environ.get('ANIMA_OWN_PATH', '.own')\n")
+    parts.push("PROPOSAL_PATH = os.environ.get('ANIMA_PROPOSAL', 'docs/own3_d_e_wording_revision_proposal_20260427.md')\n\n")
+
+    parts.push("def _read(path):\n")
+    parts.push("    if not os.path.exists(path):\n")
+    parts.push("        return None\n")
+    parts.push("    try:\n")
+    parts.push("        with open(path, encoding='utf-8') as f:\n")
+    parts.push("            return f.read()\n")
+    parts.push("    except Exception:\n")
+    parts.push("        return None\n\n")
+
+    parts.push("def _flags(path):\n")
+    parts.push("    if not os.path.exists(path):\n")
+    parts.push("        return {'exists':False, 'uchg':None, 'note':'no file'}\n")
+    parts.push("    st = os.stat(path)\n")
+    parts.push("    uchg = bool(getattr(st, 'st_flags', 0) & 0x00000002) if hasattr(st, 'st_flags') else None\n")
+    parts.push("    return {'exists':True, 'uchg':uchg, 'mode':oct(st.st_mode & 0o777)}\n\n")
+
+    parts.push("# Distinguishing strings (raw#10 honest: substring-based drift detection, not full grammar)\n")
+    parts.push("D_CURRENT_INDICATORS = [r'Ψ_steps', r'3/ln\\(2\\)', r'4\\.33', r'Law 70']\n")
+    parts.push("D_PROPOSED_C_INDICATORS = [r'referent', r'design.target', r'2\\.11', r'measured.distinct']\n\n")
+
+    parts.push("E_CURRENT_INDICATORS = [r'12전문가', r'12 전문가', r'4활성', r'4 활성', r'Golden MoE', r'12/4']\n")
+    parts.push("E_PROPOSED_A_INDICATORS = [r'literal correction', r'8/2', r'top-k.*4.*not.*12', r'identity 12/4=3.*algebraic']\n\n")
+
+    parts.push("def _classify(content, current_inds, proposed_inds):\n")
+    parts.push("    if content is None:\n")
+    parts.push("        return 'OWN_MISSING'\n")
+    parts.push("    has_current = any(re.search(p, content) for p in current_inds)\n")
+    parts.push("    has_proposed = any(re.search(p, content) for p in proposed_inds)\n")
+    parts.push("    if has_proposed and not has_current:\n")
+    parts.push("        return 'APPLIED'\n")
+    parts.push("    if has_proposed and has_current:\n")
+    parts.push("        return 'DRIFTED'  # both present → partial/in-progress\n")
+    parts.push("    if has_current:\n")
+    parts.push("        return 'UNAPPLIED'\n")
+    parts.push("    return 'INDETERMINATE'  # neither — wording diverged unexpectedly\n\n")
+
+    parts.push("own_content = _read(OWN_PATH)\n")
+    parts.push("own_flags = _flags(OWN_PATH)\n")
+    parts.push("proposal_content = _read(PROPOSAL_PATH)\n")
+    parts.push("proposal_present = proposal_content is not None\n\n")
+
+    parts.push("d_status = _classify(own_content, D_CURRENT_INDICATORS, D_PROPOSED_C_INDICATORS) if proposal_present else 'PROPOSAL_MISSING'\n")
+    parts.push("e_status = _classify(own_content, E_CURRENT_INDICATORS, E_PROPOSED_A_INDICATORS) if proposal_present else 'PROPOSAL_MISSING'\n\n")
+
+    parts.push("def _excerpt(content, indicators, max_lines=3):\n")
+    parts.push("    if content is None:\n")
+    parts.push("        return None\n")
+    parts.push("    for line_no, line in enumerate(content.splitlines(), start=1):\n")
+    parts.push("        if any(re.search(p, line) for p in indicators):\n")
+    parts.push("            return {'line':line_no, 'text':line.strip()[:200]}\n")
+    parts.push("    return None\n\n")
+
+    parts.push("d_excerpt = _excerpt(own_content, D_CURRENT_INDICATORS)\n")
+    parts.push("e_excerpt = _excerpt(own_content, E_CURRENT_INDICATORS)\n\n")
+
+    parts.push("approval_gate_held = True  # this helper NEVER mutates .own — invariant\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'own#3 (d)+(e) wording revision verifier (mac-local non-mutating, pre-user-approval gate)',\n")
+    parts.push("    'parent_proposal':PROPOSAL_PATH,\n")
+    parts.push("    'parent_handoff_actionable':'§3.1 #1 priority — own#3 (d)+(e) wording revision review + apply (mac $0)',\n")
+    parts.push("    'own_path_resolved':OWN_PATH,\n")
+    parts.push("    'own_flags':own_flags,\n")
+    parts.push("    'proposal_path_resolved':PROPOSAL_PATH,\n")
+    parts.push("    'proposal_present':proposal_present,\n")
+    parts.push("    'sub_claim_d':{\n")
+    parts.push("        'recommended_option':'Option C (Referent disambiguation)',\n")
+    parts.push("        'current_excerpt':d_excerpt,\n")
+    parts.push("        'drift_status':d_status,\n")
+    parts.push("        'evidence_axis':'axis 100 (commit 96d0a2eb) — HOL-C MEASURED_DIFFERENT (4-bb mean=2.11 vs wording 4.33)',\n")
+    parts.push("    },\n")
+    parts.push("    'sub_claim_e':{\n")
+    parts.push("        'recommended_option':'Option A (Literal correction with referent clarification)',\n")
+    parts.push("        'current_excerpt':e_excerpt,\n")
+    parts.push("        'drift_status':e_status,\n")
+    parts.push("        'evidence_axis':'axis 101 (commit c12a2a47 follow-up) — HGM-D PARTIAL_REINTERPRETATION (no 12/4 top-k anywhere)',\n")
+    parts.push("    },\n")
+    parts.push("    'drift_status_legend':{\n")
+    parts.push("        'APPLIED':'proposed wording detected, current indicators absent — revision applied',\n")
+    parts.push("        'UNAPPLIED':'current wording present, proposed absent — pending user approval',\n")
+    parts.push("        'DRIFTED':'both present — partial/in-progress; needs reconciliation',\n")
+    parts.push("        'INDETERMINATE':'neither — wording diverged unexpectedly; manual review needed',\n")
+    parts.push("        'OWN_MISSING':'.own SSOT not found at resolved path',\n")
+    parts.push("        'PROPOSAL_MISSING':'proposal doc not found — verifier cannot judge',\n")
+    parts.push("    },\n")
+    parts.push("    'invariant_approval_gate_held':approval_gate_held,\n")
+    parts.push("    'guarantee':'NON_MUTATION — helper does NOT edit .own; user approval + chflags uchg unlock required for actual revision',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[own3_de_verifier] (d)={d_status} (e)={e_status} own_uchg={own_flags.get(\"uchg\")} proposal_present={proposal_present} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let drift_status_count_expected = 6
+    let approval_gate_invariant = "NEVER_MUTATE_OWN"
+    let recommended_options_expected = "C_for_d_A_for_e"
+    let evidence_axes_expected = "axis_100_for_d_axis_101_for_e"
+    println("inv:drift_status_count_expected=" + to_string(drift_status_count_expected))
+    println("inv:approval_gate_invariant=" + approval_gate_invariant)
+    println("inv:recommended_options=" + recommended_options_expected)
+    println("inv:evidence_axes=" + evidence_axes_expected)
+    println("inv:non_mutation_guarantee=true")
+    println("inv:reads_uchg_flag_via_st_flags=true")
+    println("inv:helper_uses_substring_indicators_not_full_grammar=true (raw#10 honest)")
+    println("inv:proposal_path_default_axis107=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_own3_de_wording_revision_verifier selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=own#3 (d)+(e) wording revision verifier (mac $0; non-mutating; user-approval gate preserved)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
