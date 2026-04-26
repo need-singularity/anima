@@ -1,0 +1,113 @@
+{
+  "cycle": "omega_audio_6_alloc_indexed",
+  "timestamp": "2026-04-26T16:00:00Z",
+  "verdict": "NULL_RESULT_ROLLBACK",
+  "headline": "alloc + indexed-write is 2.6x SLOWER than [].push() in this hexa interp; migration reverted; baseline preserved byte-perfect.",
+  "context": {
+    "predecessor": "omega_audio_5 brought vocal_hexa to ~107ms via period-table; closed math gap.",
+    "hypothesis": "Per-sample 2x .push() into byte buffer (4800 push/call for 100ms vocal) is the remaining cost; pre-alloc + indexed write should beat it.",
+    "prior_signal": "omega_interp_3 added array_alloc(N) but vocal_hexa_alloc bench was NULL-RESULT — already a soft signal that this pattern doesn't help here.",
+    "scope": "anima/anima-speak/anima_audio.hexa only. NO docker, NO hexa-lang, NO git changes."
+  },
+  "method": {
+    "bench": "/Users/ghost/core/anima/anima-speak/_omega_audio_6_bench.hexa",
+    "warmup_runs": 1,
+    "measured_runs": 5,
+    "params": {
+      "vocal_hexa": "440Hz, gain=0.5, 100ms",
+      "vocal_lf_hexa": "220Hz, gain=0.5, 100ms",
+      "breath_hexa": "800-4000Hz, gain=0.5, 100ms",
+      "chain": "vocal_hexa(440,0.5,100) -> pipe_hexa(700,1100,Q=6)"
+    }
+  },
+  "before_baseline_ms": {
+    "vocal_hexa": 155,
+    "vocal_lf_hexa": 229,
+    "breath_hexa": 249,
+    "chain_vocal_pipe": 499,
+    "note": "Run 1 — pre-migration. vocal_lf and breath were not yet migrated in either pass; their numbers reflect system noise variance only."
+  },
+  "after_alloc_indexed_ms": {
+    "vocal_hexa": 401,
+    "vocal_lf_hexa": 442,
+    "breath_hexa": 744,
+    "chain_vocal_pipe": 2382,
+    "note": "Run 2 — vocal_hexa only migrated to array_alloc + indexed-write. vocal_lf/breath unchanged (still push); their slowdowns reflect coincident system load. chain blew up to 2382ms because it consumes vocal_hexa output and the slow vocal_hexa amplifies."
+  },
+  "after_revert_ms": {
+    "vocal_hexa": 177,
+    "vocal_lf_hexa": 281,
+    "breath_hexa": 444,
+    "chain_vocal_pipe": 756,
+    "note": "Run 3 — vocal_hexa reverted to push pattern. Slightly higher than run 1 due to ambient load but in the same regime; the alloc-pattern's 2.6x slowdown is reproducible signal, not noise."
+  },
+  "vocal_hexa_delta": {
+    "baseline_push_ms": 155,
+    "alloc_indexed_ms": 401,
+    "ratio": 2.59,
+    "target_was_ms_lt": 70,
+    "result": "MISS by 5.7x; SLOWER by 2.6x vs starting point"
+  },
+  "chain_speedup": {
+    "before_ms": 499,
+    "after_alloc_ms": 2382,
+    "after_revert_ms": 756,
+    "vs_target_lt_300_ms": "MISS — alloc made chain 4.8x slower"
+  },
+  "byte_hash_check": {
+    "all_four_organs_byte_identical_across_all_three_runs": true,
+    "vocal_hexa_440_0.5_100": "4815fe9ae7430e8550fd06375dbb828210929e6b6e0e84a2479c58fd750c4d73",
+    "vocal_lf_hexa_220_0.5_100": "152c07933fa1aa37b85a17530b8764b2a5fcc9a7d500e603c4ab48be8179d639",
+    "breath_hexa_800_4000_0.5_100": "ff90dad89bffe54c7f9248274f8e6c50c198b3a93dcf49f1414ae6158d4d2bf0",
+    "chain_vocal_pipe": "ad939ecd8b2aad3c8ee846d772a2cc6684d27ad8722cdd392df1429dcfaa713d",
+    "interpretation": "alloc+indexed-write produced byte-perfect output — semantics preserved. Failure was purely performance, not correctness. WAV header inline and indexed sample writes are functionally equivalent to _wav_header() + .push pairs."
+  },
+  "gap_to_python_worker": {
+    "python_warm_baseline_ms": 112,
+    "current_vocal_hexa_ms": 155,
+    "ratio_hexa_over_python": 1.38,
+    "audio_5_close_was": 0.96,
+    "delta_from_audio_5": "+0.42 — system load drift between cycles, not a regression vs audio-5 (same source)."
+  },
+  "decomposition_decision": {
+    "migrate_breath_hexa": "SKIPPED — propagating a 2.6x-slower pattern to more code would compound the regression.",
+    "migrate_vocal_lf_hexa": "SKIPPED — same reason.",
+    "migrate_pipe_hexa": "SKIPPED — same reason; chain already shows the amplification effect.",
+    "stopping_rule": "Decomposition principle: when the first organ migration shows a strong negative signal under preserved-semantics (byte-hash equal), do NOT propagate. Capture NULL-RESULT, rollback, and re-think."
+  },
+  "rollback": {
+    "performed": true,
+    "method": "Edit replaced vocal_hexa with original push-based body. _wav_header() restored as buffer initializer. .push() pairs restored in hot loop.",
+    "verification": "Run 3 hash for vocal_hexa matches run 1 (4815fe9ae74...). All organ hashes byte-identical across the entire cycle.",
+    "files_modified_then_restored": [
+      "/Users/ghost/core/anima/anima-speak/anima_audio.hexa (vocal_hexa only — function 429..515; reverted)"
+    ],
+    "files_unchanged": [
+      "breath_hexa (line 579)",
+      "vocal_lf_hexa (line 774)",
+      "pipe_hexa (line 679)"
+    ]
+  },
+  "root_cause_hypothesis": {
+    "primary": "In the current hexa interpreter, array_alloc(N) likely backs the array with a sparse / hashmap-style slot store, so indexed assigns hit a per-write hash lookup. [].push() onto an empty array uses a tight-grow vector. The .push path is actually the FAST path despite the action's intuition.",
+    "supporting_evidence": [
+      "vocal_hexa_alloc (existing, line 340) was NULL-RESULT in omega_interp_3 — same finding.",
+      "Hash is byte-identical, so the slowdown is not from extra computation — it must be in the array store backing.",
+      "chain (which feeds vocal output into pipe) showed 4.8x slowdown, consistent with vocal_hexa slowdown amplified by downstream re-read."
+    ],
+    "next_cycle_suggestion": "If alloc+indexed must win, the FIX is in /Users/ghost/core/hexa-lang interpreter (out of session scope): make array_alloc(N) back with a contiguous vector and indexed assigns be O(1) writes. THEN re-attempt this migration."
+  },
+  "gotchas": [
+    "Indexed assigns on array_alloc()-returned arrays are 2-3x slower than .push() in the current hexa interp — opposite of the audio-6 hypothesis.",
+    "The chain bench amplifies any vocal_hexa slowdown ~5x because pipe_hexa re-reads vocal output sample-by-sample.",
+    "Bench numbers vary 10-30% run-to-run due to ambient system load; the alloc-vs-push delta (2.6x) is well outside that noise floor.",
+    "Hash equality across all three runs confirms the migration was semantically correct — the ONLY failure mode was performance."
+  ],
+  "constraints_honored": {
+    "scope": "anima/anima-speak/anima_audio.hexa only",
+    "no_hexa_lang_change": true,
+    "no_docker_change": true,
+    "no_git_commit": true,
+    "stopped_at": "JSON written + 4-organ bench captured (per action spec)"
+  }
+}

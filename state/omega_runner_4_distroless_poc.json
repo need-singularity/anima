@@ -1,0 +1,128 @@
+{
+  "cycle": "omega-runner-4",
+  "axis": "infra-image-shrink",
+  "timestamp": "2026-04-26",
+  "status": "POC complete; partial cutover blocked",
+  "dockerfile_distroless_path": "/Users/ghost/core/hexa-lang/docker/runner/Dockerfile.distroless",
+  "production_dockerfile_path": "/Users/ghost/core/hexa-lang/docker/runner/Dockerfile",
+  "base_image_change": {
+    "production": "debian:12-slim",
+    "distroless_runtime": "gcr.io/distroless/cc-debian12",
+    "builder_stage": "debian:12-slim (unchanged, used to source apt-installed binaries)"
+  },
+  "size_comparison": {
+    "production_virtual_mb": 165,
+    "production_unique_mb": 35.9,
+    "production_shared_mb": 125.2,
+    "distroless_virtual_mb": 95.1,
+    "distroless_unique_mb": 22.6,
+    "distroless_shared_mb": 0,
+    "delta_virtual_mb": -69.9,
+    "delta_unique_mb": -13.3,
+    "savings_pct_virtual": 42.4,
+    "projected_was_mb": 74,
+    "projection_match": "yes (within 5.5%)"
+  },
+  "smoke_results": {
+    "a_hexa_version": {
+      "status": "PASS",
+      "evidence": "docker run --rm hexa-runner-distroless:test --version → 'hexa 0.1.0-dispatch' EXIT=0"
+    },
+    "b_curl_version": {
+      "status": "PASS",
+      "evidence": "curl 7.88.1 (aarch64-unknown-linux-gnu) libcurl/7.88.1 OpenSSL/3.0.19 zlib/1.2.13 brotli/1.0.9 zstd/1.5.4 ... EXIT=0",
+      "libssl_abi_verify": "PASS (libssl.so.3 already in distroless/cc, OpenSSL/3.0.19 same as debian:12-slim, no ABI drift)"
+    },
+    "c_curl_https_google": {
+      "status": "PASS",
+      "evidence": "curl -s https://www.google.com -w '%{http_code}' → 200 EXIT=0 (TLS handshake + cert chain + HTTPS GET all green)"
+    },
+    "d_tini_pid_watchdog": {
+      "status": "PASS",
+      "evidence": "tini -- /usr/local/bin/hexa --version → EXIT=0; tini reaping path intact (PPID=1 detection unchanged from production)"
+    },
+    "e_hexa_run_script": {
+      "status": "BLOCKED",
+      "evidence": "hexa run /work/foo.hexa → 'sh: 1: dirname: not found' / 'error: interp interpreter not found'. resolve_interp() in self/main.hexa:756 calls exec('test -x ...') which goes through popen('sh -c ...') → needs /bin/sh + GNU coreutils (dirname, basename, printf, test, awk, grep, sed, tr, head, sort, uniq, cut, wc, sha256sum, cp, mv, rm, mkdir, find, ls)",
+      "iteration_attempted": "Added /bin/dash + /bin/sh symlink (round-3): shell launches but coreutils still missing"
+    },
+    "bonus_wget_version": {
+      "status": "PASS",
+      "evidence": "GNU Wget 1.21.3 built on linux-gnu. EXIT=0"
+    }
+  },
+  "blockers_found": [
+    {
+      "id": "B1",
+      "category": "missing_dynamic_libs",
+      "issue": "round-1 build smoke: curl/wget exited 127 with libz.so.1, libpcre2-8.so.0, libuuid.so.1 missing — distroless/cc ships libssl/libcrypto/libzstd/libresolv but NOT zlib/pcre2/uuid",
+      "fix_applied": "COPY --from=builder /lib/aarch64-linux-gnu/{libz.so.1*, libpcre2-8.so.0*, libuuid.so.1*} → resolved",
+      "loc_added": 3
+    },
+    {
+      "id": "B2",
+      "category": "no_shell",
+      "issue": "round-2 smoke iter-2: hexa run failed because resolve_interp() and dozens of CLI codepaths shell out via exec() → popen('sh -c ...'); distroless has no /bin/sh",
+      "fix_applied": "COPY --from=builder /bin/dash + /bin/sh symlink (dash is 134KB, pure libc, satisfied by distroless/cc libc.so.6)",
+      "loc_added": 2
+    },
+    {
+      "id": "B3",
+      "category": "no_coreutils",
+      "issue": "round-3 smoke iter-3: shell launches but commands fail with 'sh: 1: dirname: not found'. Hexa CLI exec() patterns rely on dirname, basename, printf, test, cat, awk, grep, sed, tr, head, sort, uniq, cut, wc, sha256sum, cp, mv, rm, mkdir, find, ls (~20 GNU coreutils binaries, ~3MB). Distroless ships none.",
+      "fix_NOT_applied": "Adding 20+ individual coreutils binaries defeats much of the distroless cleanliness win and creates a maintenance liability for every new CLI exec() site. busybox-static (~1MB single binary) is the natural alternative, but that's a non-trivial scope change deferred to a follow-up cycle.",
+      "loc_to_fix_estimate": "~25 LOC if adding individual coreutils; ~5 LOC if adding busybox-static"
+    }
+  ],
+  "blocker_resolution_summary": {
+    "ω_runner_3_predicted": [
+      "(1) bridges exec curl/wget — libssl ABI verify needed",
+      "(2) tini PPID==1 watchdog — orphan reap test",
+      "(3) no shell — RUN apt-install must move to builder stage"
+    ],
+    "ω_runner_4_actual": {
+      "1_libssl_abi": "RESOLVED — distroless/cc ships same OpenSSL 3.0.19 as debian:12-slim, curl HTTPS handshake works",
+      "2_tini_pid1": "RESOLVED — tini binary copied as-is, ENTRYPOINT shape unchanged",
+      "3_no_shell": "PARTIALLY RESOLVED — added /bin/dash; UNCOVERED a deeper dependency chain (B3: ~20 coreutils needed)"
+    },
+    "new_blocker_uncovered": "B3 (coreutils requirement) was implicit in 'no shell' but the scope is larger than initially scoped — the hexa CLI runtime is shell-tool-heavy, not just shell-syntax-heavy"
+  },
+  "final_distroless_dockerfile_loc": {
+    "production_loc": 158,
+    "distroless_loc": 147,
+    "delta": -11,
+    "comment": "Slightly shorter; tradeoff is more COPY lines (transitive lib pull-through) vs the single RUN apt-install in production"
+  },
+  "recommend_cutover_yes_no": {
+    "decision": "NO (this cycle); CONDITIONAL YES for ω-runner-5",
+    "reasoning": [
+      "Image size win is real and measurable (-69.9MB virtual, -42.4%, matches ω-runner-3 projection).",
+      "Bridges (curl/wget) work end-to-end including TLS — primary infra goal achieved.",
+      "BUT: hexa run pipeline is broken in current distroless candidate. The CLI exec() pattern requires shell + ~20 coreutils. Cutover would break all hexa-runner workloads except --version and direct curl/wget invocation.",
+      "ω-runner-5 plan: switch coreutils strategy from individual binary copy → busybox-static (apt install busybox-static in builder, COPY /bin/busybox + create symlinks for needed applets). Estimated +1-2MB image, +10 LOC. Then re-run smoke e and full bridge_health flight."
+    ],
+    "alternative": "ω-runner-5b: rewrite hexa CLI exec() sites to use direct syscalls / file_exists native builtins instead of shelling out. Higher LOC, slower, but yields a TRUE distroless image (no shell, no busybox). Defer until exec() refactor is otherwise warranted."
+  },
+  "iteration_log": [
+    {"round": 1, "action": "initial COPY of expected lib set", "result": "build OK, smoke a/d PASS, smoke b/c FAIL libz", "image_mb": 92.4},
+    {"round": 2, "action": "+libz +libpcre2 +libuuid", "result": "smoke a/b/c/d PASS, smoke e FAIL no /bin/sh", "image_mb": 94.6},
+    {"round": 3, "action": "+/bin/dash +/bin/sh symlink", "result": "shell launches, smoke e FAILS no dirname", "image_mb": 95.1}
+  ],
+  "rollback": {
+    "command": "rm /Users/ghost/core/hexa-lang/docker/runner/Dockerfile.distroless && docker rmi hexa-runner-distroless:test",
+    "production_impact": "ZERO (production Dockerfile untouched, no tag overlap, no compose/k8s reference change)",
+    "git_state": "Dockerfile.distroless is untracked; rm leaves no git footprint"
+  },
+  "artifacts": {
+    "candidate_dockerfile": "/Users/ghost/core/hexa-lang/docker/runner/Dockerfile.distroless",
+    "candidate_image": "hexa-runner-distroless:test (sha256:752f71dcc9fe...)",
+    "production_dockerfile_unchanged": true,
+    "production_image_unchanged": true
+  },
+  "constraints_honored": {
+    "production_dockerfile_not_modified": true,
+    "no_linux_elf_rebuild_from_source": true,
+    "no_git_commit": true,
+    "new_file_only": true
+  }
+}

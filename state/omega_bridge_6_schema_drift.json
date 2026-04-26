@@ -1,0 +1,120 @@
+{
+  "cycle": "omega_bridge_6",
+  "axis": "schema_drift_detection",
+  "timestamp": "2026-04-26T07:12:30Z",
+  "context_ref": "/Users/ghost/core/anima/state/omega_bridge_baseline.json",
+  "addresses": "latent regression risk for the 9 silently-PASS bridges; with curl now LIVE per omega-bridge-2..5, schema drift can finally surface instead of corrupting downstream silently.",
+  "helper_change": {
+    "path": "/Users/ghost/core/nexus/tool/bridge_helper.sh",
+    "loc_before": 397,
+    "loc_after": 551,
+    "loc_delta_added": 154,
+    "sha256_before": "7b8ae7f6cddb425001d18013ceae0d3f94f1712017a528cb678d456b92203f12",
+    "sha256_after": "5b529b428c6b08b4f7ab4eaf9686e2c85c670305ffc7aae662bd4256898af74d",
+    "added_symbols": [
+      "_compute_schema_fingerprint",
+      "_lookup_baseline_fp",
+      "_record_baseline_fp",
+      "_record_candidate_fp",
+      "cmd_fingerprint_check",
+      "SCHEMA_FP_TSV (config var)",
+      "BRIDGE_HELPER_SCHEMA_FP_TSV (env override)",
+      "fingerprint-check (case dispatch entry)"
+    ]
+  },
+  "fingerprint_algorithm": {
+    "primary": "jq -r 'keys | sort | join(\"|\")' on top-level object",
+    "array_handling": "jq inspects first element; if object, prefixes with '__array__:' and uses its keys; otherwise '__array_of_<type>__'",
+    "fallback_when_no_jq": "grep -oE '\"<word>\":' over body | sed | sort -u | tr '\\n' '|' (crude — picks nested keys too — but deterministic and catches gross drift)",
+    "hash_algo": "sha1, truncated to first 16 hex chars (matches existing _url_hash convention)",
+    "what_it_catches": ["added top-level fields", "removed top-level fields", "renamed top-level fields"],
+    "what_it_does_NOT_catch": [
+      "type changes within an existing field (string->int, object->array)",
+      "nested-field renames (top-level only)",
+      "value semantics changes with stable keys"
+    ],
+    "rationale": "cheap + deterministic + jq-or-grep portable; first-line defence; full schema validation deferred."
+  },
+  "new_subcommand": {
+    "signature": "fingerprint-check <bridge> <url> [<ttl_sec>] [<min_interval_sec>]",
+    "exit_codes": {
+      "0": "BASELINE_RECORDED (first run for bridge) OR MATCH (fp == baseline)",
+      "1": "DRIFT_DETECTED (fp != baseline; candidate row written, baseline preserved)",
+      "2": "FETCH_FAIL or NON_JSON_BODY or missing args"
+    },
+    "stdout_lines": ["BASELINE_RECORDED bridge=B fp=H", "MATCH bridge=B fp=H", "DRIFT_DETECTED bridge=B expected=A actual=H", "NON_JSON_BODY bridge=B", "FETCH_FAIL bridge=B url=U"],
+    "stderr_diagnostics": "raw 66 compliant (reason+fix lines on each failure)",
+    "side_effects": "appends to baseline TSV; on drift writes 'candidate:<fp>' row, never overwrites baseline (operator-approved rotation)"
+  },
+  "baseline_path": {
+    "tsv": "/Users/ghost/core/nexus/state/bridge_schema_fingerprint.tsv",
+    "schema": "bridge<TAB>fingerprint<TAB>last_seen_iso",
+    "candidate_marker": "candidate:<fp> in column 2 (looked up via awk filter '$2 !~ /^candidate:/')",
+    "env_override": "BRIDGE_HELPER_SCHEMA_FP_TSV (test affordance)",
+    "creation_lazy": true,
+    "currently_exists": false
+  },
+  "spot_test_results": {
+    "harness": "preseeded /tmp/omega_bridge_6_test/cache via _url_hash(URL)+.body file; URL='https://example.invalid/codata_v1' (NEVER hit network — cache hit path only).",
+    "test_1_BASELINE_RECORDED": {
+      "input_body": "{\"alpha_inv\": 137.035999177, \"uncertainty\": 0.000000021, \"year\": 2022}",
+      "stdout": "BASELINE_RECORDED bridge=codata_test fp=4787d800fefacb77",
+      "exit_code": 0,
+      "tsv_after": "codata_test\\t4787d800fefacb77\\t2026-04-26T07:11:58Z",
+      "result": "PASS"
+    },
+    "test_2_MATCH": {
+      "input_body": "(same as T1, cache TTL 9999s ⇒ hit)",
+      "stdout": "MATCH bridge=codata_test fp=4787d800fefacb77",
+      "exit_code": 0,
+      "tsv_after_unchanged": true,
+      "result": "PASS"
+    },
+    "test_3_DRIFT_DETECTED": {
+      "input_body": "{\"alpha_inverse\": 137.035999177, \"uncertainty\": 0.000000021, \"year\": 2022} (renamed alpha_inv → alpha_inverse — synthetic upstream API rename)",
+      "stdout": "DRIFT_DETECTED bridge=codata_test expected=4787d800fefacb77 actual=a20551f6039f158f",
+      "stderr": "schema-drift diag with reason+fix lines (raw 66)",
+      "exit_code": 1,
+      "tsv_after": "baseline row preserved; new candidate row appended: codata_test\\tcandidate:a20551f6039f158f\\t2026-04-26T07:11:58Z",
+      "result": "PASS"
+    },
+    "test_4_NON_JSON_BODY": {
+      "input_body": "plain text not json",
+      "stdout": "NON_JSON_BODY bridge=text_test",
+      "exit_code": 2,
+      "result": "PASS"
+    },
+    "regression_sanity": {
+      "cache_stat_still_works": true,
+      "unknown_subcommand_lists_fingerprint_check_in_help": true,
+      "no_modifications_to_cmd_fetch_or_cmd_cache_gc": true
+    },
+    "summary": "4/4 PASS; existing subcommands unaffected"
+  },
+  "recommendation_for_bridge_health_integration": {
+    "scope_decision": "DEFER_TO_OMEGA_BRIDGE_7",
+    "reason": "this cycle delivers the helper primitive (fingerprint-check) plus baseline storage — keeping change surface tight to bridge_helper.sh per ω-cycle constraint. bridge_health.sh integration involves: (a) URL-discovery per bridge (currently each .hexa hardcodes its own), (b) policy on first-run BASELINE_RECORDED (silent-pass vs WARN), (c) summary aggregation in the existing PASS/FAIL/WARN report.",
+    "proposed_omega_bridge_7_design": {
+      "step_1": "add a per-bridge URL/TTL manifest at state/bridge_endpoints.tsv (bridge\\turl\\tttl) — sourced once by bridge_health.sh",
+      "step_2": "add --fingerprint-check flag to bridge_health.sh; iterate manifest, invoke 'bash bridge_helper.sh fingerprint-check $bridge $url $ttl 1', collect status lines",
+      "step_3": "summary section: 'schema drift: <n> DRIFT, <n> NEW_BASELINE, <n> MATCH, <n> NON_JSON, <n> SKIP'; DRIFT entries surface in WARN tier",
+      "step_4": "operator approval workflow: 'bash bridge_helper.sh fingerprint-rotate <bridge>' to promote latest candidate row to baseline (also future-cycle scope)"
+    },
+    "non_blocking_for_this_cycle": true
+  },
+  "rollback": {
+    "single_file": "/Users/ghost/core/nexus/tool/bridge_helper.sh",
+    "command": "git checkout HEAD -- /Users/ghost/core/nexus/tool/bridge_helper.sh",
+    "side_artifacts_to_clean": ["/Users/ghost/core/nexus/state/bridge_schema_fingerprint.tsv (will be lazily recreated; safe to rm)"],
+    "no_other_files_modified": true,
+    "no_bridges_touched": true,
+    "no_git_commit": true
+  },
+  "constraints_honoured": {
+    "edited_only_bridge_helper_sh": true,
+    "no_bridge_files_touched": true,
+    "no_live_api_hits_during_tests": "synthetic cache-preseed bodies under /tmp/omega_bridge_6_test (cleaned)",
+    "no_git_commit": true,
+    "stop_when_3_spot_tests_PASS": "satisfied (4 PASS incl. NON_JSON edge)"
+  }
+}
