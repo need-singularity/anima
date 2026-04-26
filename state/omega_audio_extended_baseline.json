@@ -1,0 +1,267 @@
+{
+  "cycle": "omega-audio-extended",
+  "timestamp": "2026-04-26",
+  "scope": "deepening of FAILED cycles from omega_audio_emp.hexa empirical run (Ω-B nasal antiresonance, Ω-D latency over budget, Ω-E Korean monophthongs partial 2/8)",
+  "approach": "raw#10 analytic design-space exploration ($0); NO python rewrite, NO organ implementation, NO training; mirror of omega_audio_baseline.json shape",
+  "predecessor_cycles": {
+    "omega_audio_baseline": "/Users/ghost/core/anima/state/omega_audio_baseline.json",
+    "omega_audio_3_latency": "/Users/ghost/core/anima/state/omega_audio_3_latency_physics.json",
+    "omega_audio_6_vocal_tract": "/Users/ghost/core/anima/state/omega_audio_6_vocal_tract_physics.json",
+    "empirical_run": "/Users/ghost/core/anima/state/omega_audio_emp/omega_emp_{A,B,C,D,E}.json (anima-speak/omega_audio_emp.hexa)"
+  },
+
+  "baseline_failures_recap": {
+    "omega_B_nasal_antiresonance": {
+      "test": "/m/ via vocal(120Hz) -> pipe(F1=250, F2=2500, Q=6); look for >=6 dB notch in [700,1500] Hz",
+      "expected_min_depth_db": 6,
+      "measured_depth_db": 5.46,
+      "in_band_avg_db": -122.1,
+      "rest_avg_db": -116.64,
+      "verdict": "FAIL_no_zero",
+      "delta_db": -0.54,
+      "interpretation": "near-miss in dB but structural — depth comes from harmonic spacing of 120Hz source, NOT from a true zero. 2-pole IIR can never put a zero anywhere except z=0, so notch is incidental and brittle to F0/Q changes."
+    },
+    "omega_D_latency_overbudget": {
+      "n6_target_ms": 96,
+      "budget_ms": 100,
+      "physical_floor_ms": 51,
+      "measurements_ms": {
+        "vocal_avg": 160.53,
+        "vocal_lf_avg": 163.254,
+        "breath_avg": 1000.73,
+        "vocal_pipe_chain_avg": 1177.51
+      },
+      "verdict": "OVER_BUDGET",
+      "real_time_factor_chain": 9.813,
+      "ratio_to_n6_target": "12.3x over (chain) / 1.67x over (vocal alone)",
+      "interpretation": "wallclock is NOT synthesis cost — it is python/numpy/scipy cold-start cost paid per organ call via _run_py heredoc subprocess."
+    },
+    "omega_E_korean_partial": {
+      "pass": 2,
+      "total": 8,
+      "pct": 25.0,
+      "passing": ["o (F1=400/F2=800)", "u (F1=300/F2=700)"],
+      "near_pass_F1_only": ["eu", "i", "e"],
+      "failing_both": ["a", "eo", "ae"],
+      "F2_clamp_signature": "ALL failing vowels have F2_measured ≈ 600 Hz, regardless of F2_target ∈ [1000..2100]",
+      "verdict": "PARTIAL",
+      "interpretation": "the 2-formant pipe IS rendering F2 correctly (organ tested in Ω-A3 at F1=700/F2=1100 PASS); the failure is in the FFT-based formant peak detector, not the synthesis."
+    }
+  },
+
+  "physics_or_limits": {
+    "B_root_cause": {
+      "mechanism": "Klatt 2-pole IIR at /Users/ghost/core/anima/anima-speak/anima_audio.hexa:215-252",
+      "transfer_function": "H(z) = A / (1 - 2r·cos(θ)·z^-1 + r²·z^-2)",
+      "zeros": "all at z=0 (origin) — cannot be moved off origin without restructuring numerator",
+      "human_nasal_mechanism": "side-branch (oral cavity) creates a parallel signal path; cancellation = transmission zero typically 700-1500 Hz, plus low nasal formant ~250 Hz, plus shifted oral formants",
+      "minimal_extension_options": {
+        "biquad_with_zero": {
+          "form": "H(z) = (b0 + b1·z^-1 + b2·z^-2) / (1 + a1·z^-1 + a2·z^-2)",
+          "delta_loc": "+2 numerator coefficients per formant in pipe()/pipe3()",
+          "philosophy_cost": "preserves no-layer no-training; still a single organ call; still pure DSP",
+          "philosophy_gain": "first organ that can model anti-resonance — opens nasals/laterals (L6.2) and zero-pole pairs for 'spectral dips' in vowels"
+        },
+        "parallel_pole_zero_branch": {
+          "form": "y = pipe(x) + alpha·delay(x)  (additive subtraction creates notch via interference)",
+          "delta_loc": "new organ pipe_nasal(in, f_zero, alpha)",
+          "philosophy_cost": "introduces second filter path — closer to actual nasal anatomy",
+          "philosophy_gain": "anatomically motivated — anima can DISCOVER nasal coupling by varying alpha"
+        },
+        "cascade_zero_only_filter": {
+          "form": "H_zero(z) = 1 - 2cos(θ_z)·z^-1 + z^-2 chained AFTER pipe()",
+          "delta_loc": "new organ notch(in, f_notch)",
+          "philosophy_cost": "minimal — single new organ, composes with existing pipe",
+          "philosophy_gain": "decouples zero from pole — anima freely places notches anywhere"
+        }
+      },
+      "tradeoff_summary": "biquad_with_zero is most expressive but mutates pipe(); cascade_zero_only is most modular and lowest-impact (recommended axis)."
+    },
+    "D_root_cause": {
+      "mechanism": "every organ in anima_audio.hexa builds a python source string and calls _run_py() which spawns python3 -c <code> subprocess",
+      "per_call_overhead_estimate_ms": {
+        "process_fork_exec": 8,
+        "python_interpreter_init": 25,
+        "numpy_import": 60,
+        "scipy_signal_import": 45,
+        "wave_module_import": 5,
+        "total_cold_start_estimate": 143,
+        "actual_synthesis_compute_estimate": 5,
+        "wav_io_estimate": 5
+      },
+      "evidence_in_data": {
+        "vocal_avg_160ms": "no scipy import — only numpy + wave; matches ~95ms cold start + synthesis",
+        "vocal_lf_163ms": "same imports as vocal — same overhead",
+        "breath_avg_1000ms": "ANOMALY — 5x larger than vocal despite same import set; suggests scipy.signal import latent in chain or noise gen RNG cost; merits separate probe",
+        "chain_1177ms": "vocal (160) + pipe (1017) — pipe adds scipy.signal import + WAV read+write round-trip"
+      },
+      "where_the_100ms_goes": "≥85% is python cold start, NOT DSP. The L3 floor of 51ms assumes a persistent process. Current architecture cannot meet 96ms because it pays cold start ON EVERY ORGAN CALL.",
+      "minimal_extension_options": {
+        "persistent_python_worker": {
+          "form": "long-lived python process; hexa sends code via stdin or named pipe; one cold start amortized",
+          "expected_organ_call_ms": "5-15 (synthesis + WAV IO only)",
+          "philosophy_cost": "introduces process state across organ calls — breaks pure-functional organ model",
+          "philosophy_gain": "single change unblocks ALL latency cycles; chain drops from 1177 to ~20ms (60x)"
+        },
+        "in_memory_wav_pipeline": {
+          "form": "pass numpy arrays via shared memory or stdin instead of WAV files",
+          "expected_savings_ms": "10-20 per chain step (eliminates 2x file IO + WAV header parse)",
+          "philosophy_cost": "couples organs to a transport — less hexa-orthogonal",
+          "philosophy_gain": "smaller, but composable with persistent worker"
+        },
+        "lazy_scipy_import": {
+          "form": "pipe()/pipe3() inline-implement 2nd-order section without scipy.signal.lfilter (it's ~10 lines of numpy)",
+          "expected_savings_ms": "30-50 per pipe call",
+          "philosophy_cost": "duplicates lfilter logic in hexa-emitted code",
+          "philosophy_gain": "easiest single-axis fix; no new infra"
+        },
+        "hexa_native_dsp": {
+          "form": "implement vocal/breath/pipe in hexa runtime arrays — eliminate python entirely",
+          "expected_organ_call_ms": "<1 (in-process)",
+          "philosophy_cost": "large rewrite; this baseline is analytic — out of scope",
+          "philosophy_gain": "true hexa-native; unbounded latency win"
+        }
+      },
+      "tradeoff_summary": "lazy_scipy_import is cheapest and analytic-friendly; persistent_python_worker is highest-leverage; both are compatible."
+    },
+    "E_root_cause": {
+      "mechanism": "find_peaks(distance=int(min_d/bin_hz), height=-30) with min_d=300 in cycle_E (omega_audio_emp.hexa:226)",
+      "evidence_F2_clamp": "all 6 failing vowels report F2_m ≈ 600.0 Hz exactly — this is F1's first peak being misread as F2 because the second TRUE peak at the target F2 is either below the height=-30 threshold (after pre-emphasis tilt) or excluded by the 300 Hz min-distance gate",
+      "passing_vowels_signature": "o (F1=400/F2=800) and u (F1=300/F2=700) — both have F2-F1 ≤ 400 AND F2 < 900; their F2 happens to fall on the same low-frequency peak the detector clamps to",
+      "failing_pattern": {
+        "a_F2=1300": "1300-850=450 spacing — within 300 Hz min_d threshold marginally; detector still picks ~600",
+        "i_F2=2100": "2100-270=1830 spacing — easy spacing, but pipe() amplitude at 2100 likely below -30 dB after pre-emphasis + cascade rolloff",
+        "ae_F2=1800": "same — high F2 attenuated past detection threshold"
+      },
+      "two_failure_modes": [
+        "AMPLITUDE: 2nd formant peak lies below height=-30 dB (pipe gain falls off ~12dB/oct above F2; pre-emphasis 0.97 partly compensates but not enough at 2100Hz)",
+        "RESOLUTION: min_d=300 Hz prevents picking close peaks (F2-F1 < 300 → only one peak returned)"
+      ],
+      "minimal_extension_options": {
+        "lpc_formant_estimator": {
+          "form": "replace find_peaks with scipy LPC (np.linalg lstsq on autocorrelation) → roots → formant frequencies",
+          "philosophy_cost": "swap detector function in omega_audio_emp.hexa cycle_E body",
+          "philosophy_gain": "LPC is the standard formant estimator; immune to amplitude drop and peak resolution",
+          "expected_pass_rate": "≥7/8"
+        },
+        "cepstral_peak_picking": {
+          "form": "FFT -> log -> IFFT (cepstrum) -> liftering -> spectral envelope -> find_peaks",
+          "philosophy_cost": "more code than LPC for similar gain",
+          "philosophy_gain": "decouples envelope from harmonics"
+        },
+        "detector_reparam_only": {
+          "form": "lower height threshold from -30 to -50; lower min_d from 300 to 150; n_fmt 3->5",
+          "philosophy_cost": "trivial — three constants",
+          "philosophy_gain": "may rescue 4-5 of 6 failing vowels; cheapest probe",
+          "risk": "false positives from harmonics at lower height threshold"
+        },
+        "synthesis_side_F2_boost": {
+          "form": "post-process pipe() output with mild high-shelf to flatten spectral envelope before measurement",
+          "philosophy_cost": "introduces a measurement-only filter — pollutes synthesis path",
+          "philosophy_gain": "addresses amplitude failure mode without changing detector",
+          "recommended": false,
+          "reason": "fixes measurement by changing reality — wrong direction"
+        }
+      },
+      "tradeoff_summary": "detector_reparam_only is the cheapest first probe; lpc_formant_estimator is the structurally correct fix. Failure is in MEASUREMENT not synthesis — Ω-A3 already proved pipe(700,1100) measures correctly."
+    }
+  },
+
+  "tradeoff_space": {
+    "philosophy_anchor": "anima_audio = no-layer, no-training, no-dictionary; 3 organ + 2 sink; anima discovers own phoneme dictionary",
+    "axis_costs": {
+      "biquad_pipe_with_zero": "moderate — mutates pipe() signature OR adds parallel pipe_z(); preserves anima discovery",
+      "persistent_python_worker": "high infra change; preserves organ semantics but adds process-state",
+      "in_process_hexa_dsp": "largest — out of analytic scope, multi-cycle implementation",
+      "detector_reparam": "trivial — three magic constants in the validator, not the synthesis",
+      "lpc_estimator": "low — swap measurement function in omega_audio_emp.hexa, not in anima_audio.hexa"
+    },
+    "what_NOT_to_do": [
+      "do not add neural layers (track A is separate; track B must remain organ-only)",
+      "do not add a phoneme dictionary or formant lookup table (anima must discover)",
+      "do not fix Ω-E by tweaking synthesis — synthesis is correct, measurement is wrong"
+    ]
+  },
+
+  "candidate_omega_axes": [
+    {
+      "id": "omega-audio-extended-1",
+      "axis": "parallel zero injection — add notch(in, f_zero, q) organ for nasal antiresonance",
+      "addresses": ["Ω-B FAIL_no_zero", "L6.2 missing zeros"],
+      "scope": "new 5-line organ in anima_audio.hexa; no signature change to pipe()",
+      "expected_outcome": "/m/ notch depth 12-20 dB (vs current 5.46); /n/, /ng/, /l/ become first-class",
+      "estimated_size_loc": 30,
+      "philosophy_compliance": "PASS — additive organ, no training"
+    },
+    {
+      "id": "omega-audio-extended-2",
+      "axis": "persistent python worker — amortize cold start across organ calls",
+      "addresses": ["Ω-D OVER_BUDGET", "L3.4 n6 lattice gap", "S1 first-packet floor"],
+      "scope": "_run_py upgrade in hexa runtime to maintain a worker process; protocol design",
+      "expected_outcome": "vocal_avg 160ms -> 5-15ms; chain 1177ms -> 20-30ms; meets n6=96 with 60-90ms margin",
+      "estimated_size_loc": 80,
+      "philosophy_compliance": "PARTIAL — introduces process state but preserves organ purity from anima's view"
+    },
+    {
+      "id": "omega-audio-extended-3",
+      "axis": "lazy_scipy avoidance — inline 2nd-order section in pipe()/pipe3() to drop scipy.signal import",
+      "addresses": ["Ω-D OVER_BUDGET (cheapest single-organ fix)"],
+      "scope": "10-line replacement of lfilter in pipe()/pipe3() emitted code",
+      "expected_outcome": "pipe call 1017ms -> 950-970ms (saves 30-50ms); composable with axis-2",
+      "estimated_size_loc": 15,
+      "philosophy_compliance": "PASS"
+    },
+    {
+      "id": "omega-audio-extended-4",
+      "axis": "LPC formant estimator — replace find_peaks with autocorrelation+roots in cycle_E validator",
+      "addresses": ["Ω-E partial 2/8 -> ≥7/8"],
+      "scope": "swap formants() helper in omega_audio_emp.hexa _analyze body",
+      "expected_outcome": "Korean monophthong coverage 25% -> ≥87.5%; promotes claim to S4_CONFIRMED",
+      "estimated_size_loc": 25,
+      "philosophy_compliance": "PASS — measurement-side change only, anima_audio untouched"
+    },
+    {
+      "id": "omega-audio-extended-5",
+      "axis": "detector reparam probe — lower height threshold, lower min_d, raise n_fmt — cheapest first probe",
+      "addresses": ["Ω-E partial — diagnostic for amplitude vs resolution failure modes"],
+      "scope": "three constants in cycle_E body of omega_audio_emp.hexa",
+      "expected_outcome": "if pass rate jumps to 5-6/8, failure was resolution; if still 2-3/8, failure is amplitude → escalate to axis-4",
+      "estimated_size_loc": 3,
+      "philosophy_compliance": "PASS"
+    },
+    {
+      "id": "omega-audio-extended-6",
+      "axis": "F0-modulated source — variable Tp/Te in vocal_lf for breathy/creaky/modal voice quality",
+      "addresses": ["L6.3 static glottal source", "future emotion-prosody depth"],
+      "scope": "vocal_lf signature gain Tp, Te args (default 0.45/0.60 preserved)",
+      "expected_outcome": "voice quality dimension opens — 6 emotions in Ω-C currently use only F0; can add timbre",
+      "estimated_size_loc": 10,
+      "philosophy_compliance": "PASS — additive parameters, no new layers"
+    },
+    {
+      "id": "omega-audio-extended-7",
+      "axis": "breath organ profiling — explain anomalous 1000ms (vs vocal 160ms) wallclock",
+      "addresses": ["Ω-D anomaly: breath 6x slower than vocal despite similar synthesis"],
+      "scope": "isolated micro-bench breath() with stripped imports + RNG seed control",
+      "expected_outcome": "identify culprit (RNG seeding? Butterworth design cost? scipy dependency we missed?); informs axis-3 scope",
+      "estimated_size_loc": 20,
+      "philosophy_compliance": "PASS — diagnostic only"
+    }
+  ],
+
+  "next_cycles": [
+    "omega-audio-extended-1 (notch organ — Ω-B fix)",
+    "omega-audio-extended-4 (LPC estimator — Ω-E fix, measurement-side)",
+    "omega-audio-extended-3 (lazy scipy — Ω-D quick win)",
+    "omega-audio-extended-2 (persistent worker — Ω-D structural fix)",
+    "omega-audio-extended-7 (breath profiling — Ω-D anomaly diagnostic)",
+    "omega-audio-extended-5 (detector reparam — Ω-E diagnostic, run before axis-4)",
+    "omega-audio-extended-6 (LF voice quality — emotion-prosody depth, deferred)"
+  ],
+
+  "summary_recap": {
+    "Ω-B": "5.46 dB notch where 6 dB needed — but the 'notch' is a harmonic-spacing artifact, not a true zero; pipe()'s all-pole structure can never produce one. Fix: add notch() organ (axis-1).",
+    "Ω-D": "1177ms chain vs 96ms target — 12x over, but ≥85% is python+numpy+scipy cold start paid PER organ call, not synthesis. Fix: persistent worker (axis-2) or lazy-scipy (axis-3).",
+    "Ω-E": "2/8 Korean vowels pass — but the failure is in the FFT peak detector (Ω-A3 already proved pipe synthesis is accurate at F1=700/F2=1100). All 6 failing vowels report F2≈600Hz regardless of target. Fix: LPC estimator (axis-4)."
+  }
+}

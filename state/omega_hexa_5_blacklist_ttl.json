@@ -1,0 +1,78 @@
+{
+  "cycle": "omega-hexa-5",
+  "axis": "blacklist TTL + RAM threshold + queue deadlines — fixed-policy adaptivity",
+  "hardcoded_constants": {
+    "HEXA_REMOTE_BLACKLIST_TTL_default_s": 300,
+    "HEXA_REMOTE_MIN_RAM_MB_default": 24576,
+    "HEXA_REMOTE_CONCURRENCY_WAIT_default_s": 300,
+    "HEXA_REMOTE_PREFLIGHT_TIMEOUT_MS_default": 300,
+    "HEXA_REMOTE_QUEUE_TTL_default_s": 300,
+    "HEXA_REMOTE_PSI_QUEUE_TTL_default_s": 300,
+    "ram_class_floors_MB": {"small": "2048", "medium": "8192", "large": "24576"}
+  },
+  "session_evidence_2026_04_26": [
+    {
+      "log": "hexa_remote: host=ubu1 SSH OK but RAM avail=23934MB < 24576MB threshold (raw#36 bracket) — skipping",
+      "interpretation": "ubu1 had 23934MB free; threshold is 24576MB; gap = 642MB (2.6%). Run rejected. No graceful retry with smaller workload."
+    },
+    {
+      "log": "hexa_remote: host=ubu1 blacklisted 64s ago (<300s TTL) — skipping probe",
+      "interpretation": "after one rejection, ubu1 frozen for 5min. Even if RAM clears in 30s, 5min lockout."
+    },
+    {
+      "log": "hexa_remote: blacklist for ubu1 expired (302s old), retrying",
+      "interpretation": "exact 300s expiry; same RAM check repeated; user must wait full 5min for next probe"
+    }
+  ],
+  "concrete_failures": [
+    {
+      "issue": "300s TTL is fixed regardless of failure cause",
+      "case_a": "transient SSH timeout: 300s lockout is excessive (10s would suffice)",
+      "case_b": "persistent host down: 300s is too short, retries every 5min wasted",
+      "case_c": "RAM-insufficient temporary: 300s blocks a host that may free RAM in 30s"
+    },
+    {
+      "issue": "24576MB threshold is fixed for 'large' workload class",
+      "case_a": "23934MB ≈ 24GB host effectively excluded by 642MB margin",
+      "case_b": "no graceful degradation: small workload could fit in 23934MB but is locked out anyway"
+    },
+    {
+      "issue": "PSI threshold absent in remote selection",
+      "current": "RAM avail-only filter",
+      "missing": "process pressure (PSI some avg10) used for ranking but not for hard reject; high PSI hosts preferred if RAM OK",
+      "session_evidence": "selected hetzner with psi=89.62 (very high, near saturation)"
+    }
+  ],
+  "remediation_options": [
+    {
+      "id": "R5.1",
+      "approach": "exponential backoff blacklist: 30s → 60s → 120s → 300s → 600s",
+      "implementation": "track failure count per host in /tmp/hexa_remote.failcount.<host>",
+      "cost": "medium — change blacklist file format",
+      "risk": "low",
+      "benefit": "transient failures recover faster; persistent ones aren't retried as often"
+    },
+    {
+      "id": "R5.2",
+      "approach": "failure-cause-aware TTL: SSH_TIMEOUT=10s, RAM_INSUFFICIENT=30s, EXEC_FAIL=300s",
+      "cost": "medium — track reason code in blacklist file",
+      "risk": "low",
+      "benefit": "right backoff per failure type"
+    },
+    {
+      "id": "R5.3",
+      "approach": "adaptive RAM threshold: dynamic based on actual workload measured",
+      "implementation": "first run profiles peak RSS; cache as workload_class.ram_actual; future selection uses learned value × 1.2 buffer",
+      "cost": "high — needs profiling + cache",
+      "risk": "medium — first runs still use static threshold"
+    },
+    {
+      "id": "R5.4",
+      "approach": "PSI hard-reject: if psi>80, reject regardless of RAM avail",
+      "cost": "low — single condition addition",
+      "risk": "low — already gathered, just unused for reject",
+      "benefit": "avoids running on near-saturated hosts (current pick had psi=89)"
+    }
+  ],
+  "verdict": "POLICY_RIGIDITY severity=MEDIUM; many places of 300s and threshold magic numbers; behavior degrades silently when host is borderline; adaptive backoff and PSI hard-reject are low-cost wins"
+}

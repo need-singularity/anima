@@ -1,0 +1,149 @@
+{
+  "cycle": "omega-runner",
+  "timestamp": "2026-04-26",
+  "scope": "hexa-runner Docker image subsystem (docker/runner/Dockerfile + tool/build_runner_image.hexa + build_interp_linux.hexa + build_hexa_cli_linux.hexa) — the single Linux landing pad for every Mac-side hexa exec per ~/.hx/bin/hexa hard-landing policy (post-2026-04-25 jetsam SIGKILL incident).",
+  "approach": "raw#73 read-only audit, $0; no rebuilds, no git/docker mutations",
+  "baseline_existing": {
+    "image_inventory": {
+      "host_arch": "arm64 (Darwin)",
+      "registry_local": [
+        {"tag": "hexa-runner:latest", "id": "16830cbffaeb", "size_mb": 236, "shared_mb": 48.7, "active_arm64": true},
+        {"tag": "hexa-runner:ab8bec13", "id": "16830cbffaeb", "size_mb": 236, "shared_mb": 48.7, "note": "alias of latest (current sha)"},
+        {"tag": "hexa-runner:5bd9f630", "id": "fe167ea7a358", "size_mb": 227, "shared_mb": 46.2, "note": "predecessor"},
+        {"tag": "hexa-runner:e075b3e8", "id": "fe167ea7a358", "size_mb": 227, "shared_mb": 46.2, "note": "alias of 5bd9f630"},
+        {"tag": "hexa-runner:87916b4c", "id": "de29583a8a9a", "size_mb": 152, "shared_mb": 32.2, "note": "older slim variant pre-curl/wget"}
+      ],
+      "running_container": "hexa-exec (long-lived; sleep infinity; reused by `~/.hx/bin/hexa` via `docker exec`)",
+      "base_image": "debian:12-slim (bookworm, debuerreotype 0.17, 5 days old)",
+      "base_layer_size_mb": 108,
+      "image_inspect": {
+        "size_bytes": 48660534,
+        "size_mb_compact": 48.66,
+        "created": "2026-04-25T23:14:42Z",
+        "architecture": "arm64",
+        "note": "Inspect returns compact size; `docker images` reports 236 MB virtual (incl. base layer not deduped at-rest)"
+      }
+    },
+    "size_and_layers": {
+      "layer_breakdown": [
+        {"layer": "debian:12-slim base", "size_mb": 108, "age": "5d"},
+        {"layer": "ARG TARGETARCH + LABEL", "size_b": 0},
+        {"layer": "RUN apt install ca-certificates perl tini curl wget", "size_mb": 72.5, "age": "7h"},
+        {"layer": "COPY hexa_linux_arm64", "size_kb": 586, "age": "28m"},
+        {"layer": "COPY hexa_linux_x86_64", "size_kb": 532, "age": "28m"},
+        {"layer": "COPY hexa_interp_linux_arm64", "size_mb": 1.7, "age": "28m"},
+        {"layer": "COPY hexa_interp_linux_x86_64", "size_mb": 2.09, "age": "28m"},
+        {"layer": "RUN install + arch-select + cleanup tmp", "size_mb": 2.29, "age": "28m"},
+        {"layer": "WORKDIR /work", "size_kb": 8.19},
+        {"layer": "ENTRYPOINT tini -- /usr/local/bin/hexa", "size_b": 0},
+        {"layer": "CMD help", "size_b": 0}
+      ],
+      "in_image_binaries": {
+        "/usr/local/bin/hexa": {"size_b": 574688, "kind": "static-musl ELF arm64, CLI dispatcher (self/main.hexa)"},
+        "/usr/local/bin/build/hexa_interp": {"size_b": 1686584, "kind": "static-musl ELF arm64, interpreter (self/hexa_full.hexa)"}
+      },
+      "wasted_payload": "x86_64 ELFs (~2.6 MB) are COPY'd then `rm -f` after arch-select; they still live in the buildkit cache layer but not the final image. The COPY-then-discard wastes layer bytes vs per-arch COPY-with-buildx-platform-branch."
+    },
+    "current_apt_packages": {
+      "deliberately_added": ["ca-certificates", "perl", "tini", "curl", "wget"],
+      "rationale": {
+        "ca-certificates": "TLS root store for fetch tools",
+        "perl": "provides /usr/bin/shasum used by main.hexa AOT cache + source fingerprinting",
+        "tini": "init-aware PID 1 — required for cmd_run() watcher subshell PPID==1 orphan-detection (without it, exit 137 SIGKILL before stdout flush)",
+        "curl_wget": "added 2026-04-26; nexus bridges (oeis/gw/arxiv/simbad/wikipedia/openalex/uniprot) exec(curl/wget) for HTTPS fetches — 7/16 bridges FAIL'd before this add"
+      },
+      "total_dpkg_count": 118,
+      "transitive_chain_examples": ["libcurl4 + libnghttp2-14 + libssh2-1 + libsasl2-2 + libgssapi-krb5-2 + libbrotli1 + librtmp1 (curl deps)", "libperl5.36 + perl-modules-5.36 + libgdbm6 (perl deps)"],
+      "absent_by_design": ["python3", "gdb", "strace", "ltrace", "gcc / build toolchain", "git", "ssh client", "less", "vim/nano", "cgroup-tools / systemd-cgls", "jq", "make", "musl runtime (binaries are static-linked)"]
+    },
+    "rebuild_pipeline": {
+      "orchestrator": "tool/build_runner_image.hexa",
+      "stages": [
+        {"id": "0", "name": "preflight", "checks": ["docker CLI", "docker buildx", "docker info", "4 ELFs present (cli×2 + interp×2)"]},
+        {"id": "1", "name": "auto-build missing ELFs", "tools": ["build_hexa_cli_linux.hexa --target=arm64|x86_64", "build_interp_linux.hexa --target=arm64|x86_64"], "compiler": "FiloSottile/musl-cross/musl-cross (aarch64-linux-musl-gcc + x86_64-linux-musl-gcc)"},
+        {"id": "2a", "name": "cache-only multi-arch buildx", "platforms": "linux/arm64,linux/amd64", "load": false, "purpose": "verify both arches compile under Dockerfile"},
+        {"id": "2b", "name": "host-arch single-platform --load", "platforms": "linux/arm64", "load": true, "purpose": "make image visible to local `docker images` (buildx --load can only materialize 1 arch)"}
+      ],
+      "buildx_builder": "hexa-runner-builder (docker-container driver — required for multi-arch; default driver cannot do multi-platform)",
+      "tagging": ["hexa-runner:<git-shortsha>", "hexa-runner:latest"],
+      "interp_compile_cost_hint": "build_interp_linux.hexa header notes ~150s for arm64 with -O2; uses 600s `timeout --kill-after=10`",
+      "cli_compile_cost_hint": "smaller (~575 KB ELF, simpler dispatch); no explicit timeout note",
+      "cold_full_rebuild_estimate_s": "~330+ (interp arm64 ~150s + interp x86_64 ~150s via qemu emulation under buildx + cli ~30s + apt layer ~15s + buildx fan-out)",
+      "warm_rebuild_estimate_s": "~10-30 (buildkit caches everything except changed COPY layers)",
+      "dockerignore_hygiene": "tight allowlist — only build/hexa_{linux,interp_linux}_{arm64,x86_64} + docker/ enter context; .git excluded explicitly"
+    },
+    "exec_profile": {
+      "entrypoint": "/usr/bin/tini -- /usr/local/bin/hexa",
+      "default_cmd": "help",
+      "workdir": "/work (expects bind-mounted .hexa source)",
+      "nexus_bridge_pattern": "host: -v $HOME/core/nexus:/nexus:ro -e NEXUS_HOME=/nexus (resolver should add when omega/drill/canon issued)",
+      "cgroup_caps_pattern": "--cpus=4 --memory=4g (per Dockerfile comment + raw#44 hard-landing policy)",
+      "warm_exec_overhead_ms": 50,
+      "cold_first_exec_overhead_s": 5,
+      "container_reuse_strategy": "hexa-exec persistent worker, sleep infinity, reused via `docker exec` (raw#44)"
+    }
+  },
+  "physics_or_limits": {
+    "buildx_load_unicity": "buildx --load can only materialize ONE platform into the local engine — multi-arch verification requires a second cache-only build pass (current pipeline does both)",
+    "qemu_cross_emulation_tax": "amd64 builds on arm64 host run via qemu-user — interp compile (~150s native) becomes minutes under emulation",
+    "static_musl_floor": "interp ELF 1.69 MB + cli ELF 575 KB = 2.27 MB binary floor; can't be smaller without splitting interp into modules",
+    "debian_slim_floor": "108 MB base — alpine could cut to ~5 MB but musl-static binaries don't need libc, so a `FROM scratch` or `FROM gcr.io/distroless/static` variant is theoretically viable",
+    "apt_fan_out_cost": "5 deliberate packages pull 70-ish transitive deps (libperl, libcurl, krb5, gnutls, ldap, sasl, ...) — explains the 72.5 MB apt layer despite minimal name list",
+    "shasum_dependency": "perl pulled solely for /usr/bin/shasum; replacing with sha256sum from coreutils (already present) would let perl + libperl5.36 + perl-modules-5.36 (~50 MB combined) be dropped",
+    "tini_pid1_invariant": "cmd_run() watcher subshell uses [ $PPID -eq 1 ] for orphan detection — non-negotiable; cannot drop tini without rewriting watchdog",
+    "raw73_admissibility": "minimum-add-only — the curl/wget add was justified by 7/16 bridge FAILs; no preemptive package additions"
+  },
+  "friction_observed": [
+    {
+      "id": "F1",
+      "axis": "image-size",
+      "observation": "236 MB final image; 108 MB is debian-slim base, 72.5 MB is apt layer (60% of which is libcurl+libperl transitive). Binary payload is only ~2.3 MB.",
+      "leverage": "FROM scratch / FROM gcr.io/distroless/static would drop ~175 MB; replace shasum-via-perl with sha256sum-via-coreutils to drop ~50 MB while keeping debian-slim"
+    },
+    {
+      "id": "F2",
+      "axis": "rebuild-latency",
+      "observation": "Cold full rebuild ~5+ min (qemu-emulated x86_64 interp dominates). Default pipeline ALWAYS builds both arches in cache, even when host-only iteration is the goal.",
+      "leverage": "expose --host-only flag in build_runner_image.hexa to skip the multi-arch cache pass during dev iteration"
+    },
+    {
+      "id": "F3",
+      "axis": "cold-start-ux (already named ω-hexa-4)",
+      "observation": "First container exec ~5s; warm ~50ms. Compounds because EVERY non-carve-out Mac hexa exec routes through docker.",
+      "leverage": "already mitigated by persistent hexa-exec worker; verify the 50ms warm ceiling actually holds via benchmark"
+    },
+    {
+      "id": "F4",
+      "axis": "x86_64-payload-discard",
+      "observation": "Dockerfile COPYs both arch ELFs unconditionally then `rm -f` the wrong-arch pair in the install RUN. The COPY layers (4.9 MB combined) are wasted on per-arch images.",
+      "leverage": "use buildx TARGETARCH-conditional COPY (--from with ARG branching) so only the host-arch ELFs enter the image"
+    },
+    {
+      "id": "F5",
+      "axis": "no-debugging-surface",
+      "observation": "Image is intentionally minimal: no gdb, strace, ps, top, less. When workloads SIGKILL/segfault inside the container, root-cause requires either rebuilding with debug or `docker cp`-ing artifacts out.",
+      "leverage": "ship a parallel hexa-runner-debug:latest variant with strace+gdb+procps; resolver opts in via `HEXA_DEBUG_RUNNER=1`"
+    },
+    {
+      "id": "F6",
+      "axis": "no-cgroup-introspection",
+      "observation": "raw#44 hard-landing policy is justified by cgroup CPU/RAM caps, but the image has no cgroup tooling — workloads can't see their own limits, can't self-throttle, can't emit /sys/fs/cgroup observability.",
+      "leverage": "add a `hexa runtime status` subcommand that reads /sys/fs/cgroup/cpu.max, memory.max, memory.current; no apt add needed"
+    },
+    {
+      "id": "F7",
+      "axis": "tag-thrash",
+      "observation": "5 hexa-runner tags currently in local registry (latest, ab8bec13, 5bd9f630, e075b3e8, 87916b4c) consuming combined ~1 GB virtual. No GC policy.",
+      "leverage": "add `tool/runner_image_gc.hexa` to keep last-N shortsha tags + always-keep latest"
+    }
+  ],
+  "next_cycles": [
+    "omega-runner-1: distroless / FROM scratch trial — cut image to <10 MB, validate hexa run + bridge fetches still work",
+    "omega-runner-2: shasum→sha256sum migration in main.hexa AOT cache + drop perl from apt (~50 MB save, no behavior change)",
+    "omega-runner-3: TARGETARCH-conditional COPY refactor — eliminate 4.9 MB wrong-arch COPY layer waste",
+    "omega-runner-4: warm-exec benchmark — confirm raw44 50ms ceiling holds across N=1000 invocations; quantify drift",
+    "omega-runner-5: hexa-runner-debug:latest sister image (gdb/strace/procps) + resolver HEXA_DEBUG_RUNNER opt-in",
+    "omega-runner-6: cgroup self-introspection — `hexa runtime status` reads /sys/fs/cgroup/{cpu.max,memory.max,memory.current}",
+    "omega-runner-7: tag GC policy + image registry hygiene tool"
+  ]
+}

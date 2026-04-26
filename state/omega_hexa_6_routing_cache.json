@@ -1,0 +1,68 @@
+{
+  "cycle": "omega-hexa-6",
+  "axis": "5s routing cache correctness + invalidation completeness",
+  "design": {
+    "cache_file": "/tmp/.hexa-resolver-cache.<uid>",
+    "ttl_s": 5,
+    "default_off": "HEXA_ROUTING_CACHE=1 to enable",
+    "env_hash_inputs": [
+      "HEXA_RESOLVER_FORCE_DOWN", "HEXA_RESOLVER_FORCE_UP",
+      "HEXA_RESOLVER_NO_DARWIN_MARKER", "HEXA_RESOLVER_NO_DARWIN_BYPASS",
+      "HEXA_DOCKER_IMAGE", "HEXA_DOCKER_NAME", "HEXA_REMOTE_WRAP"
+    ],
+    "stale_failure_mode": "docker exec rc=1 + stderr (loud, not silent)"
+  },
+  "concrete_correctness_gaps": [
+    {
+      "id": "G6.1",
+      "gap": "env_hash misses HEXA_DOCKER_CPUS / HEXA_DOCKER_MEM",
+      "scenario": "user changes HEXA_DOCKER_MEM=8g for heavier workload; cache hit reuses 4g container",
+      "consequence": "OOM in container with no indication that the larger config was ignored"
+    },
+    {
+      "id": "G6.2",
+      "gap": "env_hash misses cwd",
+      "scenario": "two scripts in different directories; first caches 'docker', second runs from synced repo where 'external' would have been correct",
+      "consequence": "5s of suboptimal routing per cwd transition"
+    },
+    {
+      "id": "G6.3",
+      "gap": "_routing_cache_lookup at line 251 reads file but does not check file mtime against TTL atomically — TOCTOU",
+      "scenario": "two concurrent hexa invocations within 5s window race to write cache; one reads while other writes",
+      "consequence": "inconsistent routing, partial line read could parse incorrectly",
+      "mitigation_existing": "subshell read-redirect makes single-block read; partial mid-write is unlikely on small file but possible"
+    },
+    {
+      "id": "G6.4",
+      "gap": "cache file in /tmp shared across all sessions",
+      "scenario": "headless launchd job sets HEXA_RESOLVER_FORCE_UP=1, writes cache; user shell with no env reads same file",
+      "consequence": "env_hash differs → cache miss, OK actually; but wasted file read",
+      "verdict": "minor"
+    }
+  ],
+  "session_evidence": "no cache hits observed in 2026-04-26 session because HEXA_ROUTING_CACHE was unset (default off)",
+  "remediation_options": [
+    {
+      "id": "R6.1",
+      "approach": "extend env_hash to include HEXA_DOCKER_CPUS, HEXA_DOCKER_MEM, PWD",
+      "cost": "low — single line addition",
+      "risk": "low",
+      "benefit": "fewer false-positive hits"
+    },
+    {
+      "id": "R6.2",
+      "approach": "fcntl lock around cache R/W",
+      "cost": "low — flock(1) wrap",
+      "risk": "low",
+      "benefit": "removes TOCTOU window"
+    },
+    {
+      "id": "R6.3",
+      "approach": "default cache ON (HEXA_ROUTING_CACHE=1) once correctness gaps closed",
+      "cost": "zero",
+      "risk": "needs G6.1+G6.2 first",
+      "benefit": "saves 216ms cold + 50ms warm per call"
+    }
+  ],
+  "verdict": "CORRECTNESS_GAPS severity=LOW; cache is opt-in and stale failures are loud; closing G6.1/G6.2 enables safe default-on"
+}

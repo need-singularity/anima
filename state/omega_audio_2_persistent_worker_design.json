@@ -1,0 +1,298 @@
+{
+  "cycle": "omega-audio-2",
+  "axis": "persistent python worker — design only",
+  "timestamp": "2026-04-26",
+  "implementation_status": "DESIGN_ONLY (no code changes)",
+  "predecessors": {
+    "extended_baseline": "/Users/ghost/core/anima/state/omega_audio_extended_baseline.json",
+    "anima_audio_target": "/Users/ghost/core/anima/anima-speak/anima_audio.hexa"
+  },
+
+  "current_state": {
+    "per_call_overhead_ms": 143,
+    "synth_actual_ms": 5,
+    "wav_io_ms": 5,
+    "amplification_factor": "~60x (chain 1177ms drops to ~20ms)",
+    "cold_start_breakdown_ms": {
+      "fork_exec": 8,
+      "python_init": 25,
+      "numpy_import": 60,
+      "scipy_signal_import": 45,
+      "wave_module": 5
+    },
+    "current_run_py_contract": {
+      "signature": "fn _run_py(code: string) -> bool",
+      "body": "exec(\"python3 - <<'PYEOF'\\n\" + code + \"\\nPYEOF\")",
+      "input": "self-contained python source string (with literal SR, paths, freqs interpolated as numeric/string literals via to_string())",
+      "output": "side-effect WAV file at a path the hexa caller already chose via _new_path() before invocation",
+      "return": "always true (does not propagate exec failure or python traceback)",
+      "call_sites": 49,
+      "organ_classes": [
+        "sources: vocal, vocal_lf, breath, tone, chirp, silence",
+        "filters: pipe, pipe3, pipe_glide, lpf, hpf, bpf, notch, gain, envelope, reverb",
+        "sinks/binaries: cat, mix",
+        "analyzers/probes invoked from omega_audio_emp.hexa via the same _run_py path"
+      ],
+      "import_diversity": "every code blob re-imports numpy + wave; subset adds 'from scipy.signal import {lfilter|butter|sosfilt|lfiltic|fftconvolve|resample_poly}' — these are the dominant cold-start cost"
+    }
+  },
+
+  "design": {
+    "worker_startup": {
+      "process": "single python3 daemon spawned lazily on first _run_py() call within an anima session; binary at /Users/ghost/core/anima/anima-speak/_audio_worker.py (new file, design-only)",
+      "boot_actions": [
+        "import numpy as np",
+        "import wave",
+        "from scipy.signal import lfilter, lfiltic, butter, sosfilt, fftconvolve, resample_poly",
+        "import sys, os, json, traceback, signal, time",
+        "rng = np.random.default_rng()  # one shared RNG; seed-overridable per request",
+        "preallocate small scratch buffer (np.empty(SR * 2) — covers most calls without realloc)",
+        "write '{\"event\":\"ready\",\"pid\":<pid>,\"version\":1}\\n' to stdout, flush"
+      ],
+      "amortization": "143ms cold start paid once per anima session; subsequent calls pay only synthesis (~5ms) + WAV IO (~5ms) + protocol overhead (~1-2ms)",
+      "memory_resident": "~80 MB (numpy + scipy + python interpreter); compared to 0 MB ephemeral baseline"
+    },
+
+    "request_protocol": {
+      "transport": "stdin/stdout pipes — chosen over named pipes/UDS because it survives any shell quoting hexa already does, and is killed automatically when the hexa process exits (no zombie risk on parent crash)",
+      "framing": "newline-delimited JSON (NDJSON) — one request per line; payload itself never contains a literal newline because we base64 the python code string",
+      "schema": {
+        "id": "u64 monotonic, hexa-side counter — used to match response to caller for future parallelism",
+        "kind": "'exec' (run a code blob) | 'ping' (health check) | 'shutdown' (cooperative exit)",
+        "code_b64": "base64(utf-8(python_source))  // already self-contained — same string today's _run_py builds",
+        "timeout_ms": "soft per-request limit; default 10_000",
+        "expect_path": "optional — the WAV path hexa expects to be created; worker sanity-checks file_size on success path"
+      },
+      "example_line": "{\"id\":42,\"kind\":\"exec\",\"code_b64\":\"aW1wb3J0IG51bXB5...\",\"timeout_ms\":5000,\"expect_path\":\"/tmp/anima_audio_xyz.wav\"}",
+      "why_b64_not_length_prefix": "length-prefix is faster but harder to debug with `tee` / shell inspection; for a 10ms request budget the b64 cost is <0.5ms for 2-3KB payloads"
+    },
+
+    "response_protocol": {
+      "framing": "single NDJSON line per request, on stdout",
+      "schema": {
+        "id": "echo of request id",
+        "ok": "bool",
+        "elapsed_ms": "float — worker-measured exec duration (excludes IPC)",
+        "bytes_out": "int — file_size(expect_path) or 0",
+        "err": "string — first 512 chars of traceback if ok=false, else \"\""
+      },
+      "stderr_use": "worker forwards uncaught traceback fragments to its own stderr (captured by hexa via 2>>logfile); stdout stays clean JSON",
+      "hexa_side_adapter": "_run_py(code) keeps signature, but body becomes: ensure_worker(); send(code); resp = recv(); return resp.ok && file_size(resp.expect_path) >= WAV_MIN_BYTES — fully backward compatible at call sites (zero edits to the 49 organ bodies)"
+    },
+
+    "lifecycle": {
+      "spawn_trigger": "lazy — first call to _run_py() in a session checks for live worker via PID file, spawns if absent",
+      "ownership_model": "one worker per anima process (per session). NOT a system-wide singleton. PID file is per-PPID to allow concurrent anima sessions.",
+      "shutdown_trigger": [
+        "explicit: hexa session-end hook sends {\"kind\":\"shutdown\"}; worker exits cleanly within 100ms",
+        "implicit: worker is a child of hexa process group — SIGHUP/SIGTERM cascades naturally on parent exit (no orphans)",
+        "idle: worker exits after IDLE_TIMEOUT_S (default 300s) of no requests to bound resident RAM in long-lived sessions"
+      ],
+      "session_warmup": "optional pre-warm in anima_audio init: send {\"kind\":\"ping\"} immediately so first real call sees no spawn jitter"
+    },
+
+    "failure_modes_and_recovery": {
+      "worker_crash_mid_call": {
+        "detection": "broken pipe on send() or readline returns empty string",
+        "recovery": "delete PID file, respawn worker, retry the request once (idempotent — synth has no observable state across calls; rng auto-reseeds)",
+        "max_retries": 1,
+        "after_max": "_run_py returns false; caller observes WAV missing and propagates empty-string sentinel as today"
+      },
+      "worker_hangs": {
+        "detection": "select()/poll() with timeout = request.timeout_ms + 500ms guard",
+        "recovery": "SIGTERM worker, await 100ms, SIGKILL if still alive, respawn, retry once"
+      },
+      "worker_traceback": {
+        "detection": "response.ok == false",
+        "recovery": "no respawn; return false; one bad code blob does not reset state — but DO log err for postmortem"
+      },
+      "stdin_buffer_blockage": {
+        "mitigation": "always flush after write; never queue >1 in-flight request in v1 (request/response strictly synchronous)"
+      },
+      "file_descriptor_exhaustion": {
+        "mitigation": "worker explicitly closes wave handles in finally blocks (organs already do this — verified)"
+      }
+    },
+
+    "pid_management": {
+      "pid_file_path": "/tmp/anima_audio_worker_${PPID}.pid  // PPID = the hexa process pid; per-session isolation",
+      "contents": "{\"pid\":<int>,\"started_ns\":<int>,\"version\":1,\"socket_or_stdio\":\"stdio\"}",
+      "race_avoidance": [
+        "atomic write: write to .tmp then rename",
+        "on read: kill -0 <pid> to verify worker is alive AND its /proc/<pid>/comm contains 'python' before reuse",
+        "if mismatch (pid recycled to another process), treat as stale and respawn",
+        "no flock needed — PID file is per-PPID, parallel anima sessions get distinct files"
+      ],
+      "cleanup": "atexit handler in anima_audio session removes PID file; orphan files are harmless because next session uses its own PPID-suffixed path",
+      "discoverability": "anima/state/active_audio_workers.jsonl — append-only audit log (pid, ppid, start_ts, end_ts) for debugging; not load-bearing"
+    }
+  },
+
+  "tradeoffs": {
+    "persistent_worker": {
+      "latency_per_call_ms": "5-15 (target 10)",
+      "amortization": "143ms paid once per session",
+      "infra_complexity": "moderate — adds ~80 LOC in hexa runtime + 1 new python file (~120 LOC)",
+      "philosophy_compliance": "PARTIAL — introduces process state across organ calls; from anima's view organs remain pure (same input WAV path → same output WAV path)",
+      "risk_profile": "PID leaks, zombies on hexa SIGKILL, RAM cost ~80MB resident",
+      "blast_radius_if_buggy": "all 49 organ call sites; mitigated by _run_py signature preservation",
+      "score_overall": "BEST for chained synthesis (60x speedup); PROVEN pattern (same as how IPython kernel, lsp servers, jupyter, sbt/scala daemon work)"
+    },
+    "current_spawn_per_call": {
+      "latency_per_call_ms": 143,
+      "amortization": "none — paid every call",
+      "infra_complexity": "zero (status quo)",
+      "philosophy_compliance": "PASS (pure functional)",
+      "risk_profile": "none — already in production",
+      "blast_radius_if_buggy": "n/a",
+      "score_overall": "FAIL the latency budget at omega-D (1177ms chain vs 96ms target)"
+    },
+    "ctypes_shared_lib": {
+      "latency_per_call_ms": "<2 (in-process)",
+      "amortization": "perfect — library loaded once at hexa startup",
+      "infra_complexity": "HIGH — must compile a C/Rust shim exposing numpy/scipy ops; hexa runtime must learn FFI; pip wheels for numpy/scipy do NOT expose stable C API for lfilter/butter/sosfilt — would need to reimplement the DSP",
+      "philosophy_compliance": "PASS (no process state)",
+      "risk_profile": "platform fragility (linux/macos/arm differ); breaks on numpy upgrade",
+      "blast_radius_if_buggy": "anima_audio entirely; segfaults take down hexa runtime",
+      "score_overall": "REJECTED — ctypes path is essentially 'rewrite the DSP' with extra steps; persistent worker dominates"
+    },
+    "pure_hexa_dsp": {
+      "latency_per_call_ms": "<1 (native loops)",
+      "amortization": "n/a — no IPC",
+      "infra_complexity": "VERY HIGH — needs hexa-native FFT, IIR, filter design (butterworth pole-placement, etc.); months of work",
+      "philosophy_compliance": "PASS (cleanest)",
+      "risk_profile": "math correctness regression vs reference scipy implementation",
+      "blast_radius_if_buggy": "all audio quality results invalidated",
+      "score_overall": "RIGHT direction long-term; OUT OF SCOPE for omega-audio-2 — explicitly noted in extended_baseline as 'large rewrite, multi-cycle implementation'"
+    },
+    "lazy_scipy_only": {
+      "latency_per_call_ms": "100-110 (saves 30-50ms)",
+      "amortization": "none",
+      "infra_complexity": "LOW — inline 10 lines of numpy in pipe()/pipe3()",
+      "philosophy_compliance": "PASS",
+      "score_overall": "COMPOSABLE — orthogonal win; recommend stacking on top of persistent worker, not as alternative"
+    }
+  },
+
+  "migration_phases": [
+    {
+      "phase": 0,
+      "name": "spec freeze + bench harness",
+      "actions": [
+        "this design doc reviewed",
+        "build a standalone benchmark: 100x vocal() calls, current vs simulated worker, on the same machine that produced 160ms baseline",
+        "establish go/no-go threshold: roundtrip < 15ms p95"
+      ],
+      "rollback": "trivial — no code change",
+      "exit_gate": "bench shows persistent-worker prototype hits <15ms p95"
+    },
+    {
+      "phase": 1,
+      "name": "POC on vocal() only",
+      "actions": [
+        "implement _audio_worker.py with vocal-codepath only (numpy + wave, no scipy)",
+        "add _run_py_v2() in anima_audio.hexa beside _run_py — only vocal() switches over",
+        "feature flag: env var ANIMA_AUDIO_WORKER=1 enables; default off"
+      ],
+      "rollback": "unset env var; vocal() returns to spawn-per-call; zero state to clean",
+      "exit_gate": "vocal_avg drops from 160ms to <20ms; output WAV byte-identical to baseline (md5 match required)"
+    },
+    {
+      "phase": 2,
+      "name": "expand to source organs (vocal_lf, breath, tone, chirp, silence)",
+      "actions": [
+        "add scipy.signal.butter+sosfilt to worker import set (covers breath)",
+        "verify: breath anomaly (1000ms — see omega_audio_extended_baseline) collapses to ~10ms — confirms cold-start hypothesis"
+      ],
+      "rollback": "per-organ flag; each organ can fall back independently",
+      "exit_gate": "all 6 source organs match baseline WAVs bit-exact"
+    },
+    {
+      "phase": 3,
+      "name": "expand to filter organs (pipe, pipe3, pipe_glide, lpf, hpf, bpf, gain, envelope, reverb, notch)",
+      "actions": [
+        "add lfilter, lfiltic, fftconvolve to worker imports",
+        "rerun omega_audio_emp.hexa Ω-D — confirm chain drops from 1177ms to <30ms",
+        "rerun omega_audio_emp.hexa Ω-A/Ω-B/Ω-C/Ω-E — confirm zero quality regression"
+      ],
+      "rollback": "per-organ flag; in worst case revert to phase-2 set",
+      "exit_gate": "Ω-D verdict flips OVER_BUDGET → PASS with margin ≥60ms"
+    },
+    {
+      "phase": 4,
+      "name": "cutover — _run_py becomes worker-backed by default",
+      "actions": [
+        "flip ANIMA_AUDIO_WORKER default to 1",
+        "remove the v2 suffix; old spawn-per-call path stays as ANIMA_AUDIO_WORKER=0 escape hatch for 1 release cycle",
+        "delete ANIMA_AUDIO_WORKER=0 path after 1 month of clean operation"
+      ],
+      "rollback": "env var still works; full revert is `git revert <cutover-commit>`",
+      "exit_gate": "1 month of production anima sessions with zero worker-related incident reports"
+    }
+  ],
+
+  "risks": [
+    {
+      "id": "R1",
+      "risk": "PID file leak — orphan PID files accumulate in /tmp",
+      "severity": "low",
+      "mitigation": "PPID-suffixed names age out with /tmp cleanup; atexit handler removes own file; periodic sweep job optional"
+    },
+    {
+      "id": "R2",
+      "risk": "zombie worker processes after hexa SIGKILL (no atexit run)",
+      "severity": "medium",
+      "mitigation": "worker registers as child of hexa process group; SIGHUP cascades on terminal close; worker also has IDLE_TIMEOUT self-exit (300s)"
+    },
+    {
+      "id": "R3",
+      "risk": "state contamination — global mutable state in numpy/scipy persists across calls (e.g., RNG seed, np.seterr settings)",
+      "severity": "medium",
+      "mitigation": "each request runs in a fresh local namespace (exec(code, {'__builtins__': __builtins__})); RNG re-seeded per request if seed param present; np.seterr restored in finally; explicit allowlist of carry-over globals (numpy, scipy, wave)"
+    },
+    {
+      "id": "R4",
+      "risk": "RAM cost ~80MB resident per anima session vs 0MB ephemeral",
+      "severity": "low",
+      "mitigation": "IDLE_TIMEOUT exits worker after 5 min of inactivity; for batch synthesis (the actual bottleneck) this is amortized over hundreds of calls — net win"
+    },
+    {
+      "id": "R5",
+      "risk": "race on concurrent anima sessions writing same PID file",
+      "severity": "low",
+      "mitigation": "PPID-suffix isolation; no shared PID file"
+    },
+    {
+      "id": "R6",
+      "risk": "non-determinism if rng auto-reseeds vs current per-call rng.default_rng() (which also auto-seeds)",
+      "severity": "low",
+      "mitigation": "behavior matches current — both use OS entropy; for repro, accept seed param in request schema (already designed)"
+    },
+    {
+      "id": "R7",
+      "risk": "stdin/stdout deadlock if worker writes >PIPE_BUF (4KB on darwin) before hexa reads",
+      "severity": "medium",
+      "mitigation": "responses are tiny JSON (<256 bytes); worker stderr is consumed via separate fd; no large data flows over stdout (WAVs go to disk as today)"
+    },
+    {
+      "id": "R8",
+      "risk": "version skew — worker python and hexa-emitted code drift apart",
+      "severity": "low",
+      "mitigation": "version field in ready/handshake; mismatch → respawn with bundled worker"
+    },
+    {
+      "id": "R9",
+      "risk": "macOS App Nap / SIGSTOP on backgrounded anima session pauses worker",
+      "severity": "low",
+      "mitigation": "worker is a child of foreground hexa; inherits scheduling class; not Apple-backgrounded independently"
+    }
+  ],
+
+  "open_questions": [
+    "Q1: should phase-1 POC use base64 or length-prefix framing? recommend base64 for debuggability; revisit if p95 > 15ms",
+    "Q2: should worker pre-import every scipy.signal symbol or lazy-import on first use per organ? recommend pre-import (one-time +45ms paid at boot, not per-call)",
+    "Q3: does hexa runtime expose exec() with stdin pipe access today, or do we need a new builtin (e.g., spawn_persistent / send_stdin)? — must verify before phase-1; if not, phase-0 includes a tiny runtime patch"
+  ],
+
+  "next_step_if_approved": "POC on vocal() organ, measure roundtrip latency vs target 10ms (phase-1 exit gate)"
+}

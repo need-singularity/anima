@@ -1,0 +1,53 @@
+{
+  "patch": "R2.2 (revised after audit)",
+  "axis": "Ω-H2 stdout suppression",
+  "audit_finding": {
+    "interpreter_state": "self/runtime.c:21-25 ALREADY has setvbuf(stdout/stderr, _IOLBF). Line-buffered, flushes on \\n.",
+    "println_impl": "self/runtime.c:3100 — `void hexa_println(HexaVal v) { hexa_print_val(v); printf(\"\\n\"); }`. No explicit fflush — relies on _IOLBF to flush on \\n.",
+    "verdict": "interpreter side appears CORRECT. Stdout suppression is transport-layer."
+  },
+  "transport_layer_hypothesis": {
+    "h1_ssh_no_pty": "hexa_remote uses ssh without -t; remote stdout is pipe-buffered, flushes on connection close — partial-line buffers may be lost",
+    "h2_docker_exec_no_tty": "resolver uses `docker exec -i` (no -t); stdout pipe not flushed before container exec exits",
+    "h3_remote_collector_swallows": "hexa_remote's command capture may redirect stdout to a log file rather than passing through"
+  },
+  "revised_patches": [
+    {
+      "id": "R2.2a",
+      "approach": "interpreter: add fflush(stdout) after each hexa_println (paranoid)",
+      "diff_path": "self/runtime.c:3100",
+      "diff": "void hexa_println(HexaVal v) { hexa_print_val(v); printf(\"\\n\"); fflush(stdout); }",
+      "cost": "trivial — 1 token addition",
+      "risk": "low — slight write overhead per println",
+      "rebuild_required": "YES — Mach-O binary",
+      "applied_in_session": false,
+      "reason_not_applied": "rebuild affects every script in workspace; deferred to user review"
+    },
+    {
+      "id": "R2.2b",
+      "approach": "transport: hexa_remote ssh -t flag",
+      "diff_target": "~/core/nexus/scripts/bin/hexa_remote",
+      "cost": "low — single ssh option",
+      "risk": "medium — pty allocation can break batch pipelines / interactive prompts",
+      "guardrail": "gate behind HEXA_REMOTE_PTY=1 default-on, env-disable-able"
+    },
+    {
+      "id": "R2.2c",
+      "approach": "transport: docker exec -t flag in resolver",
+      "diff_target": "~/.hx/bin/hexa, line 222 + line 291",
+      "cost": "low — single flag",
+      "risk": "low — TTY allocation in container",
+      "guardrail": "gate behind HEXA_DOCKER_TTY=1"
+    },
+    {
+      "id": "R2.2d",
+      "approach": "transport: docker exec stdbuf -o0",
+      "diff_target": "~/.hx/bin/hexa, prepend stdbuf -o0 to /usr/local/bin/hexa",
+      "cost": "low",
+      "risk": "low — stdbuf is GNU coreutils, may not be in container image"
+    }
+  ],
+  "applied_status": "NONE applied this session — all blocked on user review for transport-layer behavior change",
+  "interim_workaround": "println-to-file convention via exec() heredoc (already de facto for ω-audio synthesis)",
+  "session_decision": "R2.2 patch axis remains LOW priority since (a) interpreter is already correct, (b) transport-layer fix has medium UX risk (pty issues in batch), (c) the file-based evidence pattern works"
+}

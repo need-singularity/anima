@@ -1,0 +1,71 @@
+{
+  "cycle": "omega-runner-2",
+  "axis": "remove perl from hexa-runner via shasum→sha256sum migration",
+  "timestamp": "2026-04-26",
+  "shasum_audit": {
+    "total_sites": 70,
+    "scope_strategy": "minimum-viable: only edit sites compiled into the runner CLI binary (self/main.hexa monolithic — no imports) plus self/attrs/_lib/cache_utils.hexa (used by lint attr cache when invoked from container). tool/* and stdlib/* shasum sites left untouched — they only fire when those .hexa files are explicitly executed, and most tool/* already has its own sha256sum/shasum fallback ladder. Future `hexa run tool/<X>.hexa` inside the container will exercise sha256sum on its own merits if/when that path is hit; doing 65+ tool migrations in this cycle violates raw-73 minimum-add.",
+    "sha256_explicit_safe_to_migrate": [
+      "self/main.hexa:1016 source_key (AOT cache slot key) — MIGRATED",
+      "self/main.hexa:1217 src_fingerprint_deep (transitive-import fingerprint) — MIGRATED",
+      "self/attrs/_lib/cache_utils.hexa:18 file_hash_short (lint cache) — MIGRATED (precedence swap, sha256sum primary)"
+    ],
+    "sha256_explicit_NOT_migrated_this_cycle": [
+      "self/native/exec_argv_sha256.c (C source, comment only — no shell call)",
+      "stdlib/cert/{loader,writer,selftest,meta2_validator}.hexa (cert tooling — already has sha256sum fallback in loader; selftest/writer/meta2_validator do not, but only fire under explicit cert ops — defer)",
+      "stdlib/math/eigen_test.hexa (test only)",
+      "tool/cross_prover.hexa, tool/verify_meta2_chain.hexa, tool/verify_adversarial.hexa, tool/verify_multi_path_phi.hexa (proof tooling — bare shasum -a 256, no fallback; rarely run in container)",
+      "tool/build_*.hexa (build_hexa_v2_linux, build_interp_linux, build_linux_x86, build_hexa_cli_linux — these are HOST-side cross-build scripts, do NOT run inside runner image)",
+      "tool/fixpoint_*.hexa (compare/check/archive — fixpoint_archive already has sha256sum primary)",
+      "tool/raw_*.hexa (raw_audit, raw_cache, raw_sync, raw_attestation, raw_english_only_watcher — raw_attestation emits its own sh-detect ladder; others bare)",
+      "tool/{drill_classify,foundation_axiom_lock,hx_cert_chain,hx_fixedpoint_scan,hx_stage_health,meta2_verify,os_rollback_cli,ossify,rebuild_interp,roadmap_progress_check,workspace_sync}.hexa (rebuild_interp + workspace_sync + ossify already detect; others bare)"
+    ],
+    "sha1_default_NOT_migrated": [
+      "gate/lint.hexa:2073 _vp_sha1 (intentional SHA-1 — short cache key for python VP block; semantic mismatch if migrated)",
+      "gate/post_edit.hexa:48 tsid_raw (SHA-1 of TERM_SESSION_ID — short hash, intentional)",
+      "gate/post_edit.hexa:50 ph_cmd (SHA-1 of git remote URL — short hash, intentional)",
+      "gate/post_bash.hexa:48 tsid_raw (mirror of post_edit:48)",
+      "gate/post_bash.hexa:50 ph_cmd (mirror of post_edit:50)"
+    ],
+    "non_hexa_sites": [
+      "docker/runner/Dockerfile:33 (perl-shasum comment — UPDATED in this cycle)",
+      "docs/loss_free_roi_brainstorm_20260422.md (prose only)",
+      "doc/seed_unlock_runbook.md (prose only)",
+      "doc/runbook/raw_install.md (prose only)",
+      ".github/workflows/raw-verify.yml (CI — runs on github-runners with both tools; no change needed)",
+      "self/native/exec_argv_sha256.c (C symbol name only)"
+    ],
+    "sha1_risk_note": "The 5 SHA-1 sites in gate/post_edit.hexa, gate/post_bash.hexa, gate/lint.hexa hard-code /usr/bin/shasum (4 of 5 sites) or bare `shasum`. If these gate hooks ever execute INSIDE the perl-less runner container, they'll silently fail (returning empty string and falling through to fallback values). Audit needed on whether gate/post_* are ever invoked from inside the container — they appear to be Claude Code host-side hooks and so should be safe, but flagging for follow-up cycle ω-runner-3."
+  },
+  "files_edited": [
+    {
+      "path": "/Users/ghost/core/hexa-lang/self/main.hexa",
+      "diff_summary": "Lines 1010-1016 (source_key) and 1188+1215-1217 (src_fingerprint_deep): replaced bare `shasum -a 256` with `{ sha256sum 2>/dev/null || shasum -a 256; }` group-pipe — sha256sum primary (runner-image coreutils), shasum -a 256 fallback (macOS default). Single-fork performance preserved (group is still one shell). Comment blocks updated to explain ω-runner-2 portability rationale."
+    },
+    {
+      "path": "/Users/ghost/core/hexa-lang/self/attrs/_lib/cache_utils.hexa",
+      "diff_summary": "Lines 14-20 (file_hash_short): swapped precedence — sha256sum now primary, shasum -a 256 fallback. Two-exec pattern preserved (no perf regression). Comment added flagging the ω-runner-2 swap rationale."
+    },
+    {
+      "path": "/Users/ghost/core/hexa-lang/docker/runner/Dockerfile",
+      "diff_summary": "Lines 31-51: removed `perl` from apt install line (now: ca-certificates tini curl wget). Replaced perl-explanatory comment block with REMOVED 2026-04-26 ω-runner-2 marker explaining the migration and pointing to this JSON. ENTRYPOINT/CMD/COPY layers untouched."
+    }
+  ],
+  "dockerfile_change": {
+    "removed_packages": ["perl"],
+    "comment_updated": true,
+    "remaining_apt_packages": ["ca-certificates", "tini", "curl", "wget"]
+  },
+  "expected_savings_mb": "~50 MB (perl + libperl5.36 + perl-modules-5.36 per omega_runner_baseline.json). Per-arch — total saved across arm64+amd64 manifest is ~100MB on disk if both stored, ~50MB per pull.",
+  "verification_plan": "next docker rebuild (hexa tool/build_runner_image.hexa) → (1) `docker image inspect hexa-runner:latest --format '{{.Size}}'` size delta vs prior baseline (expect -50MB ±5MB per arch); (2) `docker run --rm hexa-runner:latest sh -c 'command -v sha256sum && ! command -v shasum && echo OK'` confirms sha256sum present, perl/shasum gone; (3) smoke test: `docker run --rm -v /tmp/foo.hexa:/work/foo.hexa hexa-runner:latest run /work/foo.hexa` with a trivial foo.hexa — exercises source_key + src_fingerprint_deep AOT cache code paths; expect normal output, no `sh: shasum: not found` cascades; (4) AOT warm-cache verification: run twice, second invocation should hit cache (fingerprint stable across the new sha256sum pipeline).",
+  "rebuild_required": true,
+  "rebuild_command": "hexa tool/build_runner_image.hexa",
+  "rollback": "git checkout HEAD -- /Users/ghost/core/hexa-lang/self/main.hexa /Users/ghost/core/hexa-lang/self/attrs/_lib/cache_utils.hexa /Users/ghost/core/hexa-lang/docker/runner/Dockerfile",
+  "format_equivalence_proof": {
+    "test_input": "printf 'hello'",
+    "sha256sum_output": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824  -",
+    "shasum_a256_output": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824  -",
+    "fallback_pipe_output": "2cf24dba5fb0a30e (matches both bare forms after cut -c1-16)",
+    "conclusion": "byte-identical hex digest; downstream cut/awk extraction unaffected"
+  }
+}
