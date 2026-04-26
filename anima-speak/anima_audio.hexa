@@ -112,7 +112,45 @@ fn _file_bytes(path: string) -> int {
     return file_size(path)
 }
 
+// Hexa PID — each exec()'s shell has $PPID == hexa pid. Cached once.
+// Used as the per-session key for the persistent audio worker (see
+// _audio_worker_call.sh + anima_audio_worker.py).
+fn _hexa_pid() -> string {
+    let s = exec("echo $PPID 2>/dev/null").trim()
+    if len(s) == 0 { return "0" }
+    return s
+}
+
+// Path to worker IPC adapter (sibling of this file).
+let WORKER_CALL_SH = "/Users/ghost/core/anima/anima-speak/_audio_worker_call.sh"
+
+fn _run_py_worker(code: string) -> bool {
+    // base64-encode the code so it survives shell quoting and contains no \n.
+    // We pipe code into `base64` rather than embed it inline (which would
+    // require escaping every special char). expect_path is left empty
+    // because the path is already inside `code`; caller re-checks with
+    // _file_bytes() as today, preserving existing per-organ semantics.
+    let pid = _hexa_pid()
+    // Write code to a tmp file, base64 it, invoke the helper.
+    // (heredoc with ENDMARKER keeps the python source untouched.)
+    let tmp = TMP_DIR + "/" + TAG + "_payload_" + _now_ns() + ".py"
+    let cmd = "cat > " + _shq(tmp) + " <<'PYEOFCODE'\n" + code + "\nPYEOFCODE\n"
+            + "B64=$(base64 < " + _shq(tmp) + " | tr -d '\\n')\n"
+            + "rm -f " + _shq(tmp) + "\n"
+            + _shq(WORKER_CALL_SH) + " " + pid + " \"$B64\" \"\""
+    let _ = exec(cmd)
+    // Worker writes WAV via the embedded path; caller re-validates via
+    // _file_bytes(). We always return true to match existing _run_py semantics.
+    return true
+}
+
 fn _run_py(code: string) -> bool {
+    // Phase 2 POC: route through persistent worker iff ANIMA_AUDIO_WORKER=1.
+    // Default behavior (flag unset or "0") = current spawn-per-call.
+    let flag = env("ANIMA_AUDIO_WORKER")
+    if flag == "1" {
+        return _run_py_worker(code)
+    }
     let cmd = "python3 - <<'PYEOF'\n" + code + "\nPYEOF"
     let _ = exec(cmd)
     return true

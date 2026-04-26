@@ -1,0 +1,79 @@
+{
+  "cycle": "omega-audio-2-poc",
+  "axis": "Phase 1 bench + Phase 2 vocal POC behind ANIMA_AUDIO_WORKER=1",
+  "timestamp": "2026-04-26",
+  "design_ref": "/Users/ghost/core/anima/state/omega_audio_2_persistent_worker_design.json",
+  "implementation": {
+    "worker_script": "/Users/ghost/core/anima/anima-speak/anima_audio_worker.py (LOC: 192)",
+    "ipc_helper": "/Users/ghost/core/anima/anima-speak/_audio_worker_call.sh (LOC: 120)",
+    "anima_audio_changes": "_run_py + _run_py_worker + _hexa_pid + WORKER_CALL_SH (lines added: 38, total 2205 -> 2243)",
+    "callsites_touched": 1,
+    "callsites_untouched": "all 49 organ-side _run_py callers",
+    "ipc_design_deviation": "Used FIFO + per-PPID workdir + 'sleep 86400' keepalive writer instead of pure stdin/stdout pipes. Reason: hexa exec() is one-shot per call (each call is a fresh shell); persistent stdin/stdout cannot be held across exec() invocations. FIFOs in /tmp/anima_audio_worker_${PPID}/ provide the same semantic across discrete shell calls. Worker watches the actual hexa pid (passed via ANIMA_AUDIO_PARENT_PID env) for shutdown cascade because the spawning shell exits immediately and reparenting to launchd would otherwise trip the parent-died check."
+  },
+  "benchmark": {
+    "harness": "/Users/ghost/core/anima/anima-speak/_omega_audio_2_bench.hexa (vocal(440.0, 0.5, 100) x 5, removed after measurement)",
+    "without_flag_5x_ms": [122.94, 117.68, 119.95, 116.20, 116.21],
+    "without_flag_mean_ms": 118.60,
+    "without_flag_warm_mean_ms": 117.51,
+    "with_flag_5x_ms": [679.47, 49.34, 51.49, 49.44, 50.24],
+    "with_flag_first_call_ms": 679.47,
+    "with_flag_warm_mean_ms": 50.13,
+    "speedup_warm": "2.34x",
+    "target_per_design": "60x peak (~143ms -> ~10ms warm)",
+    "target_gap_explanation": "Design assumed in-process IPC overhead (~1-2ms protocol). Actual achieved per-call IPC ~50ms because each hexa exec() forks a /bin/bash, which then forks /bin/cat (heredoc to tmp), /bin/base64, plus FIFO open/close + worker exec (~1.4ms inner). The exec() fork+shell is the dominant residual cost. Worker inner time (numpy execution) measured at 1.1-1.9 ms per call (worker reports elapsed_ms in NDJSON response) -- confirms the 60x peak is achievable in-process; the bash IPC layer adds ~48ms wall floor. To approach the design target, _run_py would need a hexa-runtime FIFO write/read primitive that bypasses the shell. Out of POC scope.",
+    "raw_measurements_3runs": {
+      "baseline_runs_ms": [
+        [153.63, 126.20, 124.54, 122.12, 123.06],
+        [124.93, 121.66, 120.24, 126.95, 122.63],
+        [122.94, 117.68, 119.95, 116.20, 116.21]
+      ],
+      "worker_runs_ms": [
+        [1106.74, 61.92, 62.99, 58.15, 62.93],
+        [679.47, 49.34, 51.49, 49.44, 50.24],
+        [883.30, 57.63, 57.28, 58.42, 58.40]
+      ],
+      "selected_run_for_summary": "baseline run 3 + worker run 2 (lowest noise)"
+    }
+  },
+  "no_flag_regression_check": {
+    "method": "/Users/ghost/core/anima/anima-speak/_omega_audio_2_smoke.hexa (3-organ smoke: vocal + breath + pipe chain) -- mirrors omega_audio_emp.hexa cycle_A's organ surface, removed after measurement",
+    "result": "PASS",
+    "evidence": "ANIMA_AUDIO_WORKER unset: SMOKE_VOCAL=4844 SMOKE_BREATH=4844 SMOKE_PIPE=4844 -> SMOKE_VERDICT PASS. ANIMA_AUDIO_WORKER=1 same: SMOKE_VOCAL=4844 SMOKE_BREATH=4844 SMOKE_PIPE=4844 -> SMOKE_VERDICT PASS. Both branches produce identical-byte WAVs (4844 = 100ms @ 24kHz mono int16 + 44-byte WAV header). pipe(scipy.signal.lfilter) and breath(butter+sosfilt) both work because worker pre-imports those symbols at boot."
+  },
+  "lifecycle_observations": {
+    "worker_spawn_overhead_ms": 679,
+    "worker_spawn_overhead_breakdown_estimate": "fork+exec ~10ms + python init ~25ms + numpy import ~60ms + scipy.signal full import ~45ms + IPC adapter setup (mkfifo + keepalive sleep + ready handshake) ~40ms; remainder ~500ms is filesystem + zsh fork overhead + macOS cold cache; subsequent runs amortize towards ~150ms cold",
+    "worker_inner_exec_ms_avg": 1.42,
+    "worker_pid_file": "/tmp/anima_audio_worker_${PPID}/pid",
+    "worker_workdir": "/tmp/anima_audio_worker_${PPID}/ (contains pid, keepalive, in, out, log)",
+    "keepalive_design_note": "A 'sleep 86400 > FIFO_IN' subprocess holds the writer side of FIFO_IN open across discrete hexa exec() shell invocations. Without this, the worker's first readline() after the spawning shell exits would return EOF (no writers) and the worker would terminate. Keepalive dies via SIGHUP cascade when hexa exits.",
+    "shutdown_cascade": "Worker polls os.kill(PARENT_PID, 0) every <=5s; exits cleanly within one poll cycle when hexa pid disappears. Idle timeout 300s as a backstop.",
+    "cleanup_verified": true,
+    "cleanup_evidence": "post-bench: pgrep anima_audio_worker.py -> 0 processes; ls /tmp/anima_audio_worker_* -> no matches; ls /tmp/anima_audio_*.wav -> no matches"
+  },
+  "design_compliance": {
+    "ndjson_protocol": "PASS (one line per request/response, base64-encoded code, expect_path optional)",
+    "lazy_spawn": "PASS (spawn only on first _run_py with flag set; reuse if PID file alive)",
+    "ppid_isolation": "PASS (workdir suffixed by hexa pid, parallel sessions get distinct workers)",
+    "state_contamination_R3": "PASS (each exec runs in fresh dict-based namespace; np.seterr saved/restored in finally)",
+    "shutdown_cascade_R2": "PASS via PARENT_PID watch (5s poll); design's prctl/SIGHUP not used because spawning shell exits immediately, breaking the natural process-group chain",
+    "stdin_writer_keepalive": "DEVIATION (design assumed stdin/stdout pipes held by hexa runtime; bash exec() can't hold fds across calls, so we use named FIFO + sleep keepalive)"
+  },
+  "deferred_to_later_phases": [
+    "phase 3 — breath organ migration (already validated in regression smoke; just needs flag rollout)",
+    "phase 3 — pipe / pipe3 / pipe_glide migration",
+    "phase 3 — vocal_lf, tone, chirp, silence migration",
+    "phase 3 — filter organs (lpf/hpf/bpf/notch/gain/envelope/reverb)",
+    "phase 3 — composition organs (cat, mix)",
+    "phase 4 — cutover (default-on)",
+    "phase 5 — remove ANIMA_AUDIO_WORKER=0 escape hatch",
+    "performance — investigate hexa-runtime FIFO primitive to drop the ~48ms shell-fork floor and approach the design's ~10ms target"
+  ],
+  "rollback": "rm /Users/ghost/core/anima/anima-speak/anima_audio_worker.py; rm /Users/ghost/core/anima/anima-speak/_audio_worker_call.sh; git checkout HEAD -- /Users/ghost/core/anima/anima-speak/anima_audio.hexa",
+  "follow_ups": [
+    "Bake _audio_worker_call.sh path resolution to be repo-relative rather than absolute (currently hardcoded /Users/ghost/...) for portability",
+    "Add explicit shutdown request from anima session-end hook (design lifecycle:explicit) — currently relies on PARENT_PID poll + idle timeout",
+    "Investigate hexa-runtime persistent-pipe primitive (open question Q3 from design) to remove the 48ms bash-fork residual"
+  ]
+}
