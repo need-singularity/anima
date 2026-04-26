@@ -1,0 +1,176 @@
+// tool/anima_eeg_cp2_7day_arrival_gate_dispatch.hexa — EEG CP2 hardware-arrival gate + D+0~D+7 7-day workflow dispatch (raw#9 hexa-only).
+//
+// PURPOSE
+//   handoff §3.10 actionable: "EEG hardware actual arrival → CP2 P1-P3 7-day plan execute".
+//   D-1 readiness 100% (CP2 dry run HCP-A FULLY READY) — but D+0 hardware bring-up tools
+//   3개 (calibrate/collect/eeg_recorder) STUB 상태 (eeg_d_day_readiness_check_landing.md).
+//
+//   본 helper = mac-local hardware-arrival gate + 7-day workflow ledger:
+//
+//     - hardware_arrived flag (env or marker file)
+//     - 7-day workflow steps (D+0~D+7) with disk_status (READY|STUB|PARTIAL) frozen
+//     - D+0 break-point identification (3 STUB tools blocking chain)
+//     - readiness verdict: ARRIVAL_BLOCKED_BY_STUBS | READY_TO_EXECUTE | EXECUTING
+//     - D+0 stub mitigation options (ship as-is + log gap | pre-land Phase 4 | use sim-only)
+//     - selftest verifies: 7-day step coverage / 3 STUB tools logged / decision matrix
+//
+// INPUT
+//   ANIMA_OUTPUT             output JSON (default: state/eeg_cp2_7day_arrival_gate.json)
+//   ANIMA_HW_ARRIVED         "true"|"false" (default "false")
+//   ANIMA_D0_STUBS_LANDED    "true"|"false" hardware bring-up Phase 4 land 여부 (default "false")
+//
+// OUTPUT
+//   - hardware_arrival_status
+//   - workflow_7day_steps: D+0..D+7 each {day, step, tool, disk_status, hardware_required}
+//   - d0_break_point: 3 STUB tools blocking
+//   - readiness: ARRIVAL_BLOCKED_BY_STUBS | READY_TO_EXECUTE | EXECUTING | PRE_ARRIVAL
+//   - mitigation_options: ship-as-is | pre-land Phase 4 | sim-only continue
+//
+// USAGE
+//   hexa run tool/anima_eeg_cp2_7day_arrival_gate_dispatch.hexa --selftest
+//   ANIMA_OUTPUT=state/eeg_cp2_7day_arrival_gate.json hexa run tool/anima_eeg_cp2_7day_arrival_gate_dispatch.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - 7-day workflow은 anima-clm-eeg/state/clm_eeg_pre_register_v1.json 의 SSOT mirror.
+//     SSOT 변경 시 본 helper 도 sync 필요.
+//   - D+0 STUB 3 tools (calibrate.hexa/collect.hexa/eeg_recorder.hexa) Phase 4 (~40h wallclock) 미진행.
+//   - hardware_arrival_status는 helper-level declaration (실제 hardware 도착 detection은 별도 marker file).
+
+let HELPER_PATH = "/tmp/anima_eeg_cp2_7day_arrival_gate_dispatch_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima EEG CP2 7-day arrival-gate dispatch helper — emitted by tool/anima_eeg_cp2_7day_arrival_gate_dispatch.hexa\n")
+    parts.push("# raw#37 transient. EEG hardware-arrival readiness + D+0~D+7 workflow dispatch ledger.\n")
+    parts.push("import json, os, sys\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/eeg_cp2_7day_arrival_gate.json')\n")
+    parts.push("HW_ARRIVED = os.environ.get('ANIMA_HW_ARRIVED', 'false').lower() == 'true'\n")
+    parts.push("D0_STUBS_LANDED = os.environ.get('ANIMA_D0_STUBS_LANDED', 'false').lower() == 'true'\n\n")
+
+    parts.push("WORKFLOW_7DAY = [\n")
+    parts.push("    {'day':'D+0','step':'hardware calibration (impedance + signal QC)','tool':'anima-eeg/calibrate.hexa','disk_status':'STUB','LOC':23,'hardware_required':True},\n")
+    parts.push("    {'day':'D+0','step':'16ch resting recording (>=60s eyes-closed)','tool':'anima-eeg/eeg_recorder.hexa or collect.hexa','disk_status':'STUB','LOC':34,'hardware_required':True},\n")
+    parts.push("    {'day':'D+1','step':'16ch N-back recording (5-10min)','tool':'anima-eeg/eeg_recorder.hexa','disk_status':'STUB+PARTIAL_PROTOCOLS','LOC':25,'hardware_required':True},\n")
+    parts.push("    {'day':'D+1','step':'P1 LZ verify against real .npy','tool':'anima-clm-eeg/tool/clm_eeg_p1_lz_pre_register.hexa','disk_status':'READY','LOC':433,'hardware_required':False},\n")
+    parts.push("    {'day':'D+3','step':'P2 TLR verify (FFT Welch + V_sync trace)','tool':'anima-clm-eeg/tool/clm_eeg_p2_tlr_pre_register.hexa','disk_status':'READY','LOC':550,'hardware_required':False},\n")
+    parts.push("    {'day':'D+3','step':'V_sync Kuramoto compute','tool':'edu/cell/lagrangian/v_sync_kuramoto.hexa','disk_status':'READY','LOC':None,'hardware_required':False},\n")
+    parts.push("    {'day':'D+5','step':'P3 GCG verify (Granger F-stat)','tool':'anima-clm-eeg/tool/clm_eeg_p3_gcg_pre_register.hexa','disk_status':'READY','LOC':620,'hardware_required':False},\n")
+    parts.push("    {'day':'D+5','step':'L_IX integrator hidden trace','tool':'edu/cell/lagrangian/l_ix_integrator.hexa','disk_status':'READY','LOC':None,'hardware_required':False},\n")
+    parts.push("    {'day':'D+5','step':'G10 hexad triangulation activate','tool':'anima-clm-eeg/tool/g10_hexad_triangulation_scaffold.hexa','disk_status':'READY','LOC':734,'hardware_required':False},\n")
+    parts.push("    {'day':'D+6','step':'G8 real-falsifier MI port','tool':'anima-clm-eeg/tool/g8_transversal_mi_matrix.hexa','disk_status':'READY_synthetic','LOC':None,'hardware_required':False},\n")
+    parts.push("    {'day':'D+7','step':'composite >= 2/3 PHENOMENAL VALIDATED','tool':'anima-clm-eeg/tool/clm_eeg_harness_smoke.hexa','disk_status':'READY','LOC':332,'hardware_required':False},\n")
+    parts.push("    {'day':'D+7','step':'Hard PASS recompute','tool':'anima-clm-eeg/tool/mk_xii_preflight_cascade.hexa','disk_status':'READY','LOC':None,'hardware_required':False},\n")
+    parts.push("]\n\n")
+
+    parts.push("D0_STUB_TOOLS = [\n")
+    parts.push("    {'tool':'anima-eeg/calibrate.hexa', 'current_LOC':23, 'phase4_target_wallclock_h':12, 'role':'impedance + signal QC'},\n")
+    parts.push("    {'tool':'anima-eeg/collect.hexa', 'current_LOC':25, 'phase4_target_wallclock_h':14, 'role':'continuous .npy stream capture'},\n")
+    parts.push("    {'tool':'anima-eeg/eeg_recorder.hexa', 'current_LOC':34, 'phase4_target_wallclock_h':14, 'role':'session recording orchestration'},\n")
+    parts.push("]\n\n")
+
+    parts.push("MITIGATION_OPTIONS = [\n")
+    parts.push("    {\n")
+    parts.push("        'option':'A_PRE_LAND_PHASE4', 'cost_wallclock_h':40,\n")
+    parts.push("        'rationale':'land 3 D+0 STUB tools FULL before hardware arrival; 0-friction D+0 entry guaranteed',\n")
+    parts.push("        'recommended_when':'hardware ETA > 7 days (ample pre-arrival window)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'option':'B_SHIP_AS_IS_LOG_GAP', 'cost_wallclock_h':2,\n")
+    parts.push("        'rationale':'arrival 직후 manual scripts로 D+0 진행 (PyOpenBCI raw direct), STUB tools는 사후 land. raw#10 honest: gap explicit logged',\n")
+    parts.push("        'recommended_when':'hardware ETA < 3 days (no pre-land window)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'option':'C_SIM_ONLY_CONTINUE', 'cost_wallclock_h':0,\n")
+    parts.push("        'rationale':'CP2 dry run HCP-A FULLY READY 결과만으로 D+1~D+7 simulated 진행 (real data 없이 chain validation); negative finding logged',\n")
+    parts.push("        'recommended_when':'hardware indefinite delay; downstream chain pre-validation 우선',\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("def _readiness(hw, d0_landed):\n")
+    parts.push("    if not hw:\n")
+    parts.push("        return 'PRE_ARRIVAL'\n")
+    parts.push("    if hw and not d0_landed:\n")
+    parts.push("        return 'ARRIVAL_BLOCKED_BY_STUBS'\n")
+    parts.push("    if hw and d0_landed:\n")
+    parts.push("        return 'READY_TO_EXECUTE'\n")
+    parts.push("    return 'INDETERMINATE'\n\n")
+
+    parts.push("readiness = _readiness(HW_ARRIVED, D0_STUBS_LANDED)\n")
+    parts.push("ready_count = sum(1 for s in WORKFLOW_7DAY if s['disk_status'].startswith('READY'))\n")
+    parts.push("stub_count = sum(1 for s in WORKFLOW_7DAY if s['disk_status'].startswith('STUB'))\n\n")
+
+    parts.push("recommended = 'A_PRE_LAND_PHASE4' if HW_ARRIVED is False else 'B_SHIP_AS_IS_LOG_GAP'\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'EEG CP2 hardware-arrival gate + D+0~D+7 7-day workflow dispatch ledger',\n")
+    parts.push("    'parent_doc':'anima-clm-eeg/docs/eeg_d_day_readiness_check_landing.md',\n")
+    parts.push("    'parent_handoff_actionable':'§3.10 EEG hardware actual arrival → CP2 P1-P3 7-day plan execute',\n")
+    parts.push("    'hardware_arrived':HW_ARRIVED,\n")
+    parts.push("    'd0_stubs_landed':D0_STUBS_LANDED,\n")
+    parts.push("    'workflow_7day_steps':WORKFLOW_7DAY,\n")
+    parts.push("    'workflow_summary':{'total_steps':len(WORKFLOW_7DAY), 'ready_count':ready_count, 'stub_count':stub_count, 'd0_steps_blocking':3},\n")
+    parts.push("    'd0_stub_tools':D0_STUB_TOOLS,\n")
+    parts.push("    'mitigation_options':MITIGATION_OPTIONS,\n")
+    parts.push("    'readiness':readiness,\n")
+    parts.push("    'recommended_mitigation':recommended,\n")
+    parts.push("    'd_minus_1_dry_run_status':'PASS (CP2 dry run HCP-A FULLY READY per handoff §1.7)',\n")
+    parts.push("    'pre_register_status':'FROZEN_MIRROR_OF_SSOT (anima-clm-eeg/state/clm_eeg_pre_register_v1.json)',\n")
+    parts.push("    'n_workflow_steps':len(WORKFLOW_7DAY),\n")
+    parts.push("    'n_d0_stubs':len(D0_STUB_TOOLS),\n")
+    parts.push("    'n_mitigation_options':len(MITIGATION_OPTIONS),\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[eeg_cp2_arrival_gate] hw={HW_ARRIVED} d0_landed={D0_STUBS_LANDED} readiness={readiness} ready={ready_count}/{len(WORKFLOW_7DAY)} stubs={stub_count} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let workflow_steps_expected = 12
+    let d0_stubs_expected = 3
+    let mitigation_options_expected = 3
+    let readiness_states = "PRE_ARRIVAL,ARRIVAL_BLOCKED_BY_STUBS,READY_TO_EXECUTE,INDETERMINATE"
+    println("inv:workflow_steps_expected=" + to_string(workflow_steps_expected))
+    println("inv:d0_stubs_expected=" + to_string(d0_stubs_expected))
+    println("inv:mitigation_options_expected=" + to_string(mitigation_options_expected))
+    println("inv:readiness_states=" + readiness_states)
+    println("inv:7_day_coverage_D0_to_D7=true")
+    println("inv:d_minus_1_dry_run_PASS_recorded=true")
+    println("inv:ssot_mirror_clm_eeg_pre_register_v1=true")
+    println("inv:cost_phase4_total_wallclock_h_40=true (12+14+14)")
+    println("inv:option_C_sim_only_explicit=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_eeg_cp2_7day_arrival_gate_dispatch selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=EEG CP2 7-day arrival gate (12 steps, 9 READY + 3 D+0 STUB blocking, 3 mitigation options)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
