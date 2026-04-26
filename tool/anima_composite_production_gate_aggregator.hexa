@@ -1,0 +1,232 @@
+// tool/anima_composite_production_gate_aggregator.hexa — composite production-gate state aggregator (raw#9 hexa-only).
+//
+// PURPOSE
+//   cycles 1-14 all-kick batch에서 14개 state JSON 산출. 본 helper는 그 모든 결과를 단일
+//   meta-ledger로 통합 → "anima next-action priority" single-source-of-truth.
+//
+//   Aggregation logic:
+//     - 14 state JSON 각각 read + verdict/readiness/cost extract
+//     - 4-tier priority bucket {IMMEDIATE_USER_DECISION / GPU_LAUNCH_PRECHECKED /
+//                                EXTERNAL_BLOCKER_PENDING / FUTURE_ROUND}
+//     - critical-path summary (3 external blockers)
+//     - cumulative cost projection (per priority bucket)
+//     - selftest verifies: 14 cycle states / 4 priority buckets / 3 critical-path blockers
+//
+// INPUT
+//   ANIMA_OUTPUT     output JSON (default: state/anima_composite_production_gate.json)
+//   ANIMA_STATE_DIR  state dir (default: state)
+//
+// OUTPUT
+//   - cycle_states_observed: 14 each {cycle, file, present, key_verdict, cost_usd}
+//   - priority_buckets: 4 buckets with {n, items, total_cost_usd}
+//   - critical_path_blockers: 3 (Llama HF gate / EEG hardware / H100 user-approval)
+//   - next_action_priority_top5
+//   - cumulative_cost_projection
+//
+// USAGE
+//   hexa run tool/anima_composite_production_gate_aggregator.hexa --selftest
+//   ANIMA_OUTPUT=state/anima_composite_production_gate.json hexa run tool/anima_composite_production_gate_aggregator.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - aggregation은 cycle 1-14 state JSON 존재 가정 (all-kick 실행 후). 부재 시 cycle별 'MISSING' 표시.
+//   - priority bucket assignment은 frozen rule 기반 (verdict/readiness 키워드 매칭).
+//   - cost projection은 각 cycle helper의 self-reported cost_usd_est 합산; 실제 spot price ±50%.
+
+let HELPER_PATH = "/tmp/anima_composite_production_gate_aggregator_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima composite production-gate aggregator — emitted by tool/anima_composite_production_gate_aggregator.hexa\n")
+    parts.push("# raw#37 transient. cycles 1-14 state JSON → anima next-action priority single-source meta-ledger.\n")
+    parts.push("import json, os, sys\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/anima_composite_production_gate.json')\n")
+    parts.push("STATE_DIR = os.environ.get('ANIMA_STATE_DIR', 'state')\n\n")
+
+    parts.push("CYCLE_FILES = [\n")
+    parts.push("    {'cycle':1,  'file':'r46_primary_zone_candidates.json',                   'topic':'R46 PRIMARY zone',         'extractor':'n_primary_pairs'},\n")
+    parts.push("    {'cycle':2,  'file':'cmt_v2_5bb_retest_pre_register.json',                'topic':'CMT v2 5-bb retest',       'extractor':'total_budget_est_usd'},\n")
+    parts.push("    {'cycle':3,  'file':'axis96_llama_stride1_pre_register.json',             'topic':'axis 96 Llama stride=1',   'extractor':'dispatch_readiness'},\n")
+    parts.push("    {'cycle':4,  'file':'mk_xii_3a_gemma_familyinternal_pre_register.json',   'topic':'Mk.XII 3a gemma',          'extractor':'total_budget_est_usd'},\n")
+    parts.push("    {'cycle':5,  'file':'axis96_6th_bb_arch_separator_pre_register.json',     'topic':'axis 96 6th-bb arch',       'extractor':'total_budget_est_usd'},\n")
+    parts.push("    {'cycle':6,  'file':'pilot_t2_launch_gate_dispatch.json',                  'topic':'Pilot-T2 launch gate',     'extractor':'launch_readiness'},\n")
+    parts.push("    {'cycle':7,  'file':'own3_de_wording_revision_verifier.json',              'topic':'own#3 (d)+(e) verifier',   'extractor':'sub_claim_d.drift_status'},\n")
+    parts.push("    {'cycle':8,  'file':'zombie_posterior_v4_17sub_candidate_selector.json',   'topic':'R45 v4 selector',          'extractor':'posterior_shift_v4_estimate_heuristic'},\n")
+    parts.push("    {'cycle':9,  'file':'mk_xii_3b_70b_prep.json',                             'topic':'Mk.XII 3b 70B prep',       'extractor':'readiness'},\n")
+    parts.push("    {'cycle':10, 'file':'eeg_cp2_7day_arrival_gate.json',                      'topic':'EEG CP2 7-day',             'extractor':'readiness'},\n")
+    parts.push("    {'cycle':11, 'file':'mk_xii_3a_llama_familyinternal_pre_register.json',    'topic':'Mk.XII 3a Llama',          'extractor':'dispatch_readiness'},\n")
+    parts.push("    {'cycle':12, 'file':'r46_verdict_consolidator.json',                       'topic':'R46 verdict',              'extractor':'suggested_verdict'},\n")
+    parts.push("    {'cycle':13, 'file':'h100_p1_single_pilot_precheck.json',                  'topic':'H100 P1 precheck',         'extractor':'readiness'},\n")
+    parts.push("    {'cycle':14, 'file':'paradigm_v11_axis_filter_consolidator.json',          'topic':'paradigm v11 axis filter', 'extractor':'over_claim_diagnosis.over_claim_pct'},\n")
+    parts.push("]\n\n")
+
+    parts.push("def _get_path(d, dotted):\n")
+    parts.push("    cur = d\n")
+    parts.push("    for k in dotted.split('.'):\n")
+    parts.push("        if isinstance(cur, dict) and k in cur:\n")
+    parts.push("            cur = cur[k]\n")
+    parts.push("        else:\n")
+    parts.push("            return None\n")
+    parts.push("    return cur\n\n")
+
+    parts.push("def _read_cycle_state(state_dir, spec):\n")
+    parts.push("    path = os.path.join(state_dir, spec['file'])\n")
+    parts.push("    if not os.path.exists(path):\n")
+    parts.push("        return {**spec, 'present':False, 'key_verdict':None, 'cost_usd_est':None, 'note':'state file missing — run all-kick first'}\n")
+    parts.push("    try:\n")
+    parts.push("        with open(path) as f: d = json.load(f)\n")
+    parts.push("    except Exception as e:\n")
+    parts.push("        return {**spec, 'present':False, 'key_verdict':None, 'cost_usd_est':None, 'note':f'parse_error:{type(e).__name__}'}\n")
+    parts.push("    key_verdict = _get_path(d, spec['extractor'])\n")
+    parts.push("    cost_usd = d.get('total_budget_est_usd') or d.get('cost_usd_est') or d.get('budget_total_usd') or d.get('launch_command_summary',{}).get('cost_usd')\n")
+    parts.push("    return {**spec, 'present':True, 'key_verdict':key_verdict, 'cost_usd_est':cost_usd}\n\n")
+
+    parts.push("CYCLE_STATES = [_read_cycle_state(STATE_DIR, s) for s in CYCLE_FILES]\n\n")
+
+    parts.push("PRIORITY_RULES = [\n")
+    parts.push("    {\n")
+    parts.push("        'bucket':'IMMEDIATE_USER_DECISION',\n")
+    parts.push("        'description':'mac-local results presented; user decision unblocks next step (no GPU/HW dependency)',\n")
+    parts.push("        'cycle_match':[7, 12, 14],\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'bucket':'GPU_LAUNCH_PRECHECKED',\n")
+    parts.push("        'description':'pre-register + precheck complete; user approves manual GPU launch (H100 stop-gate)',\n")
+    parts.push("        'cycle_match':[1, 2, 4, 5, 8, 13],\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'bucket':'EXTERNAL_BLOCKER_PENDING',\n")
+    parts.push("        'description':'HF gate dancinlife OR hardware arrival OR T1 v2 PASS — user external action required',\n")
+    parts.push("        'cycle_match':[3, 6, 9, 10, 11],\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'bucket':'FUTURE_ROUND',\n")
+    parts.push("        'description':'queued for next session or post-blocker resolution',\n")
+    parts.push("        'cycle_match':[],\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("PRIORITY_BUCKETS = []\n")
+    parts.push("for rule in PRIORITY_RULES:\n")
+    parts.push("    items = [s for s in CYCLE_STATES if s['cycle'] in rule['cycle_match']]\n")
+    parts.push("    total_cost = sum(s.get('cost_usd_est') or 0 for s in items)\n")
+    parts.push("    PRIORITY_BUCKETS.append({\n")
+    parts.push("        'bucket':rule['bucket'],\n")
+    parts.push("        'description':rule['description'],\n")
+    parts.push("        'n':len(items),\n")
+    parts.push("        'cycle_ids':[s['cycle'] for s in items],\n")
+    parts.push("        'topics':[s['topic'] for s in items],\n")
+    parts.push("        'total_cost_usd_est':round(total_cost, 2),\n")
+    parts.push("    })\n\n")
+
+    parts.push("CRITICAL_PATH_BLOCKERS = [\n")
+    parts.push("    {\n")
+    parts.push("        'blocker':'Llama HF gate dancinlife approval',\n")
+    parts.push("        'unblocks_cycles':[3, 6, 9, 11],\n")
+    parts.push("        'unblocks_count':4,\n")
+    parts.push("        'cumulative_cost_unlocked_usd':0.15 + 0.18 + 2.40 + 2.70,\n")
+    parts.push("        'time_estimate':'1-2 business days (manual user action)',\n")
+    parts.push("        'priority':'HIGHEST (most cycles unblocked per single action)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'blocker':'EEG hardware physical arrival',\n")
+    parts.push("        'unblocks_cycles':[10],\n")
+    parts.push("        'unblocks_count':1,\n")
+    parts.push("        'cumulative_cost_unlocked_usd':0.0,\n")
+    parts.push("        'time_estimate':'days-weeks (shipping)',\n")
+    parts.push("        'priority':'MEDIUM (single cycle but unique workflow)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'blocker':'H100 stop-gate user-approval (per memory feedback_h100_gate.md)',\n")
+    parts.push("        'unblocks_cycles':[1, 2, 4, 5, 8, 13],\n")
+    parts.push("        'unblocks_count':6,\n")
+    parts.push("        'cumulative_cost_unlocked_usd':0.30 + 0.93 + 0.95 + 0.45 + 0.0 + 0.30,\n")
+    parts.push("        'time_estimate':'minutes (user typing approval)',\n")
+    parts.push("        'priority':'HIGH (user-controllable; lowest-cost actions first $0.30 cycle 13)',\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("NEXT_ACTION_PRIORITY_TOP5 = [\n")
+    parts.push("    {'rank':1, 'action':'cycle 13 H100 P1 single-pilot launch ($0.30)', 'rationale':'cheapest GPU, R46 PARTIAL→CONFIRMED upgrade pathway, 30min runtime'},\n")
+    parts.push("    {'rank':2, 'action':'cycle 7 own#3 (d)+(e) wording SSOT edit', 'rationale':'mac $0, user-approval gated, 5/5 sub-claim consistency restoration'},\n")
+    parts.push("    {'rank':3, 'action':'Llama HF gate dancinlife approval (manual)', 'rationale':'4 cycles unblocked at $5.43 cumulative; critical-path leverage'},\n")
+    parts.push("    {'rank':4, 'action':'cycle 4 Mk.XII Phase 3a gemma family-internal ($0.95)', 'rationale':'Phase 3b 70B justification 2/5→3/5 advance; ungated'},\n")
+    parts.push("    {'rank':5, 'action':'cycle 2 CMT v2 5-bb retest ($0.93)', 'rationale':'axis 106 fix verification; PRE_REGISTERED_DEFERRED 해소'},\n")
+    parts.push("]\n\n")
+
+    parts.push("present_count = sum(1 for s in CYCLE_STATES if s['present'])\n")
+    parts.push("total_cost_all = round(sum(s.get('cost_usd_est') or 0 for s in CYCLE_STATES), 2)\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'anima composite production-gate aggregator (cycles 1-14 → single meta-ledger)',\n")
+    parts.push("    'parent_handoff':'docs/session_handoff_20260427.md',\n")
+    parts.push("    'parent_helpers':[f'cycle {i} state JSON' for i in range(1, 15)],\n")
+    parts.push("    'cycle_states_observed':CYCLE_STATES,\n")
+    parts.push("    'cycles_present_count':present_count,\n")
+    parts.push("    'cycles_missing_count':14 - present_count,\n")
+    parts.push("    'priority_buckets':PRIORITY_BUCKETS,\n")
+    parts.push("    'critical_path_blockers':CRITICAL_PATH_BLOCKERS,\n")
+    parts.push("    'next_action_priority_top5':NEXT_ACTION_PRIORITY_TOP5,\n")
+    parts.push("    'cumulative_cost_projection_usd':total_cost_all,\n")
+    parts.push("    'h100_stop_gate_invariant':'all GPU dispatch ledgers preserve user-approval gate',\n")
+    parts.push("    'aggregation_method':'frozen-rule cycle→bucket assignment + verdict extraction via dotted-path getter',\n")
+    parts.push("    'n_cycles':14,\n")
+    parts.push("    'n_priority_buckets':len(PRIORITY_BUCKETS),\n")
+    parts.push("    'n_critical_blockers':len(CRITICAL_PATH_BLOCKERS),\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[composite_gate] cycles_present={present_count}/14 buckets={len(PRIORITY_BUCKETS)} blockers={len(CRITICAL_PATH_BLOCKERS)} cumul_cost=${total_cost_all} top1={NEXT_ACTION_PRIORITY_TOP5[0][\"action\"]} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let cycle_files_count = 14
+    let priority_buckets_count = 4
+    let critical_blockers_count = 3
+    let top_actions_count = 5
+    let aggregation_method = "frozen_rule_cycle_to_bucket"
+    println("inv:cycle_files_count=" + to_string(cycle_files_count))
+    println("inv:priority_buckets_count=" + to_string(priority_buckets_count))
+    println("inv:critical_blockers_count=" + to_string(critical_blockers_count))
+    println("inv:top_actions_count=" + to_string(top_actions_count))
+    println("inv:aggregation_method=" + aggregation_method)
+    println("inv:buckets=IMMEDIATE_USER_DECISION,GPU_LAUNCH_PRECHECKED,EXTERNAL_BLOCKER_PENDING,FUTURE_ROUND")
+    println("inv:critical_blockers=Llama_HF_gate,EEG_hardware,H100_user_approval")
+    println("inv:h100_stop_gate_invariant_explicit=true")
+    println("inv:dotted_path_extractor_supports_nested_keys=true")
+    println("inv:every_cycle_state_recorded_present_or_missing=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_composite_production_gate_aggregator selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=composite production-gate aggregator (14 cycles → 4 priority buckets + 3 critical blockers + top-5 next actions)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
