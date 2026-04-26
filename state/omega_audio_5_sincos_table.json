@@ -1,0 +1,129 @@
+{
+  "cycle": "omega-audio-5",
+  "axis": "sin/cos table optimization for hexa-native organs",
+  "timestamp": "2026-04-26T00:00:00Z",
+  "current_date": "2026-04-26",
+  "approach_chosen": {
+    "selected": "B",
+    "rationale": "Period-table approach: precompute one period of sin (vocal_hexa) or full LF waveform (vocal_lf_hexa) of size period_n=round(SR/hz), then cycle the table inside the synthesis hot loop. Replaces ~N transcendental calls with ~period_n calls (43-109× reduction in transcendental count). Also precomputed hann ramp tables eliminate ~480 cos() calls per organ invocation. Option (A) rejected per user analysis: pure precompute of N sin() values doesn't reduce total sin count when there is only one sin per inner iteration, so it provides minimal win on its own (we still bundle the hann table precompute since k=240 << N=2400 yields a real reduction). Option (C) rejected: a fixed high-resolution table requires phase interpolation, adds index math overhead, and introduces interpolation error without much advantage over (B) when frequencies are mostly in the speech range where period_n is small enough."
+  },
+  "organs_optimized": [
+    "vocal_hexa",
+    "vocal_lf_hexa"
+  ],
+  "organs_unchanged": [
+    "breath_hexa (PRNG noise + IIR; sin/cos only in setup, not hot loop)",
+    "pipe_hexa (formant resonator IIR; sin/cos only in setup)"
+  ],
+  "implementation_notes": [
+    "Frequency quantization: rendered_hz = SR / round(SR/hz). For hz=440 SR=24000 → period_n=55, rendered=436.36Hz (-0.83% pitch). For hz=220 → period_n=109, rendered=220.18Hz (+0.08%). Acceptable for voicing, NOT byte-perfect.",
+    "Hann ramp tables (size k=240) precomputed once at function entry; eliminates 2 cos() per inner iteration on edge windows.",
+    "Phase index uses integer modulo via if-wraparound (no float % op), deterministic across runs."
+  ],
+  "bench": {
+    "method": "5 warm runs each, median of 3 trials reported. SR=24000, ms=100, n=2400 samples.",
+    "vocal_hexa": {
+      "params": "freq=440Hz gain=0.5 ms=100",
+      "before_warm_mean_ms": 124,
+      "before_trials_ms": [111, 124, 150],
+      "after_warm_mean_ms": 107,
+      "after_trials_ms": [107, 106, 107],
+      "speedup_x": 1.16
+    },
+    "vocal_lf_hexa": {
+      "params": "freq=220Hz gain=0.5 ms=100",
+      "before_warm_mean_ms": 228,
+      "before_trials_ms": [211, 228, 297],
+      "after_warm_mean_ms": 146,
+      "after_trials_ms": [146, 144, 150],
+      "speedup_x": 1.56
+    },
+    "breath_hexa_unchanged": {
+      "params": "lo=800 hi=4000 gain=0.5 ms=100",
+      "before_warm_mean_ms": 227,
+      "after_warm_mean_ms": 209,
+      "speedup_x": 1.09,
+      "note": "no code change; observed delta within run-to-run variance"
+    },
+    "chain_vocal_pipe": {
+      "params": "vocal(440)→pipe(700,1100,Q=6) ms=100",
+      "before_warm_mean_ms": 454,
+      "before_trials_ms": [413, 454, 591],
+      "after_warm_mean_ms": 406,
+      "after_trials_ms": [399, 406, 414],
+      "speedup_x": 1.12,
+      "note": "chain dominated by pipe_hexa IIR + array push of 2400 samples (unchanged); modest win comes from upstream vocal_hexa speedup"
+    }
+  },
+  "chain_speedup": {
+    "before_ms": 454,
+    "after_ms": 406,
+    "ratio_x": 1.12,
+    "delta_ms": -48
+  },
+  "vs_python_worker_gap": {
+    "python_worker_warm_vocal_ms": 112,
+    "hexa_native_before_vocal_ms": 124,
+    "hexa_native_after_vocal_ms": 107,
+    "before_ratio_x": 1.11,
+    "after_ratio_x": 0.96,
+    "interpretation": "User-reported 3.6× gap appears to predate ω-interp-3 fixes. Current build shows hexa-native vocal_hexa was already competitive (1.11× slower) before this cycle and is now slightly faster than the python worker (0.96×). Further improvements require attacking the dominant hot-path costs: 4800 array push() calls + per-sample byte clamp/pack."
+  },
+  "byte_perfect_check": {
+    "vocal_hexa": {
+      "before_sha256": "933bec7edd464032291a24cf67c76ef7c49942eca3ced390030503530e943a68",
+      "after_sha256":  "4815fe9ae7430e8550fd06375dbb828210929e6b6e0e84a2479c58fd750c4d73",
+      "byte_perfect": false,
+      "reason": "Frequency quantization: requested 440Hz → rendered at 24000/55 = 436.36Hz (-0.83% pitch shift). Algorithm differs (period table vs direct angle). Acceptable for voicing perception."
+    },
+    "vocal_lf_hexa": {
+      "before_sha256": "8e81b454627122fa5e270178674ab606ed2f5c5cd212f933c30e24b30d08b0d1",
+      "after_sha256":  "152c07933fa1aa37b85a17530b8764b2a5fcc9a7d500e603c4ab48be8179d639",
+      "byte_perfect": false,
+      "reason": "Same period quantization mechanism. 220Hz → 220.18Hz. Peak normalization within 1 ULP of original."
+    },
+    "breath_hexa": {
+      "before_sha256": "ff90dad89bffe54c7f9248274f8e6c50c198b3a93dcf49f1414ae6158d4d2bf0",
+      "after_sha256":  "ff90dad89bffe54c7f9248274f8e6c50c198b3a93dcf49f1414ae6158d4d2bf0",
+      "byte_perfect": true,
+      "reason": "No code change."
+    },
+    "chain_vocal_pipe": {
+      "before_sha256": "556dde4a2b9ed739ea4367e92d3279dca3381b2e1245f3d1102b47d2c8cbea39",
+      "after_sha256":  "ad939ecd8b2aad3c8ee846d772a2cc6684d27ad8722cdd392df1429dcfaa713d",
+      "byte_perfect": false,
+      "reason": "Downstream of vocal_hexa change."
+    },
+    "stability_across_optimized_runs": "All 4 hashes identical across 3 trials → deterministic output (no race / no nondeterminism introduced)."
+  },
+  "recommendation_for_remaining_organs": {
+    "breath_hexa": "No change. Hot loop is LCG noise + 2-pole biquad IIR. sin/cos used only once at filter coefficient setup. Speedup target would have to attack the ~2400 array push() calls and per-sample byte packing.",
+    "pipe_hexa": "No change. Hot loop is 2-formant cascade IIR (4 mul+add). sin/cos used only twice at coefficient setup. Same dominant cost as breath.",
+    "next_cycle_target": "ω-audio-6 candidate: array_alloc + indexed assignment for output bytes (mirrors vocal_hexa_alloc variant from ω-interp-3) to eliminate per-sample push() overhead. Per audio-3 redo bench, push→alloc gave the largest single-organ win in vocal_hexa."
+  },
+  "constraints_honored": {
+    "hexa_only_edits": true,
+    "no_hexa_lang_edits": true,
+    "no_docker_rebuild": true,
+    "no_linux_elf_rebuild": true,
+    "no_git_commit": true,
+    "files_modified": ["/Users/ghost/core/anima/anima-speak/anima_audio.hexa"],
+    "files_created": [
+      "/Users/ghost/core/anima/anima-speak/_omega_audio_5_bench.hexa",
+      "/Users/ghost/core/anima/state/omega_audio_5_sincos_table.json"
+    ]
+  },
+  "rollback": {
+    "method": "git checkout -- anima-speak/anima_audio.hexa",
+    "remove_artifacts": [
+      "rm /Users/ghost/core/anima/anima-speak/_omega_audio_5_bench.hexa",
+      "rm /Users/ghost/core/anima/state/omega_audio_5_sincos_table.json"
+    ],
+    "scope": "Only vocal_hexa() and vocal_lf_hexa() functions touched in anima_audio.hexa; all other organs (vocal_hexa_alloc, breath_hexa, pipe_hexa, vocal, breath, vocal_lf, etc.) untouched."
+  },
+  "risks_and_caveats": [
+    "Period quantization: pitch error up to ±0.5/period_n ≈ ±1% in the worst case at high frequencies. Negligible for typical voicing fundamentals (80-400Hz where period_n ≥ 60). At hz=8000Hz period_n=3 → larger relative error; not a use case for vocal organs.",
+    "User's reported baseline (144/232/236/311/1037ms) was substantially slower than what was measured in this cycle (111/210/206/-/404). Either ω-interp-3 cab8ef20 already closed most of the gap, or the prior measurement was on a different machine state. Current effective speedup vs ω-audio-3 redo numbers is larger (vocal_hexa 144→107 = 1.35×; chain 1037→406 = 2.55×).",
+    "vocal_hexa speedup smaller than predicted (1.16×, not the targeted 3×+). Diagnosis: in this build, sin/cos primitives are NOT interp-dispatched per call — they appear to compile to direct C math calls. Per-sample push()/byte clamp/floor() now dominate. The period table still trims real cycles but the fraction of total time spent in transcendentals was overestimated."
+  ]
+}

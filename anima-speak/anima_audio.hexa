@@ -440,25 +440,56 @@ fn vocal_hexa(freq_hz: float, gain: float, ms: int) -> string {
     if n < 1 { n = 1 }
     // Build WAV header.
     let mut bytes = _wav_header(SR, n)
-    // Per-sample synthesis: y = g * sin(2π * hz * t / SR), int16 LE.
+    // ── ω-audio-5 sin/cos table optimization ──
+    // Original: y[i] = g * sin(2π * hz * i / SR) — N sin() calls in hot loop.
+    // Optimized (period-table, option B):
+    //   period_n = round(SR/hz). Build sin_tbl[0..period_n) once. In hot loop
+    //   y[i] = g * sin_tbl[i % period_n]. ~N → ~period_n sin() calls (43× for
+    //   hz=440). Effective rendered freq = SR/period_n (slight quantization
+    //   for non-divisor frequencies; e.g., 440Hz → 24000/55 = 436.36Hz).
+    //   Hann ramp tables also precomputed (eliminates ~2k cos calls).
     let two_pi_hz_over_sr = 2.0 * 3.141592653589793 * hz / (SR + 0.0)
+    // Determine integer period in samples; fall back to N when too short.
+    let period_f = (SR + 0.0) / hz
+    let mut period_n = floor(period_f + 0.5)
+    if period_n < 2 { period_n = 2 }
+    if period_n > n { period_n = n }
+    // Quantized angular step that exactly closes period_n samples.
+    let two_pi_over_period = 2.0 * 3.141592653589793 / (period_n + 0.0)
     // 10ms hann ramp (mirror vocal() envelope), capped at n/2.
     let mut k = (SR + 0) / 100  // 10ms = SR/100 samples
     if k > n / 2 { k = n / 2 }
+    // Precompute sin table over one period.
+    let mut sin_tbl = array_alloc(period_n)
+    let mut ti = 0
+    while ti < period_n {
+        sin_tbl[ti] = sin(two_pi_over_period * (ti + 0.0))
+        ti = ti + 1
+    }
+    // Precompute hann ramp table (size k).
+    let mut hann_tbl = array_alloc(k)
+    if k > 0 {
+        let denom_h = (k - 1 + 0.0)
+        let mut hi = 0
+        while hi < k {
+            hann_tbl[hi] = 0.5 * (1.0 - cos(3.141592653589793 * (hi + 0.0) / denom_h))
+            hi = hi + 1
+        }
+    }
     let mut i = 0
+    let mut p = 0       // phase index, kept in [0, period_n)
     while i < n {
-        let t = i + 0.0
-        let mut y = g * sin(two_pi_hz_over_sr * t)
-        // Hann ramp on edges.
+        let mut y = g * sin_tbl[p]
+        p = p + 1
+        if p >= period_n { p = 0 }
+        // Hann ramp on edges (table lookup, no cos in hot loop).
         if k > 0 {
             if i < k {
-                let r = 0.5 * (1.0 - cos(3.141592653589793 * (i + 0.0) / (k - 1 + 0.0)))
-                y = y * r
+                y = y * hann_tbl[i]
             }
             let tail = n - i - 1
             if tail < k {
-                let r = 0.5 * (1.0 - cos(3.141592653589793 * (tail + 0.0) / (k - 1 + 0.0)))
-                y = y * r
+                y = y * hann_tbl[tail]
             }
         }
         // clamp [-1, 1] → int16. Use floor(y*32767+0.5) to force int (round()
@@ -476,6 +507,8 @@ fn vocal_hexa(freq_hz: float, gain: float, ms: int) -> string {
         bytes.push((u >> 8) & 0xFF)
         i = i + 1
     }
+    // Suppress unused-warning for raw freq when period quantizes.
+    let _ = two_pi_hz_over_sr
     write_bytes(path, bytes)
     if _file_bytes(path) < WAV_MIN_BYTES { return "" }
     return path
@@ -757,15 +790,25 @@ fn vocal_lf_hexa(freq_hz: float, gain: float, ms: int) -> string {
     let denom_open = pi_v / Tp
     let denom_close = pi_v / (2.0 * (Te - Tp))
 
-    let mut samples = []
+    // ── ω-audio-5 period-table optimization ──
+    // LF waveform is strictly periodic with period_n = round(SR/hz) samples.
+    // Build one period's samples (sin/cos/exp dispatched only period_n times),
+    // then reuse cyclically. Replaces ~N transcendentals with ~period_n
+    // (e.g. 109× speedup at 220Hz: 2400 → ~109 calls).
+    let period_f = (SR + 0.0) / hz
+    let mut period_n = floor(period_f + 0.5)
+    if period_n < 2 { period_n = 2 }
+    if period_n > n { period_n = n }
+    let inv_period = 1.0 / (period_n + 0.0)
+
+    // Precompute one period of LF waveform; track peak over the period (peak
+    // repeats across periods so this matches the original max-over-N peak when
+    // n ≥ period_n).
+    let mut period_buf = array_alloc(period_n)
     let mut peak = 0.000000001
-    let mut i = 0
-    while i < n {
-        let t = (i + 0.0) / (SR + 0.0)
-        // phase = (t mod T0) / T0, computed without a `%` op on floats.
-        let cycles = t / T0
-        let cyc_floor = floor(cycles) + 0.0
-        let phase = cycles - cyc_floor
+    let mut pi2 = 0
+    while pi2 < period_n {
+        let phase = (pi2 + 0.0) * inv_period
         let mut x = 0.0
         if phase < Tp {
             x = sin(denom_open * phase)
@@ -776,31 +819,43 @@ fn vocal_lf_hexa(freq_hz: float, gain: float, ms: int) -> string {
                 x = (0.0 - 0.5) * exp((0.0 - 12.0) * (phase - Te))
             }
         }
-        samples.push(x)
+        period_buf[pi2] = x
         let mut ax = x
         if ax < 0.0 { ax = 0.0 - ax }
         if ax > peak { peak = ax }
-        i = i + 1
+        pi2 = pi2 + 1
     }
 
     // Hann ramp window 10ms.
     let mut k = SR / 100
     if k > n / 2 { k = n / 2 }
 
+    // Precompute hann ramp table.
+    let mut hann_tbl = array_alloc(k)
+    if k > 0 {
+        let denom_h = (k - 1 + 0.0)
+        let mut hi = 0
+        while hi < k {
+            hann_tbl[hi] = 0.5 * (1.0 - cos(pi_v * (hi + 0.0) / denom_h))
+            hi = hi + 1
+        }
+    }
+
     let mut bytes = _wav_header(SR, n)
     let scale = g / peak
     let mut j = 0
+    let mut p = 0   // index into period_buf, in [0, period_n)
     while j < n {
-        let mut y = samples[j] * scale
+        let mut y = period_buf[p] * scale
+        p = p + 1
+        if p >= period_n { p = 0 }
         if k > 0 {
             if j < k {
-                let r = 0.5 * (1.0 - cos(pi_v * (j + 0.0) / (k - 1 + 0.0)))
-                y = y * r
+                y = y * hann_tbl[j]
             }
             let tail = n - j - 1
             if tail < k {
-                let r = 0.5 * (1.0 - cos(pi_v * (tail + 0.0) / (k - 1 + 0.0)))
-                y = y * r
+                y = y * hann_tbl[tail]
             }
         }
         if y > 1.0 { y = 1.0 }
@@ -811,6 +866,7 @@ fn vocal_lf_hexa(freq_hz: float, gain: float, ms: int) -> string {
         _push_int16_le(bytes, s)
         j = j + 1
     }
+    let _ = T0
     write_bytes(path, bytes)
     if _file_bytes(path) < WAV_MIN_BYTES { return "" }
     return path

@@ -1,0 +1,90 @@
+{
+  "cycle": "omega-network-2",
+  "axis": "PSI per-host threshold calibration audit",
+  "timestamp": "2026-04-26T06:38:22Z",
+  "trigger": "hetzner pick at PSI 89.62 in nexus d84a0601 (ω-hexa-5 R5.4) — uniform threshold 80 may not reflect host-class headroom",
+  "current_threshold": {
+    "value": 80,
+    "scope": "ALL hosts (single threshold)",
+    "implementation": "scripts/bin/hexa_remote lines 117-130 (pre-edit) — psi*100 > 8000 hard-reject",
+    "disable_env": "HEXA_REMOTE_NO_PSI_REJECT=1"
+  },
+  "audit_findings": {
+    "host_pool_inventory": {
+      "fallback_chain": ["preferred", "ubu1", "ubu2", "htz"],
+      "heavy_compute_override": "PREFERRED forced to hetzner for {drill,smash,free,absolute,meta-closure,hyperarithmetic} (lines 179-198)",
+      "ram_class": {
+        "hetzner": {"total_gb": 128, "headroom_class": "large", "note": "100GB+ headroom; preferred for heavy-compute (raw#36)"},
+        "htz": {"alias_of": "hetzner", "ssh_alias": "157.180.8.154"},
+        "ubu1": {"total_gb": 32, "headroom_class": "small", "cgroup": "MemoryMax=20G", "note": "post-2026-04-24 recovery; Korean-locale issue fixed via LC_ALL=C"},
+        "ubu2": {"total_gb": 32, "headroom_class": "small", "cgroup": "MemoryMax=20G", "note": "smash +917 absorptions → SIGTERM (rc=137) observed 2026-04-25"}
+      },
+      "workload_distribution": {
+        "heavy_compute (drill/smash/free/absolute/meta-closure/hyperarithmetic)": "hetzner forced",
+        "small/medium": "preferred (ubu1 default) → ubu1 → ubu2 → htz",
+        "concurrency_per_host": "HEXA_REMOTE_CONCURRENCY_{HETZNER,UBU1,UBU2} (lines 266-281)"
+      }
+    },
+    "historical_psi_events": {
+      "search_paths": ["/Users/ghost/core/anima/state/", "/tmp/hexa_remote*"],
+      "matches": [
+        {"file": "state/omega_hexa_5_blacklist_ttl.json", "evidence": "selected hetzner with psi=89.62 (very high, near saturation) — basis for R5.4 threshold=80"},
+        {"file": "state/omega_hexa_patches_applied.json", "evidence": "R5.4_hexa_remote_psi_reject patch record"},
+        {"file": "/tmp/hexa_remote.psi_queue.htz.tsv", "evidence": "exists but empty (zero-byte)"}
+      ],
+      "verdict": "Single threshold 80 calibrated from ONE saturated event (hetzner@89.62). No accepted/rejected distribution data per-host yet — calibration must precede per-host tuning."
+    }
+  },
+  "options_considered": {
+    "A_instrument_first": "Pure observability TSV log; data-driven calibration deferred to ω-network-3.",
+    "B_per_host_env_overrides": "HEXA_REMOTE_PSI_THRESHOLD_<HOST> env vars; manual operator-set asymmetry. NO data yet to justify split values — premature.",
+    "C_adaptive_p95": "Rolling-window per-host p95 + safety margin. Self-calibrating but high complexity; needs distribution log first."
+  },
+  "option_chosen": "A — instrument first (mirrors ω-network-1 reconnect log pattern at line 1227-1244)",
+  "rationale": "Single 89.62 datapoint cannot justify per-host tuning. Need accept/reject distribution per host before splitting threshold. Option B left as comment for ω-network-3 once log accumulates.",
+  "changes_applied": {
+    "file": "/Users/ghost/core/nexus/scripts/bin/hexa_remote",
+    "block": "PSI hard-reject (post-edit lines ~121-152, was 121-130)",
+    "additions": [
+      "HEXA_REMOTE_PSI_THRESHOLD env var (default 80) — exposes magic number for future override",
+      "HEXA_REMOTE_PSI_LOG env var (default /tmp/hexa_remote_psi.log) — TSV log path",
+      "HEXA_REMOTE_PSI_LOG_OFF=1 — disable kill-switch",
+      "_psi_emit() inner function — TSV emission (silent failure)",
+      "Emit on BOTH branches: reject (psi > threshold) AND accept (psi <= threshold)"
+    ],
+    "tsv_format": "ISO_ts \\t host \\t psi_avg10 \\t threshold \\t outcome \\t reason",
+    "outcome_values": ["reject", "accept"],
+    "behavior_change": "NONE — pure observability. Threshold value still 80, env-disable still HEXA_REMOTE_NO_PSI_REJECT=1."
+  },
+  "validation": {
+    "bash_n": "PASS (bash -n /Users/ghost/core/nexus/scripts/bin/hexa_remote)",
+    "unit_trace": {
+      "test_method": "isolated bash script (/tmp/psi_unit_test.sh) replicating threshold-check block",
+      "case_1": {"psi": "89.62", "host": "hetzner", "expected": "reject", "actual": "reject — log line emitted"},
+      "case_2": {"psi": "42.00", "host": "ubu1", "expected": "accept", "actual": "accept — log line emitted"},
+      "log_sample": [
+        "2026-04-26T06:38:22Z\thetzner\t89.62\t80\treject\tPSI avg10=89.62 > 80 (R5.4)",
+        "2026-04-26T06:38:22Z\tubu1\t42.00\t80\taccept\tPSI avg10=42.00 <= 80"
+      ]
+    },
+    "real_ssh_probe": "NOT executed (per session constraint: no live ssh hammering)"
+  },
+  "next_step_recommendation_for_network_3": {
+    "trigger": "After /tmp/hexa_remote_psi.log accumulates >= 100 entries OR 7 days elapsed",
+    "analysis": "Per host, compute p50 / p90 / p95 / p99 of PSI from accept rows; reject_count / total per host.",
+    "candidate_thresholds": {
+      "hetzner": "p95 + 5 (likely 70-85; large RAM tolerates higher but 89.62 was real saturation)",
+      "ubu1": "p95 + 5 (likely 60-75; smaller RAM, less stall budget)",
+      "ubu2": "p95 + 5 (likely 60-75; same class as ubu1, OOM-prone under smash)",
+      "htz": "alias to hetzner — same threshold"
+    },
+    "implementation_path": "Add HEXA_REMOTE_PSI_THRESHOLD_<HOST_UPPER> env override; resolve in _probe_host via case lookup before falling back to HEXA_REMOTE_PSI_THRESHOLD default 80.",
+    "alternative_C": "If accept distributions show high variance per-host AND operators don't want to manually tune, consider Option C (rolling window p95) — but only if asymmetry data is overwhelming."
+  },
+  "rollback": {
+    "method": "git diff /Users/ghost/core/nexus/scripts/bin/hexa_remote then git checkout -- scripts/bin/hexa_remote",
+    "alternative_runtime_disable": "export HEXA_REMOTE_PSI_LOG_OFF=1 (suppresses TSV emit; threshold check still active)",
+    "blast_radius": "ZERO — emission is in non-error path with || true; failure to write log does not break dispatch.",
+    "safety": "All env vars have safe defaults; no behavior change vs pre-edit."
+  }
+}
