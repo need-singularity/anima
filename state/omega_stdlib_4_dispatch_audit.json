@@ -1,0 +1,104 @@
+{
+  "cycle": "omega-stdlib-4",
+  "axis": "interp dispatch arm sweep — audit ALL I/O arms for the read_file+strlen / unsafe-shellout antipattern fixed by ω-stdlib-3",
+  "timestamp": "2026-04-26T07:39:47Z",
+  "trigger": "ω-stdlib-3 (commit 205fa545) fixed file_size dispatch arm; this cycle audits siblings (file_*, dir_*, path_*, read_*, write_*) for the same class of bug.",
+  "scope": {
+    "file": "/Users/ghost/core/hexa-lang/self/hexa_full.hexa",
+    "lines_searched": "9936-15000 (interp builtin dispatch chain — 474 `if name ==` arms total)",
+    "io_arms_in_scope": 21
+  },
+  "arms_audited": [
+    { "fn": "file_size",         "line": 10597, "verdict": "BROKEN_FIXED", "issue": "dir paths returned BSD `stat -f %z` data-block size (e.g. 10624) instead of 0; mismatched rt_file_size S_ISREG semantics", "fix": "added `test -f` S_ISREG gate before stat shellout" },
+    { "fn": "sha256_file",       "line": 10379, "verdict": "CLEAN",        "note": "delegates to hx_sha256_file C builtin" },
+    { "fn": "exec",              "line": 10188, "verdict": "CLEAN",        "note": "host call; not file I/O size-sensitive" },
+    { "fn": "exec_capture",      "line": 10210, "verdict": "CLEAN",        "note": "host call" },
+    { "fn": "exec_with_status",  "line": 10290, "verdict": "CLEAN",        "note": "host call" },
+    { "fn": "read_file_bytes",   "line": 12814, "verdict": "CLEAN",        "note": "delegates to host rt_read_file_bytes (binary-safe, NUL-preserving)" },
+    { "fn": "write_file_bytes",  "line": 12821, "verdict": "CLEAN",        "note": "delegates to write_bytes_v (Val-aware, NUL-preserving)" },
+    { "fn": "read_bytes_at",     "line": 12836, "verdict": "CLEAN",        "note": "delegates to host pread-style builtin" },
+    { "fn": "write_bytes_append","line": 12847, "verdict": "CLEAN",        "note": "delegates to write_bytes_append_v" },
+    { "fn": "read_file (arm A)", "line": 13270, "verdict": "CLEAN",        "note": "delegates to host rt_read_file with error-tag handling" },
+    { "fn": "write_file (arm A)","line": 13283, "verdict": "CLEAN",        "note": "delegates to host rt_write_file" },
+    { "fn": "append_file (A)",   "line": 13292, "verdict": "CLEAN",        "note": "delegates to host" },
+    { "fn": "read_lines (arm A)","line": 13301, "verdict": "CLEAN",        "note": "delegates to host rt_read_lines" },
+    { "fn": "file_exists (A)",   "line": 13310, "verdict": "CLEAN",        "note": "delegates to host rt_file_exists (S_ISREG-aware, ω-stdlib-2)" },
+    { "fn": "dir_exists (A)",    "line": 13314, "verdict": "BROKEN_FIXED", "issue": "exec(\"test -d '\"+path+\"'\") naively concatenates path inside single quotes — paths with apostrophes break the shell parse", "fix": "single-quote-escape the path (mirrors file_size pattern)" },
+    { "fn": "mkdir (A)",         "line": 13322, "verdict": "BROKEN_FIXED", "issue": "same naive single-quote concat as dir_exists", "fix": "single-quote-escape" },
+    { "fn": "list_dir (A)",      "line": 13329, "verdict": "BROKEN_FIXED", "issue": "same naive concat; also no stderr swallow", "fix": "single-quote-escape + 2>/dev/null. Newline-in-filename limitation noted, out of scope" },
+    { "fn": "delete_file (A)",   "line": 13340, "verdict": "CLEAN",        "note": "delegates to host" },
+    { "fn": "read_file (arm B)", "line": 13810, "verdict": "CLEAN",        "note": "delegates to host" },
+    { "fn": "read_lines (arm B)","line": 13820, "verdict": "BROKEN_FIXED", "issue": "reimplemented as read_file(p).split('\\n') — same antipattern as ω-stdlib-3 file_size: whole-file RAM read, drifts from rt_read_lines contract, no try/catch, no host-error handling", "fix": "delegate to host read_lines with try/catch wrapper (mirrors arm A at 13301)" },
+    { "fn": "write_file (arm B)","line": 13830, "verdict": "CLEAN",        "note": "delegates to host" },
+    { "fn": "write_file (arm C)","line": 14615, "verdict": "CLEAN",        "note": "delegates to host" },
+    { "fn": "append_file (C)",   "line": 14625, "verdict": "CLEAN",        "note": "delegates to host" },
+    { "fn": "file_exists (C)",   "line": 14635, "verdict": "CLEAN",        "note": "delegates to host" },
+    { "fn": "dir_exists (C)",    "line": 14641, "verdict": "BROKEN_FIXED", "issue": "second copy of arm-A bug (apostrophe quoting)", "fix": "single-quote-escape" },
+    { "fn": "mkdir (C)",         "line": 14651, "verdict": "BROKEN_FIXED", "issue": "second copy of arm-A bug", "fix": "single-quote-escape" },
+    { "fn": "list_dir (C)",      "line": 14660, "verdict": "BROKEN_FIXED", "issue": "second copy of arm-A bug", "fix": "single-quote-escape + 2>/dev/null" },
+    { "fn": "delete_file (C)",   "line": 14673, "verdict": "CLEAN",        "note": "delegates to host" }
+  ],
+  "summary": {
+    "total_io_arms_audited": 28,
+    "clean": 20,
+    "broken_fixed": 8,
+    "broken_deferred": 0
+  },
+  "fixes_applied": [
+    {
+      "arm": "file_size",
+      "line_range_post_fix": "10597-10625",
+      "before": "stat -f %z (BSD) → stat -c %s (GNU) — no S_ISREG gate; directories returned BSD inode-block size (e.g. 10624)",
+      "after": "added `test -f` gate before stat — S_ISREG-equivalent; directories now return 0 (matches rt_file_size at runtime.c:3909)",
+      "rationale": "ω-stdlib-2 selftest expected dir→0 but stdlib-3 dispatch arm still returned macOS dir-block size. This cycle closes the parity gap."
+    },
+    {
+      "arm": "read_lines (arm B at line 13820)",
+      "line_range_post_fix": "13824-13839",
+      "before": "let content = read_file(p); let lines = content.split(\"\\n\")",
+      "after": "let lines = read_lines(p) (host call, with try/catch wrapper, mirrors arm A at 13301)",
+      "rationale": "Same antipattern as ω-stdlib-3 file_size: re-implements via read_file→whole-file-RAM, drifts from rt_read_lines C-side contract, no error tag handling. Now delegates to host."
+    },
+    {
+      "arm": "dir_exists / mkdir / list_dir (both copies — arms A at 13314/13322/13329 and arms C at 14641/14651/14660)",
+      "before": "exec(\"test -d '\" + path + \"'\") and exec(\"mkdir -p '\" + path + \"'\") and exec(\"ls -1 '\" + path + \"'\") — single-quote concatenation breaks on paths containing an apostrophe",
+      "after": "let escaped = \"'\" + path.replace(\"'\", \"'\\\\''\") + \"'\" before exec; mirrors the escape pattern already used by file_size at 10606. list_dir gained `2>/dev/null` to swallow noise.",
+      "rationale": "Matches ω-stdlib-3 audit criterion 'arms that re-implement what a C builtin already does correctly' — these have no C builtin so the shellout stays, but quoting safety must match. Newline-in-filename is a separate limitation tracked but out of scope (would require a real readdir(3) builtin)."
+    }
+  ],
+  "selftest": {
+    "new": {
+      "path": "/tmp/_omega_stdlib_4_selftest.hexa",
+      "command": "build/hexa_interp /tmp/_omega_stdlib_4_selftest.hexa",
+      "result": "PASS",
+      "covers": [
+        "read_lines parity on small text file (3 lines)",
+        "dir_exists/mkdir/list_dir on a path with embedded apostrophe (\"/tmp/_omega_stdlib_4_d'ir\") — survives the quote-escape",
+        "dir_exists missing → 0",
+        "file_size known small file (17 bytes) → 17",
+        "file_exists missing → false (regression sanity)"
+      ]
+    },
+    "regression": {
+      "path": "/Users/ghost/core/anima/tool/_omega_stdlib_2_selftest.hexa",
+      "command": "build/hexa_interp /Users/ghost/core/anima/tool/_omega_stdlib_2_selftest.hexa",
+      "result_pre_stdlib4": "FAIL (notes=dir_builtin_size_nonzero(10624))",
+      "result_post_stdlib4": "PASS",
+      "improvement": "directory file_size now returns 0 (was 10624 on macOS via BSD stat -f %z)"
+    }
+  },
+  "host_rebuild": {
+    "command": "./hexa tool/build_interp.hexa",
+    "result": "BUILD OK (build/hexa_interp.real, 2797296 bytes)",
+    "smoke": "[build_interp] smoke OK",
+    "shim_intact": true
+  },
+  "scope_constraints_honored": [
+    "edited /Users/ghost/core/hexa-lang/self/hexa_full.hexa ONLY",
+    "no anima edits (selftest in /tmp not anima/tool)",
+    "no docker/Linux ELF rebuild — Darwin host interp only",
+    "no git commit"
+  ],
+  "rollback": "git checkout -- /Users/ghost/core/hexa-lang/self/hexa_full.hexa && ./hexa tool/build_interp.hexa  # reverts: file_size S_ISREG gate, read_lines arm B host-delegation, dir_exists/mkdir/list_dir quote escape (both copies)",
+  "closure_status": "COMPLETE — 28 I/O arms audited, 8 fixed (1 file_size S_ISREG, 1 read_lines re-impl, 6 quote-escapes across 3 fns × 2 dispatch copies), 0 deferred. Selftests PASS.  Bonus: stdlib-2 directory selftest regression also resolved by file_size S_ISREG gate."
+}

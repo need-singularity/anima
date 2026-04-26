@@ -438,12 +438,53 @@ fn vocal_hexa(freq_hz: float, gain: float, ms: int) -> string {
     if g > 1.0 { g = 1.0 }
     let mut n = (SR * ms) / 1000
     if n < 1 { n = 1 }
-    // Build WAV header.
-    // ω-audio-6 NULL-RESULT (2026-04-26): alloc + indexed-write migration
-    // measured 401ms vs 155ms baseline (2.6× SLOWER). array_alloc-backed
-    // indexed assigns are slower than [].push() in this interp. Reverting.
-    // See state/omega_audio_6_alloc_indexed.json. push-based path is FAST path.
-    let mut bytes = _wav_header(SR, n)
+    // ω-audio-6 redo (2026-04-26): array_alloc(44 + 2*n) + indexed-write.
+    // Previous attempt (anima ω-audio-6) was 2.6× SLOWER due to interp's
+    // IndexAssign hot path going through Arena. ω-interp-4 (hexa-lang
+    // 47682761) added @no_arena array_set_inplace_idx; microbench shows
+    // 3.18× faster, vocal_hexa A/B 1.20× faster. Re-attempting now.
+    // WAV header inline at buf[0..44); per-sample int16 LE at buf[44+2*i..].
+    let data_bytes = n * 2
+    let chunk_size = 36 + data_bytes
+    let total = 44 + data_bytes
+    let mut bytes = array_alloc(total)
+    // "RIFF"
+    bytes[0] = 0x52; bytes[1] = 0x49; bytes[2] = 0x46; bytes[3] = 0x46
+    bytes[4] = chunk_size & 0xFF
+    bytes[5] = (chunk_size >> 8) & 0xFF
+    bytes[6] = (chunk_size >> 16) & 0xFF
+    bytes[7] = (chunk_size >> 24) & 0xFF
+    // "WAVE"
+    bytes[8] = 0x57; bytes[9] = 0x41; bytes[10] = 0x56; bytes[11] = 0x45
+    // "fmt "
+    bytes[12] = 0x66; bytes[13] = 0x6D; bytes[14] = 0x74; bytes[15] = 0x20
+    // Subchunk1Size = 16
+    bytes[16] = 16; bytes[17] = 0; bytes[18] = 0; bytes[19] = 0
+    // AudioFormat = 1 (PCM)
+    bytes[20] = 1; bytes[21] = 0
+    // NumChannels = 1
+    bytes[22] = 1; bytes[23] = 0
+    // SampleRate
+    bytes[24] = SR & 0xFF
+    bytes[25] = (SR >> 8) & 0xFF
+    bytes[26] = (SR >> 16) & 0xFF
+    bytes[27] = (SR >> 24) & 0xFF
+    // ByteRate = SR * 2
+    let br = SR * 2
+    bytes[28] = br & 0xFF
+    bytes[29] = (br >> 8) & 0xFF
+    bytes[30] = (br >> 16) & 0xFF
+    bytes[31] = (br >> 24) & 0xFF
+    // BlockAlign = 2
+    bytes[32] = 2; bytes[33] = 0
+    // BitsPerSample = 16
+    bytes[34] = 16; bytes[35] = 0
+    // "data"
+    bytes[36] = 0x64; bytes[37] = 0x61; bytes[38] = 0x74; bytes[39] = 0x61
+    bytes[40] = data_bytes & 0xFF
+    bytes[41] = (data_bytes >> 8) & 0xFF
+    bytes[42] = (data_bytes >> 16) & 0xFF
+    bytes[43] = (data_bytes >> 24) & 0xFF
     // ── ω-audio-5 sin/cos table optimization ──
     // Original: y[i] = g * sin(2π * hz * i / SR) — N sin() calls in hot loop.
     // Optimized (period-table, option B):
@@ -482,6 +523,7 @@ fn vocal_hexa(freq_hz: float, gain: float, ms: int) -> string {
     }
     let mut i = 0
     let mut p = 0       // phase index, kept in [0, period_n)
+    let mut off = 44
     while i < n {
         let mut y = g * sin_tbl[p]
         p = p + 1
@@ -504,11 +546,12 @@ fn vocal_hexa(freq_hz: float, gain: float, ms: int) -> string {
         let mut s = floor(y * 32767.0 + 0.5)
         if s > 32767 { s = 32767 }
         if s < 0 - 32768 { s = 0 - 32768 }
-        // little-endian 2-byte signed → unsigned bytes
+        // little-endian 2-byte signed → unsigned bytes — indexed-write.
         let mut u = s
         if u < 0 { u = u + 65536 }
-        bytes.push(u & 0xFF)
-        bytes.push((u >> 8) & 0xFF)
+        bytes[off] = u & 0xFF
+        bytes[off + 1] = (u >> 8) & 0xFF
+        off = off + 2
         i = i + 1
     }
     // Suppress unused-warning for raw freq when period quantizes.
@@ -639,10 +682,40 @@ fn breath_hexa(band_lo: float, band_hi: float, gain: float, ms: int) -> string {
     let mut k = SR / 125
     if k > n / 2 { k = n / 2 }
 
-    // Build WAV header + int16 LE data.
-    let mut bytes = _wav_header(SR, n)
+    // ω-audio-6 redo: array_alloc(44+2n) + indexed-write (interp-4 backed).
+    let data_bytes = n * 2
+    let chunk_size = 36 + data_bytes
+    let total = 44 + data_bytes
+    let mut bytes = array_alloc(total)
+    bytes[0] = 0x52; bytes[1] = 0x49; bytes[2] = 0x46; bytes[3] = 0x46
+    bytes[4] = chunk_size & 0xFF
+    bytes[5] = (chunk_size >> 8) & 0xFF
+    bytes[6] = (chunk_size >> 16) & 0xFF
+    bytes[7] = (chunk_size >> 24) & 0xFF
+    bytes[8] = 0x57; bytes[9] = 0x41; bytes[10] = 0x56; bytes[11] = 0x45
+    bytes[12] = 0x66; bytes[13] = 0x6D; bytes[14] = 0x74; bytes[15] = 0x20
+    bytes[16] = 16; bytes[17] = 0; bytes[18] = 0; bytes[19] = 0
+    bytes[20] = 1; bytes[21] = 0
+    bytes[22] = 1; bytes[23] = 0
+    bytes[24] = SR & 0xFF
+    bytes[25] = (SR >> 8) & 0xFF
+    bytes[26] = (SR >> 16) & 0xFF
+    bytes[27] = (SR >> 24) & 0xFF
+    let br_b = SR * 2
+    bytes[28] = br_b & 0xFF
+    bytes[29] = (br_b >> 8) & 0xFF
+    bytes[30] = (br_b >> 16) & 0xFF
+    bytes[31] = (br_b >> 24) & 0xFF
+    bytes[32] = 2; bytes[33] = 0
+    bytes[34] = 16; bytes[35] = 0
+    bytes[36] = 0x64; bytes[37] = 0x61; bytes[38] = 0x74; bytes[39] = 0x61
+    bytes[40] = data_bytes & 0xFF
+    bytes[41] = (data_bytes >> 8) & 0xFF
+    bytes[42] = (data_bytes >> 16) & 0xFF
+    bytes[43] = (data_bytes >> 24) & 0xFF
     let scale = g / peak
     let mut j = 0
+    let mut off = 44
     while j < n {
         let mut y = samples[j] * scale
         if k > 0 {
@@ -661,7 +734,11 @@ fn breath_hexa(band_lo: float, band_hi: float, gain: float, ms: int) -> string {
         let mut s = floor(y * 32767.0 + 0.5)
         if s > 32767 { s = 32767 }
         if s < 0 - 32768 { s = 0 - 32768 }
-        _push_int16_le(bytes, s)
+        let mut u = s
+        if u < 0 { u = u + 65536 }
+        bytes[off] = u & 0xFF
+        bytes[off + 1] = (u >> 8) & 0xFF
+        off = off + 2
         j = j + 1
     }
     write_bytes(path, bytes)
@@ -745,9 +822,40 @@ fn pipe_hexa(in_path: string, f1: float, f2: float, q: float) -> string {
         i = i + 1
     }
 
-    let mut bytes = _wav_header(sr2, n)
+    // ω-audio-6 redo: array_alloc(44+2n) + indexed-write (interp-4 backed).
+    let data_bytes = n * 2
+    let chunk_size = 36 + data_bytes
+    let total = 44 + data_bytes
+    let mut bytes = array_alloc(total)
+    bytes[0] = 0x52; bytes[1] = 0x49; bytes[2] = 0x46; bytes[3] = 0x46
+    bytes[4] = chunk_size & 0xFF
+    bytes[5] = (chunk_size >> 8) & 0xFF
+    bytes[6] = (chunk_size >> 16) & 0xFF
+    bytes[7] = (chunk_size >> 24) & 0xFF
+    bytes[8] = 0x57; bytes[9] = 0x41; bytes[10] = 0x56; bytes[11] = 0x45
+    bytes[12] = 0x66; bytes[13] = 0x6D; bytes[14] = 0x74; bytes[15] = 0x20
+    bytes[16] = 16; bytes[17] = 0; bytes[18] = 0; bytes[19] = 0
+    bytes[20] = 1; bytes[21] = 0
+    bytes[22] = 1; bytes[23] = 0
+    bytes[24] = sr2 & 0xFF
+    bytes[25] = (sr2 >> 8) & 0xFF
+    bytes[26] = (sr2 >> 16) & 0xFF
+    bytes[27] = (sr2 >> 24) & 0xFF
+    let br_b = sr2 * 2
+    bytes[28] = br_b & 0xFF
+    bytes[29] = (br_b >> 8) & 0xFF
+    bytes[30] = (br_b >> 16) & 0xFF
+    bytes[31] = (br_b >> 24) & 0xFF
+    bytes[32] = 2; bytes[33] = 0
+    bytes[34] = 16; bytes[35] = 0
+    bytes[36] = 0x64; bytes[37] = 0x61; bytes[38] = 0x74; bytes[39] = 0x61
+    bytes[40] = data_bytes & 0xFF
+    bytes[41] = (data_bytes >> 8) & 0xFF
+    bytes[42] = (data_bytes >> 16) & 0xFF
+    bytes[43] = (data_bytes >> 24) & 0xFF
     let scale = 0.9 / peak
     let mut j = 0
+    let mut off = 44
     while j < n {
         let mut y = buf[j] * scale
         if y > 1.0 { y = 1.0 }
@@ -755,7 +863,11 @@ fn pipe_hexa(in_path: string, f1: float, f2: float, q: float) -> string {
         let mut s = floor(y * 32767.0 + 0.5)
         if s > 32767 { s = 32767 }
         if s < 0 - 32768 { s = 0 - 32768 }
-        _push_int16_le(bytes, s)
+        let mut u = s
+        if u < 0 { u = u + 65536 }
+        bytes[off] = u & 0xFF
+        bytes[off + 1] = (u >> 8) & 0xFF
+        off = off + 2
         j = j + 1
     }
     write_bytes(out, bytes)
@@ -845,10 +957,41 @@ fn vocal_lf_hexa(freq_hz: float, gain: float, ms: int) -> string {
         }
     }
 
-    let mut bytes = _wav_header(SR, n)
+    // ω-audio-6 redo: array_alloc(44+2n) + indexed-write (interp-4 backed).
+    let data_bytes = n * 2
+    let chunk_size = 36 + data_bytes
+    let total = 44 + data_bytes
+    let mut bytes = array_alloc(total)
+    bytes[0] = 0x52; bytes[1] = 0x49; bytes[2] = 0x46; bytes[3] = 0x46
+    bytes[4] = chunk_size & 0xFF
+    bytes[5] = (chunk_size >> 8) & 0xFF
+    bytes[6] = (chunk_size >> 16) & 0xFF
+    bytes[7] = (chunk_size >> 24) & 0xFF
+    bytes[8] = 0x57; bytes[9] = 0x41; bytes[10] = 0x56; bytes[11] = 0x45
+    bytes[12] = 0x66; bytes[13] = 0x6D; bytes[14] = 0x74; bytes[15] = 0x20
+    bytes[16] = 16; bytes[17] = 0; bytes[18] = 0; bytes[19] = 0
+    bytes[20] = 1; bytes[21] = 0
+    bytes[22] = 1; bytes[23] = 0
+    bytes[24] = SR & 0xFF
+    bytes[25] = (SR >> 8) & 0xFF
+    bytes[26] = (SR >> 16) & 0xFF
+    bytes[27] = (SR >> 24) & 0xFF
+    let br_b = SR * 2
+    bytes[28] = br_b & 0xFF
+    bytes[29] = (br_b >> 8) & 0xFF
+    bytes[30] = (br_b >> 16) & 0xFF
+    bytes[31] = (br_b >> 24) & 0xFF
+    bytes[32] = 2; bytes[33] = 0
+    bytes[34] = 16; bytes[35] = 0
+    bytes[36] = 0x64; bytes[37] = 0x61; bytes[38] = 0x74; bytes[39] = 0x61
+    bytes[40] = data_bytes & 0xFF
+    bytes[41] = (data_bytes >> 8) & 0xFF
+    bytes[42] = (data_bytes >> 16) & 0xFF
+    bytes[43] = (data_bytes >> 24) & 0xFF
     let scale = g / peak
     let mut j = 0
     let mut p = 0   // index into period_buf, in [0, period_n)
+    let mut off = 44
     while j < n {
         let mut y = period_buf[p] * scale
         p = p + 1
@@ -867,7 +1010,11 @@ fn vocal_lf_hexa(freq_hz: float, gain: float, ms: int) -> string {
         let mut s = floor(y * 32767.0 + 0.5)
         if s > 32767 { s = 32767 }
         if s < 0 - 32768 { s = 0 - 32768 }
-        _push_int16_le(bytes, s)
+        let mut u = s
+        if u < 0 { u = u + 65536 }
+        bytes[off] = u & 0xFF
+        bytes[off + 1] = (u >> 8) & 0xFF
+        off = off + 2
         j = j + 1
     }
     let _ = T0
