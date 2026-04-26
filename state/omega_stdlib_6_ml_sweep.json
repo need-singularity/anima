@@ -1,0 +1,132 @@
+{
+  "cycle": "omega-stdlib-6",
+  "axis": "ml_tensor_dispatch_audit",
+  "timestamp": "2026-04-26T00:00:00Z",
+  "scope": {
+    "file": "/Users/ghost/core/hexa-lang/self/hexa_full.hexa",
+    "block_line_range": "10628-13180",
+    "ml_arms_total_estimated": 150,
+    "session_constraint": "hexa-only; edits limited to self/hexa_full.hexa"
+  },
+  "arms_sampled": {
+    "count": 56,
+    "categories": {
+      "tensor_ops": ["argmax", "flatten", "transpose", "matmul", "matvec", "hadamard", "one_hot", "topk", "shuffle", "zeros", "ones", "mat_scale", "mat_add_inplace", "memcpy_host", "embedding"],
+      "activations": ["softmax", "gelu", "swish/silu", "rms_norm", "layer_norm", "batch_norm", "group_norm", "dropout", "normalize"],
+      "loss":        ["cross_entropy", "mse", "mae", "smooth_l1_loss", "focal_loss", "contrastive_loss", "kl_divergence", "js_divergence", "mse_loss"],
+      "optimizer":   ["adam_step", "adamw_step", "sgd_step", "weight_decay", "warmup_lr", "cosine_lr", "phase_lr", "grad_clip_norm", "grad_accumulate", "xavier_init", "kaiming_init"],
+      "attention":   ["attention", "multi_head_attention", "sliding_window_attention", "linear_attention", "kv_cache_init", "kv_cache_reset", "kv_cache_append", "kv_cache_decode", "rope", "attention_fused_into"],
+      "moe_lora":    ["moe_gate", "moe_combine", "lora_init", "lora_forward"],
+      "misc":        ["entropy", "cosine_sim", "cosine_sim_matrix", "ema", "clip", "sample_token", "beam_search_step", "sinusoidal_pe", "label_smoothing", "ffn_fused_into", "param_count", "quantize_int8", "dequantize_int8"]
+    }
+  },
+  "broken_fixed": [
+    {
+      "arm": "gelu",
+      "line_range_before": "11159-11172",
+      "line_range_after":  "11159-11178",
+      "category": "activations",
+      "antipattern": "silent_failure / contract_mismatch (matches stdlib-3/4/5 family)",
+      "before_summary": "TAG_TENSOR branch returned val_tensor(tensor_shape(args[0]), [].push(0)) — a dummy 1-element tensor — silently discarding the computed `result`. Tensor callers received garbage shape/data; array callers worked fine, so the bug only triggers on the tensor path.",
+      "after_summary": "Threads `result` Val-array → raw float vector → val_tensor(shape, raw_out). Pattern now mirrors the working softmax arm (lines 10908-10911) used as reference.",
+      "severity": "high"
+    },
+    {
+      "arm": "normalize",
+      "line_range_before": "11477-11493",
+      "line_range_after":  "11477-11499",
+      "category": "tensor_ops",
+      "antipattern": "silent_failure / contract_mismatch (duplicate of gelu bug — copy-paste replication)",
+      "before_summary": "Same identical antipattern as gelu: TAG_TENSOR path returned val_tensor(shape, [].push(0)) instead of normalized result. Confirms duplicated dispatch antipattern: two arms hit by the same bug, suggesting the original was templated/copied.",
+      "after_summary": "Threads `result` through raw_out same as gelu fix. Both arms now share the canonical softmax-style return pattern.",
+      "severity": "high"
+    },
+    {
+      "arm": "kv_cache_decode",
+      "line_range_before": "12005-12058",
+      "line_range_after":  "12005-12061",
+      "category": "attention",
+      "antipattern": "missing_guard (negative index → empty array → out-of-bounds)",
+      "before_summary": "When pos < 0 the `while i <= pos` loop never executes, leaving `scores` empty; the next `let mut max_s = scores[0]` indexes into an empty array (crash or undefined).",
+      "after_summary": "Added `if pos < 0 { return val_array([]) }` early-return. NULL-RESULT contract: caller learns no decode happened.",
+      "severity": "medium"
+    },
+    {
+      "arm": "moe_combine",
+      "line_range_before": "12346-12370",
+      "line_range_after":  "12346-12373",
+      "category": "moe_lora",
+      "antipattern": "missing_guard (heterogeneous len: ws shorter than outs → ws[e] OOB)",
+      "before_summary": "Iterated `e` from 0 to `len(outs)` and accessed `ws[e]` without checking `len(ws)`; if router emits fewer weights than experts, undefined indexing.",
+      "after_summary": "Caps inner loop to `min(len(outs), len(ws))` — missing weights are zero-weight (NULL-RESULT for that expert).",
+      "severity": "medium"
+    }
+  ],
+  "clean_confirmed": {
+    "count": 52,
+    "notes": [
+      "softmax (10887): correct dual-path return (used as reference for gelu/normalize fix).",
+      "cross_entropy: stable max-subtract softmax, target bounds-checked, returns 0.0 on OOB target (clean NULL-RESULT).",
+      "adam_step / adamw_step: bias-correction and eps-stabilized denom; type-safe per-element float coercion.",
+      "matmul / matvec / hadamard: explicit dim args, type-coerce both operands, no silent overflow (float accumulators throughout — passes stdlib-5 int-vs-float check).",
+      "attention / multi_head_attention / sliding_window_attention: stable softmax (max-subtract), causal mask uses -1e9 sentinel, scale via 1/sqrt(dim).",
+      "kv_cache_append: bounds-guarded (`d < row_size && d < len(k_in)`).",
+      "embedding: 3-arg path bounds-checks `base + dim > len(table)`, returns empty NULL-RESULT.",
+      "topk: O(n*k) selection, picks valid sentinel -1 to avoid double-pick.",
+      "quantize_int8: zero-range path returns explicit zero array + scale=1.0 (no div-by-zero).",
+      "running_stats: Welford-style update; prev_n==0 special-cased to avoid div-by-zero.",
+      "log: 1-arg defaults to ln (no silent NaN); 2-arg computes ln(x)/ln(base).",
+      "trend_slope / autocorrelation: denom==0 guarded with NULL-RESULT 0.0.",
+      "lora_forward: explicit ind/outd/rank, base+=alpha*delta accumulator pattern correct.",
+      "rope: handles odd dim with remainder copy.",
+      "No exec()/shell-injection arms found in ML range — exec/system calls live elsewhere; ML block is pure compute."
+    ]
+  },
+  "audit_completeness": {
+    "sampled": 56,
+    "total_estimated": 150,
+    "fraction": "37%",
+    "remainder_tail_arms_unaudited": "~94 arms in tail blocks (consciousness/anima placeholders 12626-12686, Phase-16 FFI memory/JSON 12372-12557, channel/IO/HTTP stubs 13186-end). Most are stub returns (val_void/val_int(0)/val_array([])) — low risk.",
+    "rationale_for_stop": "Hit two duplicates of stdlib-3/4/5 antipattern in the actively-used compute arms (gelu, normalize) plus two missing-guard issues (kv_cache_decode, moe_combine). Active-compute coverage of softmax/attention/loss/optimizer/normalization was ~100%; remaining unsampled arms are predominantly stub placeholders that already match NULL-RESULT contract."
+  },
+  "antipattern_lineage": {
+    "stdlib-3-4-5_family": "silent failure where dispatch arm returns wrong-shape sentinel rather than computed result OR error",
+    "instances_in_stdlib-6": [
+      {"arm": "gelu",      "form": "val_tensor(shape, [].push(0)) — empty placeholder for tensor-tagged input"},
+      {"arm": "normalize", "form": "identical copy-paste of gelu's broken tensor return"}
+    ],
+    "evidence_of_copy_paste": "Two arms hit by character-for-character identical buggy expression `val_tensor(tensor_shape(args[0]), [].push(0))` with grep returning exactly 2 matches before the fix and 0 after. Strongly suggests templated dispatch generation that replicated a buggy template."
+  },
+  "validation": {
+    "method": "syntactic-only (grep verification + pattern-equivalence with reference softmax arm)",
+    "rebuild_attempted": false,
+    "rebuild_skipped_reason": "Per session constraint (hexa-only / no shell-orchestrated host build invocation in this cycle); stdlib-5 closure deferred ML block specifically because validation requires E2E selftest — recommend stdlib-7 to E2E-validate.",
+    "pattern_equivalence_check": {
+      "reference_arm": "softmax (lines 10908-10911)",
+      "fixed_arm_gelu": "lines 11170-11177 — uses identical `for w in result { raw_out.push(w.float_val) } ; return val_tensor(tensor_shape(args[0]), raw_out)` body",
+      "fixed_arm_normalize": "lines 11498-11505 — same structure",
+      "result": "PASS (structurally equivalent to known-good softmax path)"
+    },
+    "post_fix_grep": "grep 'tensor_shape(args\\[0\\]), \\[\\].push(0)' → 0 matches (was 2 pre-fix)"
+  },
+  "next_recommendation": [
+    "ω-stdlib-7: E2E selftest of gelu(tensor) and normalize(tensor) — write small hexa probe that constructs a TAG_TENSOR via val_tensor, applies gelu/normalize, and asserts shape preserved + values numerically correct. Without rebuild this cycle could not run dynamic validation.",
+    "ω-stdlib-7: audit the remaining ~94 unsampled arms (Phase-16 FFI memory ops + tail stubs). FFI arms are likely candidates for the same family of bugs (silent address-tag mismatches).",
+    "ω-stdlib-7: investigate dispatch-template provenance — two character-identical bugs implies a template/macro that needs source-of-truth correction so future generated arms inherit the fix.",
+    "ω-stdlib-7: add lint that flags `val_tensor(_, [].push(0))` constructor as forbidden — that exact expression has no valid use case (always evaluates to a 1-element [0]-tagged tensor)."
+  ],
+  "rollback": {
+    "method": "git diff /Users/ghost/core/hexa-lang/self/hexa_full.hexa shows exactly four hunks (gelu / normalize / kv_cache_decode / moe_combine). Revert with `git checkout -- self/hexa_full.hexa` if regression observed.",
+    "blast_radius": "self/hexa_full.hexa only — interpreter source. Until host interp rebuilt from this source the fixes are dormant; previous interp binary unaffected.",
+    "risk_assessment": "low — fixes only widen the contract (correct tensor return where dummy was returned; bounds-guard added; no API/type changes). Callers expecting the old buggy single-element tensor would have been broken anyway."
+  },
+  "session_invariants": {
+    "files_edited": ["/Users/ghost/core/hexa-lang/self/hexa_full.hexa"],
+    "linux_elf_modified": false,
+    "docker_modified": false,
+    "anima_code_modified": false,
+    "git_commits": 0,
+    "rebuilds": 0,
+    "json_artifact_path": "/Users/ghost/core/anima/state/omega_stdlib_6_ml_sweep.json"
+  }
+}
