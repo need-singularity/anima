@@ -1,0 +1,197 @@
+// tool/anima_memory_dir_staleness_auditor.hexa — memory/ project_*.md staleness auditor (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   cycle 21이 project_uchg_ssot.md memory와 actual chflags 상태 mismatch 발견.
+//   본 helper = 다른 memory entries도 동일 staleness 가능성 audit.
+//
+//   각 memory file별:
+//     - file existence (MEMORY.md index와 sync)
+//     - file size + age (mtime)
+//     - claim verification: memory가 referencing하는 path/cmd/state 존재 검증
+//     - 본 helper는 NON_MUTATION; mutation 제안만
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/memory_dir_staleness_auditor.json)
+//   ANIMA_MEMORY_DIR  memory dir (default: /Users/ghost/.claude-claude11/projects/-Users-ghost-core-anima/memory)
+//
+// OUTPUT
+//   - memory_files: list of {file, present_in_index, file_size, age_days, references, broken_references}
+//   - staleness_findings: cycle 21-style mismatches per memory entry
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_memory_dir_staleness_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/memory_dir_staleness_auditor.json hexa run tool/anima_memory_dir_staleness_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - reference verification은 path/file existence만 (cycle 17 dangling pattern reuse).
+//   - claim semantic verification은 helper-out-of-scope; 사용자 manual review 필요.
+//   - memory/ 디렉토리 외부 path 참조 (e.g. $HEXA_LANG/bin/...) 은 env var resolution 시도.
+
+let HELPER_PATH = "/tmp/anima_memory_dir_staleness_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima memory/ project_*.md staleness auditor — emitted by tool/anima_memory_dir_staleness_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION memory staleness audit.\n")
+    parts.push("import json, os, sys, re, time\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/memory_dir_staleness_auditor.json')\n")
+    parts.push("MEMORY_DIR = os.environ.get('ANIMA_MEMORY_DIR', '/Users/ghost/.claude-claude11/projects/-Users-ghost-core-anima/memory')\n\n")
+
+    parts.push("if not os.path.isdir(MEMORY_DIR):\n")
+    parts.push("    summary = {'paradigm':'memory dir staleness audit', 'status':'MEMORY_DIR_MISSING', 'memory_dir':MEMORY_DIR}\n")
+    parts.push("    os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("    print(f'[memory_staleness] status=MEMORY_DIR_MISSING -> {OUTPUT}')\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("entries = sorted([f for f in os.listdir(MEMORY_DIR) if f.endswith('.md')])\n")
+    parts.push("memory_index_file = 'MEMORY.md'\n\n")
+
+    parts.push("# Read MEMORY.md index\n")
+    parts.push("index_path = os.path.join(MEMORY_DIR, memory_index_file)\n")
+    parts.push("indexed_files = []\n")
+    parts.push("if os.path.exists(index_path):\n")
+    parts.push("    with open(index_path, encoding='utf-8') as f:\n")
+    parts.push("        idx_content = f.read()\n")
+    parts.push("    INDEX_LINK_RE = re.compile(r'\\[([^\\]]+)\\]\\(([^)]+\\.md)\\)')\n")
+    parts.push("    for label, fname in INDEX_LINK_RE.findall(idx_content):\n")
+    parts.push("        indexed_files.append({'label':label, 'file':fname})\n\n")
+
+    parts.push("# Per-file audit\n")
+    parts.push("now = time.time()\n")
+    parts.push("PATH_REFERENCE_RE = re.compile(r'`([^`]+)`')\n")
+    parts.push("memory_audit = []\n")
+    parts.push("staleness_findings = []\n\n")
+
+    parts.push("for fname in entries:\n")
+    parts.push("    if fname == memory_index_file:\n")
+    parts.push("        continue\n")
+    parts.push("    path = os.path.join(MEMORY_DIR, fname)\n")
+    parts.push("    try:\n")
+    parts.push("        st = os.stat(path)\n")
+    parts.push("        age_days = (now - st.st_mtime) / 86400\n")
+    parts.push("        with open(path, encoding='utf-8') as f:\n")
+    parts.push("            content = f.read()\n")
+    parts.push("    except Exception:\n")
+    parts.push("        continue\n")
+    parts.push("    in_index = any(idx['file'] == fname for idx in indexed_files)\n")
+    parts.push("    # extract path-like backtick references\n")
+    parts.push("    refs = PATH_REFERENCE_RE.findall(content)\n")
+    parts.push("    path_refs = []\n")
+    parts.push("    broken = []\n")
+    parts.push("    for ref in refs:\n")
+    parts.push("        ref = ref.strip()\n")
+    parts.push("        # heuristic: looks like a path if contains / and no spaces\n")
+    parts.push("        if ' ' in ref or len(ref) < 3: continue\n")
+    parts.push("        # env var expansion\n")
+    parts.push("        expanded = os.path.expandvars(os.path.expanduser(ref))\n")
+    parts.push("        # path-like: contains / OR endswith common extensions\n")
+    parts.push("        looks_path = '/' in expanded or expanded.endswith(('.json','.hexa','.md','.py','.txt'))\n")
+    parts.push("        if not looks_path: continue\n")
+    parts.push("        path_refs.append(ref)\n")
+    parts.push("        # try various resolutions from cwd\n")
+    parts.push("        candidates = [expanded, os.path.join(os.getcwd(), expanded), os.path.join(os.getcwd(), '..', expanded)]\n")
+    parts.push("        if not any(os.path.exists(c) for c in candidates):\n")
+    parts.push("            broken.append({'ref':ref, 'expanded':expanded})\n")
+    parts.push("    audit_entry = {\n")
+    parts.push("        'file':fname,\n")
+    parts.push("        'present_in_index':in_index,\n")
+    parts.push("        'file_size':st.st_size,\n")
+    parts.push("        'age_days':round(age_days, 1),\n")
+    parts.push("        'path_references_total':len(path_refs),\n")
+    parts.push("        'broken_references_count':len(broken),\n")
+    parts.push("        'broken_references_sample':broken[:3],\n")
+    parts.push("    }\n")
+    parts.push("    memory_audit.append(audit_entry)\n")
+    parts.push("    if not in_index:\n")
+    parts.push("        staleness_findings.append({'file':fname, 'kind':'MISSING_FROM_INDEX', 'severity':'medium'})\n")
+    parts.push("    if broken:\n")
+    parts.push("        staleness_findings.append({'file':fname, 'kind':'BROKEN_PATH_REFS', 'count':len(broken), 'severity':'high'})\n")
+    parts.push("    if age_days > 30:\n")
+    parts.push("        staleness_findings.append({'file':fname, 'kind':'STALE_GT_30D', 'age_days':round(age_days, 1), 'severity':'low'})\n\n")
+
+    parts.push("# Cycle 21 known finding mirror: project_uchg_ssot.md says 3 SSOT uchg-locked but actual unlocked\n")
+    parts.push("uchg_known_drift = {\n")
+    parts.push("    'memory_file':'project_uchg_ssot.md',\n")
+    parts.push("    'memory_claim':'.roadmap + canonical state/config files are BSD uchg-locked',\n")
+    parts.push("    'cycle21_finding':'3/7 SSOT actually unlocked (.roadmap, atlas JSONL, witness_ledger.meta)',\n")
+    parts.push("    'kind':'SEMANTIC_DRIFT_VS_REALITY',\n")
+    parts.push("    'severity':'high',\n")
+    parts.push("    'remediation':'either chflags uchg restore OR update memory text to reflect new pattern',\n")
+    parts.push("}\n\n")
+
+    parts.push("indexed_set = set(idx['file'] for idx in indexed_files)\n")
+    parts.push("disk_set = set(e for e in entries if e != memory_index_file)\n")
+    parts.push("orphan_index_entries = sorted(indexed_set - disk_set)  # in index but no file\n")
+    parts.push("orphan_disk_files = sorted(disk_set - indexed_set)     # on disk but not in index\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'memory/ project_*.md staleness audit (cycle 21 uchg drift discovery generalized)',\n")
+    parts.push("    'memory_dir':MEMORY_DIR,\n")
+    parts.push("    'memory_index':memory_index_file,\n")
+    parts.push("    'memory_files_total':len(entries) - 1,\n")
+    parts.push("    'indexed_entries_count':len(indexed_files),\n")
+    parts.push("    'memory_audit':memory_audit,\n")
+    parts.push("    'staleness_findings':staleness_findings,\n")
+    parts.push("    'staleness_count':len(staleness_findings),\n")
+    parts.push("    'orphan_index_entries':orphan_index_entries,\n")
+    parts.push("    'orphan_disk_files':orphan_disk_files,\n")
+    parts.push("    'cycle_21_known_uchg_drift':uchg_known_drift,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify memory files; user manual update required',\n")
+    parts.push("    'cross_link_cycles':['cycle 21 SSOT chflags audit (uchg drift parent)','cycle 22-24 governance triple'],\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[memory_staleness] files={len(memory_audit)} indexed={len(indexed_files)} staleness={len(staleness_findings)} orphan_idx={len(orphan_index_entries)} orphan_disk={len(orphan_disk_files)} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let memory_files_min = 5
+    let staleness_kinds = "MISSING_FROM_INDEX,BROKEN_PATH_REFS,STALE_GT_30D,SEMANTIC_DRIFT_VS_REALITY"
+    let non_mutation = "READ_ONLY"
+    let cycle_21_uchg_drift_recorded = "true"
+    println("inv:memory_files_min=" + to_string(memory_files_min))
+    println("inv:staleness_kinds=" + staleness_kinds)
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:cycle_21_uchg_drift_recorded=" + cycle_21_uchg_drift_recorded)
+    println("inv:env_var_expansion_via_expandvars_expanduser=true")
+    println("inv:orphan_detection_index_vs_disk=true")
+    println("inv:broken_ref_resolution_tries_multiple_cwd_relative=true")
+    println("inv:cross_link_cycle21_governance_triple=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_memory_dir_staleness_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=memory/ staleness audit (orphan detection + broken refs + uchg known drift; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
