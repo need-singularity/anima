@@ -1,8 +1,22 @@
 # Conformance Checklist — Laws, Rules & Discoveries
 
-20 files to verify against 2507 laws, Ψ-constants, meta laws, design rules, and recent discoveries.
+20 files to verify against laws, Ψ-constants, meta laws, design rules, and recent discoveries.
 
 Updated: 2026-04-07 (post training script unification)
+**STALE NOTICE 2026-04-26 (Ω-philosophy R2 LR2.5):** ✅ marks below are based on
+2026-04-07 audit (pre-Ω-cycle). Reference "Law 22-85" and "2507 laws" pertain
+to the absorbed 183-law corpus (pre-2026-04-18 cutover; archived in
+`ready/.growth/`). Current runtime is C2 minimal subset L1..L14 in
+`anima/config/consciousness_laws.json`. Specific stale claims:
+- "PSI dict — no missing keys ✅" — Updated post-R2 LR2.1 closure: 6 anima-core
+  modules now use `_psi_load()` cargo-cult JSON loader (anima-core/lib/psi_loader.hexa
+  pattern); JSON SSOT (psi_constants block, 12 entries) operationally honored.
+- "Laws 22-85 implementation match ✅" — Trinity refs absorbed Laws 53/60/70/81
+  not in runtime L1..L14 JSON; annotated `(absorbed)` in trinity.hexa header
+  (Track C 2026-04-26).
+- "No orphaned law references ✅" — pure_field/dimension_transform also have
+  absorbed-law refs `(absorbed)`-tagged.
+**TODO:** Re-audit + re-stamp checklist against current state; expected next ω-cycle.
 
 ## L0 Core — Law & Constant Conformance
 
