@@ -1,0 +1,96 @@
+{
+  "cycle": "omega-network-4",
+  "axis": "per-host PSI threshold env override",
+  "timestamp": "2026-04-26T00:00:00Z",
+  "predecessors": {
+    "omega-network-2": "introduced single global HEXA_REMOTE_PSI_THRESHOLD (default 80) + observability log",
+    "omega-network-3": "analyzer recommends per-host thresholds from log distribution",
+    "omega-network-3b": "analyzer recreated/refined; manual env override gap identified"
+  },
+  "env_pattern": {
+    "format": "HEXA_REMOTE_PSI_THRESHOLD_<HOST>",
+    "host_normalization": "uppercase + non-alnum→'_' (tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]_' '_')",
+    "examples": [
+      "HEXA_REMOTE_PSI_THRESHOLD_HETZNER=95",
+      "HEXA_REMOTE_PSI_THRESHOLD_UBU1=70",
+      "HEXA_REMOTE_PSI_THRESHOLD_UBU2=70",
+      "HEXA_REMOTE_PSI_THRESHOLD_HTZ=95"
+    ],
+    "note": "host name comes from probe candidate ($cand) which is the canonical ssh-config alias post-normalization (htz→hetzner happens later in pick_preferred_host)."
+  },
+  "fallback_chain": [
+    {"order": 1, "var": "HEXA_REMOTE_PSI_THRESHOLD_<HOST_UPPER>", "src_label": "HEXA_REMOTE_PSI_THRESHOLD_<HOST>"},
+    {"order": 2, "var": "HEXA_REMOTE_PSI_THRESHOLD",              "src_label": "HEXA_REMOTE_PSI_THRESHOLD"},
+    {"order": 3, "var": "(none — built-in default)",              "src_label": "default80", "value": 80}
+  ],
+  "file_change": {
+    "path": "/Users/ghost/core/nexus/scripts/bin/hexa_remote",
+    "header_doc_lines": "12-26 (env doc block extended +9)",
+    "lookup_lines": "~134-176 (former ~134-153, expanded +25)",
+    "loc_before": 1378,
+    "loc_after": 1412,
+    "loc_delta": 34
+  },
+  "log_format_change": {
+    "before": "ts \\t host \\t psi \\t threshold \\t outcome \\t reason  (6 cols)",
+    "after":  "ts \\t host \\t psi \\t threshold \\t outcome \\t reason \\t src  (7 cols)",
+    "src_values": ["HEXA_REMOTE_PSI_THRESHOLD_<HOST>", "HEXA_REMOTE_PSI_THRESHOLD", "default80"],
+    "rationale": "Operators reading /tmp/hexa_remote_psi.log can now distinguish rows where a per-host override was active from rows under the global/default — critical for analyzer attribution."
+  },
+  "validation": {
+    "bash_n": "PASS (bash -n /Users/ghost/core/nexus/scripts/bin/hexa_remote → exit 0)",
+    "unit_traces": [
+      {
+        "id": "TRACE 1",
+        "input": {"host": "hetzner", "psi": 89, "env": {"HEXA_REMOTE_PSI_THRESHOLD_HETZNER": 95}},
+        "expected": "ACCEPT (would have been REJECT under default 80)",
+        "actual":   "host=hetzner psi=89 threshold=95 src=HEXA_REMOTE_PSI_THRESHOLD_HETZNER outcome=ACCEPT",
+        "result": "PASS"
+      },
+      {
+        "id": "TRACE 2",
+        "input": {"host": "ubu1", "psi": 72, "env": {"HEXA_REMOTE_PSI_THRESHOLD_UBU1": 70}},
+        "expected": "REJECT (would have been ACCEPT under default 80)",
+        "actual":   "host=ubu1 psi=72 threshold=70 src=HEXA_REMOTE_PSI_THRESHOLD_UBU1 outcome=REJECT",
+        "result": "PASS"
+      },
+      {
+        "id": "TRACE 3 (backward-compat)",
+        "input": {"host": "hetzner", "psi": 89, "env": {}},
+        "expected": "REJECT under built-in default 80",
+        "actual":   "host=hetzner psi=89 threshold=80 src=default80 outcome=REJECT",
+        "result": "PASS"
+      },
+      {
+        "id": "TRACE 4 (backward-compat)",
+        "input": {"host": "ubu1", "psi": 72, "env": {}},
+        "expected": "ACCEPT under built-in default 80",
+        "actual":   "host=ubu1 psi=72 threshold=80 src=default80 outcome=ACCEPT",
+        "result": "PASS"
+      }
+    ]
+  },
+  "backward_compat": {
+    "no_env_set": "src=default80, threshold=80 — identical reject boundary to ω-network-2 baseline (8000 = 80*100).",
+    "global_only_set": "src=HEXA_REMOTE_PSI_THRESHOLD, behavior unchanged from ω-network-2.",
+    "log_consumers": "TSV column count grew 6→7. Existing parsers that index by tab position 1-6 (ts/host/psi/thr/outcome/reason) continue to work; only column 7 (src) is new and ignorable.",
+    "comparison_constant": "Removed hard-coded 8000 reject literal in favor of awk-derived _psi_threshold_int — no integer-vs-int*100 mismatch when default path is taken (80*100 = 8000)."
+  },
+  "recommendation": {
+    "initial_calibration": {
+      "HEXA_REMOTE_PSI_THRESHOLD_HETZNER": 95,
+      "HEXA_REMOTE_PSI_THRESHOLD_UBU1": 70,
+      "HEXA_REMOTE_PSI_THRESHOLD_UBU2": 70,
+      "HEXA_REMOTE_PSI_THRESHOLD_HTZ": 95
+    },
+    "rationale": "hetzner anima-ax102 has 128GB + 100GB+ headroom — saturating PSI events tolerable. ubu1/ubu2 (32GB + cgroup MemoryMax=20G) reach SIGTERM territory long before psi=80 — earlier reject prevents OOM kills observed 2026-04-25.",
+    "rollout": "Deploy after ω-network-3 analyzer accumulates >=200 PSI rows per host so the chosen thresholds are distribution-justified, not anecdotal.",
+    "next_cycle_hooks": "ω-network-5 candidate: analyzer auto-emits a sourceable env file (e.g. /tmp/hexa_remote_psi_thresholds.env) the operator can `. source` to apply suggested per-host values atomically."
+  },
+  "constraints_honored": {
+    "edited_files": ["/Users/ghost/core/nexus/scripts/bin/hexa_remote"],
+    "live_ssh": "none — unit-trace harness simulates threshold lookup logic in /tmp without touching the network",
+    "git_commit": "not performed (per session constraint)",
+    "hexa_only": "modification is to a tracked .sh foundational shell — sweeper-safe per session policy"
+  }
+}
