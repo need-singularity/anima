@@ -1,0 +1,148 @@
+{
+  "cycle": "omega_bridge_14",
+  "axis": "bridge / hexa-sim live-data infrastructure",
+  "timestamp": "2026-04-26T18:25:00Z",
+  "user_email": "mk225599@proton.me",
+  "title": "cross-bridge anomaly detector — rolling per-bridge response_time + failure_rate comparator with deferred-recommendation INSUFFICIENT_DATA fallback",
+  "summary": "Build sweeper-safe .hexa analyzer (tool/bridge_anomaly.hexa) that compares each bridge's most recent selftest sample against the median of its prior window. Flag DURATION_SPIKE when current_ms > multiplier * prior_median AND current_ms >= 200ms jitter floor. Flag FRESH_FAILURE when latest status is non-PASS and prior fail_ratio < 0.5. Emit INSUFFICIENT_DATA sentinel when history TSV is missing OR every bridge has < 3 samples (network-3 deferred-recommendation pattern). Wiring bridge_health.sh to APPEND per-bridge rows is intentionally deferred to omega-bridge-15. State stub state/bridge_health_history.tsv created with documented schema header.",
+  "context": {
+    "predecessors": {
+      "omega_bridge_7": "bridge_health.sh --fingerprint-check (per-bridge schema drift detection, opt-in)",
+      "omega_bridge_13": "16 .hexa callers simplified onto bridge_helper config table",
+      "omega_network_3": "psi_log_analyzer.sh deferred-recommendation pattern (insufficient_data gate at min_count=50)"
+    },
+    "problem": "bridge_health.sh emits aggregate counts to state/atlas_health_timeline.jsonl. Per-bridge $DUR is computed in-loop (lines 210-217 of bridge_health.sh) and printed to stdout under --quiet=0/--json=0, but is never persisted. Consequence: a bridge that was 100ms yesterday and 5000ms today never trips a flag — the 50× regression is invisible.",
+    "design_goal": "lightweight rolling comparison with two flag rules (duration spike + fresh failure) + INSUFFICIENT_DATA fallback so the tool is safe to invoke from day 1 even with no history.",
+    "scope_constraints_honoured": [
+      "hexa-only-suffix (raw 9): NEW file is .hexa, no .sh edits this cycle",
+      "NO bridge_health.sh wiring (deferred to omega-bridge-15)",
+      "NO live API hammering (synthetic-only test)",
+      "NO git commit"
+    ]
+  },
+  "files_created": [
+    {
+      "path": "/Users/ghost/core/nexus/tool/bridge_anomaly.hexa",
+      "loc": 285,
+      "lang": "hexa stage1",
+      "role": "analyzer (default subcommand: check)",
+      "exec_strategy": "single awk invocation per bridge for median + threshold + ratio + flag decisions; no per-element shell-out (avoids the digit-by-digit fan-out that was hanging an earlier draft)"
+    },
+    {
+      "path": "/Users/ghost/core/nexus/state/bridge_health_history.tsv",
+      "loc": 22,
+      "role": "schema stub + canonical default path for analyzer",
+      "format": "ts<TAB>bridge<TAB>status<TAB>duration_ms<TAB>ec",
+      "header_only": true,
+      "note": "Until omega-bridge-15 lands, default invocation returns INSUFFICIENT_DATA. Operators may pre-populate or use --history PATH."
+    }
+  ],
+  "files_edited": [],
+  "subcommands": {
+    "check": {
+      "default": true,
+      "flags": {
+        "--history PATH": "override history TSV (default state/bridge_health_history.tsv)",
+        "--window N": "tail size per bridge (default 7)",
+        "--multiplier F": "duration-spike threshold factor (default 3.0)",
+        "--quiet": "suppress human-readable header; sentinel only",
+        "--help|-h": "usage"
+      }
+    }
+  },
+  "sentinel": {
+    "format": "__BRIDGE_ANOMALY__ <PASS|WARN|INSUFFICIENT_DATA> bridges=B samples=N flagged=F window=W mult=M",
+    "flagged_row_format": "  FLAG  <bridge>  DURATION_SPIKE current_ms=X median_ms=Y threshold_ms=Z[; FRESH_FAILURE current_status=S prior_fail_ratio=R]",
+    "compliance": "raw 80"
+  },
+  "algorithm": {
+    "duration_spike": "current_dur_ms > multiplier * median(prior_window_durations) AND current_dur_ms >= 200ms (DURATION_FLOOR_MS jitter guard)",
+    "fresh_failure": "current_status in {FAIL,OFFLINE,TAMPERED} AND prior_fail_ratio < 0.5",
+    "insufficient_data": "history file absent OR every bridge has fewer than 3 samples in the window",
+    "verdict_priority": "INSUFFICIENT_DATA (analyzed=0) > WARN (flagged>0) > PASS"
+  },
+  "validation": {
+    "synthetic_test": {
+      "fixture": "/tmp/fake_bridge_history.tsv",
+      "rows": 35,
+      "bridges": 5,
+      "samples_per_bridge": 7,
+      "anomalies_injected": [
+        {"bridge": "codata", "rule": "DURATION_SPIKE", "prior_durs": [100,95,110,105,98,120], "prior_median": 102.5, "current": 5500, "threshold@3x": 307.5, "expect_flag": true},
+        {"bridge": "arxiv",  "rule": "FRESH_FAILURE", "prior_status_all_PASS": true, "current_status": "FAIL", "prior_fail_ratio": 0.0, "expect_flag": true}
+      ],
+      "controls_no_flag": [
+        {"bridge": "oeis", "prior_durs": [300,320,310,305,315,300], "current": 340, "expect_flag": false, "reason": "current within 3x of median"},
+        {"bridge": "gw",   "prior_durs": [1500,1600,1550,1450,1700,1620], "current": 1590, "expect_flag": false},
+        {"bridge": "wikipedia", "prior_durs": [250,260,240,255,245,265], "current": 250, "expect_flag": false}
+      ],
+      "command": "HEXA_ARGV='check --history /tmp/fake_bridge_history.tsv' /Users/ghost/core/hexa-lang/hexa run tool/bridge_anomaly.hexa",
+      "actual_output": [
+        "═══ BRIDGE ANOMALY — history=/tmp/fake_bridge_history.tsv",
+        "  bridges_seen=5  samples=35  window=7  mult=3.0",
+        "  analyzed=5  insufficient=0  flagged=2",
+        "  FLAG  codata  DURATION_SPIKE current_ms=5500 median_ms=102.50 threshold_ms=307.50",
+        "  FLAG  arxiv  FRESH_FAILURE current_status=FAIL prior_fail_ratio=0.000",
+        "  fix:    investigate flagged bridge(s); check upstream API latency / outage / cache state",
+        "__BRIDGE_ANOMALY__ WARN bridges=5 samples=35 flagged=2 window=7 mult=3.0"
+      ],
+      "expected_flagged": 2,
+      "actual_flagged": 2,
+      "verdict_expected": "WARN",
+      "verdict_actual": "WARN",
+      "PASS": true
+    },
+    "missing_history_test": {
+      "command": "HEXA_ARGV='check --history /tmp/no_such_history_file.tsv' /Users/ghost/core/hexa-lang/hexa run tool/bridge_anomaly.hexa",
+      "actual_output": [
+        "__BRIDGE_ANOMALY__ INSUFFICIENT_DATA bridges=0 samples=0 flagged=0 window=7 mult=3.0 reason=history_missing path=/tmp/no_such_history_file.tsv",
+        "  fix:    seed history TSV via bridge_health.sh wiring (ω-bridge-15) or pass --history PATH",
+        "  schema: # ts<TAB>bridge<TAB>status<TAB>duration_ms<TAB>ec"
+      ],
+      "verdict_expected": "INSUFFICIENT_DATA",
+      "verdict_actual": "INSUFFICIENT_DATA",
+      "PASS": true
+    },
+    "header_only_history_test": {
+      "fixture": "/Users/ghost/core/nexus/state/bridge_health_history.tsv (only schema comment lines, no data rows)",
+      "command": "/Users/ghost/core/hexa-lang/hexa run tool/bridge_anomaly.hexa",
+      "actual_output": [
+        "__BRIDGE_ANOMALY__ INSUFFICIENT_DATA bridges=0 samples=0 flagged=0 window=7 mult=3.0 reason=no_data_rows path=/Users/ghost/core/nexus/state/bridge_health_history.tsv"
+      ],
+      "verdict_expected": "INSUFFICIENT_DATA",
+      "verdict_actual": "INSUFFICIENT_DATA",
+      "PASS": true
+    },
+    "all_PASS": true
+  },
+  "perf_note": "Initial draft used per-digit shell-out (_to_float / _to_int loops) which produced thousands of exec() calls and hung hexa stage1 for >5min on a 35-row fixture. Refactored to one awk invocation per bridge — for the full 16-bridge registry this is ~16 exec() calls, sub-second total. Lesson recorded: hexa stage1 string→number must be batched, never per-character.",
+  "pending_followup_omega_bridge_15": {
+    "scope": "wire bridge_health.sh to APPEND a row per bridge per sweep into state/bridge_health_history.tsv",
+    "code_locus": "tool/bridge_health.sh lines 210-217 (per-bridge loop computes T0/T1/DUR; add `printf '%s\\t%s\\t%s\\t%d\\t%d\\n' ... >> $HISTORY_TSV`)",
+    "considerations": [
+      "DUR currently in seconds (line 217: DUR=$((T1 - T0))) — multiply by 1000 for ms or update analyzer floor",
+      "rotate the history TSV to keep size bounded (e.g. last 500 rows = ~31 sweeps × 16 bridges)",
+      "atomic append (>> on POSIX is atomic for <PIPE_BUF byte writes; one row << 4096 bytes)",
+      "session class: this cycle is hexa-only-suffix; ω-bridge-15 will need shell-edits suffix"
+    ]
+  },
+  "rollback": {
+    "level_1": "rm /Users/ghost/core/nexus/tool/bridge_anomaly.hexa  # analyzer is purely additive; nothing depends on it yet",
+    "level_2": "rm /Users/ghost/core/nexus/state/bridge_health_history.tsv  # stub schema is comment-only; safe to remove"
+  },
+  "compliance": {
+    "hexa_only_suffix": "honoured (raw 9): only .hexa + .tsv stub created; no .sh / .py edits",
+    "raw_71_report_only": "INSUFFICIENT_DATA path returns 0 (no exit-code escalation); WARN does not exit non-zero (analyzer is informational)",
+    "raw_73_admissibility": "two flag rules with explicit thresholds and named sentinels; INSUFFICIENT_DATA carries reason= field",
+    "raw_77_append_only": "history TSV format is documented as append-only; analyzer never writes to it",
+    "raw_80_sentinel": "__BRIDGE_ANOMALY__ <verdict> ... format with key=value pairs"
+  },
+  "constraints_honoured": [
+    "Created NEW tool/bridge_anomaly.hexa (.hexa for sweeper safety) — no edits to existing bridges",
+    "ZERO bridge_health.sh edits (wiring deferred to omega-bridge-15)",
+    "NO live API hammering — synthetic /tmp/fake_bridge_history.tsv only",
+    "NO git commit",
+    "Stopped when JSON written + synthetic test PASS"
+  ],
+  "verification_summary": "Analyzer compiles + executes under hexa stage1. Three test paths exercised: WARN (2/5 flagged on synthetic 35-row fixture, both anomalies caught with correct rule attribution), INSUFFICIENT_DATA on missing file, INSUFFICIENT_DATA on header-only file. Median computation cross-checked: prior=[100,95,110,105,98,120] sorted=[95,98,100,105,110,120], median=(100+105)/2=102.5 — matches awk output 102.50. Threshold at 3x = 307.5 — matches awk output 307.50. FRESH_FAILURE rule fires on arxiv where 6 prior PASS samples → fail_ratio=0.0 < 0.5 with current=FAIL. Per session brief, no further wiring this cycle."
+}
