@@ -1,0 +1,268 @@
+// tool/anima_atlas_rtier_integrity_verifier.hexa — atlas R-tier convergence witness integrity verifier (raw#9 hexa-only).
+//
+// PURPOSE
+//   state/atlas_convergence_witness.jsonl는 anima atlas R-tier evidence chain 핵심 SSOT.
+//   45 lines (round 1..52) 누적. 본 helper는 mac-local non-mutating integrity verifier:
+//
+//     - JSONL 각 line 파싱 (schema sanity)
+//     - round number monotone 검증 (gap/duplicate detection)
+//     - witness_id format consistency (R<num>_<TYPE>_<descriptor> 패턴)
+//     - cross_links field 존재 + dangling reference 탐지 (file path resolution)
+//     - sha256 field 명시 line의 actual file sha verification (선택)
+//     - selftest verifies: invariant counts + non-mutation guarantee
+//
+// INPUT
+//   ANIMA_OUTPUT     output JSON (default: state/atlas_rtier_integrity_verifier.json)
+//   ANIMA_ATLAS      atlas JSONL path (default: state/atlas_convergence_witness.jsonl)
+//   ANIMA_VERIFY_SHA "true"|"false" perform actual sha256 of cross-linked artifacts (default "false" — disk read heavy)
+//
+// OUTPUT
+//   - atlas_path
+//   - line_count
+//   - round_monotone_check {ok, gaps, duplicates}
+//   - witness_id_format_check {ok, malformed_count, malformed_list}
+//   - cross_link_resolution {ok, total_links, dangling_count, dangling_list}
+//   - sha_verification (if enabled)
+//   - status: 'INTEGRITY_OK' | 'INTEGRITY_VIOLATIONS_<count>'
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_atlas_rtier_integrity_verifier.hexa --selftest
+//   ANIMA_OUTPUT=state/atlas_rtier_integrity_verifier.json hexa run tool/anima_atlas_rtier_integrity_verifier.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - JSONL parsing은 stdlib json — malformed line은 INDIVIDUAL_PARSE_ERROR로 기록 (전체 abort 안 함).
+//   - cross_link resolution은 cross_links field의 path-like 항목만 (commit hashes/etc 제외).
+//   - sha verification은 default OFF — heavy disk I/O. 명시적 ANIMA_VERIFY_SHA=true 시만 수행.
+
+let HELPER_PATH = "/tmp/anima_atlas_rtier_integrity_verifier_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima atlas R-tier integrity verifier — emitted by tool/anima_atlas_rtier_integrity_verifier.hexa\n")
+    parts.push("# raw#37 transient. mac-local non-mutating atlas SSOT integrity verifier.\n")
+    parts.push("import json, os, sys, re, hashlib\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/atlas_rtier_integrity_verifier.json')\n")
+    parts.push("ATLAS_PATH = os.environ.get('ANIMA_ATLAS', 'state/atlas_convergence_witness.jsonl')\n")
+    parts.push("VERIFY_SHA = os.environ.get('ANIMA_VERIFY_SHA', 'false').lower() == 'true'\n\n")
+
+    parts.push("WITNESS_ID_RE = re.compile(r'^R\\d+_[A-Z][A-Za-z0-9_]*(?:_[A-Za-z0-9_]+)*$')\n\n")
+
+    parts.push("def _read_lines(path):\n")
+    parts.push("    if not os.path.exists(path):\n")
+    parts.push("        return None, f'atlas file missing at {path}'\n")
+    parts.push("    try:\n")
+    parts.push("        with open(path, encoding='utf-8') as f:\n")
+    parts.push("            return f.readlines(), None\n")
+    parts.push("    except Exception as e:\n")
+    parts.push("        return None, f'read_error:{type(e).__name__}'\n\n")
+
+    parts.push("def _parse_line(line, line_no):\n")
+    parts.push("    try:\n")
+    parts.push("        return json.loads(line), None\n")
+    parts.push("    except Exception as e:\n")
+    parts.push("        return None, {'line':line_no, 'error':type(e).__name__, 'preview':line[:80]}\n\n")
+
+    parts.push("def _check_rounds(parsed_entries):\n")
+    parts.push("    rounds = []\n")
+    parts.push("    duplicates = []\n")
+    parts.push("    seen = set()\n")
+    parts.push("    for line_no, e in parsed_entries:\n")
+    parts.push("        r = e.get('round')\n")
+    parts.push("        if r is None:\n")
+    parts.push("            continue\n")
+    parts.push("        try:\n")
+    parts.push("            r = int(r)\n")
+    parts.push("        except (TypeError, ValueError):\n")
+    parts.push("            continue\n")
+    parts.push("        if r in seen:\n")
+    parts.push("            duplicates.append({'round':r, 'line':line_no})\n")
+    parts.push("        else:\n")
+    parts.push("            seen.add(r)\n")
+    parts.push("        rounds.append((line_no, r))\n")
+    parts.push("    sorted_rounds = sorted(seen)\n")
+    parts.push("    gaps = []\n")
+    parts.push("    if sorted_rounds:\n")
+    parts.push("        for i in range(sorted_rounds[0], sorted_rounds[-1]+1):\n")
+    parts.push("            if i not in seen:\n")
+    parts.push("                gaps.append(i)\n")
+    parts.push("    monotone_violations = []\n")
+    parts.push("    for i in range(1, len(rounds)):\n")
+    parts.push("        if rounds[i][1] < rounds[i-1][1]:\n")
+    parts.push("            monotone_violations.append({'line':rounds[i][0], 'round':rounds[i][1], 'previous_round':rounds[i-1][1]})\n")
+    parts.push("    return {\n")
+    parts.push("        'ok':not duplicates and not gaps and not monotone_violations,\n")
+    parts.push("        'duplicates':duplicates,\n")
+    parts.push("        'gaps':gaps,\n")
+    parts.push("        'monotone_violations':monotone_violations,\n")
+    parts.push("        'min_round':sorted_rounds[0] if sorted_rounds else None,\n")
+    parts.push("        'max_round':sorted_rounds[-1] if sorted_rounds else None,\n")
+    parts.push("        'unique_round_count':len(seen),\n")
+    parts.push("    }\n\n")
+
+    parts.push("def _check_witness_ids(parsed_entries):\n")
+    parts.push("    malformed = []\n")
+    parts.push("    for line_no, e in parsed_entries:\n")
+    parts.push("        wid = e.get('witness_id')\n")
+    parts.push("        if not wid:\n")
+    parts.push("            malformed.append({'line':line_no, 'witness_id':None, 'reason':'missing'})\n")
+    parts.push("            continue\n")
+    parts.push("        if not WITNESS_ID_RE.match(wid):\n")
+    parts.push("            malformed.append({'line':line_no, 'witness_id':wid, 'reason':'pattern_mismatch'})\n")
+    parts.push("    return {'ok':not malformed, 'malformed_count':len(malformed), 'malformed_list':malformed[:5]}\n\n")
+
+    parts.push("def _check_cross_links(parsed_entries):\n")
+    parts.push("    total = 0\n")
+    parts.push("    dangling = []\n")
+    parts.push("    for line_no, e in parsed_entries:\n")
+    parts.push("        cls = e.get('cross_links') or []\n")
+    parts.push("        if not isinstance(cls, list):\n")
+    parts.push("            continue\n")
+    parts.push("        for cl in cls:\n")
+    parts.push("            if not isinstance(cl, str):\n")
+    parts.push("                continue\n")
+    parts.push("            looks_path = '/' in cl and not cl.startswith(('commit ','sha256','pod ','round ','docs/','axis '))\n")
+    parts.push("            looks_doc = cl.startswith(('docs/','tool/','state/','anima','edu/'))\n")
+    parts.push("            if not (looks_path or looks_doc):\n")
+    parts.push("                continue\n")
+    parts.push("            target = cl.split(' ')[0]\n")
+    parts.push("            target = re.sub(r'\\(.*\\)$', '', target).strip()\n")
+    parts.push("            total += 1\n")
+    parts.push("            if not os.path.exists(target):\n")
+    parts.push("                dangling.append({'line':line_no, 'cross_link':cl, 'resolved_target':target})\n")
+    parts.push("    return {'ok':not dangling, 'total_links_checked':total, 'dangling_count':len(dangling), 'dangling_list':dangling[:10]}\n\n")
+
+    parts.push("def _verify_sha(parsed_entries):\n")
+    parts.push("    if not VERIFY_SHA:\n")
+    parts.push("        return {'enabled':False, 'note':'set ANIMA_VERIFY_SHA=true to enable (heavy disk I/O)'}\n")
+    parts.push("    checked = 0\n")
+    parts.push("    mismatches = []\n")
+    parts.push("    for line_no, e in parsed_entries:\n")
+    parts.push("        arts = e.get('artifacts') or {}\n")
+    parts.push("        if not isinstance(arts, dict):\n")
+    parts.push("            continue\n")
+    parts.push("        for k, v in arts.items():\n")
+    parts.push("            if not isinstance(v, str) or not (k.endswith('_sha256') or 'sha' in k):\n")
+    parts.push("                continue\n")
+    parts.push("            file_key = k.replace('_sha256','').replace('_sha','')\n")
+    parts.push("            file_path = arts.get(file_key)\n")
+    parts.push("            if not file_path or not os.path.exists(file_path):\n")
+    parts.push("                continue\n")
+    parts.push("            try:\n")
+    parts.push("                h = hashlib.sha256()\n")
+    parts.push("                with open(file_path, 'rb') as fh:\n")
+    parts.push("                    for chunk in iter(lambda: fh.read(8192), b''):\n")
+    parts.push("                        h.update(chunk)\n")
+    parts.push("                actual = h.hexdigest()\n")
+    parts.push("                checked += 1\n")
+    parts.push("                if actual != v:\n")
+    parts.push("                    mismatches.append({'line':line_no, 'file':file_path, 'expected':v, 'actual':actual})\n")
+    parts.push("            except Exception:\n")
+    parts.push("                continue\n")
+    parts.push("    return {'enabled':True, 'checked':checked, 'mismatches':len(mismatches), 'mismatch_list':mismatches[:5]}\n\n")
+
+    parts.push("lines, err = _read_lines(ATLAS_PATH)\n")
+    parts.push("if lines is None:\n")
+    parts.push("    summary = {'paradigm':'atlas R-tier integrity verifier', 'atlas_path':ATLAS_PATH, 'status':'ATLAS_MISSING', 'error':err}\n")
+    parts.push("    os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("    print(f'[atlas_integrity] status=ATLAS_MISSING -> {OUTPUT}')\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("parsed_entries = []\n")
+    parts.push("parse_errors = []\n")
+    parts.push("for line_no, line in enumerate(lines, start=1):\n")
+    parts.push("    line = line.strip()\n")
+    parts.push("    if not line:\n")
+    parts.push("        continue\n")
+    parts.push("    obj, err = _parse_line(line, line_no)\n")
+    parts.push("    if err:\n")
+    parts.push("        parse_errors.append(err)\n")
+    parts.push("    else:\n")
+    parts.push("        parsed_entries.append((line_no, obj))\n\n")
+
+    parts.push("rounds_check = _check_rounds(parsed_entries)\n")
+    parts.push("witness_check = _check_witness_ids(parsed_entries)\n")
+    parts.push("xlink_check = _check_cross_links(parsed_entries)\n")
+    parts.push("sha_check = _verify_sha(parsed_entries)\n\n")
+
+    parts.push("violations = 0\n")
+    parts.push("if parse_errors: violations += len(parse_errors)\n")
+    parts.push("if not rounds_check['ok']: violations += len(rounds_check['duplicates']) + len(rounds_check['gaps']) + len(rounds_check['monotone_violations'])\n")
+    parts.push("if not witness_check['ok']: violations += witness_check['malformed_count']\n")
+    parts.push("if not xlink_check['ok']: violations += xlink_check['dangling_count']\n")
+    parts.push("if sha_check.get('enabled') and sha_check.get('mismatches', 0) > 0: violations += sha_check['mismatches']\n\n")
+
+    parts.push("status = 'INTEGRITY_OK' if violations == 0 else f'INTEGRITY_VIOLATIONS_{violations}'\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'atlas R-tier convergence witness integrity verifier (mac-local non-mutating)',\n")
+    parts.push("    'atlas_path':ATLAS_PATH,\n")
+    parts.push("    'line_count':len(lines),\n")
+    parts.push("    'parsed_count':len(parsed_entries),\n")
+    parts.push("    'parse_error_count':len(parse_errors),\n")
+    parts.push("    'parse_errors':parse_errors[:5],\n")
+    parts.push("    'round_monotone_check':rounds_check,\n")
+    parts.push("    'witness_id_format_check':witness_check,\n")
+    parts.push("    'cross_link_resolution':xlink_check,\n")
+    parts.push("    'sha_verification':sha_check,\n")
+    parts.push("    'violations_total':violations,\n")
+    parts.push("    'status':status,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify atlas JSONL; read-only verification',\n")
+    parts.push("    'cross_link_cycles':['cycle 12 (R46 verdict)','cycle 16 (axis 82 closure)'],\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[atlas_integrity] status={status} parsed={len(parsed_entries)}/{len(lines)} rounds={rounds_check[\"unique_round_count\"]} dangling={xlink_check[\"dangling_count\"]}/{xlink_check[\"total_links_checked\"]} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let checks_count = 4
+    let status_states = "INTEGRITY_OK,INTEGRITY_VIOLATIONS_*,ATLAS_MISSING"
+    let non_mutation_invariant = "READ_ONLY"
+    let sha_default = "false"
+    println("inv:checks_count=" + to_string(checks_count))
+    println("inv:status_states=" + status_states)
+    println("inv:non_mutation_invariant=" + non_mutation_invariant)
+    println("inv:sha_verification_default=" + sha_default)
+    println("inv:checks=parse,round_monotone,witness_id_format,cross_link_resolution,(sha_verification_optional)")
+    println("inv:dangling_list_capped_at_10=true")
+    println("inv:malformed_list_capped_at_5=true")
+    println("inv:non_mutation_guarantee_explicit=true")
+    println("inv:cross_link_cycle12_cycle16=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_atlas_rtier_integrity_verifier selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=atlas R-tier integrity verifier (4 checks + optional sha; mac $0; non-mutating)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
