@@ -1,0 +1,102 @@
+* NE555 astable Monte Carlo — Arduino-style RC oscillator drift Phi-proxy
+* Topology: classic 555 astable (R1 + R2 + C, output toggles between Vth=2/3*VCC and Vtl=1/3*VCC)
+* Behavioral macromodel: SR-latch via B-source ternary + RC delay decoupling (1ns time constant)
+* Theoretical period:  T = ln(2) * (R1 + 2*R2) * C
+* Theoretical duty:    D = (R1 + R2) / (R1 + 2*R2)   = 2/3 for R1=R2
+*
+* POSITIVE: R1=10k+/-5%, R2=10k+/-5%, C=100n+/-10%, n_trials=16, seed=42
+* NEGATIVE: tolerance=0, n_trials=16, seed=42 (deterministic identical -> std=0)
+*
+* Component values come from the .control block at runtime via 'alter' (Monte Carlo).
+* The placeholder values below are nominal; they are overridden every trial.
+*
+* raw#9 hexa-only strict (no .py wrapper); ngspice -b CLI + awk parsing.
+
+.param R1nom=10k R2nom=10k Cnom=100n VCC=5 Vth=3.333 Vtl=1.667 Vmid=2.5
+
+V1 vcc 0 dc {VCC}
+
+* SR-latch comparator (Schmitt-style hysteresis on cap voltage)
+*   when V(cap) > Vth  -> state goes low  (output low, discharge active)
+*   when V(cap) < Vtl  -> state goes high (output high, charging)
+*   otherwise          -> state holds previous (filtered through small RC delay)
+Bcomp comp 0 V = (V(cap) > {Vth}) ? 0 : ((V(cap) < {Vtl}) ? {VCC} : V(state))
+Rdelay comp state 1k
+Cdelay state 0 1n IC={VCC}
+
+* Output buffer (no algebraic loop because state is RC-filtered)
+Bout vout 0 V = V(state)
+
+* Charging path: VCC -> R1 -> n1 -> R2 -> cap (ideal NE555 charging via R1+R2)
+R1n vcc n1 R1nom
+R2n n1 cap R2nom
+Ccap cap 0 Cnom IC=0
+
+* Discharge transistor model: voltage-controlled current sink at n1
+*   when state < Vmid (output low) -> discharge active, sinks V(n1)/10 [Rdis=10 ohm]
+*   when state > Vmid (output high) -> off
+Bdis n1 0 I = (V(state) < {Vmid}) ? V(n1)/10 : 0
+
+.control
+set seed=42
+
+let r1nom_v = 10000
+let r2nom_v = 10000
+let cnom_v  = 100e-9
+let n_trials = 16
+
+* === POSITIVE: component tolerances (R +/-5%, C +/-10%) ===
+let r1tol_v = 0.05
+let r2tol_v = 0.05
+let ctol_v  = 0.10
+let i = 0
+echo "POS_BEGIN"
+while i < n_trials
+  let r1f = 1 + r1tol_v * (sgauss(0))
+  let r2f = 1 + r2tol_v * (sgauss(0))
+  let cf  = 1 + ctol_v  * (sgauss(0))
+  let r1v = r1nom_v * r1f
+  let r2v = r2nom_v * r2f
+  let cv  = cnom_v  * cf
+  alter R1n = r1v
+  alter R2n = r2v
+  alter Ccap = cv
+  tran 1u 20m UIC
+  meas tran t_r3 WHEN V(vout)=2.5 RISE=3
+  meas tran t_r4 WHEN V(vout)=2.5 RISE=4
+  meas tran t_f4 WHEN V(vout)=2.5 FALL=4
+  let duty = (t_f4 - t_r3) / (t_r4 - t_r3)
+  echo "POS_TRIAL idx= $&i  duty= $&duty"
+  let i = i + 1
+end
+echo "POS_END"
+
+* === NEGATIVE: tolerance=0 (deterministic ideal components) ===
+set seed=42
+let r1tol_v = 0.0
+let r2tol_v = 0.0
+let ctol_v  = 0.0
+let i = 0
+echo "NEG_BEGIN"
+while i < n_trials
+  let r1f = 1 + r1tol_v * (sgauss(0))
+  let r2f = 1 + r2tol_v * (sgauss(0))
+  let cf  = 1 + ctol_v  * (sgauss(0))
+  let r1v = r1nom_v * r1f
+  let r2v = r2nom_v * r2f
+  let cv  = cnom_v  * cf
+  alter R1n = r1v
+  alter R2n = r2v
+  alter Ccap = cv
+  tran 1u 20m UIC
+  meas tran t_r3 WHEN V(vout)=2.5 RISE=3
+  meas tran t_r4 WHEN V(vout)=2.5 RISE=4
+  meas tran t_f4 WHEN V(vout)=2.5 FALL=4
+  let duty = (t_f4 - t_r3) / (t_r4 - t_r3)
+  echo "NEG_TRIAL idx= $&i  duty= $&duty"
+  let i = i + 1
+end
+echo "NEG_END"
+
+.endc
+.end

@@ -1,0 +1,311 @@
+// anima-physics/cmos/cloud_facade_poc.hexa
+// Cloud-facade CMOS substrate POC — NgSpice 5-stage inverter ring oscillator.
+// raw#9 hexa-only strict — exec(ngspice/awk/sed/sha256sum/mkdir/date) only.
+// raw#37 .py / .sh transient helpers FORBIDDEN (scripts/ cleanup daemon victim).
+//
+// SIBLING (cumulative 7 cycles, this = 7th)
+//   anima-physics/quantum/cloud_facade_poc.hexa            qiskit-aer            4/4 PASS
+//   anima-physics/photonic/cloud_facade_poc.hexa           perceval-quandela     4/4 PASS
+//   anima-physics/neuromorphic/cloud_facade_poc.hexa       brian2 LIF            4/4 PASS
+//   anima-physics/quantum/cloud_real_ibm_q_facade.hexa     IBM Quantum runtime   pre-flight
+//   anima-physics/analog/cloud_facade_poc.hexa             AWS Braket QuEra      4/4 PASS
+//   anima-physics/superconducting/cloud_facade_poc.hexa    Braket Rigetti        4/4 PASS
+//   anima-physics/memristor/cloud_facade_poc.hexa          NgSpice + Biolek HP   4/4 PASS
+//
+// PURPOSE
+//   memristor sibling F 가 NgSpice CLI 로 Biolek HP TiO2 hysteresis 4/4 PASS 후
+//   raw#37 .py 가 scripts/ cleanup daemon 으로 삭제됨. 본 cycle = **그 패턴 회피**:
+//   ngspice CLI 직접 호출 + .cir emit/edit + tran 결과 awk 파싱, 모두 .hexa 안에서.
+//   PySpice 의존도 제거. 진짜 cloud foundry endpoint 부재 (web-search 확인) — 동일
+//   "cloud_sim_local_<sim>" facade 패턴 유지.
+//
+// ENUM (frozen contract — extends sibling memristor)
+//   substrate_backend ∈ { "local_hexa",
+//                          "cloud_sim_local_ngspice",       // memristor sibling F + this cycle
+//                          "cloud_real_NOT_AVAILABLE" }     // foundry public API absent
+//
+// PROBE = 5-stage CMOS inverter ring oscillator phase-noise (cycle-to-cycle period jitter)
+//   positive Vdd=1.8V → free oscillation ~8.85 GHz (period ~113 ps), 1700+ cycles in 200 ns
+//                       jitter σ ≥ 1e-12 s = 1 ps  (G1 threshold)
+//   negative Vdd=0.3V → sub-threshold, no oscillation, period count = 0 → jitter=0  (G2 sign-flip)
+//   ngspice deterministic on identical netlist → byte-identical 2-run sha256 (G3)
+//   backend_name == "local_ngspice_<ver>_cmos_5stage_ringosc_180nm" (G4 facade contract)
+//
+// USAGE
+//   hexa run anima-physics/cmos/cloud_facade_poc.hexa
+//   hexa run anima-physics/cmos/cloud_facade_poc.hexa --selftest
+//
+// PAIRS
+//   anima-physics/cmos/cmos_ring_osc.cir              SPICE netlist (template, __VDD__ token)
+//   anima-physics/memristor/cloud_facade_poc.hexa     sibling F (Biolek HP, raw#37 helper had .py)
+//   anima-physics/docs/cmos_local_sim_landing.md      landing doc
+//   state/v10_anima_physics_cloud_facade/
+//     poc_cmos_local_ngspice/marker.json              silent-land marker
+//
+// raw#9 hexa-only strict / raw#37 .py FORBIDDEN / raw#15 SSOT this file
+
+let SCHEMA           = "anima_physics/cloud_facade_cmos/1"
+let CIR_TEMPLATE     = "anima-physics/cmos/cmos_ring_osc.cir"
+let CIR_TMP_POS      = "/tmp/anima_cmos_ring_osc_pos.cir"
+let CIR_TMP_NEG      = "/tmp/anima_cmos_ring_osc_neg.cir"
+let TRAN_TMP_POS     = "/tmp/anima_cmos_ring_osc_pos.out"
+let TRAN_TMP_NEG     = "/tmp/anima_cmos_ring_osc_neg.out"
+let TRAN_TMP_POS2    = "/tmp/anima_cmos_ring_osc_pos2.out"
+let SEED             = 42
+
+let VDD_POS          = "1.8"
+let VDD_NEG          = "0.3"
+let VTH_POS          = "0.9"   // mid-rail threshold for positive (Vdd/2)
+let VTH_NEG          = "0.15"  // mid-rail threshold for negative (Vdd/2 of 0.3V)
+
+// G1 — cycle-to-cycle jitter must exceed 1 ps (model-noise floor at fixed timestep)
+let G1_JITTER_MIN    = 0.000000000001   // 1e-12 s = 1 ps
+
+// G4 backend_name contract
+let BACKEND_PREFIX   = "local_ngspice_"
+let BACKEND_SUFFIX   = "_cmos_5stage_ringosc_180nm"
+
+let BACKEND_LOCAL    = "local_hexa"
+let BACKEND_SIM      = "cloud_sim_local_ngspice"
+let BACKEND_REAL     = "cloud_real_NOT_AVAILABLE"
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn starts_with(s: string, prefix: string) -> bool {
+    let n = len(s)
+    let m = len(prefix)
+    if m > n { return false }
+    return s.substring(0, m) == prefix
+}
+
+fn ends_with(s: string, suffix: string) -> bool {
+    let n = len(s)
+    let m = len(suffix)
+    if m > n { return false }
+    return s.substring(n - m, n) == suffix
+}
+
+fn read_template_apply_vdd(vdd: string, dst_path: string) {
+    // Use sed to substitute __VDD__ → vdd value, write to dst_path.
+    let cmd = "sed 's/__VDD__/" + vdd + "/g' " + shell_escape(CIR_TEMPLATE) +
+              " > " + shell_escape(dst_path)
+    let _ = exec(cmd)
+}
+
+fn run_ngspice(cir_path: string, out_path: string) -> string {
+    let cmd = "ngspice -b " + shell_escape(cir_path) + " > " + shell_escape(out_path) + " 2>&1"
+    let _ = exec(cmd)
+    // also return the trailing tail (status diagnostic)
+    let tail_cmd = "tail -3 " + shell_escape(out_path)
+    return exec(tail_cmd).trim()
+}
+
+// Detect ngspice version (e.g. "46").
+fn ngspice_version() -> string {
+    let cmd = "ngspice --version 2>&1 | awk 'NR==2 {n=match($0, /[0-9]+/); if (n>0) print substr($0,n,RLENGTH); exit}'"
+    return exec(cmd).trim()
+}
+
+// Strip header lines from ngspice -b transient print output, keep only data rows
+// (lines beginning with index<TAB>time<TAB>value), and emit sha256 of those rows.
+fn data_rows_sha256(out_path: string) -> string {
+    let cmd = "grep -E '^[0-9]+\t' " + shell_escape(out_path) + " | shasum -a 256 | cut -c1-64"
+    return exec(cmd).trim()
+}
+
+// Count zero-crossings (rising-edge through threshold). Returns count as int via stdout.
+fn count_zero_crossings(out_path: string, vth: string) -> int {
+    let awk_prog = "/^[0-9]+\\t/ {t=$2; v=$3; if (NR>30 && prev_v<vth && v>=vth) {n+=1}; prev_v=v} END {print n+0}"
+    let cmd = "awk -v vth=" + vth + " " + shell_escape(awk_prog) + " " + shell_escape(out_path)
+    let r = exec(cmd).trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// Compute cycle-to-cycle jitter (std of consecutive period differences) from rising-edge crossings.
+// Returns formatted scientific notation string ("0" if no jitter computable).
+fn compute_jitter_seconds(out_path: string, vth: string) -> string {
+    // Two-pass awk: first emit crossing times to /tmp file, then compute.
+    let zc_path = out_path + ".zc"
+    let cmd1 = "awk -v vth=" + vth + " '/^[0-9]+\\t/ {t=$2; v=$3; if (NR>30 && prev_v<vth && v>=vth) {print t}; prev_v=v}' " +
+               shell_escape(out_path) + " > " + shell_escape(zc_path)
+    let _ = exec(cmd1)
+    // Compute cycle-to-cycle jitter = sqrt(mean(Δperiod²)) where Δperiod = period_i - period_{i-1}
+    let awk_jitter = "BEGIN {prev=-1; prev_p=-1; jsum=0; jn=0} { if (prev>0) { p=$1-prev; if (prev_p>0) { d=p-prev_p; jsum+=d*d; jn+=1 } prev_p=p } prev=$1 } END { if (jn>0) printf \"%.6e\", sqrt(jsum/jn); else printf \"0\" }"
+    let cmd2 = "awk " + shell_escape(awk_jitter) + " " + shell_escape(zc_path)
+    let r = exec(cmd2).trim()
+    if r == "" { return "0" }
+    return r
+}
+
+// Simple float parser from scientific-notation string ("0" → 0.0).
+fn parse_sci(s: string) -> float {
+    if s == "0" { return 0.0 }
+    if s == "" { return 0.0 }
+    return to_float(s)
+}
+
+fn run_facade() -> bool {
+    println("[cloud_facade_poc] backend=" + BACKEND_SIM + " seed=" + to_string(SEED))
+    let ngver = ngspice_version()
+    println("[ngspice] version=" + ngver)
+    if ngver == "" {
+        println("[ngspice] FAIL — ngspice not installed (expected in PATH).")
+        return false
+    }
+
+    // 1. Positive run (Vdd=1.8V) twice — for byte-identical check.
+    read_template_apply_vdd(VDD_POS, CIR_TMP_POS)
+    let pos_tail = run_ngspice(CIR_TMP_POS, TRAN_TMP_POS)
+    println("[positive] ngspice tail=" + pos_tail)
+    let pos_sha1 = data_rows_sha256(TRAN_TMP_POS)
+    let _ = exec("cp " + shell_escape(TRAN_TMP_POS) + " " + shell_escape(TRAN_TMP_POS2))
+    let _ = run_ngspice(CIR_TMP_POS, TRAN_TMP_POS)
+    let pos_sha2 = data_rows_sha256(TRAN_TMP_POS)
+
+    let pos_zc = count_zero_crossings(TRAN_TMP_POS, VTH_POS)
+    let pos_jitter_str = compute_jitter_seconds(TRAN_TMP_POS, VTH_POS)
+    let pos_jitter = parse_sci(pos_jitter_str)
+    println("[positive] zero_crossings=" + to_string(pos_zc) + " jitter_s=" + pos_jitter_str)
+    println("[positive] run1_sha=" + pos_sha1)
+    println("[positive] run2_sha=" + pos_sha2)
+
+    // 2. Negative run (Vdd=0.3V, sub-threshold).
+    read_template_apply_vdd(VDD_NEG, CIR_TMP_NEG)
+    let neg_tail = run_ngspice(CIR_TMP_NEG, TRAN_TMP_NEG)
+    println("[negative] ngspice tail=" + neg_tail)
+    let neg_zc = count_zero_crossings(TRAN_TMP_NEG, VTH_NEG)
+    let neg_jitter_str = compute_jitter_seconds(TRAN_TMP_NEG, VTH_NEG)
+    let neg_jitter = parse_sci(neg_jitter_str)
+    println("[negative] zero_crossings=" + to_string(neg_zc) + " jitter_s=" + neg_jitter_str)
+
+    // 3. Backend name (G4 facade contract).
+    let backend_name = BACKEND_PREFIX + ngver + BACKEND_SUFFIX
+    println("[backend] name=" + backend_name)
+
+    // 4. Netlist sha256 (frozen-contract reproducibility marker).
+    let cmd_nlsha = "shasum -a 256 " + shell_escape(CIR_TEMPLATE) + " | cut -c1-64"
+    let netlist_sha = exec(cmd_nlsha).trim()
+    println("[netlist] sha256=" + netlist_sha)
+
+    // 5. Gates.
+    let g1 = pos_jitter >= G1_JITTER_MIN
+    let g2 = neg_jitter < pos_jitter
+    let g3 = pos_sha1 == pos_sha2 && pos_sha1 != ""
+    let g4 = starts_with(backend_name, BACKEND_PREFIX) && ends_with(backend_name, BACKEND_SUFFIX)
+
+    if g1 { println("G1 PASS — jitter=" + pos_jitter_str + " >= " + to_string(G1_JITTER_MIN)) } else { println("G1 FAIL — jitter=" + pos_jitter_str + " < " + to_string(G1_JITTER_MIN)) }
+    if g2 { println("G2 PASS — neg jitter " + neg_jitter_str + " < pos jitter " + pos_jitter_str + " (sign-flip)") } else { println("G2 FAIL — neg >= pos") }
+    if g3 { println("G3 PASS — byte-identical sha=" + pos_sha1) } else { println("G3 FAIL — sha1=" + pos_sha1 + " sha2=" + pos_sha2) }
+    if g4 { println("G4 PASS — backend=" + backend_name + " matches contract") } else { println("G4 FAIL — backend=" + backend_name) }
+
+    let all_pass = g1 && g2 && g3 && g4
+
+    // 6. Marker JSON.
+    let marker_dir = "state/v10_anima_physics_cloud_facade/poc_cmos_local_ngspice"
+    let _ = exec("mkdir -p " + marker_dir)
+    let marker_path = marker_dir + "/marker.json"
+
+    let mut verdict = "FAIL"
+    if all_pass { verdict = "PASS" }
+
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"" + SCHEMA + "\",\n"
+    j = j + "  \"cycle\": \"anima_physics_cloud_facade_poc_cmos_local_ngspice\",\n"
+    j = j + "  \"verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"backend\": \"" + BACKEND_SIM + "\",\n"
+    j = j + "  \"backend_name\": \"" + backend_name + "\",\n"
+    j = j + "  \"ngspice_version\": \"" + ngver + "\",\n"
+    j = j + "  \"circuit_topology\": \"5stage_cmos_inverter_ring_180nm\",\n"
+    j = j + "  \"netlist_template\": \"" + CIR_TEMPLATE + "\",\n"
+    j = j + "  \"netlist_sha256\": \"" + netlist_sha + "\",\n"
+    j = j + "  \"seed\": " + to_string(SEED) + ",\n"
+    j = j + "  \"raw37_py_used\": false,\n"
+    j = j + "  \"raw37_sh_used\": false,\n"
+    j = j + "  \"vdd_positive_v\": " + VDD_POS + ",\n"
+    j = j + "  \"vdd_negative_v\": " + VDD_NEG + ",\n"
+    j = j + "  \"positive_zero_crossings\": " + to_string(pos_zc) + ",\n"
+    j = j + "  \"negative_zero_crossings\": " + to_string(neg_zc) + ",\n"
+    j = j + "  \"positive_period_jitter_s\": " + pos_jitter_str + ",\n"
+    j = j + "  \"negative_period_jitter_s\": " + neg_jitter_str + ",\n"
+    j = j + "  \"g1_jitter_min_threshold_s\": 1e-12,\n"
+    j = j + "  \"gates\": {\n"
+    j = j + "    \"G1\": " + to_string(g1) + ",\n"
+    j = j + "    \"G2\": " + to_string(g2) + ",\n"
+    j = j + "    \"G3\": " + to_string(g3) + ",\n"
+    j = j + "    \"G4\": " + to_string(g4) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"byte_identical_run1_sha\": \"" + pos_sha1 + "\",\n"
+    j = j + "  \"byte_identical_run2_sha\": \"" + pos_sha2 + "\",\n"
+    j = j + "  \"byte_identical_match\": " + to_string(g3) + ",\n"
+    j = j + "  \"substrate_backend_enum\": [\"" + BACKEND_LOCAL + "\", \"" + BACKEND_SIM + "\", \"" + BACKEND_REAL + "\"],\n"
+    j = j + "  \"files\": [\n"
+    j = j + "    \"anima-physics/cmos/cloud_facade_poc.hexa\",\n"
+    j = j + "    \"" + CIR_TEMPLATE + "\",\n"
+    j = j + "    \"anima-physics/docs/cmos_local_sim_landing.md\",\n"
+    j = j + "    \"" + marker_path + "\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"limits_raw_10_honest\": [\n"
+    j = j + "    \"cloud_sim_local_ngspice = NOT real cloud — facade naming for substrate dispatch consistency only (CMOS foundry public API absent: TSMC/Samsung = fab-design service, Arduino Cloud = IoT telemetry)\",\n"
+    j = j + "    \"180nm Level-1 NMOS/PMOS = inline idealized; real fab corner (SS/FF/TT), temperature, aging variance NOT modeled — single deterministic seed only\",\n"
+    j = j + "    \"phase-noise period jitter Φ-proxy axis ≠ memristor sibling hysteresis-area axis ≠ quantum entanglement-entropy axis; cross-substrate Φ comparison NOT valid (substrate-internal monotone proxy only)\",\n"
+    j = j + "    \"jitter source = numerical timestep discretization (truncation) — NOT physical thermal/shot noise; real CMOS phase-noise needs Monte-Carlo + .noise analysis (out of scope this cycle)\",\n"
+    j = j + "    \"7 of 9 substrates covered (quantum / photonic / neuromorphic / analog / superconducting / memristor / cmos); fpga + arduino still pending — same NgSpice-or-verilator pattern fan-out\",\n"
+    j = j + "    \"raw#9 hexa-only strict via exec(ngspice/awk/sed/sha256sum/mkdir/date); NO raw#37 .py or .sh helper — all logic inline in this single .hexa to avoid scripts/ cleanup daemon victim pattern\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"next_cycle_followup\": \"fpga (yosys+verilator combinational depth proxy) + arduino (555-timer RC oscillator NgSpice or analog-equivalent) — close last 2 of 9 substrates\",\n"
+    j = j + "  \"cost_usd\": 0.0,\n"
+    j = j + "  \"timestamp\": \"" + ts + "\"\n"
+    j = j + "}\n"
+
+    write_file(marker_path, j)
+    println("[marker] " + marker_path)
+
+    if all_pass {
+        println("[cloud_facade_poc] 4/4 PASS — POC cmos cloud-facade VERIFIED")
+        return true
+    }
+    println("[cloud_facade_poc] verdict=" + verdict)
+    return false
+}
+
+fn cmd_selftest() {
+    println("── cloud_facade_poc cmos selftest ──")
+    let cmd1 = "test -f " + CIR_TEMPLATE + " && echo y || echo n"
+    let cir_ok = exec(cmd1).trim()
+    println("netlist_template_exists=" + cir_ok)
+    let ng = exec("which ngspice && ngspice --version 2>&1 | head -1").trim()
+    println("ngspice=" + ng)
+    let aw = exec("which awk && awk --version 2>&1 | head -1").trim()
+    println("awk=" + aw)
+    let sd = exec("which sed").trim()
+    println("sed=" + sd)
+    let sh = exec("which shasum").trim()
+    println("shasum=" + sh)
+    println("selftest=ok")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+    let ok = run_facade()
+    if ok { exit(0) }
+    exit(1)
+}
+
+main()

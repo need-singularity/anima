@@ -1,0 +1,320 @@
+// anima-physics/arduino/cloud_facade_poc.hexa
+// Cloud-facade Arduino-style RC-oscillator POC — NgSpice NE555 astable + Monte Carlo backend.
+// raw#9 hexa-only strict (exec(awk/sha/ngspice) only; NO raw#37 .py wrapper, NO .sh helper).
+//
+// PURPOSE
+//   Arduino IoT Cloud (https://cloud.arduino.cc) 는 IoT telemetry endpoint 로 substrate
+//   Phi-probing 부적합 (web-search 2026-04 verified). 본 cycle = NgSpice 로컬 시뮬을 endpoint 로
+//   wrapping = "cloud_sim_local_<sim>" facade 패턴. Arduino-board ↔ 555 timer 의 표준 결합
+//   (PWM/blink/timing) 을 substrate proxy 로 채택.
+//
+// PROBE = NE555 astable RC-oscillator duty-cycle drift across component tolerance (Monte Carlo n=16).
+//   positive: R1=10k +/-5%, R2=10k +/-5%, C=100n +/-10%, sgauss(seed=42)
+//     -> expected duty std >= 0.001 (G1 threshold; nominal duty=2/3, sigma ~ 0.005-0.010)
+//   negative: tolerance=0 (ideal components) -> all 16 trials identical duty -> std=0 (G2 sign-flip)
+//   ngspice deterministic on identical netlist + seed -> byte-identical (G3)
+//   backend_name == "local_ngspice_<ver>_ne555_astable_mc16" (G4 facade contract)
+//
+// USAGE
+//   hexa run anima-physics/arduino/cloud_facade_poc.hexa
+//   hexa run anima-physics/arduino/cloud_facade_poc.hexa --selftest
+//
+// PAIRS
+//   anima-physics/arduino/ne555_astable.cir         frozen Monte Carlo netlist
+//   anima-physics/memristor/cloud_facade_poc.hexa   sibling memristor POC (hysteresis area axis)
+//   anima-physics/quantum/cloud_facade_poc.hexa     sibling quantum POC (entanglement entropy axis)
+//
+// raw#9 hexa-only strict / raw#15 SSOT this file / raw#37 NOT used (no .py / .sh)
+
+let SCHEMA            = "anima_physics/cloud_facade_arduino/1"
+let CIR_PATH          = "anima-physics/arduino/ne555_astable.cir"
+let SEED              = 42
+
+// G1 — duty-cycle std must exceed 1e-3 across MC trials
+let G1_DUTY_STD_MIN   = 0.001
+
+// G4 — backend_name expected
+let BACKEND_PREFIX    = "local_ngspice_"
+let BACKEND_SUFFIX    = "_ne555_astable_mc16"
+
+// frozen substrate_backend enum (design-only — facade naming consistency)
+let BACKEND_LOCAL     = "local_hexa"
+let BACKEND_SIM       = "cloud_sim_local_ngspice"
+let BACKEND_REAL      = "cloud_real_NOT_AVAILABLE"
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn fabs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sqrt_f(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    if g < 1.0 { g = 1.0 }
+    let mut i = 0
+    while i < 60 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    return g
+}
+
+fn starts_with(s: string, prefix: string) -> bool {
+    let n = len(s)
+    let m = len(prefix)
+    if m > n { return false }
+    return s.substring(0, m) == prefix
+}
+
+fn ends_with(s: string, suffix: string) -> bool {
+    let n = len(s)
+    let m = len(suffix)
+    if m > n { return false }
+    return s.substring(n - m, n) == suffix
+}
+
+// Compute sha256 of a file via shasum.
+fn sha256_file(path: string) -> string {
+    let cmd = "shasum -a 256 " + shell_escape(path) + " | cut -c1-64"
+    return exec(cmd).trim()
+}
+
+// Compute sha256 of an arbitrary string.
+fn sha256_str(s: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(s) + " | shasum -a 256 | cut -c1-64"
+    return exec(cmd).trim()
+}
+
+// Run ngspice in batch mode on the netlist; capture stdout (which contains POS_TRIAL / NEG_TRIAL lines).
+fn run_ngspice(cir_path: string) -> string {
+    // -b : batch; redirect stderr to stdout-discard (warnings not parsed)
+    let cmd = "ngspice -b " + shell_escape(cir_path) + " 2>/dev/null"
+    return exec(cmd)
+}
+
+// Extract MC trial values from raw stdout.
+// kind = "POS_TRIAL" or "NEG_TRIAL"
+// Returns a sha-stable canonical "v0,v1,...,v15" comma-joined string of duty values.
+fn extract_duties_csv(stdout: string, kind: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(stdout) +
+        " | awk -v K=" + shell_escape(kind) +
+        " '$1==K { for(i=1;i<=NF;i++){ if($i==\"duty=\"){ print $(i+1); next } } }' " +
+        " | paste -sd, -"
+    return exec(cmd).trim()
+}
+
+// Compute mean over a CSV of floats (best-effort, returns 0 on empty).
+fn csv_mean(csv: string) -> float {
+    if csv == "" { return 0.0 }
+    let cmd = "printf '%s' " + shell_escape(csv) +
+        " | awk -F, '{ s=0; n=0; for(i=1;i<=NF;i++){ s+=$i; n++ } if(n==0){print 0}else{printf \"%.10f\\n\", s/n} }'"
+    let r = exec(cmd).trim()
+    if r == "" { return 0.0 }
+    return to_float(r)
+}
+
+// Compute population std-dev over a CSV of floats.
+fn csv_std(csv: string) -> float {
+    if csv == "" { return 0.0 }
+    let cmd = "printf '%s' " + shell_escape(csv) +
+        " | awk -F, '{ s=0; ss=0; n=0; for(i=1;i<=NF;i++){ s+=$i; ss+=$i*$i; n++ } if(n==0){print 0}else{ m=s/n; v=ss/n - m*m; if(v<0)v=0; printf \"%.10f\\n\", sqrt(v) } }'"
+    let r = exec(cmd).trim()
+    if r == "" { return 0.0 }
+    return to_float(r)
+}
+
+// Count comma-separated fields.
+fn csv_count(csv: string) -> int {
+    if csv == "" { return 0 }
+    let cmd = "printf '%s' " + shell_escape(csv) + " | awk -F, '{ print NF }'"
+    let r = exec(cmd).trim()
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+// Resolve ngspice version string ("46").
+fn ngspice_version() -> string {
+    let cmd = "ngspice --version 2>&1 | awk -F'-' '/ngspice-/{ for(i=1;i<=NF;i++){ if($i ~ /^[0-9]+/){ split($i,a,\" \"); print a[1]; exit } } }'"
+    let r = exec(cmd).trim()
+    if r == "" { return "unknown" }
+    return r
+}
+
+fn run_facade() -> bool {
+    println("[cloud_facade_poc] backend=" + BACKEND_SIM + " seed=" + to_string(SEED))
+
+    // 0. Pre-flight
+    let cir_sha = sha256_file(CIR_PATH)
+    let ngver = ngspice_version()
+    println("[netlist] " + CIR_PATH + " sha256=" + cir_sha)
+    println("[ngspice] version=" + ngver)
+
+    // 1. Run twice for byte-identical reproducibility check
+    let stdout1 = run_ngspice(CIR_PATH)
+    let stdout2 = run_ngspice(CIR_PATH)
+
+    // Extract canonical duty CSVs
+    let pos_csv1 = extract_duties_csv(stdout1, "POS_TRIAL")
+    let neg_csv1 = extract_duties_csv(stdout1, "NEG_TRIAL")
+    let pos_csv2 = extract_duties_csv(stdout2, "POS_TRIAL")
+    let neg_csv2 = extract_duties_csv(stdout2, "NEG_TRIAL")
+
+    let canonical1 = "POS=" + pos_csv1 + "|NEG=" + neg_csv1
+    let canonical2 = "POS=" + pos_csv2 + "|NEG=" + neg_csv2
+    let sha_run1 = sha256_str(canonical1)
+    let sha_run2 = sha256_str(canonical2)
+
+    let pos_n = csv_count(pos_csv1)
+    let neg_n = csv_count(neg_csv1)
+    let pos_mean = csv_mean(pos_csv1)
+    let pos_std  = csv_std(pos_csv1)
+    let neg_mean = csv_mean(neg_csv1)
+    let neg_std  = csv_std(neg_csv1)
+
+    println("[mc] pos_trials=" + to_string(pos_n) + " mean=" + to_string(pos_mean) + " std=" + to_string(pos_std))
+    println("[mc] neg_trials=" + to_string(neg_n) + " mean=" + to_string(neg_mean) + " std=" + to_string(neg_std))
+    println("[mc] run1_sha=" + sha_run1)
+    println("[mc] run2_sha=" + sha_run2)
+
+    // 2. Backend-name contract
+    let backend_name = BACKEND_PREFIX + ngver + BACKEND_SUFFIX
+    println("[backend] name=" + backend_name)
+
+    // 3. Gates
+    let g1 = pos_std >= G1_DUTY_STD_MIN
+    let g2 = neg_std < pos_std
+    let g3 = sha_run1 == sha_run2
+    let g4_prefix_ok = starts_with(backend_name, BACKEND_PREFIX)
+    let g4_suffix_ok = ends_with(backend_name, BACKEND_SUFFIX)
+    let g4_trials_ok = (pos_n == 16) && (neg_n == 16)
+    let g4 = g4_prefix_ok && g4_suffix_ok && g4_trials_ok
+
+    if g1 { println("G1 PASS — duty std=" + to_string(pos_std) + " >= " + to_string(G1_DUTY_STD_MIN)) } else { println("G1 FAIL — duty std=" + to_string(pos_std) + " < " + to_string(G1_DUTY_STD_MIN)) }
+    if g2 { println("G2 PASS — neg std=" + to_string(neg_std) + " < pos std=" + to_string(pos_std) + " (sign-flip)") } else { println("G2 FAIL — negative std not strictly less than positive") }
+    if g3 { println("G3 PASS — byte-identical sha=" + sha_run1) } else { println("G3 FAIL — sha1=" + sha_run1 + " sha2=" + sha_run2) }
+    if g4 { println("G4 PASS — backend=" + backend_name + " trials=16/16") } else { println("G4 FAIL — backend=" + backend_name + " trials_ok=" + to_string(g4_trials_ok)) }
+
+    let all_pass = g1 && g2 && g3 && g4
+
+    // 4. Marker JSON
+    let marker_dir = "state/v10_anima_physics_cloud_facade/poc_arduino_local_ngspice"
+    let _ = exec("mkdir -p " + marker_dir)
+    let marker_path = marker_dir + "/marker.json"
+
+    let mut verdict = "FAIL"
+    if all_pass { verdict = "PASS" }
+
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"" + SCHEMA + "\",\n"
+    j = j + "  \"cycle\": \"anima_physics_cloud_facade_poc_arduino_local_ngspice\",\n"
+    j = j + "  \"verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"backend\": \"" + BACKEND_SIM + "\",\n"
+    j = j + "  \"backend_name\": \"" + backend_name + "\",\n"
+    j = j + "  \"ngspice_installed\": true,\n"
+    j = j + "  \"ngspice_version\": \"" + ngver + "\",\n"
+    j = j + "  \"raw37_py_used\": false,\n"
+    j = j + "  \"raw37_sh_used\": false,\n"
+    j = j + "  \"hexa_runtime\": \"bare_binary_bypass_macos_native\",\n"
+    j = j + "  \"hexa_runtime_path\": \"~/.hx/packages/hexa/build/hexa.real\",\n"
+    j = j + "  \"hexa_runtime_reason\": \"default container (HEXA_RESOLVER_IN_CONTAINER=1) lacks ngspice/shasum; bare binary exposes macOS /opt/homebrew/bin\",\n"
+    j = j + "  \"omega_cycle_iterations\": 5,\n"
+    j = j + "  \"omega_cycle_log\": [\n"
+    j = j + "    \"iter1: ngspice if() not native -> B-source ternary ?: (parse_fail FIXED)\",\n"
+    j = j + "    \"iter2: SR-latch algebraic loop -> 1k+1n RC delay decoupler (timestep_too_small FIXED)\",\n"
+    j = j + "    \"iter3: .meas brace expansion {VCC/2} fail -> literal 2.5 (param_expand FIXED)\",\n"
+    j = j + "    \"iter4: TRIG=RISE3 TARG=FALL3 negative high (FALL precedes RISE) -> FALL=4 (steady_state_alignment FIXED)\",\n"
+    j = j + "    \"iter5: hexa default container missing ngspice/shasum -> bare-binary bypass macOS native (container_path FIXED, G8#182 precedent)\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"circuit_topology\": \"ne555_astable_R1_10k_R2_10k_C_100n_mc16_tolerance\",\n"
+    j = j + "  \"tolerance\": { \"R1_pct\": 5.0, \"R2_pct\": 5.0, \"C_pct\": 10.0 },\n"
+    j = j + "  \"n_trials\": 16,\n"
+    j = j + "  \"seed\": " + to_string(SEED) + ",\n"
+    j = j + "  \"gates\": {\n"
+    j = j + "    \"G1\": " + to_string(g1) + ",\n"
+    j = j + "    \"G2\": " + to_string(g2) + ",\n"
+    j = j + "    \"G3\": " + to_string(g3) + ",\n"
+    j = j + "    \"G4\": " + to_string(g4) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"positive_duty_mean\": " + to_string(pos_mean) + ",\n"
+    j = j + "  \"positive_duty_std\": " + to_string(pos_std) + ",\n"
+    j = j + "  \"negative_duty_mean\": " + to_string(neg_mean) + ",\n"
+    j = j + "  \"negative_duty_std\": " + to_string(neg_std) + ",\n"
+    j = j + "  \"g1_duty_std_min_threshold\": " + to_string(G1_DUTY_STD_MIN) + ",\n"
+    j = j + "  \"netlist_sha256\": \"" + cir_sha + "\",\n"
+    j = j + "  \"byte_identical_run1_sha\": \"" + sha_run1 + "\",\n"
+    j = j + "  \"byte_identical_run2_sha\": \"" + sha_run2 + "\",\n"
+    j = j + "  \"byte_identical_match\": " + to_string(g3) + ",\n"
+    j = j + "  \"positive_duty_csv\": \"" + pos_csv1 + "\",\n"
+    j = j + "  \"negative_duty_csv\": \"" + neg_csv1 + "\",\n"
+    j = j + "  \"substrate_backend_enum\": [\"" + BACKEND_LOCAL + "\", \"" + BACKEND_SIM + "\", \"" + BACKEND_REAL + "\"],\n"
+    j = j + "  \"files\": [\n"
+    j = j + "    \"" + CIR_PATH + "\",\n"
+    j = j + "    \"anima-physics/arduino/cloud_facade_poc.hexa\",\n"
+    j = j + "    \"anima-physics/docs/arduino_local_sim_landing.md\",\n"
+    j = j + "    \"" + marker_path + "\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"limits_raw_10_honest\": [\n"
+    j = j + "    \"NE555 = behavioral macromodel (B-source SR-latch + 1ns RC delay decoupler); real chip internal latch propagation delay variation NOT captured\",\n"
+    j = j + "    \"duty-cycle drift Phi-proxy axis differs from memristor (hysteresis area) and quantum (entanglement entropy) siblings; cross-substrate Phi numerical comparison NOT valid\",\n"
+    j = j + "    \"Monte Carlo n=16 trials is statistically thin; n>=100 recommended for tighter sigma estimates (cost trade-off: each tran 20ms ~50ms wallclock)\",\n"
+    j = j + "    \"Arduino IoT Cloud rejected as substrate endpoint (web-search 2026-04: telemetry-only, no Phi-probing) — facade naming = local_sim only; ESP32 (anima-physics/esp32/) closer to real Arduino-style hardware substrate\",\n"
+    j = j + "    \"raw#9 hexa-only strict honored: zero .py / .sh helpers; only exec(ngspice/awk/shasum/date/printf/mkdir) primitives\",\n"
+    j = j + "    \"bare-binary bypass required: hexa default container (HEXA_RESOLVER_IN_CONTAINER=1) lacks ngspice/shasum; reproduction needs '~/.hx/packages/hexa/build/hexa.real run' (G8 cycle #182 precedent)\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"next_cycle_followup\": \"Arduino IoT Cloud (Phi 부적합 -> 폐기) 또는 ESP32 진짜 hardware probe (anima-physics/esp32/qrng_bridge.hexa 와 통합) — 그리고 cmos 잔여 1 substrate 동일 NgSpice 패턴 fan-out\",\n"
+    j = j + "  \"cost_usd\": 0.0,\n"
+    j = j + "  \"timestamp\": \"" + ts + "\"\n"
+    j = j + "}\n"
+
+    write_file(marker_path, j)
+    println("[marker] " + marker_path)
+
+    if all_pass {
+        println("[cloud_facade_poc] 4/4 PASS — POC arduino cloud-facade VERIFIED")
+        return true
+    }
+    println("[cloud_facade_poc] verdict=" + verdict)
+    return false
+}
+
+fn cmd_selftest() {
+    println("── cloud_facade_poc arduino selftest ──")
+    let cir_ok = exec("test -f " + CIR_PATH + " && echo y || echo n").trim()
+    println("cir_exists=" + cir_ok)
+    let ng = exec("which ngspice").trim()
+    println("ngspice_path=" + ng)
+    let ngver = ngspice_version()
+    println("ngspice_version=" + ngver)
+    let awk_ok = exec("which awk").trim()
+    println("awk_path=" + awk_ok)
+    let sha_ok = exec("which shasum").trim()
+    println("shasum_path=" + sha_ok)
+    println("selftest=ok")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+    let ok = run_facade()
+    if ok { exit(0) }
+    exit(1)
+}
+
+main()

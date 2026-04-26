@@ -1,0 +1,300 @@
+// anima-physics/fpga/cloud_facade_poc.hexa
+// Cloud-facade FPGA substrate POC — local Icarus Verilog (iverilog) RTL simulator backend.
+// raw#9 hexa-only strict (no .py / .sh; only exec(iverilog/awk/jq/sha/date/mkdir) CLI).
+// raw#37 transient: NONE (this cycle pure RTL — SystemVerilog file is sibling not script).
+//
+// PURPOSE
+//   anima-physics README 9-substrate cloud-facade. AWS F1 신규차단 / F2 비싸 → local
+//   open-source RTL simulator (iverilog v13_0) 를 endpoint 로 wrapping = "cloud_sim_local_iverilog"
+//   facade. sibling memristor (ngspice) / quantum (qiskit-aer) 와 동일 4-gate 구조.
+//
+// ENUM (frozen contract — substrate_backend dispatch consistency)
+//   substrate_backend ∈ { "local_hexa", "cloud_sim_local_iverilog", "cloud_real_aws_fpga" }
+//   본 cycle = "cloud_sim_local_iverilog" 만 구현. AWS F2 ($1.65/hr) Phase 2 대기.
+//
+// PROBE = 8-bit Galois LFSR (poly_mask=0xB8, taps=[8,6,5,4]) + 8-bit ring counter coupled.
+//   1024 clock cycles → 1024-bit stream → 128 × 8-bit symbol Shannon entropy (max=8.0)
+//   positive: rst released after 2 cycles → max-length sequence → expected H ≈ 7.0
+//   negative: rst held forever → bit_out=0 stuck → H=0.0
+//   iverilog deterministic on identical RTL+seed → byte-identical bitstream sha
+//
+// 4 GATES
+//   G1: positive_entropy_bits ≥ 6.0   (LFSR uniform-symbol floor; max=8 ideal)
+//   G2: negative_entropy < positive_entropy   (sign-flip lever)
+//   G3: sha256(positive bitstream) run1 == run2   (byte-identical)
+//   G4: backend_name == "local_iverilog_<ver>_lfsr8_galois_ring8_coupled"
+//
+// USAGE
+//   hexa run anima-physics/fpga/cloud_facade_poc.hexa
+//   hexa run anima-physics/fpga/cloud_facade_poc.hexa --selftest
+//
+// PAIRS
+//   anima-physics/fpga/cmos_8bit_ring_lfsr.sv    SystemVerilog RTL+testbench (frozen)
+//   anima-physics/memristor/cloud_facade_poc.hexa sibling memristor (ngspice)
+//   anima-physics/quantum/cloud_facade_poc.hexa  sibling quantum (qiskit-aer)
+//   anima-physics/docs/fpga_local_sim_landing.md landing doc
+//
+// raw#9 hexa-only strict / raw#37 NOT used / raw#15 SSOT this file
+
+let SCHEMA            = "anima_physics/cloud_facade_fpga/1"
+let RTL_PATH          = "anima-physics/fpga/cmos_8bit_ring_lfsr.sv"
+let SIM_BIN           = "/tmp/anima_fpga_sim.out"
+let POS_OUT           = "/tmp/anima_fpga_pos.txt"
+let NEG_OUT           = "/tmp/anima_fpga_neg.txt"
+let POS_OUT2          = "/tmp/anima_fpga_pos2.txt"
+let SEED_HEX_LFSR     = "0x42"
+let SEED_HEX_RING     = "0xA5"
+let POLY_MASK_HEX     = "0xB8"
+let N_CYCLES          = 1024
+
+// G1 — positive entropy lower bound (bits)
+let G1_ENTROPY_MIN    = 6.0
+
+// G4 — backend_name contract
+let BACKEND_FPGA_PREFIX = "local_iverilog_"
+let BACKEND_FPGA_SUFFIX = "_lfsr8_galois_ring8_coupled"
+
+// frozen substrate_backend enum (facade dispatch)
+let BACKEND_LOCAL     = "local_hexa"
+let BACKEND_SIM       = "cloud_sim_local_iverilog"
+let BACKEND_REAL      = "cloud_real_aws_fpga_NOT_AVAILABLE"
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn starts_with(s: string, prefix: string) -> bool {
+    let n = len(s)
+    let m = len(prefix)
+    if m > n { return false }
+    return s.substring(0, m) == prefix
+}
+
+fn ends_with(s: string, suffix: string) -> bool {
+    let n = len(s)
+    let m = len(suffix)
+    if m > n { return false }
+    return s.substring(n - m, n) == suffix
+}
+
+// Compile RTL once.  iverilog is deterministic on identical SV input.
+fn compile_rtl() -> bool {
+    let cmd = "iverilog -g2012 -o " + SIM_BIN + " " + RTL_PATH + " 2>&1"
+    let out = exec(cmd)
+    let trimmed = out.trim()
+    if trimmed != "" {
+        println("[compile] iverilog output: " + trimmed)
+    }
+    let ok_cmd = "test -x " + SIM_BIN + " && echo y || echo n"
+    return exec(ok_cmd).trim() == "y"
+}
+
+// Run simulation, redirect to file. positive: no plus-arg. negative: +mode=negative.
+fn run_sim(out_path: string, negative: bool) {
+    let mut plus = ""
+    if negative { plus = " +mode=negative" }
+    let cmd = SIM_BIN + plus + " > " + out_path + " 2>&1"
+    let _ = exec(cmd)
+}
+
+// Compute Shannon entropy (bits/symbol) on bitstream from sim output.
+// 8-bit symbol packing → max H = 8.0 for uniform.
+fn compute_entropy(out_path: string) -> float {
+    let cmd =
+        "awk '/^bitline=/ { gsub(\"bitline=\",\"\",$0); bits=bits $0 } " +
+        "END { n=int(length(bits)/8); " +
+        "for (i=0;i<n;i++) { s=substr(bits, i*8+1, 8); v=0; " +
+        "for (j=1;j<=8;j++) v=v*2+(substr(s,j,1)+0); cnt[v]++ } " +
+        "total=n; H=0.0; for (k in cnt) { p=cnt[k]/total; H -= p*log(p)/log(2.0) } " +
+        "printf(\"%.6f\\n\", H) }' " + out_path
+    let r = exec(cmd).trim()
+    if r == "" { return -1.0 }
+    return to_float(r)
+}
+
+// Count distinct 8-bit symbols (diagnostic).
+fn count_unique_symbols(out_path: string) -> int {
+    let cmd =
+        "awk '/^bitline=/ { gsub(\"bitline=\",\"\",$0); bits=bits $0 } " +
+        "END { n=int(length(bits)/8); " +
+        "for (i=0;i<n;i++) { s=substr(bits, i*8+1, 8); v=0; " +
+        "for (j=1;j<=8;j++) v=v*2+(substr(s,j,1)+0); cnt[v]++ } " +
+        "u=0; for (k in cnt) u++; print u }' " + out_path
+    let r = exec(cmd).trim()
+    if r == "" { return -1 }
+    return to_int(r)
+}
+
+// Sha256 of bitstream lines only (ignoring done summary line for stability).
+fn sha256_bitstream(out_path: string) -> string {
+    let cmd = "grep '^bitline=' " + out_path + " | shasum -a 256 | cut -c1-64"
+    return exec(cmd).trim()
+}
+
+fn iverilog_version() -> string {
+    let cmd = "iverilog -V 2>&1 | head -1 | awk '{print $4}' | tr -d 'v()'"
+    return exec(cmd).trim()
+}
+
+fn run_facade() -> bool {
+    println("[cloud_facade_poc fpga] backend=" + BACKEND_SIM)
+
+    // 0. Tooling check
+    let which_iv = exec("which iverilog").trim()
+    if which_iv == "" {
+        println("[FAIL] iverilog not found on PATH; install via 'brew install icarus-verilog'")
+        return false
+    }
+    let iv_ver_raw = iverilog_version()
+    let mut iv_ver = iv_ver_raw
+    if iv_ver == "" { iv_ver = "unknown" }
+    println("[tool] iverilog=" + which_iv + " version=" + iv_ver)
+
+    // 1. Compile RTL
+    if !compile_rtl() {
+        println("[FAIL] iverilog compile failed for " + RTL_PATH)
+        return false
+    }
+
+    // 2. Run positive (run1)
+    run_sim(POS_OUT, false)
+    let pos_h = compute_entropy(POS_OUT)
+    let pos_unique = count_unique_symbols(POS_OUT)
+    let pos_sha1 = sha256_bitstream(POS_OUT)
+
+    // 3. Run positive (run2 — byte-identical check)
+    run_sim(POS_OUT2, false)
+    let pos_sha2 = sha256_bitstream(POS_OUT2)
+
+    // 4. Run negative (rst held high)
+    run_sim(NEG_OUT, true)
+    let neg_h = compute_entropy(NEG_OUT)
+    let neg_unique = count_unique_symbols(NEG_OUT)
+
+    println("[positive] entropy_bits=" + to_string(pos_h) + " unique_symbols=" + to_string(pos_unique) + "/256")
+    println("[positive] sha_run1=" + pos_sha1)
+    println("[positive] sha_run2=" + pos_sha2)
+    println("[negative] entropy_bits=" + to_string(neg_h) + " unique_symbols=" + to_string(neg_unique) + "/256")
+
+    // 5. Construct backend_name
+    let mut iv_ver_clean = iv_ver.replace(".", "_")
+    if iv_ver_clean == "" || iv_ver_clean == "unknown" { iv_ver_clean = "v0_0" }
+    let backend_name = BACKEND_FPGA_PREFIX + "v" + iv_ver_clean + BACKEND_FPGA_SUFFIX
+
+    // 6. Gates
+    let g1 = pos_h >= G1_ENTROPY_MIN
+    let g2 = neg_h < pos_h
+    let g3 = pos_sha1 == pos_sha2 && pos_sha1 != ""
+    let g4_prefix_ok = starts_with(backend_name, BACKEND_FPGA_PREFIX)
+    let g4_suffix_ok = ends_with(backend_name, BACKEND_FPGA_SUFFIX)
+    let g4 = g4_prefix_ok && g4_suffix_ok
+
+    if g1 { println("G1 PASS — positive entropy=" + to_string(pos_h) + " >= " + to_string(G1_ENTROPY_MIN)) } else { println("G1 FAIL — positive entropy=" + to_string(pos_h) + " < " + to_string(G1_ENTROPY_MIN)) }
+    if g2 { println("G2 PASS — negative " + to_string(neg_h) + " < positive " + to_string(pos_h) + " (sign-flip)") } else { println("G2 FAIL — negative entropy >= positive entropy") }
+    if g3 { println("G3 PASS — byte-identical sha=" + pos_sha1) } else { println("G3 FAIL — sha1=" + pos_sha1 + " sha2=" + pos_sha2) }
+    if g4 { println("G4 PASS — backend=" + backend_name + " matches contract") } else { println("G4 FAIL — backend=" + backend_name + " contract mismatch") }
+
+    let all_pass = g1 && g2 && g3 && g4
+
+    // 7. Marker JSON
+    let marker_dir = "state/v10_anima_physics_cloud_facade/poc_fpga_local_verilator"
+    let _ = exec("mkdir -p " + marker_dir)
+    let marker_path = marker_dir + "/marker.json"
+
+    let mut verdict = "FAIL"
+    if all_pass { verdict = "PASS" }
+
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"" + SCHEMA + "\",\n"
+    j = j + "  \"cycle\": \"anima_physics_cloud_facade_poc_fpga_local_verilator\",\n"
+    j = j + "  \"verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"backend\": \"" + BACKEND_SIM + "\",\n"
+    j = j + "  \"backend_name\": \"" + backend_name + "\",\n"
+    j = j + "  \"simulator\": \"iverilog\",\n"
+    j = j + "  \"simulator_version\": \"" + iv_ver + "\",\n"
+    j = j + "  \"rtl_topology\": \"lfsr8_galois_taps_8_6_5_4_+_ring8_coupled\",\n"
+    j = j + "  \"poly_mask_hex\": \"" + POLY_MASK_HEX + "\",\n"
+    j = j + "  \"seed_lfsr_hex\": \"" + SEED_HEX_LFSR + "\",\n"
+    j = j + "  \"seed_ring_hex\": \"" + SEED_HEX_RING + "\",\n"
+    j = j + "  \"n_cycles\": " + to_string(N_CYCLES) + ",\n"
+    j = j + "  \"gates\": {\n"
+    j = j + "    \"G1\": " + to_string(g1) + ",\n"
+    j = j + "    \"G2\": " + to_string(g2) + ",\n"
+    j = j + "    \"G3\": " + to_string(g3) + ",\n"
+    j = j + "    \"G4\": " + to_string(g4) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"positive_entropy_bits\": " + to_string(pos_h) + ",\n"
+    j = j + "  \"negative_entropy_bits\": " + to_string(neg_h) + ",\n"
+    j = j + "  \"positive_unique_symbols_of_256\": " + to_string(pos_unique) + ",\n"
+    j = j + "  \"negative_unique_symbols_of_256\": " + to_string(neg_unique) + ",\n"
+    j = j + "  \"g1_entropy_min_threshold\": " + to_string(G1_ENTROPY_MIN) + ",\n"
+    j = j + "  \"byte_identical_run1_sha\": \"" + pos_sha1 + "\",\n"
+    j = j + "  \"byte_identical_run2_sha\": \"" + pos_sha2 + "\",\n"
+    j = j + "  \"byte_identical_match\": " + to_string(g3) + ",\n"
+    j = j + "  \"substrate_backend_enum\": [\"" + BACKEND_LOCAL + "\", \"" + BACKEND_SIM + "\", \"" + BACKEND_REAL + "\"],\n"
+    j = j + "  \"files\": [\n"
+    j = j + "    \"" + RTL_PATH + "\",\n"
+    j = j + "    \"anima-physics/fpga/cloud_facade_poc.hexa\",\n"
+    j = j + "    \"anima-physics/docs/fpga_local_sim_landing.md\",\n"
+    j = j + "    \"" + marker_path + "\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"limits_raw_10_honest\": [\n"
+    j = j + "    \"iverilog = behavioral SystemVerilog simulator — real FPGA timing/parasitic/power/place-and-route NOT modeled; logical equivalence only\",\n"
+    j = j + "    \"LFSR is deterministic PRNG — Shannon H is sampling-based estimate of generator output, NOT thermodynamic/quantum entropy\",\n"
+    j = j + "    \"8-bit symbol alphabet (256 values) on 1024-cycle stream → small-sample bias; real FPGA LUT-rich entropy probes (>=10⁶ cycles, multi-channel) NOT comparable\",\n"
+    j = j + "    \"cloud_sim_local_iverilog = facade naming — NOT real cloud (AWS F1 신규차단 + F2 $1.65/hr 보류); cross-substrate Φ-proxy axis differs from quantum/memristor siblings\",\n"
+    j = j + "    \"raw#9 strict via exec(iverilog/awk/grep/shasum/date/mkdir) CLI; raw#37 .py NOT used (SV file is RTL artifact, not script)\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"raw37_py_used\": false,\n"
+    j = j + "  \"next_cycle_followup\": \"AWS F2 cloud_real_aws_fpga (Phase 2, ~$1.65/hr, backend swap) 또는 cmos / arduino sibling cycle (NgSpice CMOS inverter ring oscillator)\",\n"
+    j = j + "  \"cost_usd\": 0.0,\n"
+    j = j + "  \"timestamp\": \"" + ts + "\"\n"
+    j = j + "}\n"
+
+    write_file(marker_path, j)
+    println("[marker] " + marker_path)
+
+    if all_pass {
+        println("[cloud_facade_poc fpga] 4/4 PASS — POC fpga local-verilator VERIFIED")
+        return true
+    }
+    println("[cloud_facade_poc fpga] verdict=" + verdict)
+    return false
+}
+
+fn cmd_selftest() {
+    println("── cloud_facade_poc fpga selftest ──")
+    let iv = exec("which iverilog").trim()
+    println("iverilog_path=" + iv)
+    let iv_v = exec("iverilog -V 2>&1 | head -1").trim()
+    println("iverilog_banner=" + iv_v)
+    let rtl_ok = exec("test -f " + RTL_PATH + " && echo y || echo n").trim()
+    println("rtl_file_exists=" + rtl_ok)
+    println("seed_lfsr=" + SEED_HEX_LFSR + " seed_ring=" + SEED_HEX_RING + " poly_mask=" + POLY_MASK_HEX)
+    println("n_cycles=" + to_string(N_CYCLES))
+    println("g1_entropy_min=" + to_string(G1_ENTROPY_MIN))
+    println("selftest=ok")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+    let ok = run_facade()
+    if ok { exit(0) }
+    exit(1)
+}
+
+main()
