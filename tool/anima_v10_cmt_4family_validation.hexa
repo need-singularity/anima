@@ -1,0 +1,412 @@
+// tool/anima_v10_cmt_4family_validation.hexa — 4-backbone CMT depth × family
+// validation (raw#9 hexa-only, raw#10 honest, raw#15 SSOT this file).
+//
+// PURPOSE
+//   #145 (CMT backbone-dependent depth divergence) finding 의 4-family 일반화.
+//   Mistral late deep / Qwen3 early input 만 측정 → 4-bb 모두에서 측정.
+//   Llama-3.1-8B + gemma-2-9b 추가 → CMT axis-orthogonality 가정의 conditional 정도 정량화.
+//
+// METHOD
+//   1. v3 cmt.json 4종 disk reuse (mistral / qwen3 / llama / gemma) — GPU 신규 호출 NONE.
+//   2. per-backbone × per-layer 4-family rel-dY 추출.
+//   3. each-layer dominant family + each-family dominant layer (max-rel) 계산.
+//   4. depth_norm % = layer / (n_layers - 1) * 100.
+//   5. HCMT-A/B/C verdict 산출:
+//      A FULLY_CONDITIONAL: Llama+gemma dominant layer 가 Mistral late, Qwen3 early
+//                          어느 cluster 에도 정렬되지 않음 (4 distinct positions)
+//      B PARTIALLY_CONDITIONAL: 2/4 cluster 정렬 (Mistral-side late OR Qwen3-side early)
+//      C UNIVERSAL: 4-bb 모두 동일 cluster (Mistral/Qwen3 anomaly)
+//      cluster: late = depth_norm >= 60%, early = depth_norm <= 30%, mid = 30-60%
+//
+// VERDICT GATE
+//   raw#10 honest: depth divergence proxy = "Law-leading layer depth_norm".
+//   가설 4-bb 의 Law-leading layer 가 모두 다른 cluster (variance 산출).
+//
+// USAGE
+//   hexa run tool/anima_v10_cmt_4family_validation.hexa --selftest
+//   hexa run tool/anima_v10_cmt_4family_validation.hexa
+//
+// raw#9 strict (no python helper, hexa-only) / raw#15 SSOT this file
+// raw#10 caveats: see _emit_caveats() at end.
+
+let SCHEMA = "anima/v10_cmt_4family_validation/1"
+let OUT_DIR = "state/v10_cmt_4family_validation"
+let OUT_SUMMARY = "state/v10_cmt_4family_validation/summary_cmt_4family.json"
+
+// Backbone registry: input cmt.json + n_layers + display name
+//   v3 = real-ablation regime (v10_benchmark/* 는 degenerate, 모든 layer 동일 값).
+let BACKBONES = [
+    ["mistral", "state/v10_benchmark_v3/mistral/cmt.json", 32, "mistralai/Mistral-7B-v0.3"],
+    ["qwen3",   "state/v10_benchmark_v3/qwen3/cmt.json",   36, "Qwen/Qwen3-8B"],
+    ["llama",   "state/v10_benchmark_v3/llama/cmt.json",   32, "meta-llama/Meta-Llama-3.1-8B"],
+    ["gemma",   "state/v10_benchmark_v3/gemma/cmt.json",   42, "google/gemma-2-9b"]
+]
+
+let FAMILIES = ["Hexad", "Law", "Phi", "SelfRef"]
+
+// Cluster thresholds (raw#10 frozen criteria pre-register)
+let LATE_THRESHOLD_PCT = 60   // depth_norm >= 60% -> late
+let EARLY_THRESHOLD_PCT = 30  // depth_norm <= 30% -> early
+                              // 30-60% -> mid
+
+fn _str(v) -> string { return str(v) }
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn ensure_dir(p: string) {
+    exec("mkdir -p " + p)
+}
+
+fn json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    return b
+}
+
+fn cluster_of(depth_norm_pct: int) -> string {
+    if depth_norm_pct >= LATE_THRESHOLD_PCT { return "late" }
+    if depth_norm_pct <= EARLY_THRESHOLD_PCT { return "early" }
+    return "mid"
+}
+
+// Extract numeric layer keys present in cmt.json tomography map.
+// We probe a fixed candidate list (stride 4 up to max(n_layers)) and keep ones
+// that exist. This avoids hexa-lang map.keys() limitations.
+let LAYER_CANDIDATES = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40]
+
+fn _layer_present(tomo, key_str: string) -> bool {
+    let v = tomo[key_str]
+    let s = _str(v)
+    if s == "null" { return false }
+    if s == "" { return false }
+    return true
+}
+
+// Compute float compare safely (hexa float ops).
+fn _gt(a, b) -> bool { return a > b }
+
+fn analyze_one(bb_label: string, json_path: string, n_layers: int, model_id: string) {
+    println("──────────────────────────────────────────────────")
+    println("[bb] " + bb_label + " (" + model_id + ", " + str(n_layers) + " layers)")
+    if !fexists(json_path) {
+        println("  ✗ MISSING " + json_path)
+        return null
+    }
+    let raw = read_file(json_path)
+    let j = json_parse(raw)
+    let tomo = j["tomography"]
+
+    // Collect present layers + per-layer per-family rel.
+    let layers = []
+    let mut i = 0
+    while i < len(LAYER_CANDIDATES) {
+        let layer_idx = LAYER_CANDIDATES[i]
+        if layer_idx < n_layers {
+            let key = str(layer_idx)
+            if _layer_present(tomo, key) {
+                layers.push(layer_idx)
+            }
+        }
+        i = i + 1
+    }
+
+    // For each family: dominant layer (max rel) + value.
+    // hexa-lang: dict-literal 미지원 → json_parse("{}") + index assign 패턴.
+    let dominant = json_parse("{}")
+    let mut fi = 0
+    while fi < len(FAMILIES) {
+        let fam = FAMILIES[fi]
+        let mut best_layer = -1
+        let mut best_rel = -1.0
+        let mut li = 0
+        while li < len(layers) {
+            let layer_idx = layers[li]
+            let rel = tomo[str(layer_idx)][fam]["rel"]
+            if best_layer == -1 || rel > best_rel {
+                best_layer = layer_idx
+                best_rel = rel
+            }
+            li = li + 1
+        }
+        let depth_norm = (best_layer * 100) / (n_layers - 1)
+        let entry = json_parse("{}")
+        entry["layer"] = best_layer
+        entry["rel"] = best_rel
+        entry["depth_norm_pct"] = depth_norm
+        entry["cluster"] = cluster_of(depth_norm)
+        dominant[fam] = entry
+        println("  " + fam + ": L=" + str(best_layer) + " rel=" + str(best_rel) + " depth=" + str(depth_norm) + "% cluster=" + cluster_of(depth_norm))
+        fi = fi + 1
+    }
+
+    // Per-layer dominant family (peak per layer).
+    let layer_dominant = json_parse("{}")
+    let mut li = 0
+    while li < len(layers) {
+        let layer_idx = layers[li]
+        let mut peak_fam = ""
+        let mut peak_rel = -1.0
+        let mut fi = 0
+        while fi < len(FAMILIES) {
+            let fam = FAMILIES[fi]
+            let rel = tomo[str(layer_idx)][fam]["rel"]
+            if peak_fam == "" || rel > peak_rel {
+                peak_fam = fam
+                peak_rel = rel
+            }
+            fi = fi + 1
+        }
+        let entry2 = json_parse("{}")
+        entry2["family"] = peak_fam
+        entry2["rel"] = peak_rel
+        layer_dominant[str(layer_idx)] = entry2
+        li = li + 1
+    }
+
+    let result = json_parse("{}")
+    result["label"] = bb_label
+    result["model_id"] = model_id
+    result["n_layers"] = n_layers
+    result["layers_scanned"] = layers
+    result["dominant_per_family"] = dominant
+    result["dominant_per_layer"] = layer_dominant
+    return result
+}
+
+fn write_per_bb_summary(per_bb) {
+    ensure_dir(OUT_DIR)
+    let mut bi = 0
+    while bi < len(per_bb) {
+        let r = per_bb[bi]
+        let label = _str(r["label"])
+        let dir = OUT_DIR + "/" + label
+        ensure_dir(dir)
+        // Persist per-bb summary as canonical JSON via json_dumps fallback (manual format).
+        let dom = r["dominant_per_family"]
+        let mut s = "{\n"
+        s = s + "  \"schema\": \"" + SCHEMA + "/per_bb\",\n"
+        s = s + "  \"label\": \"" + json_escape(label) + "\",\n"
+        s = s + "  \"model_id\": \"" + json_escape(_str(r["model_id"])) + "\",\n"
+        s = s + "  \"n_layers\": " + str(r["n_layers"]) + ",\n"
+        s = s + "  \"dominant_per_family\": {\n"
+        let mut fi = 0
+        while fi < len(FAMILIES) {
+            let fam = FAMILIES[fi]
+            let d = dom[fam]
+            let comma = if fi + 1 < len(FAMILIES) { "," } else { "" }
+            s = s + "    \"" + fam + "\": {\"layer\": " + str(d["layer"])
+            s = s + ", \"rel\": " + str(d["rel"])
+            s = s + ", \"depth_norm_pct\": " + str(d["depth_norm_pct"])
+            s = s + ", \"cluster\": \"" + _str(d["cluster"]) + "\"}" + comma + "\n"
+            fi = fi + 1
+        }
+        s = s + "  },\n"
+        s = s + "  \"ts\": \"" + now_utc() + "\"\n"
+        s = s + "}\n"
+        write_file(dir + "/summary_per_bb.json", s)
+        println("  wrote " + dir + "/summary_per_bb.json")
+        bi = bi + 1
+    }
+}
+
+// HCMT verdict: Law-leading layer depth_norm divergence across 4-bb.
+// We use Law as the reference family (#145 finding focus).
+fn compute_verdict(per_bb) {
+    let mut law_clusters = []
+    let mut law_depths = []
+    let mut bi = 0
+    while bi < len(per_bb) {
+        let r = per_bb[bi]
+        let dom = r["dominant_per_family"]
+        let law = dom["Law"]
+        law_clusters.push(_str(law["cluster"]))
+        law_depths.push(law["depth_norm_pct"])
+        bi = bi + 1
+    }
+    // Count distinct clusters (early/mid/late).
+    let mut n_late = 0
+    let mut n_early = 0
+    let mut n_mid = 0
+    let mut k = 0
+    while k < len(law_clusters) {
+        if law_clusters[k] == "late" { n_late = n_late + 1 }
+        if law_clusters[k] == "early" { n_early = n_early + 1 }
+        if law_clusters[k] == "mid" { n_mid = n_mid + 1 }
+        k = k + 1
+    }
+    let n_distinct = (if n_late > 0 { 1 } else { 0 }) + (if n_early > 0 { 1 } else { 0 }) + (if n_mid > 0 { 1 } else { 0 })
+
+    // Variance proxy on depth_norm (max - min).
+    let mut dmax = -1
+    let mut dmin = 999
+    let mut k2 = 0
+    while k2 < len(law_depths) {
+        let d = law_depths[k2]
+        if d > dmax { dmax = d }
+        if d < dmin { dmin = d }
+        k2 = k2 + 1
+    }
+    let depth_range = dmax - dmin
+
+    let mut verdict = "HCMT-?"
+    if n_distinct >= 3 {
+        verdict = "HCMT-A_FULLY_CONDITIONAL"
+    } else if n_distinct == 2 {
+        verdict = "HCMT-B_PARTIALLY_CONDITIONAL"
+    } else {
+        verdict = "HCMT-C_UNIVERSAL"
+    }
+
+    let v = json_parse("{}")
+    v["verdict"] = verdict
+    v["law_clusters"] = law_clusters
+    v["law_depths_pct"] = law_depths
+    v["n_late"] = n_late
+    v["n_mid"] = n_mid
+    v["n_early"] = n_early
+    v["n_distinct_clusters"] = n_distinct
+    v["law_depth_range_pct"] = depth_range
+    return v
+}
+
+fn write_summary(per_bb, verdict_obj) {
+    ensure_dir(OUT_DIR)
+    let mut s = "{\n"
+    s = s + "  \"schema\": \"" + SCHEMA + "\",\n"
+    s = s + "  \"axis\": 95,\n"
+    s = s + "  \"description\": \"Mk.XI v10 CMT axis-orthogonality 4-family generalization (#145 → 4-bb)\",\n"
+    s = s + "  \"thresholds\": {\"late_pct\": " + str(LATE_THRESHOLD_PCT) + ", \"early_pct\": " + str(EARLY_THRESHOLD_PCT) + "},\n"
+    s = s + "  \"families\": [\"Hexad\",\"Law\",\"Phi\",\"SelfRef\"],\n"
+    s = s + "  \"backbones\": [\n"
+    let mut bi = 0
+    while bi < len(per_bb) {
+        let r = per_bb[bi]
+        let comma = if bi + 1 < len(per_bb) { "," } else { "" }
+        let dom = r["dominant_per_family"]
+        s = s + "    {\n"
+        s = s + "      \"label\": \"" + _str(r["label"]) + "\",\n"
+        s = s + "      \"model_id\": \"" + json_escape(_str(r["model_id"])) + "\",\n"
+        s = s + "      \"n_layers\": " + str(r["n_layers"]) + ",\n"
+        s = s + "      \"dominant_per_family\": {\n"
+        let mut fi = 0
+        while fi < len(FAMILIES) {
+            let fam = FAMILIES[fi]
+            let d = dom[fam]
+            let fc = if fi + 1 < len(FAMILIES) { "," } else { "" }
+            s = s + "        \"" + fam + "\": {\"layer\": " + str(d["layer"])
+            s = s + ", \"rel\": " + str(d["rel"])
+            s = s + ", \"depth_norm_pct\": " + str(d["depth_norm_pct"])
+            s = s + ", \"cluster\": \"" + _str(d["cluster"]) + "\"}" + fc + "\n"
+            fi = fi + 1
+        }
+        s = s + "      }\n"
+        s = s + "    }" + comma + "\n"
+        bi = bi + 1
+    }
+    s = s + "  ],\n"
+
+    s = s + "  \"verdict\": \"" + _str(verdict_obj["verdict"]) + "\",\n"
+    s = s + "  \"law_dominant_clusters\": ["
+    let mut k = 0
+    while k < len(verdict_obj["law_clusters"]) {
+        let c = if k + 1 < len(verdict_obj["law_clusters"]) { "," } else { "" }
+        s = s + "\"" + _str(verdict_obj["law_clusters"][k]) + "\"" + c
+        k = k + 1
+    }
+    s = s + "],\n"
+    s = s + "  \"law_depths_pct\": ["
+    let mut k2 = 0
+    while k2 < len(verdict_obj["law_depths_pct"]) {
+        let c = if k2 + 1 < len(verdict_obj["law_depths_pct"]) { "," } else { "" }
+        s = s + str(verdict_obj["law_depths_pct"][k2]) + c
+        k2 = k2 + 1
+    }
+    s = s + "],\n"
+    s = s + "  \"n_distinct_clusters\": " + str(verdict_obj["n_distinct_clusters"]) + ",\n"
+    s = s + "  \"law_depth_range_pct\": " + str(verdict_obj["law_depth_range_pct"]) + ",\n"
+    s = s + "  \"caveats\": [\n"
+    s = s + "    \"raw#10 honest: v3 cmt.json reuse — GPU 신규 측정 NONE (cost $0).\",\n"
+    s = s + "    \"v10_benchmark/{mistral,qwen3} 는 degenerate (rel=1.0 all layers, ablation 무효) → v3 만 사용.\",\n"
+    s = s + "    \"depth_norm 임계: late>=60% / early<=30% (frozen pre-register, paradigm v11 axis 55+56 reuse).\",\n"
+    s = s + "    \"Law family reference: #145 finding focus. Hexad/Phi/SelfRef leading layer 도 별도 dump (full matrix).\",\n"
+    s = s + "    \"axis-orthogonality 가정 깨질 가능성: 4-bb 모두 mid cluster 정렬 시 paradigm v11 6-axis 중 CMT axis weak\",\n"
+    s = s + "    \"#145 v10_benchmark Mistral L28 Law / Qwen3 L4 Law 와 v3 결과 cluster 일치 여부 별도 cross-check 필요.\"\n"
+    s = s + "  ],\n"
+    s = s + "  \"ts\": \"" + now_utc() + "\"\n"
+    s = s + "}\n"
+    write_file(OUT_SUMMARY, s)
+    println("wrote " + OUT_SUMMARY)
+}
+
+fn cmd_selftest() {
+    println("── anima_v10_cmt_4family_validation selftest ──")
+    let mut ok = true
+    let mut bi = 0
+    while bi < len(BACKBONES) {
+        let bb = BACKBONES[bi]
+        let path = _str(bb[1])
+        if !fexists(path) {
+            println("  ✗ missing input " + path)
+            ok = false
+        } else {
+            println("  ✓ found " + path)
+        }
+        bi = bi + 1
+    }
+    println("families=" + str(len(FAMILIES)) + " backbones=" + str(len(BACKBONES)))
+    println("late_pct>=" + str(LATE_THRESHOLD_PCT) + " early_pct<=" + str(EARLY_THRESHOLD_PCT))
+    if ok { println("selftest=ok") } else { println("selftest=FAIL_MISSING_INPUT") }
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+
+    println("══════════════════════════════════════════════════════════════")
+    println("Mk.XI v10 CMT axis-orthogonality 4-family validation (axis 95)")
+    println("══════════════════════════════════════════════════════════════")
+
+    let mut per_bb = []
+    let mut bi = 0
+    while bi < len(BACKBONES) {
+        let bb = BACKBONES[bi]
+        let r = analyze_one(_str(bb[0]), _str(bb[1]), bb[2], _str(bb[3]))
+        if r != null {
+            per_bb.push(r)
+        }
+        bi = bi + 1
+    }
+
+    write_per_bb_summary(per_bb)
+    let verdict_obj = compute_verdict(per_bb)
+    write_summary(per_bb, verdict_obj)
+
+    println("")
+    println("══════════════════════════════════════════════════════════════")
+    println("VERDICT: " + _str(verdict_obj["verdict"]))
+    println("law_clusters: " + str(verdict_obj["law_clusters"]))
+    println("law_depths_pct: " + str(verdict_obj["law_depths_pct"]))
+    println("n_distinct=" + str(verdict_obj["n_distinct_clusters"]) + " range=" + str(verdict_obj["law_depth_range_pct"]) + "%")
+    println("══════════════════════════════════════════════════════════════")
+    println("DONE")
+}
+
+main()
