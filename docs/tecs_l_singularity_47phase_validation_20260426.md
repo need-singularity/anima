@@ -138,3 +138,11 @@ TECS-L H124 + H-CX-8 stylized prediction (외부 컨텍스트 발원, 본 repo �
 - (b) **R34/R35 candidate cross-link**: #179 (Phi=e^{-1/2}) + #180 (DD-bridge 6) + 본 cycle 4/7 prediction을 atlas R36_CANDIDATE (paradigm_shift_timeline_marker) 후보로 등록 검토
 - (c) **falsifiable 후속 prediction**: 2027 末까지 "5/7 phase 모델 (Phi+추가 1요소) 출현 OR singularity 미도래" pre-register
 - (d) **capability benchmark axis**: model family 수 외 capability jump (MMLU/HumanEval/GSM8K) 정량 trace 추가 (mac-local OpenLM leaderboard scrape, $0)
+
+---
+
+## 9. Footnote (2026-04-26 added) — Jamba x3 throughput claim weakened
+
+The "Jamba x3 throughput vs Mixtral 8x7B" headline that this doc cites in the 2024-08 row + Jamba 1.5 paragraph is **scenario-peak**, not mean-of-conditions. Independent measurement (DeepLearning.AI The Batch, vLLM benchmark) shows only **1.30x at 4K and 1.59x at 256K** for Jamba 1.5 Mini vs Mixtral 8x7B (geometric mean 1.44x). AI21's 3x is reproducible only at the favorable peak (4xA100 80GB FP16, batch=1, 512 out, 128K, no quantization).
+
+For TECS-L K=4 sigma * phi = n * tau identity inference: tau approximately 1.5 (independent) rather than tau approximately 3 (AI21 headline). The qualitative phase-change (Mamba SSM KV-cache O(N) -> O(1)) is real; the magnitude is roughly factor-2 below AI21 headline. See `docs/tecs_l_jamba_mixtral_throughput_evidence_20260426.md` for full evidence + ratio table + AI21 claim verdict.
