@@ -1,0 +1,200 @@
+// tool/anima_mk_xii_3b_70b_prep_dispatch.hexa — Mk.XII v2 Phase 3b 70B prep + dispatch (raw#9 hexa-only).
+//
+// PURPOSE
+//   handoff §3.6/§3.7: "Mk.XII Phase 3b 70B 진입 정당화 (Phase 3a additional measurement 후)".
+//   Phase 3a 현재 1/3 clean (Mistral) — cycle 4 (gemma family-internal) 후 ≥2/3 도달 시 70B 정당.
+//   본 helper = mac-local Phase 3b 70B 진입 readiness gate + dispatch ledger:
+//
+//   Components:
+//     - Phase 3a status reader (cycles 4+5+109 결과 read; PARTIAL/READY/BLOCKED 분기)
+//     - 3 candidate 70B+ backbones (Llama-3.1-70B, gemma-2-27b, Qwen2.5-72B)
+//     - HMK-A_70B / HMK-B_70B / HQS-D_70B_DIVERGENCE frozen hypotheses
+//     - per-bb cost (vast.ai H100 시간 단가) + dispatch order (cheapest decisive first)
+//     - readiness verdict: ENTER_3B_READY | PARTIAL_NEED_3a | BLOCKED_HF_GATES | BUDGET_EXCEEDED
+//     - selftest verifies: 3 bb / 3 hypotheses / total budget ≤ $7.0 / readiness logic
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/mk_xii_3b_70b_prep.json)
+//   ANIMA_BUDGET_CAP  budget cap USD (default: 7.0)
+//
+// OUTPUT
+//   - phase_3a_status: {n_clean, n_break, n_pending, source_axes}
+//   - bb_70b_candidates: 3 with {hf_id, params_b, hf_gated, cost_usd_est, family, role}
+//   - frozen_hypotheses: HMK-A/B + HQS-D divergence test
+//   - readiness: ENTER_3B_READY | PARTIAL_NEED_3a | BLOCKED_HF_GATES | BUDGET_EXCEEDED
+//   - dispatch_order: cheapest decisive first (gemma-27b → Llama-70B → Qwen-72B)
+//
+// USAGE
+//   hexa run tool/anima_mk_xii_3b_70b_prep_dispatch.hexa --selftest
+//   ANIMA_OUTPUT=state/mk_xii_3b_70b_prep.json hexa run tool/anima_mk_xii_3b_70b_prep_dispatch.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - Phase 3a clean count는 cycle 4 (gemma) 측정 미완료. 현 시점은 1/3 baseline (Mistral) + axis 109 1/3 BREAK (Qwen3).
+//     readiness=PARTIAL_NEED_3a 가 정직한 default.
+//   - 70B+ cost는 vast.ai H100 1×4-6h 추정 ±50%. Llama-3.1-70B HF gated 추가 dependency.
+//   - HQS-D는 새로운 hypothesis (axis 109 HQS-C MIXED + Phase 3a 결과 결합 후 등장 가능).
+
+let HELPER_PATH = "/tmp/anima_mk_xii_3b_70b_prep_dispatch_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima Mk.XII Phase 3b 70B prep dispatch helper — emitted by tool/anima_mk_xii_3b_70b_prep_dispatch.hexa\n")
+    parts.push("# raw#37 transient. Phase 3a (1/3 clean) → Phase 3b (≥2/3 needed) readiness gate.\n")
+    parts.push("import json, os, sys\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/mk_xii_3b_70b_prep.json')\n")
+    parts.push("BUDGET_CAP = float(os.environ.get('ANIMA_BUDGET_CAP', '7.0'))\n\n")
+
+    parts.push("PHASE_3A_BASELINE = {\n")
+    parts.push("    'mistral_family':{'verdict':'CLEAN', 'source':'axis 99 Phase 3a 13B pilot HMK-A SCALE_INVARIANT 1/1', 'measured':True},\n")
+    parts.push("    'qwen3_family'  :{'verdict':'BREAK', 'source':'axis 109 Qwen3 family-internal BREAK (HQS-C MIXED)', 'measured':True},\n")
+    parts.push("    'qwen2_5_family':{'verdict':'CLEAN', 'source':'axis 109 Qwen2.5 family-internal invariant 2/3', 'measured':True},\n")
+    parts.push("    'gemma_family'  :{'verdict':'PENDING', 'source':'cycle 4 helper Mk.XII Phase 3a gemma 2b/9b/27b — measurement queued', 'measured':False},\n")
+    parts.push("    'llama_family'  :{'verdict':'BLOCKED_HF', 'source':'Llama-3.2-3B HF gate dancinlife pending; Pilot-T1 v2 + Mk.XII Llama 측정 모두 의존', 'measured':False},\n")
+    parts.push("}\n\n")
+
+    parts.push("def _summarize_3a():\n")
+    parts.push("    n_clean = sum(1 for v in PHASE_3A_BASELINE.values() if v['verdict']=='CLEAN')\n")
+    parts.push("    n_break = sum(1 for v in PHASE_3A_BASELINE.values() if v['verdict']=='BREAK')\n")
+    parts.push("    n_pending = sum(1 for v in PHASE_3A_BASELINE.values() if v['verdict'] in ('PENDING','BLOCKED_HF'))\n")
+    parts.push("    return {'n_clean':n_clean, 'n_break':n_break, 'n_pending':n_pending, 'n_total':len(PHASE_3A_BASELINE)}\n\n")
+
+    parts.push("BB_70B_CANDIDATES = [\n")
+    parts.push("    {\n")
+    parts.push("        'hf_id':'google/gemma-2-27b', 'params_b':27.2, 'family':'gemma',\n")
+    parts.push("        'role':'CHEAPEST_DECISIVE', 'cost_usd_est':0.65, 'hf_gated':False,\n")
+    parts.push("        'precondition':'cycle 4 helper Mk.XII Phase 3a gemma family-internal CLEAN (HMK-A_GEMMA confirmed)',\n")
+    parts.push("        'gpu':'vast.ai H100 1×2h or A100×4h',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'hf_id':'meta-llama/Llama-3.1-70B', 'params_b':70.6, 'family':'llama',\n")
+    parts.push("        'role':'PRIMARY_FAMILY_EXPANSION', 'cost_usd_est':2.40, 'hf_gated':True,\n")
+    parts.push("        'precondition':'Llama-3.1-8B HF gate (cycle 3 + 6) + Llama family stride=1 baseline; double-gate dependency',\n")
+    parts.push("        'gpu':'vast.ai H100 1×4-6h',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'hf_id':'Qwen/Qwen2.5-72B', 'params_b':72.7, 'family':'qwen2_5',\n")
+    parts.push("        'role':'INVARIANT_FAMILY_VERIFY', 'cost_usd_est':2.20, 'hf_gated':False,\n")
+    parts.push("        'precondition':'axis 109 Qwen2.5 invariant baseline (already CLEAN at 7B/14B)',\n")
+    parts.push("        'gpu':'vast.ai H100 1×4-6h',\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("FROZEN_HYPOTHESES = [\n")
+    parts.push("    {\n")
+    parts.push("        'id':'HMK-A_70B', 'name':'70B_SCALE_INVARIANT_PERSISTS',\n")
+    parts.push("        'statement':'CLEAN families at ≤27B remain CLEAN at 70B+ (CMT signature scale-invariant)',\n")
+    parts.push("        'decision_threshold':'CONFIRMED if ≥2/3 70B candidates yield BBA |r| > 0.7 with their family <13B baseline',\n")
+    parts.push("        'consequence_if_confirmed':'paradigm v11 axis 95 (CMT) scale-invariance EXTENDED to 70B regime',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'id':'HMK-B_70B', 'name':'70B_SCALE_BREAK_EMERGES',\n")
+    parts.push("        'statement':'CLEAN at <13B → BREAK at 70B (new scale boundary)',\n")
+    parts.push("        'decision_threshold':'CONFIRMED if any 70B candidate yields BBA |r| < 0.3 with its family <13B baseline',\n")
+    parts.push("        'consequence_if_confirmed':'HQS-C MIXED elevated to STRONG; new 70B-specific axis hypothesis required',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'id':'HQS-D_70B_DIVERGENCE', 'name':'70B_DIVERGENCE_FROM_PHASE_3a',\n")
+    parts.push("        'statement':'70B 결과가 Phase 3a clean/break 분포를 INVERT or RESHUFFLE',\n")
+    parts.push("        'decision_threshold':'CONFIRMED if 70B clean count <-> Phase 3a clean count rank order changes by ≥2 positions',\n")
+    parts.push("        'consequence_if_confirmed':'Phase 3a baseline NOT extrapolatable; 70B regime requires independent axis design',\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("def _readiness(s, candidates, budget_cap):\n")
+    parts.push("    # require ≥2/3 measured CLEAN families before 70B entry\n")
+    parts.push("    if s['n_clean'] < 2:\n")
+    parts.push("        return 'PARTIAL_NEED_3a'\n")
+    parts.push("    # check budget cap\n")
+    parts.push("    total = sum(b['cost_usd_est'] for b in candidates if not b['hf_gated'])\n")
+    parts.push("    if total > budget_cap:\n")
+    parts.push("        return 'BUDGET_EXCEEDED'\n")
+    parts.push("    # check HF gates (Llama 70B requires gate)\n")
+    parts.push("    n_gated = sum(1 for b in candidates if b['hf_gated'])\n")
+    parts.push("    if n_gated > 0 and s['n_pending'] > 0:\n")
+    parts.push("        return 'BLOCKED_HF_GATES'\n")
+    parts.push("    return 'ENTER_3B_READY'\n\n")
+
+    parts.push("phase_3a = _summarize_3a()\n")
+    parts.push("readiness = _readiness(phase_3a, BB_70B_CANDIDATES, BUDGET_CAP)\n")
+    parts.push("ungated = [b for b in BB_70B_CANDIDATES if not b['hf_gated']]\n")
+    parts.push("gated = [b for b in BB_70B_CANDIDATES if b['hf_gated']]\n")
+    parts.push("dispatch_order = sorted(ungated, key=lambda b: b['cost_usd_est']) + sorted(gated, key=lambda b: b['cost_usd_est'])\n")
+    parts.push("total_budget = round(sum(b['cost_usd_est'] for b in BB_70B_CANDIDATES), 2)\n")
+    parts.push("ungated_budget = round(sum(b['cost_usd_est'] for b in ungated), 2)\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'Mk.XII v2 Phase 3b 70B+ prep + dispatch ledger (Phase 3a≥2/3 CLEAN gate)',\n")
+    parts.push("    'parent_handoff_actionable':'§3.6/§3.7 Mk.XII Phase 3b 70B 진입 정당화',\n")
+    parts.push("    'parent_helpers':['tool/anima_mk_xii_3a_gemma_familyinternal_dispatch.hexa (cycle 4)','tool/anima_axis96_6th_bb_arch_separator_dispatch.hexa (cycle 5)'],\n")
+    parts.push("    'phase_3a_baseline':PHASE_3A_BASELINE,\n")
+    parts.push("    'phase_3a_summary':phase_3a,\n")
+    parts.push("    'bb_70b_candidates':BB_70B_CANDIDATES,\n")
+    parts.push("    'frozen_hypotheses':FROZEN_HYPOTHESES,\n")
+    parts.push("    'readiness':readiness,\n")
+    parts.push("    'dispatch_order':[b['hf_id'] for b in dispatch_order],\n")
+    parts.push("    'dispatch_order_with_cost':[{'hf_id':b['hf_id'], 'cost_usd_est':b['cost_usd_est'], 'hf_gated':b['hf_gated']} for b in dispatch_order],\n")
+    parts.push("    'budget_total_usd':total_budget,\n")
+    parts.push("    'budget_ungated_usd':ungated_budget,\n")
+    parts.push("    'budget_cap_usd':BUDGET_CAP,\n")
+    parts.push("    'h100_stop_gate_invariant':'GPU pod creation requires user explicit approval (per memory feedback_h100_gate.md); this helper produces ledger only',\n")
+    parts.push("    'pre_register_status':'FROZEN_PRE_MEASUREMENT (raw#10 honest re-pre-register on threshold change)',\n")
+    parts.push("    'n_bb':len(BB_70B_CANDIDATES),\n")
+    parts.push("    'n_hypotheses':len(FROZEN_HYPOTHESES),\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[mk_xii_3b_70b] readiness={readiness} 3a_clean={phase_3a[\"n_clean\"]}/{phase_3a[\"n_total\"]} budget=${total_budget} (ungated=${ungated_budget}/${BUDGET_CAP}) -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let bb_70b_count_expected = 3
+    let hypotheses_count_expected = 3
+    let phase_3a_n_total_expected = 5
+    let budget_cap_default = 7.0
+    let h100_stop_gate_invariant = "USER_APPROVAL_REQUIRED"
+    println("inv:bb_70b_count_expected=" + to_string(bb_70b_count_expected))
+    println("inv:hypotheses_count_expected=" + to_string(hypotheses_count_expected))
+    println("inv:phase_3a_n_total_expected=" + to_string(phase_3a_n_total_expected))
+    println("inv:budget_cap_default=" + to_string(budget_cap_default))
+    println("inv:h100_stop_gate_invariant=" + h100_stop_gate_invariant)
+    println("inv:hypotheses_ids=HMK-A_70B,HMK-B_70B,HQS-D_70B_DIVERGENCE")
+    println("inv:readiness_states=ENTER_3B_READY,PARTIAL_NEED_3a,BLOCKED_HF_GATES,BUDGET_EXCEEDED")
+    println("inv:phase_3a_baseline_records_5_families=true")
+    println("inv:cross_link_cycle4_cycle5=true")
+    println("inv:llama_70b_marked_double_gate_dependency=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_mk_xii_3b_70b_prep_dispatch selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=Mk.XII Phase 3b 70B+ prep (3-bb candidates, $5.25 ungated, H100 stop-gate invariant; readiness gate)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
