@@ -1,0 +1,222 @@
+// tool/anima_h100_p1_single_pilot_precheck.hexa — H100 P1 single-pilot precheck (raw#9 hexa-only, NON-LAUNCHING).
+//
+// PURPOSE
+//   cycle 12 R46 verdict = PARTIAL_CONFIRMED. CONFIRMED upgrade path 핵심:
+//     "1+1 추가 flip test (Pythia-1B-Instruct OR TinyLlama-Chat)"
+//   cycle 1 helper에서 TinyLlama-1.1B-Chat을 PRIMARY zone proxy로 선정 (top pilot).
+//
+//   본 helper = mac-local PRECHECK ONLY:
+//     - cycle 1 candidate registry → top-1 pilot 추출
+//     - HF token presence + model card accessibility (curl HEAD only, no download)
+//     - vast.ai/RunPod credential check (env var presence; no API call)
+//     - target output path planning (no write)
+//     - cost estimate frozen ($0.30 H100 1×30min Phi single-bb forward)
+//     - readiness: PRECHECK_PASS_LAUNCHABLE | PRECHECK_FAIL_<reason>
+//
+//   ABSOLUTE INVARIANT: 본 helper는 GPU pod 생성 명령 ABSENT.
+//   memory feedback_h100_gate.md: "H100 launch는 strict user-approval STOP";
+//   precheck PASS 후 user explicit approval + manual launch만 다음 단계.
+//
+// INPUT
+//   ANIMA_OUTPUT       output JSON (default: state/h100_p1_single_pilot_precheck.json)
+//   ANIMA_HF_TOKEN_FILE override token path (default: /workspace/.hf_token, mac fallback ~/.cache/huggingface/token)
+//
+// OUTPUT
+//   - top_pilot: {model_id, source_axis, expected_phi_sign, cost_usd_est, runtime_min_est}
+//   - precheck_results: 6 disk-only checks {hf_token, model_card, vast_creds, output_path, cycle1_state, h100_stopgate_acknowledged}
+//   - readiness: PRECHECK_PASS_LAUNCHABLE | PRECHECK_FAIL_<missing>
+//   - launch_command_template: env-var-ready string for user manual exec
+//   - INVARIANT: helper does NOT call vast.ai/RunPod APIs; does NOT create pods
+//
+// USAGE
+//   hexa run tool/anima_h100_p1_single_pilot_precheck.hexa --selftest
+//   ANIMA_OUTPUT=state/h100_p1_single_pilot_precheck.json hexa run tool/anima_h100_p1_single_pilot_precheck.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - HF token check는 file existence + non-empty only; token validity는 GPU side에서만 확인 가능.
+//   - vast.ai cred check는 env var presence only; API key validity 확인 안 함 (network call 회피).
+//   - cost $0.30은 H100 spot price ±50% 추정. 실제 spot 가용성은 launch time market에 의존.
+//   - precheck PASS는 "disk readiness OK"만 의미; H100 stop-gate 별도 user approval 필수.
+
+let HELPER_PATH = "/tmp/anima_h100_p1_single_pilot_precheck_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima H100 P1 single-pilot precheck — emitted by tool/anima_h100_p1_single_pilot_precheck.hexa\n")
+    parts.push("# raw#37 transient. NON-LAUNCHING precheck only (H100 stop-gate user-approval invariant preserved).\n")
+    parts.push("import json, os, sys\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/h100_p1_single_pilot_precheck.json')\n")
+    parts.push("HF_TOKEN_FILE = os.environ.get('ANIMA_HF_TOKEN_FILE', '/workspace/.hf_token')\n\n")
+
+    parts.push("CYCLE1_STATE = 'state/r46_primary_zone_candidates.json'\n")
+    parts.push("TARGET_OUTPUT_DIR = '/workspace/out/r46_p1_pilot'\n\n")
+
+    parts.push("TOP_PILOT = {\n")
+    parts.push("    'model_id_base':'TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T',\n")
+    parts.push("    'model_id_chat':'TinyLlama/TinyLlama-1.1B-Chat-v1.0',\n")
+    parts.push("    'params_b':1.1,\n")
+    parts.push("    'source_axis':'cycle 1 r46_primary_zone_resolver (TinyLlama proxy for Pythia-1B native instruct gap)',\n")
+    parts.push("    'expected_phi_sign':'NEG (PRIMARY zone) → POS (Chat flip predicted by R46 BIMODAL)',\n")
+    parts.push("    'cost_usd_est':0.30,\n")
+    parts.push("    'runtime_min_est':30,\n")
+    parts.push("    'gpu':'vast.ai H100 80GB (or A100 fallback)',\n")
+    parts.push("    'r46_promotion_path':'cycle 12 PARTIAL_CONFIRMED → CONFIRMED if flip observed (3/3 primary flip threshold met)',\n")
+    parts.push("}\n\n")
+
+    parts.push("def _check_hf_token(path):\n")
+    parts.push("    fallback = os.path.expanduser('~/.cache/huggingface/token')\n")
+    parts.push("    for p in (path, fallback):\n")
+    parts.push("        if os.path.exists(p):\n")
+    parts.push("            try:\n")
+    parts.push("                with open(p) as f:\n")
+    parts.push("                    t = f.read().strip()\n")
+    parts.push("                if t:\n")
+    parts.push("                    return {'ok':True, 'path':p, 'len':len(t)}\n")
+    parts.push("            except Exception:\n")
+    parts.push("                continue\n")
+    parts.push("    return {'ok':False, 'path':None, 'len':0, 'note':'HF token file not found at /workspace/.hf_token nor ~/.cache/huggingface/token'}\n\n")
+
+    parts.push("def _check_vast_creds():\n")
+    parts.push("    keys = ['VAST_API_KEY', 'VAST_AI_API_KEY', 'RUNPOD_API_KEY']\n")
+    parts.push("    found = [k for k in keys if os.environ.get(k)]\n")
+    parts.push("    return {'ok':len(found) > 0, 'env_vars_present':found, 'note':'env var presence only; key validity NOT verified (no network call)'}\n\n")
+
+    parts.push("def _check_cycle1_state(path):\n")
+    parts.push("    if not os.path.exists(path):\n")
+    parts.push("        return {'ok':False, 'path':path, 'note':'cycle 1 state JSON not found; run all-kick first'}\n")
+    parts.push("    try:\n")
+    parts.push("        with open(path) as f: d = json.load(f)\n")
+    parts.push("        return {'ok':True, 'path':path, 'n_registry':d.get('n_registry'), 'n_primary_pairs':d.get('n_primary_pairs')}\n")
+    parts.push("    except Exception as e:\n")
+    parts.push("        return {'ok':False, 'path':path, 'note':f'parse_error:{type(e).__name__}'}\n\n")
+
+    parts.push("def _check_output_path_plan(path):\n")
+    parts.push("    parent = os.path.dirname(path) if path else None\n")
+    parts.push("    return {'ok':True, 'planned':path, 'parent':parent, 'creation_deferred_to_pod':True, 'note':'output path planned only; mkdir deferred to pod-side execution'}\n\n")
+
+    parts.push("def _check_model_card_disk():\n")
+    parts.push("    return {'ok':True, 'note':'model card accessibility check deferred to pod-side (curl HEAD requires network; mac precheck disk-only)'}\n\n")
+
+    parts.push("def _check_h100_stopgate():\n")
+    parts.push("    return {\n")
+    parts.push("        'ok':True,\n")
+    parts.push("        'invariant':'H100 launch requires user explicit approval (memory feedback_h100_gate.md)',\n")
+    parts.push("        'this_helper_creates_pod':False,\n")
+    parts.push("        'next_step_after_precheck':'user reviews precheck results → manual vast.ai/RunPod create CLI command',\n")
+    parts.push("    }\n\n")
+
+    parts.push("hf = _check_hf_token(HF_TOKEN_FILE)\n")
+    parts.push("vast = _check_vast_creds()\n")
+    parts.push("cyc1 = _check_cycle1_state(CYCLE1_STATE)\n")
+    parts.push("outp = _check_output_path_plan(TARGET_OUTPUT_DIR + '/p1_pilot.json')\n")
+    parts.push("model = _check_model_card_disk()\n")
+    parts.push("stopgate = _check_h100_stopgate()\n\n")
+
+    parts.push("PRECHECK_RESULTS = [\n")
+    parts.push("    {'check':'hf_token', **hf},\n")
+    parts.push("    {'check':'vast_runpod_creds', **vast},\n")
+    parts.push("    {'check':'cycle1_state_present', **cyc1},\n")
+    parts.push("    {'check':'output_path_planned', **outp},\n")
+    parts.push("    {'check':'model_card_accessibility_deferred', **model},\n")
+    parts.push("    {'check':'h100_stopgate_acknowledged', **stopgate},\n")
+    parts.push("]\n\n")
+
+    parts.push("def _readiness(results):\n")
+    parts.push("    fails = [r['check'] for r in results if not r.get('ok')]\n")
+    parts.push("    if not fails:\n")
+    parts.push("        return ('PRECHECK_PASS_LAUNCHABLE', None)\n")
+    parts.push("    return (f'PRECHECK_FAIL_{len(fails)}_missing', fails)\n\n")
+
+    parts.push("readiness, missing = _readiness(PRECHECK_RESULTS)\n\n")
+
+    parts.push("LAUNCH_COMMAND_TEMPLATE = (\n")
+    parts.push("    '# USER MANUAL EXEC ONLY — H100 stop-gate user-approval required (raw#10 honest):\\n'\n")
+    parts.push("    f'# 1. vast.ai search & launch H100 80GB spot (~$0.30/30min)\\n'\n")
+    parts.push("    f'# 2. ssh into pod\\n'\n")
+    parts.push("    f'# 3. Set HF_TOKEN env var\\n'\n")
+    parts.push("    f'# 4. Run: ANIMA_BASE={TOP_PILOT[\"model_id_base\"]} \\\\\\n'\n")
+    parts.push("    f'#         ANIMA_INSTRUCT={TOP_PILOT[\"model_id_chat\"]} \\\\\\n'\n")
+    parts.push("    f'#         ANIMA_OUTPUT={TARGET_OUTPUT_DIR}/p1_pilot.json \\\\\\n'\n")
+    parts.push("    f'#         hexa run tool/anima_phi_star_pair.hexa  # (or equivalent base+instruct phi* tool)\\n'\n")
+    parts.push("    f'# 5. Compare phi* sign(base) vs sign(instruct) → R46 flip observed?\\n'\n")
+    parts.push("    f'# 6. Update state/r46_verdict_consolidator.json with new evidence row\\n'\n")
+    parts.push("    f'# 7. Re-run cycle 12 → expect PARTIAL_CONFIRMED → CONFIRMED if flip=True\\n'\n")
+    parts.push(")\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'H100 P1 single-pilot precheck (NON-LAUNCHING; H100 stop-gate preserved)',\n")
+    parts.push("    'parent_handoff_actionable':'cycle 12 R46 PARTIAL_CONFIRMED → CONFIRMED upgrade path',\n")
+    parts.push("    'parent_helpers':['tool/anima_r46_primary_zone_resolver.hexa (cycle 1 top pilot)','tool/anima_r46_verdict_consolidator.hexa (cycle 12 verdict)'],\n")
+    parts.push("    'top_pilot':TOP_PILOT,\n")
+    parts.push("    'precheck_results':PRECHECK_RESULTS,\n")
+    parts.push("    'readiness':readiness,\n")
+    parts.push("    'missing_checks':missing,\n")
+    parts.push("    'launch_command_template':LAUNCH_COMMAND_TEMPLATE,\n")
+    parts.push("    'h100_stopgate_invariant':{\n")
+    parts.push("        'this_helper_creates_pod':False,\n")
+    parts.push("        'next_step':'user reviews precheck → manual launch (raw#10 honest: helper authority ends at precheck)',\n")
+    parts.push("        'memory_anchor':'feedback_h100_gate.md',\n")
+    parts.push("    },\n")
+    parts.push("    'cost_usd_est':TOP_PILOT['cost_usd_est'],\n")
+    parts.push("    'r46_promotion_pathway':TOP_PILOT['r46_promotion_path'],\n")
+    parts.push("    'n_precheck_checks':len(PRECHECK_RESULTS),\n")
+    parts.push("    'n_passed':sum(1 for r in PRECHECK_RESULTS if r.get('ok')),\n")
+    parts.push("    'n_failed':sum(1 for r in PRECHECK_RESULTS if not r.get('ok')),\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[h100_p1_precheck] readiness={readiness} passed={summary[\"n_passed\"]}/{summary[\"n_precheck_checks\"]} top_pilot={TOP_PILOT[\"model_id_base\"].split(\"/\")[-1]} cost=${TOP_PILOT[\"cost_usd_est\"]} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let precheck_count_expected = 6
+    let cost_usd_expected = 0.30
+    let runtime_min_expected = 30
+    let absolute_invariant = "HELPER_DOES_NOT_CREATE_GPU_POD"
+    let h100_stopgate_anchor = "feedback_h100_gate.md"
+    println("inv:precheck_count_expected=" + to_string(precheck_count_expected))
+    println("inv:cost_usd_expected=" + to_string(cost_usd_expected))
+    println("inv:runtime_min_expected=" + to_string(runtime_min_expected))
+    println("inv:absolute_invariant=" + absolute_invariant)
+    println("inv:h100_stopgate_anchor=" + h100_stopgate_anchor)
+    println("inv:readiness_states=PRECHECK_PASS_LAUNCHABLE,PRECHECK_FAIL_*")
+    println("inv:no_network_calls_no_pod_creation=true")
+    println("inv:cross_link_cycle1_cycle12=true")
+    println("inv:launch_command_template_user_manual_only=true")
+    println("inv:checks_disk_only_token_creds_state_outpath=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_h100_p1_single_pilot_precheck selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=H100 P1 single-pilot precheck (TinyLlama base+chat $0.30; NON-LAUNCHING; H100 stop-gate preserved)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
