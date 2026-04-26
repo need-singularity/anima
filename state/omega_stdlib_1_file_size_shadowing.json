@@ -1,0 +1,61 @@
+{
+  "cycle": "omega-stdlib-1",
+  "axis": "file_size builtin vs portable_fs.file_size shadow resolution",
+  "timestamp": "2026-04-26",
+  "trigger": "Phase B agent flagged silent shadowing depending on import order; portable_fs.file_size only wins if portable_fs is imported after (or instead of) any context where the builtin would be reached. file_exists has the same shadowing.",
+  "builtin_audit": {
+    "exists": true,
+    "implementation_summary": "Two builtin layers: (1) self/runtime.c rt_file_size (line 3656) — fopen + fseeko/SEEK_END + ftello, returns -1 on failure, O(1) native stat-equivalent. (2) self/hexa_full.hexa interp dispatch (line 10606) — read_file(args[0]) then len(content), returns -1 on exception. The interp dispatch path LOADS THE WHOLE FILE into memory — fatal for multi-GB safetensors shards, exactly the failure mode portable_fs was designed to avoid. file_exists is also a builtin (hexa_full.hexa lines 13292 + 14617) — wraps host file_exists. now_ns and file_mtime have no builtin shadow.",
+    "semantics_vs_portable_fs": "differ_on_missing_path (-1 vs 0) AND differ_on_large_files (interp builtin OOMs by reading whole content; portable_fs uses wc -c shellout in constant memory). Native rt_file_size in runtime.c is fine but the interp dispatch path is the actual hazard."
+  },
+  "consumers_inventory": [
+    {
+      "path": "/Users/ghost/core/hexa-lang/stdlib/portable_fs.hexa",
+      "uses_portable_fs": true,
+      "calls": ["self (definitions only)"]
+    },
+    {
+      "path": "/Users/ghost/core/anima/anima-speak/anima_audio.hexa",
+      "uses_portable_fs": true,
+      "calls": ["file_size (1: _file_bytes)", "file_exists (3: python3 probe + worker path + brew py)"]
+    },
+    {
+      "path": "/Users/ghost/core/nexus/cli/run.hexa",
+      "uses_portable_fs": true,
+      "calls": ["now_ns (12 sites)", "file_exists (7 sites)"]
+    },
+    {
+      "path": "/Users/ghost/core/hexa-lang/gate/pre_tool_guard.hexa",
+      "uses_portable_fs": true,
+      "calls": ["now_ns (3 sites: pre-tool tmp paths)"]
+    },
+    {
+      "path": "/Users/ghost/core/anima/state/omega_smoke.hexa",
+      "uses_portable_fs": true,
+      "calls": ["file_size (1)", "now_ns (1)", "file_exists (1)"]
+    }
+  ],
+  "option_chosen": "A",
+  "rationale": "Builtin and portable_fs versions are NOT semantically equivalent (return -1 vs 0 on missing; interp builtin reads whole file vs wc -c shellout). Option C (document) leaves the foot-gun armed. Option B (remove builtin) needs runtime.c + hexa_full.hexa edits — out of scope per constraints. Option A renames portable_fs exports with explicit `pfs_` prefix, eliminating ambiguity at every call site regardless of import order. Blast is bounded (5 files, all already known) and renames are mechanical. Updated: pfs_file_size, pfs_now_ns, pfs_file_mtime, pfs_file_exists.",
+  "changes_applied": {
+    "files_modified": [
+      "/Users/ghost/core/hexa-lang/stdlib/portable_fs.hexa",
+      "/Users/ghost/core/anima/anima-speak/anima_audio.hexa",
+      "/Users/ghost/core/nexus/cli/run.hexa",
+      "/Users/ghost/core/hexa-lang/gate/pre_tool_guard.hexa",
+      "/Users/ghost/core/anima/state/omega_smoke.hexa"
+    ],
+    "rename_pattern": "file_size -> pfs_file_size, now_ns -> pfs_now_ns, file_mtime -> pfs_file_mtime, file_exists -> pfs_file_exists (only at call sites in the 4 consumers known to import portable_fs; other stdlib files using file_exists without importing portable_fs were already calling the builtin and remain untouched)",
+    "totals": {
+      "anima_audio.hexa": "1 file_size + 3 file_exists",
+      "run.hexa": "12 now_ns + 7 file_exists",
+      "pre_tool_guard.hexa": "3 now_ns",
+      "omega_smoke.hexa": "1 file_size + 1 now_ns + 1 file_exists"
+    }
+  },
+  "regression_check": {
+    "smoke_test": "hexa run /Users/ghost/core/anima/state/omega_smoke.hexa (covers all 3 portable_fs primitives via pfs_* prefix)",
+    "result": "PASS — emitted {\"smoke\":true,\"file_size\":587,\"now_ns\":\"1777172813975225842\",\"exists\":true}; pfs_file_size returned correct byte count, pfs_now_ns returned ns precision, pfs_file_exists returned true. Secondary: hexa run /Users/ghost/core/nexus/cli/run.hexa --help printed full subcommand listing without parse error. Tertiary: hexa run /Users/ghost/core/anima/anima-speak/anima_audio_demo.hexa loaded anima_audio.hexa, exercised pfs_now_ns (timestamps in WAV paths) and pfs_file_size (via _file_bytes) without parse error (python3-missing failures are container-side, unrelated)."
+  },
+  "rollback": "git diff/checkout on the 5 files listed in changes_applied.files_modified; or sed-replace pfs_file_size->file_size, pfs_now_ns->now_ns, pfs_file_mtime->file_mtime, pfs_file_exists->file_exists across those 5 paths. No external state, no commit, no docker rebuild."
+}
