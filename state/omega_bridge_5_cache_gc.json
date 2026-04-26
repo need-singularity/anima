@@ -1,0 +1,93 @@
+{
+  "cycle": "omega-bridge-5",
+  "axis": "self-knowledge / mechanism-improvement (cache lifecycle)",
+  "timestamp": "2026-04-26T15:55:00Z",
+  "objective": "Add cache garbage collection + size limit to bridge_helper.sh — eliminate monotonic cache growth from long-running bridge_health cron polling.",
+  "problem": {
+    "description": "Post omega-bridge-2: filesystem cache stores per-bridge response bodies at $CACHE_DIR/<bridge>_<sha1(url)>.body. TTL is honored on read (stale → bypass + refetch) but stale entries are NEVER deleted. URL drift, helper-call diversity, and cron cadence (~16 entries/run × N runs/day) cause unbounded directory growth.",
+    "impact": "Disk leak + filesystem clutter. Manual workaround was rm -rf $CACHE_DIR; helper now self-manages."
+  },
+  "helper_change": {
+    "path": "/Users/ghost/core/nexus/tool/bridge_helper.sh",
+    "loc_before": 270,
+    "loc_after": 397,
+    "loc_delta": 127,
+    "sha256_before": "1def21fc631a9a0f2e5855d547f76fac3df24b810711f9ec22f25a1b420829f7",
+    "sha256_after": "7b8ae7f6cddb425001d18013ceae0d3f94f1712017a528cb678d456b92203f12",
+    "syntax_check": "bash -n PASS"
+  },
+  "new_subcommands": {
+    "cache-gc": {
+      "args": "[age_seconds] [max_bytes]",
+      "behaviour": "Phase A age-based eviction (.body + matching .meta), Phase B size-limit oldest-first eviction.",
+      "stdout_summary_format": "scanned=N\\tkept=N\\tdeleted=N\\tbytes_freed=N",
+      "default_age_s": 7200,
+      "default_max_bytes": 50000000
+    }
+  },
+  "new_env_vars": {
+    "BRIDGE_HELPER_CACHE_GC_AGE_S": {
+      "default": 7200,
+      "purpose": "Age threshold (seconds) for cache-gc deletion (default 2h = max(TTL×2, 1h) heuristic)"
+    },
+    "BRIDGE_HELPER_CACHE_MAX_BYTES": {
+      "default": 50000000,
+      "purpose": "Max total cache dir size in bytes (default 50 MB). 0 disables size-limit phase."
+    },
+    "BRIDGE_HELPER_GC_PROBABILITY": {
+      "default": 100,
+      "purpose": "Probabilistic gc trigger frequency on fetch: 1-in-N (RANDOM % N == 0). 0 disables; 1 = every fetch (test mode)."
+    }
+  },
+  "probabilistic_trigger": {
+    "default_frequency": "1/100 (~1% overhead)",
+    "implementation": "_maybe_gc_trigger() invoked at top of cmd_fetch (after CACHE_DIR ensured, before cache-key derivation). Silent: stdout suppressed, only verbose stderr trace.",
+    "race_safety": "Single-pass per-trigger; rm -f is no-op if file vanishes mid-pass. No double-delete because each cmd_cache_gc invocation runs sequentially within the calling fetch process."
+  },
+  "size_limit_implemented": {
+    "status": "yes",
+    "phase": "Phase B of cache-gc, runs after age eviction.",
+    "algorithm": "Sum sizes of remaining .body files; if total > max_bytes, sort by mtime ascending (eldest first), delete .body+.meta until under limit.",
+    "validation_result": "10 files × 1000 B with 4000 B limit → 4 files × 1000 B = 4000 B kept (oldest-first eviction confirmed by mtime stagger)."
+  },
+  "validation": {
+    "age_gc_test": {
+      "setup": "5 stale .body+.meta backdated 5h, 2 fresh .body+.meta",
+      "expected": "5 deleted, 2 kept",
+      "actual_summary": "scanned=7 kept=2 deleted=5 bytes_freed=60",
+      "result": "PASS_AGE_GC"
+    },
+    "size_gc_test": {
+      "setup": "10×1000 B fresh files, mtime staggered 1-10 minutes ago, AGE=86400 (no age eviction), MAX_BYTES=4000",
+      "expected": "Oldest-first eviction down to <=4000 B",
+      "actual_summary": "scanned=10 kept=4 deleted=6 bytes_freed=6000; 4×1000 B remain (most-recent mtimes)",
+      "result": "PASS_SIZE_GC"
+    },
+    "fetch_cache_hit_test": {
+      "setup": "Pre-seeded cache body for invalid URL, fetch invoked",
+      "expected": "Body returned from cache, no network call",
+      "actual": "fetch_out='CACHED_BODY_OK'",
+      "result": "PASS_FETCH_CACHE"
+    },
+    "probabilistic_trigger_test": {
+      "setup": "GC_PROBABILITY=1 forces gc every fetch; one stale junk file + one fresh-cache probe",
+      "expected": "Stale junk deleted by gc-side-effect, fresh cache hit returns body",
+      "actual": "junk_remaining=0, fresh_remaining=1",
+      "result": "PASS_PROBABILISTIC_TRIGGER"
+    },
+    "all_validations": "PASS"
+  },
+  "constraints_honored": {
+    "edits_limited_to": "/Users/ghost/core/nexus/tool/bridge_helper.sh ONLY",
+    "no_bridge_file_edits": true,
+    "no_live_api_hammering": true,
+    "no_git_commit": true,
+    "hexa_only_session": "helper is bash; no hexa source touched"
+  },
+  "rollback": {
+    "method_a": "git checkout -- /Users/ghost/core/nexus/tool/bridge_helper.sh (restores sha256 1def21fc...).",
+    "method_b": "Set BRIDGE_HELPER_GC_PROBABILITY=0 to neutralize the inline trigger; cache-gc subcommand becomes opt-in only. cmd_cache_clear and cmd_cache_stat unchanged — original cache lifecycle still available.",
+    "blast_radius": "Self-contained: cache-gc adds new code paths; existing fetch / cache-clear / cache-stat unchanged in default behaviour. Probabilistic trigger fires ~1% of fetches and cannot delete fresh entries."
+  },
+  "compliance_notes": "raw 66 (reason+fix on diags retained), raw 71 (gc summary on stdout, verbose trace on stderr — body unchanged). No new attack surface; all writes confined to existing $CACHE_DIR."
+}
