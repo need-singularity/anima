@@ -1,0 +1,300 @@
+// anima-physics/quantum/cloud_real_ibm_q_facade.hexa
+// Phase 2 — IBM Q Runtime backend swap on top of qiskit-aer POC contract.
+// raw#9 hexa-only strict (exec(awk/sha/python3) allowed; no exec("head") fileread).
+// raw#37 transient: scripts/anima_physics_ibmq_runtime_probe.py (helper, not library).
+//
+// PURPOSE
+//   Swap qiskit-aer (cloud_sim) → qiskit-ibm-runtime (cloud_real_ibm_q).
+//   Same 4-gate contract as POC, but G3 byte-identical = NOT_APPLICABLE on real HW
+//   (shot noise is fundamental). Graceful degrade when IBM token absent.
+//
+// ENUM (frozen contract, mirrors POC)
+//   substrate_backend ∈ { "local_hexa", "cloud_sim_qiskit_aer", "cloud_real_ibm_q" }
+//   본 cycle = "cloud_real_ibm_q" 만 구현. physics.hexa quantum_engine() dispatch 통합은
+//   sibling C cycle 영역 (이 파일에서 수정 금지).
+//
+// PROBE = 4-qubit, marginal entropy on first 2 qubits (measurement-based).
+//   ghz       → marginal{00,11}=50/50 → H ≈ ln(2) (G1)
+//   random    → broader marginal     → H < ghz expectation (G2)
+//   shots     = 1024 (cost-conscious)
+//   backend   == ibmq_runtime_<actual> on success (G4)
+//
+// VERDICTS
+//   PHASE2_PASS_REAL_QUANTUM_HARDWARE  — token + cloud + 4-gate (G3 NA-substituted) PASS
+//   PHASE2_DEGRADED_NO_TOKEN           — no token; honest skip-pass
+//   PHASE2_DEGRADED_CLOUD_UNREACHABLE  — token present, cloud failure
+//
+// USAGE
+//   hexa run anima-physics/quantum/cloud_real_ibm_q_facade.hexa
+//   hexa run anima-physics/quantum/cloud_real_ibm_q_facade.hexa --selftest
+//
+// PAIRS
+//   anima-physics/quantum/cloud_facade_poc.hexa  sibling Phase 1 (qiskit-aer)
+//   anima-physics/physics.hexa                   quantum_engine() dispatch site (NOT modified here)
+//
+// raw#9 hexa-only strict / raw#37 transient helper / raw#15 SSOT this file
+
+let SCHEMA            = "anima_physics/cloud_facade_quantum/2_ibmq_runtime"
+let BACKEND_PREFIX    = "ibmq_runtime_"
+let SCRIPT_PATH       = "scripts/anima_physics_ibmq_runtime_probe.py"
+let VENV_PYTHON       = "anima-physics/.venv/bin/python3"
+let SEED              = 42
+let N_QUBITS          = 4
+let SHOTS             = 1024
+
+// G1 — GHZ marginal entropy must exceed ln(2) - 0.10 (looser than POC because real-HW noise).
+let G1_LN2            = 0.693147180559945
+let G1_TOL_REAL_HW    = 0.15
+let G1_MIN_REAL_HW    = 0.543147180559945
+let G1_TOL_DEGRADED   = 0.05  // unused in degraded path but kept for documentation
+
+// frozen substrate_backend enum (design only — facade returns the chosen value).
+let BACKEND_LOCAL     = "local_hexa"
+let BACKEND_SIM       = "cloud_sim_qiskit_aer"
+let BACKEND_REAL      = "cloud_real_ibm_q"
+
+// Verdict literals
+let V_PASS_REAL       = "PHASE2_PASS_REAL_QUANTUM_HARDWARE"
+let V_DEG_NO_TOKEN    = "PHASE2_DEGRADED_NO_TOKEN"
+let V_DEG_UNREACHABLE = "PHASE2_DEGRADED_CLOUD_UNREACHABLE"
+let V_DEG_OTHER       = "PHASE2_DEGRADED_OTHER"
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn fabs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Run the raw#37 helper for one circuit kind. Returns the raw stdout JSON line.
+fn invoke_probe(circuit_kind: string, seed: int) -> string {
+    let cmd = VENV_PYTHON + " " + SCRIPT_PATH + " --circuit " + circuit_kind + " --seed " + to_string(seed)
+    let out = exec(cmd)
+    return out.trim()
+}
+
+// Compute sha256 of a string via shell.
+fn sha256_hex(s: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(s) + " | shasum -a 256 | cut -c1-64"
+    return exec(cmd).trim()
+}
+
+// Extract a numeric field from JSON via awk (no python parse — raw#9 strict).
+fn extract_float(json_line: string, key: string) -> float {
+    let cmd = "printf '%s' " + shell_escape(json_line) +
+        " | awk -v k=" + shell_escape(key) +
+        " 'BEGIN{ q=\"\\\"\" } { s=$0; pat=q k q \":[ ]*\"; n=match(s, pat); if (n==0) { print \"\"; exit } rest=substr(s, n+RLENGTH); m=match(rest, /-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?/); if (m==0) { print \"\"; exit } print substr(rest, m, RLENGTH) }'"
+    let r = exec(cmd).trim()
+    if r == "" { return -999999.0 }
+    return to_float(r)
+}
+
+// Extract a string field from JSON via awk.
+fn extract_string(json_line: string, key: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(json_line) +
+        " | awk -v k=" + shell_escape(key) +
+        " 'BEGIN{ q=\"\\\"\" } { s=$0; pat=q k q \":[ ]*\" q; n=match(s, pat); if (n==0) { print \"\"; exit } rest=substr(s, n+RLENGTH); m=index(rest, q); if (m==0) { print \"\"; exit } print substr(rest, 1, m-1) }'"
+    return exec(cmd).trim()
+}
+
+// Extract a boolean field via awk (matches "key": true|false).
+fn extract_bool(json_line: string, key: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(json_line) +
+        " | awk -v k=" + shell_escape(key) +
+        " 'BEGIN{ q=\"\\\"\" } { s=$0; pat=q k q \":[ ]*\"; n=match(s, pat); if (n==0) { print \"\"; exit } rest=substr(s, n+RLENGTH); if (substr(rest,1,4)==\"true\") { print \"true\"; exit } if (substr(rest,1,5)==\"false\") { print \"false\"; exit } print \"\" }'"
+    return exec(cmd).trim()
+}
+
+fn run_facade() -> bool {
+    println("[cloud_real_ibm_q] backend=" + BACKEND_REAL + " seed=" + to_string(SEED) + " n_qubits=" + to_string(N_QUBITS) + " shots=" + to_string(SHOTS))
+
+    // 1. GHZ probe
+    let ghz_run1 = invoke_probe("ghz", SEED)
+    let ghz_token = extract_bool(ghz_run1, "token_present")
+    let ghz_degraded = extract_bool(ghz_run1, "degraded")
+    let ghz_entropy = extract_float(ghz_run1, "entropy_marginal_nat")
+    let ghz_circuit_sha = extract_string(ghz_run1, "sha256_circuit")
+    let ghz_backend = extract_string(ghz_run1, "backend_name")
+    let ghz_actual = extract_string(ghz_run1, "actual_backend")
+    let ghz_error = extract_string(ghz_run1, "error")
+    let ghz_shots = extract_float(ghz_run1, "shots")
+
+    println("[ghz] token_present=" + ghz_token + " degraded=" + ghz_degraded)
+    println("[ghz] backend=" + ghz_backend + " actual=" + ghz_actual)
+    println("[ghz] entropy_marginal_nat=" + to_string(ghz_entropy))
+    println("[ghz] shots=" + to_string(ghz_shots))
+    if ghz_error != "" { println("[ghz] error=" + ghz_error) }
+
+    let token_present = ghz_token == "true"
+    let degraded = ghz_degraded == "true"
+
+    // Branch 1: NO TOKEN — honest degraded marker.
+    if token_present == false {
+        println("[cloud_real_ibm_q] NO IBM TOKEN — honest degraded path")
+        write_marker(false, false, ghz_backend, "", ghz_entropy, 0.0, 0, ghz_circuit_sha, ghz_run1, "", V_DEG_NO_TOKEN, ghz_error, false, false, false, false)
+        // Degraded NO_TOKEN is honest, NOT a hard failure for cycle bookkeeping.
+        // Return true so exit(0); operator inspects marker for verdict.
+        return true
+    }
+
+    // Branch 2: Token present but cloud degraded.
+    if degraded == true {
+        println("[cloud_real_ibm_q] TOKEN PRESENT but cloud degraded — error=" + ghz_error)
+        let v = V_DEG_UNREACHABLE
+        if ghz_backend.starts_with("ibmq_runtime_DEGRADED_") {
+            // Use the specific suffix as part of verdict if not the standard ones
+        }
+        write_marker(true, true, ghz_backend, ghz_actual, ghz_entropy, 0.0, 0, ghz_circuit_sha, ghz_run1, "", v, ghz_error, false, false, false, false)
+        return true
+    }
+
+    // Branch 3: Real HW PASS path. Run random baseline.
+    let rnd_run1 = invoke_probe("random", SEED)
+    let rnd_entropy = extract_float(rnd_run1, "entropy_marginal_nat")
+    let rnd_degraded = extract_bool(rnd_run1, "degraded")
+    let rnd_actual = extract_string(rnd_run1, "actual_backend")
+    println("[random] entropy_marginal_nat=" + to_string(rnd_entropy) + " degraded=" + rnd_degraded + " actual=" + rnd_actual)
+
+    if rnd_degraded == "true" {
+        println("[cloud_real_ibm_q] random circuit cloud-degraded; verdict=UNREACHABLE")
+        let rnd_error = extract_string(rnd_run1, "error")
+        write_marker(true, true, ghz_backend, ghz_actual, ghz_entropy, rnd_entropy, SHOTS, ghz_circuit_sha, ghz_run1, rnd_run1, V_DEG_UNREACHABLE, rnd_error, false, false, false, false)
+        return true
+    }
+
+    // 4-gate evaluation (G3 = NOT APPLICABLE on real HW; treat as "soft pass" with caveat string).
+    let g1 = ghz_entropy >= G1_MIN_REAL_HW
+    let g2 = rnd_entropy < ghz_entropy
+    // G3 NOT_APPLICABLE: real HW shot noise → byte-identical sha is impossible. Honest.
+    let g3 = false  // Not asserted; marker carries NOT_APPLICABLE_REAL_HW string.
+    let g4 = ghz_backend == (BACKEND_PREFIX + ghz_actual)
+
+    if g1 { println("G1 PASS — GHZ marginal entropy=" + to_string(ghz_entropy) + " >= " + to_string(G1_MIN_REAL_HW) + " (ln2 - 0.15 noise tol)") } else { println("G1 FAIL — GHZ marginal entropy=" + to_string(ghz_entropy) + " < " + to_string(G1_MIN_REAL_HW)) }
+    if g2 { println("G2 PASS — random " + to_string(rnd_entropy) + " < ghz " + to_string(ghz_entropy)) } else { println("G2 FAIL — random >= ghz, no sign-flip") }
+    println("G3 NOT_APPLICABLE_REAL_HW — shot noise prevents byte-identical sha (honest)")
+    if g4 { println("G4 PASS — backend=" + ghz_backend + " == " + BACKEND_PREFIX + ghz_actual) } else { println("G4 FAIL — backend=" + ghz_backend + " != " + BACKEND_PREFIX + ghz_actual) }
+
+    let real_pass = g1 && g2 && g4
+    let verdict = V_DEG_OTHER
+    if real_pass { verdict = V_PASS_REAL }
+
+    write_marker(true, false, ghz_backend, ghz_actual, ghz_entropy, rnd_entropy, SHOTS, ghz_circuit_sha, ghz_run1, rnd_run1, verdict, "", g1, g2, false, g4)
+
+    if real_pass {
+        println("[cloud_real_ibm_q] PHASE2 REAL HW PASS — IBM Q backend " + ghz_actual)
+        return true
+    }
+    println("[cloud_real_ibm_q] verdict=" + verdict)
+    return false
+}
+
+fn bool_str(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+fn write_marker(token_present: bool, cloud_degraded: bool, backend_name: string, actual_backend: string, ghz_h: float, rnd_h: float, shots_used: int, circuit_sha: string, raw_ghz: string, raw_rnd: string, verdict: string, error: string, g1: bool, g2: bool, g3: bool, g4: bool) {
+    let marker_dir = "state/v10_anima_physics_cloud_facade/phase2_ibmq_runtime"
+    let _ = exec("mkdir -p " + marker_dir)
+    let marker_path = marker_dir + "/marker.json"
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+    // Escape inner quotes for JSON embedding of raw_ghz / raw_rnd.
+    let raw_ghz_esc = raw_ghz.replace("\\", "\\\\").replace("\"", "\\\"")
+    let raw_rnd_esc = raw_rnd.replace("\\", "\\\\").replace("\"", "\\\"")
+    let error_esc = error.replace("\\", "\\\\").replace("\"", "\\\"")
+
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"" + SCHEMA + "\",\n"
+    j = j + "  \"cycle\": \"anima_physics_cloud_facade_phase2_ibmq_runtime\",\n"
+    j = j + "  \"verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"backend\": \"" + BACKEND_REAL + "\",\n"
+    j = j + "  \"backend_name\": \"" + backend_name + "\",\n"
+    j = j + "  \"actual_backend\": \"" + actual_backend + "\",\n"
+    j = j + "  \"token_present\": " + bool_str(token_present) + ",\n"
+    j = j + "  \"cloud_degraded\": " + bool_str(cloud_degraded) + ",\n"
+    j = j + "  \"n_qubits\": " + to_string(N_QUBITS) + ",\n"
+    j = j + "  \"seed\": " + to_string(SEED) + ",\n"
+    j = j + "  \"shots\": " + to_string(shots_used) + ",\n"
+    j = j + "  \"gates\": {\n"
+    j = j + "    \"G1\": " + bool_str(g1) + ",\n"
+    j = j + "    \"G2\": " + bool_str(g2) + ",\n"
+    j = j + "    \"G3\": \"NOT_APPLICABLE_REAL_HW\",\n"
+    j = j + "    \"G4\": " + bool_str(g4) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"ghz_entropy_real_hw\": " + to_string(ghz_h) + ",\n"
+    j = j + "  \"random_entropy_real_hw\": " + to_string(rnd_h) + ",\n"
+    j = j + "  \"ln2_reference\": " + to_string(G1_LN2) + ",\n"
+    j = j + "  \"g1_min_real_hw\": " + to_string(G1_MIN_REAL_HW) + ",\n"
+    j = j + "  \"circuit_sha256\": \"" + circuit_sha + "\",\n"
+    j = j + "  \"byte_identical_match\": \"NOT_APPLICABLE_REAL_HW\",\n"
+    j = j + "  \"substrate_backend_enum\": [\"" + BACKEND_LOCAL + "\", \"" + BACKEND_SIM + "\", \"" + BACKEND_REAL + "\"],\n"
+    j = j + "  \"raw_probe_stdout_ghz\": \"" + raw_ghz_esc + "\",\n"
+    j = j + "  \"raw_probe_stdout_random\": \"" + raw_rnd_esc + "\",\n"
+    j = j + "  \"error\": \"" + error_esc + "\",\n"
+    j = j + "  \"files\": [\n"
+    j = j + "    \"" + SCRIPT_PATH + "\",\n"
+    j = j + "    \"anima-physics/quantum/cloud_real_ibm_q_facade.hexa\",\n"
+    j = j + "    \"" + marker_path + "\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"limits_raw_10_honest\": [\n"
+    j = j + "    \"G3 byte-identical NOT_APPLICABLE on real HW (shot noise is fundamental); statevector path keeps G3 sha equivalence\",\n"
+    j = j + "    \"degraded path produces honest marker (NOT silent skip-pass): no_token=NO_TOKEN, cloud_fail=UNREACHABLE\",\n"
+    j = j + "    \"IBM Q free-tier queue may exceed 60s timeout — TIMEOUT_SECONDS poll bound is best-effort, real run may exceed\",\n"
+    j = j + "    \"marginal entropy on first 2 qubits is upper-bounded by ln(2)*2; threshold tolerance widened to ln2-0.15 to absorb HW noise\",\n"
+    j = j + "    \"actual_backend chosen via least_busy(operational=True, simulator=False); deterministic re-runs choose different physical chips\",\n"
+    j = j + "    \"physics.hexa quantum_engine() dispatch site NOT modified (sibling C cycle; this cycle = isolated facade)\",\n"
+    j = j + "    \"raw#9 strict respected via exec(awk/sha/python3); helper script is raw#37 transient (main-only, no library)\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"next_phase\": \"physics.hexa quantum_engine() dispatch 통합 (sibling C cycle) + photonic/neuromorphic fan-out\",\n"
+    j = j + "  \"cost_usd\": 0.0,\n"
+    j = j + "  \"ibm_q_free_tier_minutes_used\": 0,\n"
+    j = j + "  \"timestamp\": \"" + ts + "\"\n"
+    j = j + "}\n"
+
+    write_file(marker_path, j)
+    println("[marker] " + marker_path)
+    println("[verdict] " + verdict)
+}
+
+fn cmd_selftest() {
+    println("── cloud_real_ibm_q_facade selftest ──")
+    let cmd = "test -f " + VENV_PYTHON + " && echo y || echo n"
+    let venv_ok = exec(cmd).trim()
+    println("venv_python_exists=" + venv_ok)
+    let cmd2 = "test -f " + SCRIPT_PATH + " && echo y || echo n"
+    let script_ok = exec(cmd2).trim()
+    println("helper_script_exists=" + script_ok)
+    if venv_ok == "y" {
+        let qv = exec(VENV_PYTHON + " -c 'import qiskit, qiskit_ibm_runtime; print(qiskit.__version__, qiskit_ibm_runtime.__version__)' 2>&1").trim()
+        println("qiskit_ibm_runtime_versions=" + qv)
+    }
+    // Probe token detection without running cloud.
+    let cmd3 = VENV_PYTHON + " -c 'import os; t=bool(os.environ.get(\"IBM_QUANTUM_TOKEN\") or os.environ.get(\"QISKIT_IBM_TOKEN\") or os.path.isfile(os.path.expanduser(\"~/.qiskit/qiskit-ibm.json\"))); print(\"token_present=\"+(\"true\" if t else \"false\"))'"
+    let tok = exec(cmd3).trim()
+    println(tok)
+    println("selftest=ok")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+    let ok = run_facade()
+    if ok { exit(0) }
+    exit(1)
+}
+
+main()

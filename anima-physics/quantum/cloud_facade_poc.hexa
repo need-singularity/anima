@@ -1,0 +1,220 @@
+// anima-physics/quantum/cloud_facade_poc.hexa
+// Cloud-facade quantum substrate POC — qiskit-aer statevector backend.
+// raw#9 hexa-only strict (exec(awk/sha/python3) allowed; no exec("head") fileread).
+// raw#37 transient: scripts/anima_physics_qiskit_aer_probe.py (helper, not library).
+//
+// PURPOSE
+//   8 substrate platforms 중 quantum 첫 cloud-facade — IBM Q API key 불필요.
+//   qiskit-aer 로컬 statevector simulator = production-grade Schrödinger sim,
+//   Phase 2 IBMQRuntime backend swap 만으로 진짜 cloud 확장 가능 (frozen contract).
+//
+// ENUM (frozen contract)
+//   substrate_backend ∈ { "local_hexa", "cloud_sim_qiskit_aer", "cloud_real_ibm_q" }
+//   본 cycle = "cloud_sim_qiskit_aer" 만 구현. 다른 둘은 design-only stub.
+//
+// PROBE = 4-qubit bipartition entanglement entropy.
+//   ghz       → ln(2) = 0.6931 ± 0.05  (G1)
+//   random    → < ghz                  (G2 negative-falsify lever)
+//   seed=42 deterministic               (G3 byte-identical)
+//   backend   == "qiskit_aer_statevector" (G4 facade contract)
+//
+// USAGE
+//   hexa run anima-physics/quantum/cloud_facade_poc.hexa
+//   hexa run anima-physics/quantum/cloud_facade_poc.hexa --selftest
+//
+// PAIRS
+//   anima-physics/quantum/bell_state.hexa   prior 4D-statevec hexa-native sim
+//   anima-physics/physics.hexa              quantum_engine() stub site (this cycle = isolated POC)
+//   tool/anima_train_ia3.hexa               raw#9 emit-helper template
+//
+// raw#9 hexa-only strict / raw#37 transient helper / raw#15 SSOT this file
+
+let SCHEMA            = "anima_physics/cloud_facade_quantum/1"
+let BACKEND_NAME      = "qiskit_aer_statevector"
+let SCRIPT_PATH       = "scripts/anima_physics_qiskit_aer_probe.py"
+let VENV_PYTHON       = "anima-physics/.venv/bin/python3"
+let SEED              = 42
+let N_QUBITS          = 4
+
+// G1 — GHZ entropy must exceed ln(2) - 0.05
+let G1_LN2            = 0.693147180559945
+let G1_TOL            = 0.05
+let G1_MIN            = 0.643147180559945
+
+// frozen substrate_backend enum (design-only — facade returns the chosen value).
+let BACKEND_LOCAL     = "local_hexa"
+let BACKEND_SIM       = "cloud_sim_qiskit_aer"
+let BACKEND_REAL      = "cloud_real_ibm_q"
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn fabs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Run the raw#37 helper for one circuit kind. Returns the raw stdout JSON line.
+fn invoke_probe(circuit_kind: string, seed: int) -> string {
+    let cmd = VENV_PYTHON + " " + SCRIPT_PATH + " --circuit " + circuit_kind + " --seed " + to_string(seed)
+    let out = exec(cmd)
+    return out.trim()
+}
+
+// Compute sha256 of a string via shell.
+fn sha256_hex(s: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(s) + " | shasum -a 256 | cut -c1-64"
+    return exec(cmd).trim()
+}
+
+// Extract a numeric field from JSON via awk (no python parse — keep raw#9 strict).
+fn extract_float(json_line: string, key: string) -> float {
+    // Match "key": <number>  (no quotes)
+    let cmd = "printf '%s' " + shell_escape(json_line) +
+        " | awk -v k=" + shell_escape(key) +
+        " 'BEGIN{ q=\"\\\"\" } { s=$0; pat=q k q \":[ ]*\"; n=match(s, pat); if (n==0) { print \"\"; exit } rest=substr(s, n+RLENGTH); m=match(rest, /-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?/); if (m==0) { print \"\"; exit } print substr(rest, m, RLENGTH) }'"
+    let r = exec(cmd).trim()
+    if r == "" { return -999999.0 }
+    return to_float(r)
+}
+
+// Extract a string field from JSON via awk.
+fn extract_string(json_line: string, key: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(json_line) +
+        " | awk -v k=" + shell_escape(key) +
+        " 'BEGIN{ q=\"\\\"\" } { s=$0; pat=q k q \":[ ]*\" q; n=match(s, pat); if (n==0) { print \"\"; exit } rest=substr(s, n+RLENGTH); m=index(rest, q); if (m==0) { print \"\"; exit } print substr(rest, 1, m-1) }'"
+    return exec(cmd).trim()
+}
+
+fn run_facade() -> bool {
+    println("[cloud_facade_poc] backend=" + BACKEND_SIM + " seed=" + to_string(SEED) + " n_qubits=" + to_string(N_QUBITS))
+
+    // 1. GHZ probe
+    let ghz_run1 = invoke_probe("ghz", SEED)
+    let ghz_run2 = invoke_probe("ghz", SEED)
+    let ghz_sha1 = sha256_hex(ghz_run1)
+    let ghz_sha2 = sha256_hex(ghz_run2)
+    let ghz_entropy = extract_float(ghz_run1, "entropy_bipartition_nat")
+    let ghz_circuit_sha = extract_string(ghz_run1, "sha256_circuit")
+    let ghz_backend = extract_string(ghz_run1, "backend_name")
+
+    println("[ghz] entropy_nat=" + to_string(ghz_entropy))
+    println("[ghz] backend=" + ghz_backend)
+    println("[ghz] circuit_sha256=" + ghz_circuit_sha)
+    println("[ghz] run1_sha=" + ghz_sha1)
+    println("[ghz] run2_sha=" + ghz_sha2)
+
+    // 2. Random baseline probe (negative falsify)
+    let rnd_run1 = invoke_probe("random", SEED)
+    let rnd_entropy = extract_float(rnd_run1, "entropy_bipartition_nat")
+    println("[random] entropy_nat=" + to_string(rnd_entropy))
+
+    // 3. Gates
+    let g1 = ghz_entropy >= G1_MIN
+    let g2 = rnd_entropy < ghz_entropy
+    let g3 = ghz_sha1 == ghz_sha2
+    let g4 = ghz_backend == BACKEND_NAME
+
+    if g1 { println("G1 PASS — GHZ entropy=" + to_string(ghz_entropy) + " >= " + to_string(G1_MIN) + " (ln2 - 0.05)") } else { println("G1 FAIL — GHZ entropy=" + to_string(ghz_entropy) + " < " + to_string(G1_MIN)) }
+    if g2 { println("G2 PASS — random " + to_string(rnd_entropy) + " < ghz " + to_string(ghz_entropy) + " (sign-flip)") } else { println("G2 FAIL — random >= ghz, no sign-flip") }
+    if g3 { println("G3 PASS — byte-identical sha=" + ghz_sha1) } else { println("G3 FAIL — sha1=" + ghz_sha1 + " sha2=" + ghz_sha2) }
+    if g4 { println("G4 PASS — backend=" + ghz_backend + " == " + BACKEND_NAME) } else { println("G4 FAIL — backend=" + ghz_backend + " != " + BACKEND_NAME) }
+
+    let all_pass = g1 && g2 && g3 && g4
+
+    // 4. Marker JSON
+    let marker_dir = "state/v10_anima_physics_cloud_facade/poc_quantum_qiskit_aer"
+    let _ = exec("mkdir -p " + marker_dir)
+    let marker_path = marker_dir + "/marker.json"
+
+    let verdict = "FAIL"
+    if all_pass { verdict = "PASS" }
+
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"" + SCHEMA + "\",\n"
+    j = j + "  \"cycle\": \"anima_physics_cloud_facade_poc_quantum_qiskit_aer\",\n"
+    j = j + "  \"verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"backend\": \"" + BACKEND_SIM + "\",\n"
+    j = j + "  \"backend_name\": \"" + ghz_backend + "\",\n"
+    j = j + "  \"n_qubits\": " + to_string(N_QUBITS) + ",\n"
+    j = j + "  \"seed\": " + to_string(SEED) + ",\n"
+    j = j + "  \"gates\": {\n"
+    j = j + "    \"G1\": " + to_string(g1) + ",\n"
+    j = j + "    \"G2\": " + to_string(g2) + ",\n"
+    j = j + "    \"G3\": " + to_string(g3) + ",\n"
+    j = j + "    \"G4\": " + to_string(g4) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"ghz_entropy_nat\": " + to_string(ghz_entropy) + ",\n"
+    j = j + "  \"random_entropy_nat\": " + to_string(rnd_entropy) + ",\n"
+    j = j + "  \"ln2_reference\": " + to_string(G1_LN2) + ",\n"
+    j = j + "  \"circuit_sha256\": \"" + ghz_circuit_sha + "\",\n"
+    j = j + "  \"byte_identical_run1_sha\": \"" + ghz_sha1 + "\",\n"
+    j = j + "  \"byte_identical_run2_sha\": \"" + ghz_sha2 + "\",\n"
+    j = j + "  \"byte_identical_match\": " + to_string(g3) + ",\n"
+    j = j + "  \"substrate_backend_enum\": [\"" + BACKEND_LOCAL + "\", \"" + BACKEND_SIM + "\", \"" + BACKEND_REAL + "\"],\n"
+    j = j + "  \"files\": [\n"
+    j = j + "    \"" + SCRIPT_PATH + "\",\n"
+    j = j + "    \"anima-physics/quantum/cloud_facade_poc.hexa\",\n"
+    j = j + "    \"" + marker_path + "\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"limits_raw_10_honest\": [\n"
+    j = j + "    \"qiskit-aer statevector = production simulator but NOT real quantum hardware (Phase 2 IBM Q required)\",\n"
+    j = j + "    \"4-qubit POC covers 1 of 8 substrate platforms; photonic/neuromorphic/fpga/cmos/memristor/superconducting/analog still TODO\",\n"
+    j = j + "    \"substrate_backend enum = design only this cycle; physics.hexa quantum_engine() stub unmodified (isolated POC proof)\",\n"
+    j = j + "    \"GHZ ln(2) bipartition entropy assumes noiseless ideal Schrödinger evolution; real-hardware noise will reduce entropy\",\n"
+    j = j + "    \"raw#9 strict respected via exec(awk/sha/python3); helper script is raw#37 transient (main-only, no library)\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"next_phase\": \"Phase 2 IBMQRuntime cloud_real_ibm_q backend swap (API key required) + photonic/neuromorphic POC fan-out\",\n"
+    j = j + "  \"cost_usd\": 0.0,\n"
+    j = j + "  \"timestamp\": \"" + ts + "\"\n"
+    j = j + "}\n"
+
+    write_file(marker_path, j)
+    println("[marker] " + marker_path)
+
+    if all_pass {
+        println("[cloud_facade_poc] 4/4 PASS — POC quantum cloud-facade VERIFIED")
+        return true
+    }
+    println("[cloud_facade_poc] verdict=FAIL")
+    return false
+}
+
+fn cmd_selftest() {
+    println("── cloud_facade_poc selftest ──")
+    let cmd = "test -f " + VENV_PYTHON + " && echo y || echo n"
+    let venv_ok = exec(cmd).trim()
+    println("venv_python_exists=" + venv_ok)
+    let cmd2 = "test -f " + SCRIPT_PATH + " && echo y || echo n"
+    let script_ok = exec(cmd2).trim()
+    println("helper_script_exists=" + script_ok)
+    if venv_ok == "y" {
+        let qv = exec(VENV_PYTHON + " -c 'import qiskit, qiskit_aer; print(qiskit.__version__, qiskit_aer.__version__)'").trim()
+        println("qiskit_versions=" + qv)
+    }
+    println("selftest=ok")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+    let ok = run_facade()
+    if ok { exit(0) }
+    exit(1)
+}
+
+main()

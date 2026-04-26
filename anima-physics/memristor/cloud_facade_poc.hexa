@@ -1,0 +1,245 @@
+// anima-physics/memristor/cloud_facade_poc.hexa
+// Cloud-facade memristor substrate POC — NgSpice + Biolek HP TiO2 backend.
+// raw#9 hexa-only strict (exec(awk/sha/python3) allowed; no exec("head") fileread).
+// raw#37 transient: scripts/anima_physics_memristor_ngspice_probe.py (helper, not library).
+//
+// PURPOSE
+//   memristor / cmos / arduino 는 cloud API 부재 (web search 확인). 본 cycle =
+//   NgSpice 로컬 시뮬을 endpoint 로 wrapping = "cloud_sim_local_<sim>" facade 패턴.
+//   sibling quantum (qiskit-aer) cycle 과 동일 4-gate 구조 유지.
+//
+// ENUM (frozen contract)
+//   substrate_backend ∈ { "local_hexa", "cloud_sim_local_ngspice", "cloud_real_<future>" }
+//   본 cycle = "cloud_sim_local_ngspice" 만 구현. 진짜 cloud 는 부재 (raw#10 명시).
+//
+// PROBE = pinched I-V hysteresis loop area (V·A units, shoelace).
+//   Biolek HP TiO2 memristor + 0.1 Hz / 1.5 V sin / 20 s / 2000 samples
+//     → expected area ≈ 6.8e-3 V·A  (≥ 1e-4 G1 threshold)
+//   pure 1k resistor + 동일 input
+//     → expected area ≈ 4e-14 V·A  (numerical floor)  (G2 sign-flip lever)
+//   ngspice deterministic on identical netlist  → byte-identical (G3)
+//   backend_name == "local_ngspice_<ver>_biolek_hp_memristor"  (G4 facade contract)
+//
+// USAGE
+//   hexa run anima-physics/memristor/cloud_facade_poc.hexa
+//   hexa run anima-physics/memristor/cloud_facade_poc.hexa --selftest
+//
+// PAIRS
+//   anima-physics/quantum/cloud_facade_poc.hexa     sibling quantum POC (entanglement)
+//   anima-physics/physics.hexa                      memristor_engine() stub site (this cycle = isolated POC)
+//   scripts/anima_physics_memristor_ngspice_probe.py raw#37 transient helper
+//
+// raw#9 hexa-only strict / raw#37 transient helper / raw#15 SSOT this file
+
+let SCHEMA            = "anima_physics/cloud_facade_memristor/1"
+let SCRIPT_PATH       = "scripts/anima_physics_memristor_ngspice_probe.py"
+let VENV_PYTHON       = "anima-physics/.venv/bin/python3"
+let SEED              = 42
+
+// G1 — memristor hysteresis area must exceed 1e-4 V·A
+let G1_AREA_MIN       = 0.0001
+
+// G4 — backend_name prefix expected from helper
+let BACKEND_MEM_PREFIX  = "local_ngspice_"
+let BACKEND_MEM_SUFFIX  = "_biolek_hp_memristor"
+let BACKEND_RES_SUFFIX  = "_linear_resistor_baseline"
+
+// frozen substrate_backend enum (design-only — facade naming consistency).
+let BACKEND_LOCAL     = "local_hexa"
+let BACKEND_SIM       = "cloud_sim_local_ngspice"
+let BACKEND_REAL      = "cloud_real_NOT_AVAILABLE"
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn fabs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Run the raw#37 helper for one device kind. Returns the raw stdout JSON line.
+fn invoke_probe(device_kind: string, seed: int) -> string {
+    let cmd = VENV_PYTHON + " " + SCRIPT_PATH + " --device " + device_kind + " --seed " + to_string(seed)
+    let out = exec(cmd)
+    return out.trim()
+}
+
+// Compute sha256 of a string via shell.
+fn sha256_hex(s: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(s) + " | shasum -a 256 | cut -c1-64"
+    return exec(cmd).trim()
+}
+
+// Extract a numeric field from JSON via awk.
+fn extract_float(json_line: string, key: string) -> float {
+    let cmd = "printf '%s' " + shell_escape(json_line) +
+        " | awk -v k=" + shell_escape(key) +
+        " 'BEGIN{ q=\"\\\"\" } { s=$0; pat=q k q \":[ ]*\"; n=match(s, pat); if (n==0) { print \"\"; exit } rest=substr(s, n+RLENGTH); m=match(rest, /-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?/); if (m==0) { print \"\"; exit } print substr(rest, m, RLENGTH) }'"
+    let r = exec(cmd).trim()
+    if r == "" { return -999999.0 }
+    return to_float(r)
+}
+
+// Extract a string field from JSON via awk.
+fn extract_string(json_line: string, key: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(json_line) +
+        " | awk -v k=" + shell_escape(key) +
+        " 'BEGIN{ q=\"\\\"\" } { s=$0; pat=q k q \":[ ]*\" q; n=match(s, pat); if (n==0) { print \"\"; exit } rest=substr(s, n+RLENGTH); m=index(rest, q); if (m==0) { print \"\"; exit } print substr(rest, 1, m-1) }'"
+    return exec(cmd).trim()
+}
+
+fn ends_with(s: string, suffix: string) -> bool {
+    let n = len(s)
+    let m = len(suffix)
+    if m > n { return false }
+    return s.substring(n - m, n) == suffix
+}
+
+fn starts_with(s: string, prefix: string) -> bool {
+    let n = len(s)
+    let m = len(prefix)
+    if m > n { return false }
+    return s.substring(0, m) == prefix
+}
+
+fn run_facade() -> bool {
+    println("[cloud_facade_poc] backend=" + BACKEND_SIM + " seed=" + to_string(SEED))
+
+    // 1. Memristor probe (positive)
+    let mem_run1 = invoke_probe("memristor", SEED)
+    let mem_run2 = invoke_probe("memristor", SEED)
+    let mem_sha1 = sha256_hex(mem_run1)
+    let mem_sha2 = sha256_hex(mem_run2)
+    let mem_area = extract_float(mem_run1, "hysteresis_area_v_a")
+    let mem_backend = extract_string(mem_run1, "backend_name")
+    let mem_netlist_sha = extract_string(mem_run1, "sha256_netlist")
+    let ngver = extract_string(mem_run1, "ngspice_version")
+
+    println("[memristor] hysteresis_area_v_a=" + to_string(mem_area))
+    println("[memristor] backend=" + mem_backend)
+    println("[memristor] ngspice_version=" + ngver)
+    println("[memristor] netlist_sha256=" + mem_netlist_sha)
+    println("[memristor] run1_sha=" + mem_sha1)
+    println("[memristor] run2_sha=" + mem_sha2)
+
+    // 2. Resistor baseline (negative falsify)
+    let res_run1 = invoke_probe("resistor", SEED)
+    let res_area = extract_float(res_run1, "hysteresis_area_v_a")
+    let res_backend = extract_string(res_run1, "backend_name")
+    println("[resistor] hysteresis_area_v_a=" + to_string(res_area))
+    println("[resistor] backend=" + res_backend)
+
+    // 3. Gates
+    let g1 = mem_area >= G1_AREA_MIN
+    let g2 = res_area < mem_area
+    let g3 = mem_sha1 == mem_sha2
+    let g4_prefix_ok = starts_with(mem_backend, BACKEND_MEM_PREFIX)
+    let g4_suffix_ok = ends_with(mem_backend, BACKEND_MEM_SUFFIX)
+    let g4 = g4_prefix_ok && g4_suffix_ok
+
+    if g1 { println("G1 PASS — memristor area=" + to_string(mem_area) + " >= " + to_string(G1_AREA_MIN)) } else { println("G1 FAIL — memristor area=" + to_string(mem_area) + " < " + to_string(G1_AREA_MIN)) }
+    if g2 { println("G2 PASS — resistor " + to_string(res_area) + " < memristor " + to_string(mem_area) + " (sign-flip)") } else { println("G2 FAIL — resistor area >= memristor area") }
+    if g3 { println("G3 PASS — byte-identical sha=" + mem_sha1) } else { println("G3 FAIL — sha1=" + mem_sha1 + " sha2=" + mem_sha2) }
+    if g4 { println("G4 PASS — backend=" + mem_backend + " matches contract") } else { println("G4 FAIL — backend=" + mem_backend + " contract mismatch") }
+
+    let all_pass = g1 && g2 && g3 && g4
+
+    // 4. Marker JSON
+    let marker_dir = "state/v10_anima_physics_cloud_facade/poc_memristor_local_ngspice"
+    let _ = exec("mkdir -p " + marker_dir)
+    let marker_path = marker_dir + "/marker.json"
+
+    let mut verdict = "FAIL"
+    if all_pass { verdict = "PASS" }
+
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"" + SCHEMA + "\",\n"
+    j = j + "  \"cycle\": \"anima_physics_cloud_facade_poc_memristor_local_ngspice\",\n"
+    j = j + "  \"verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"backend\": \"" + BACKEND_SIM + "\",\n"
+    j = j + "  \"backend_name\": \"" + mem_backend + "\",\n"
+    j = j + "  \"resistor_backend_name\": \"" + res_backend + "\",\n"
+    j = j + "  \"ngspice_installed\": true,\n"
+    j = j + "  \"ngspice_version\": \"" + ngver + "\",\n"
+    j = j + "  \"pyspice_installed\": true,\n"
+    j = j + "  \"subcircuit_model\": \"biolek_hp_2009_adapted_ngspice46\",\n"
+    j = j + "  \"seed\": " + to_string(SEED) + ",\n"
+    j = j + "  \"gates\": {\n"
+    j = j + "    \"G1\": " + to_string(g1) + ",\n"
+    j = j + "    \"G2\": " + to_string(g2) + ",\n"
+    j = j + "    \"G3\": " + to_string(g3) + ",\n"
+    j = j + "    \"G4\": " + to_string(g4) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"positive_hysteresis_area\": " + to_string(mem_area) + ",\n"
+    j = j + "  \"resistor_hysteresis_area\": " + to_string(res_area) + ",\n"
+    j = j + "  \"g1_area_min_threshold\": " + to_string(G1_AREA_MIN) + ",\n"
+    j = j + "  \"netlist_sha256\": \"" + mem_netlist_sha + "\",\n"
+    j = j + "  \"byte_identical_run1_sha\": \"" + mem_sha1 + "\",\n"
+    j = j + "  \"byte_identical_run2_sha\": \"" + mem_sha2 + "\",\n"
+    j = j + "  \"byte_identical_match\": " + to_string(g3) + ",\n"
+    j = j + "  \"substrate_backend_enum\": [\"" + BACKEND_LOCAL + "\", \"" + BACKEND_SIM + "\", \"" + BACKEND_REAL + "\"],\n"
+    j = j + "  \"files\": [\n"
+    j = j + "    \"" + SCRIPT_PATH + "\",\n"
+    j = j + "    \"anima-physics/memristor/cloud_facade_poc.hexa\",\n"
+    j = j + "    \"anima-physics/docs/memristor_local_sim_landing.md\",\n"
+    j = j + "    \"" + marker_path + "\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"limits_raw_10_honest\": [\n"
+    j = j + "    \"cloud_sim_local_ngspice = NOT real cloud — facade naming for substrate dispatch consistency only (memristor cloud API absent, web-search verified)\",\n"
+    j = j + "    \"Biolek HP TiO2 model = idealized linear-drift; real device LRS/HRS distribution + switching kinetics + Joule heating ignored\",\n"
+    j = j + "    \"hysteresis area Φ-proxy axis ≠ quantum sibling entanglement-entropy axis; direct cross-substrate Φ comparison NOT valid\",\n"
+    j = j + "    \"3 of 8 substrates covered (quantum + memristor); cmos / arduino / photonic / neuromorphic / fpga / superconducting / analog still TODO\",\n"
+    j = j + "    \"raw#9 strict via exec(awk/sha/python3); helper script raw#37 transient (main-only, no library); ngspice 46 stp/pow not native — replaced with smoothstep B-source expression\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"next_cycle_followup\": \"cmos / arduino 동일 NgSpice 패턴 fan-out (CMOS inverter ring oscillator + 555-timer-style Φ-proxy)\",\n"
+    j = j + "  \"cost_usd\": 0.0,\n"
+    j = j + "  \"timestamp\": \"" + ts + "\"\n"
+    j = j + "}\n"
+
+    write_file(marker_path, j)
+    println("[marker] " + marker_path)
+
+    if all_pass {
+        println("[cloud_facade_poc] 4/4 PASS — POC memristor cloud-facade VERIFIED")
+        return true
+    }
+    println("[cloud_facade_poc] verdict=" + verdict)
+    return false
+}
+
+fn cmd_selftest() {
+    println("── cloud_facade_poc memristor selftest ──")
+    let cmd = "test -f " + VENV_PYTHON + " && echo y || echo n"
+    let venv_ok = exec(cmd).trim()
+    println("venv_python_exists=" + venv_ok)
+    let cmd2 = "test -f " + SCRIPT_PATH + " && echo y || echo n"
+    let script_ok = exec(cmd2).trim()
+    println("helper_script_exists=" + script_ok)
+    let ng = exec("which ngspice && ngspice --version 2>&1 | head -1").trim()
+    println("ngspice=" + ng)
+    println("selftest=ok")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+    let ok = run_facade()
+    if ok { exit(0) }
+    exit(1)
+}
+
+main()

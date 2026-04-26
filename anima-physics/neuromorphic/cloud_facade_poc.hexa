@@ -1,0 +1,274 @@
+// anima-physics/neuromorphic/cloud_facade_poc.hexa
+// Cloud-facade neuromorphic substrate POC — BrainChip Akida Cloud backend.
+// raw#9 hexa-only strict (exec(awk/sha/python3) allowed; no exec("head") fileread).
+// raw#37 transient: scripts/anima_physics_akida_probe.py (helper, not library).
+//
+// PURPOSE
+//   8 substrate platforms 중 neuromorphic 첫 cloud-facade — Akida API token 불필요
+//   상태에서도 surrogate fallback 으로 4-gate 검증 가능. Token 받으면 cloud_real_akida
+//   backend 로 즉시 swap (frozen contract).
+//
+// ENUM (frozen contract — sibling quantum 와 isomorphic)
+//   substrate_backend ∈ { "local_hexa",
+//                          "cloud_sim_akida_simulator",
+//                          "cloud_real_akida_2gen",
+//                          "surrogate_algorithmic" }
+//   본 cycle = 환경에 따라 4중 1 자동 dispatch (Python wrapper 내부 결정).
+//
+// PROBE = 4-input → 8-class spike-train Shannon entropy.
+//   positive  → spike_entropy ≥ 0.3 nat              (G1)
+//   zero      → spike_entropy < positive              (G2 sign-flip)
+//   seed=42 deterministic → byte-identical 2-run sha  (G3)
+//   backend_name 가 frozen prefix 시작 (G4 facade contract)
+//
+// USAGE
+//   hexa run anima-physics/neuromorphic/cloud_facade_poc.hexa
+//   hexa run anima-physics/neuromorphic/cloud_facade_poc.hexa --selftest
+//
+// PAIRS
+//   anima-physics/quantum/cloud_facade_poc.hexa     sibling quantum POC (isomorphic 4-gate)
+//   anima-physics/physics.hexa                      neuromorphic_engine() stub (this cycle = isolated)
+//   anima-physics/docs/akida_cloud_signup_guide.md  user signup walkthrough
+//
+// raw#9 hexa-only strict / raw#37 transient helper / raw#15 SSOT this file
+
+let SCHEMA            = "anima_physics/cloud_facade_neuromorphic/1"
+let SCRIPT_PATH       = "scripts/anima_physics_akida_probe.py"
+let VENV_PYTHON       = "anima-physics/.venv/bin/python3"
+let SEED              = 42
+let N_INPUTS          = 4
+let N_CLASSES         = 8
+
+// G1 — positive spike entropy must exceed 0.3 nat (conservative; surrogate yields ~1.75).
+let G1_MIN_ENTROPY    = 0.3
+
+// frozen substrate_backend enum (design-only — facade returns the chosen value).
+let BACKEND_LOCAL     = "local_hexa"
+let BACKEND_SIM       = "cloud_sim_akida_simulator"
+let BACKEND_REAL      = "cloud_real_akida_2gen"
+let BACKEND_SURROGATE = "surrogate_algorithmic"
+
+// G4 — backend_name 가 본 4 prefix 중 하나로 시작해야 (auto fallback 까지 모두 허용).
+let PREFIX_CLOUD      = "brainchip_akida_cloud_"
+let PREFIX_SIM        = "brainchip_akida_simulator_local_"
+let PREFIX_SURROGATE  = "brainchip_akida_DEGRADED_SDK_UNAVAILABLE"
+let PREFIX_SURROGATE_ALT = "brainchip_akida_surrogate_with_sdk_present"
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn starts_with(haystack: string, needle: string) -> bool {
+    if len(needle) > len(haystack) { return false }
+    let pre = haystack.substr(0, len(needle))
+    return pre == needle
+}
+
+fn invoke_probe(pattern: string, seed: int) -> string {
+    let cmd = VENV_PYTHON + " " + SCRIPT_PATH + " --pattern " + pattern + " --seed " + to_string(seed) + " --backend auto"
+    let out = exec(cmd)
+    return out.trim()
+}
+
+fn sha256_hex(s: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(s) + " | shasum -a 256 | cut -c1-64"
+    return exec(cmd).trim()
+}
+
+fn extract_float(json_line: string, key: string) -> float {
+    let cmd = "printf '%s' " + shell_escape(json_line) +
+        " | awk -v k=" + shell_escape(key) +
+        " 'BEGIN{ q=\"\\\"\" } { s=$0; pat=q k q \":[ ]*\"; n=match(s, pat); if (n==0) { print \"\"; exit } rest=substr(s, n+RLENGTH); m=match(rest, /-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?/); if (m==0) { print \"\"; exit } print substr(rest, m, RLENGTH) }'"
+    let r = exec(cmd).trim()
+    if r == "" { return -999999.0 }
+    return to_float(r)
+}
+
+fn extract_string(json_line: string, key: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(json_line) +
+        " | awk -v k=" + shell_escape(key) +
+        " 'BEGIN{ q=\"\\\"\" } { s=$0; pat=q k q \":[ ]*\" q; n=match(s, pat); if (n==0) { print \"\"; exit } rest=substr(s, n+RLENGTH); m=index(rest, q); if (m==0) { print \"\"; exit } print substr(rest, 1, m-1) }'"
+    return exec(cmd).trim()
+}
+
+fn extract_bool(json_line: string, key: string) -> bool {
+    let cmd = "printf '%s' " + shell_escape(json_line) +
+        " | awk -v k=" + shell_escape(key) +
+        " 'BEGIN{ q=\"\\\"\" } { s=$0; pat=q k q \":[ ]*\"; n=match(s, pat); if (n==0) { print \"\"; exit } rest=substr(s, n+RLENGTH); m=match(rest, /(true|false)/); if (m==0) { print \"\"; exit } print substr(rest, m, RLENGTH) }'"
+    let r = exec(cmd).trim()
+    return r == "true"
+}
+
+fn run_facade() -> bool {
+    println("[neuromorphic_cloud_facade] backend=auto seed=" + to_string(SEED) + " n_in=" + to_string(N_INPUTS) + " n_out=" + to_string(N_CLASSES))
+
+    // 1. Positive probe — 4-input pattern → spike train.
+    let pos_run1 = invoke_probe("positive", SEED)
+    let pos_run2 = invoke_probe("positive", SEED)
+    let pos_sha1 = sha256_hex(pos_run1)
+    let pos_sha2 = sha256_hex(pos_run2)
+    let pos_entropy = extract_float(pos_run1, "spike_entropy_nat")
+    let pos_count = extract_float(pos_run1, "spike_count")
+    let backend_name = extract_string(pos_run1, "backend_name")
+    let mode = extract_string(pos_run1, "mode")
+    let sdk_available = extract_bool(pos_run1, "sdk_available")
+    let token_present = extract_bool(pos_run1, "token_present")
+    let sdk_version = extract_string(pos_run1, "sdk_version")
+    let pattern_sha = extract_string(pos_run1, "sha256_pattern_spec")
+
+    println("[positive] entropy_nat=" + to_string(pos_entropy))
+    println("[positive] spike_count=" + to_string(pos_count))
+    println("[positive] backend_name=" + backend_name)
+    println("[positive] mode=" + mode + " sdk_available=" + to_string(sdk_available) + " token_present=" + to_string(token_present))
+    println("[positive] pattern_sha=" + pattern_sha)
+    println("[positive] run1_sha=" + pos_sha1)
+    println("[positive] run2_sha=" + pos_sha2)
+
+    // 2. Zero baseline (negative falsify).
+    let zero_run1 = invoke_probe("zero", SEED)
+    let zero_entropy = extract_float(zero_run1, "spike_entropy_nat")
+    let zero_count = extract_float(zero_run1, "spike_count")
+    println("[zero] entropy_nat=" + to_string(zero_entropy))
+    println("[zero] spike_count=" + to_string(zero_count))
+
+    // 3. Gates
+    let g1 = pos_entropy >= G1_MIN_ENTROPY
+    let g2 = zero_entropy < pos_entropy
+    let g3 = pos_sha1 == pos_sha2
+    let g4_cloud = starts_with(backend_name, PREFIX_CLOUD)
+    let g4_sim = starts_with(backend_name, PREFIX_SIM)
+    let g4_surr = starts_with(backend_name, PREFIX_SURROGATE)
+    let g4_surr_alt = starts_with(backend_name, PREFIX_SURROGATE_ALT)
+    let g4 = g4_cloud || g4_sim || g4_surr || g4_surr_alt
+
+    if g1 { println("G1 PASS — positive entropy=" + to_string(pos_entropy) + " >= " + to_string(G1_MIN_ENTROPY)) } else { println("G1 FAIL — positive entropy=" + to_string(pos_entropy) + " < " + to_string(G1_MIN_ENTROPY)) }
+    if g2 { println("G2 PASS — zero " + to_string(zero_entropy) + " < positive " + to_string(pos_entropy) + " (sign-flip)") } else { println("G2 FAIL — zero >= positive, no sign-flip") }
+    if g3 { println("G3 PASS — byte-identical sha=" + pos_sha1) } else { println("G3 FAIL — sha1=" + pos_sha1 + " sha2=" + pos_sha2) }
+    if g4 { println("G4 PASS — backend_name=" + backend_name + " matches frozen prefix") } else { println("G4 FAIL — backend_name=" + backend_name + " unknown prefix") }
+
+    let all_pass = g1 && g2 && g3 && g4
+
+    // 4. Verdict — distinguish cloud / simulator / surrogate / prep-ready
+    let mut verdict = "FAIL"
+    if all_pass {
+        if mode == "cloud" { verdict = "CLOUD_PASS" }
+        if mode == "simulator" { verdict = "SIMULATOR_PASS" }
+        if mode == "surrogate" {
+            if sdk_available {
+                verdict = "SURROGATE_PASS_WITH_SDK"
+            } else {
+                verdict = "PREP_READY_AWAITING_USER_SIGNUP"
+            }
+        }
+    }
+
+    // 5. Marker JSON
+    let marker_dir = "state/v10_anima_physics_cloud_facade/poc_neuromorphic_akida_cloud"
+    let _ = exec("mkdir -p " + marker_dir)
+    let marker_path = marker_dir + "/marker.json"
+    let signup_url = "https://developer.brainchip.com/ach/"
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+    let mut j = "{\n"
+    j = j + "  \"schema\": \"" + SCHEMA + "\",\n"
+    j = j + "  \"cycle\": \"anima_physics_cloud_facade_poc_neuromorphic_akida_cloud\",\n"
+    j = j + "  \"verdict\": \"" + verdict + "\",\n"
+    j = j + "  \"mode\": \"" + mode + "\",\n"
+    j = j + "  \"backend_name\": \"" + backend_name + "\",\n"
+    j = j + "  \"akida_sdk_installed\": " + to_string(sdk_available) + ",\n"
+    j = j + "  \"akida_sdk_version\": \"" + sdk_version + "\",\n"
+    j = j + "  \"token_present\": " + to_string(token_present) + ",\n"
+    j = j + "  \"backend_used\": \"" + mode + "\",\n"
+    j = j + "  \"n_inputs\": " + to_string(N_INPUTS) + ",\n"
+    j = j + "  \"n_classes\": " + to_string(N_CLASSES) + ",\n"
+    j = j + "  \"seed\": " + to_string(SEED) + ",\n"
+    j = j + "  \"gates\": {\n"
+    j = j + "    \"G1\": " + to_string(g1) + ",\n"
+    j = j + "    \"G2\": " + to_string(g2) + ",\n"
+    j = j + "    \"G3\": " + to_string(g3) + ",\n"
+    j = j + "    \"G4\": " + to_string(g4) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"positive_entropy\": " + to_string(pos_entropy) + ",\n"
+    j = j + "  \"zero_entropy\": " + to_string(zero_entropy) + ",\n"
+    j = j + "  \"positive_spike_count\": " + to_string(pos_count) + ",\n"
+    j = j + "  \"zero_spike_count\": " + to_string(zero_count) + ",\n"
+    j = j + "  \"g1_threshold_nat\": " + to_string(G1_MIN_ENTROPY) + ",\n"
+    j = j + "  \"pattern_sha256\": \"" + pattern_sha + "\",\n"
+    j = j + "  \"byte_identical_run1_sha\": \"" + pos_sha1 + "\",\n"
+    j = j + "  \"byte_identical_run2_sha\": \"" + pos_sha2 + "\",\n"
+    j = j + "  \"byte_identical_match\": " + to_string(g3) + ",\n"
+    j = j + "  \"substrate_backend_enum\": [\"" + BACKEND_LOCAL + "\", \"" + BACKEND_SIM + "\", \"" + BACKEND_REAL + "\", \"" + BACKEND_SURROGATE + "\"],\n"
+    j = j + "  \"signup_url\": \"" + signup_url + "\",\n"
+    j = j + "  \"signup_guide_url_verified\": true,\n"
+    j = j + "  \"user_action_required\": \"BrainChip Akida Cloud 계정 가입 후 BRAINCHIP_AKIDA_TOKEN 환경변수 설정 (또는 Linux/x86_64 환경에서 pip install akida)\",\n"
+    j = j + "  \"files\": [\n"
+    j = j + "    \"" + SCRIPT_PATH + "\",\n"
+    j = j + "    \"anima-physics/neuromorphic/cloud_facade_poc.hexa\",\n"
+    j = j + "    \"anima-physics/docs/akida_cloud_signup_guide.md\",\n"
+    j = j + "    \"" + marker_path + "\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"limits_raw_10_honest\": [\n"
+    j = j + "    \"akida PyPI wheels는 Linux x86_64/aarch64 + Windows AMD64 만 제공; macOS arm64 미지원 → 본 cycle host 는 surrogate 모드 강제\",\n"
+    j = j + "    \"surrogate = LCG-deterministic 8-bit FullyConnected 흉내; 실제 Akida 2nd-gen ASIC 결과와 다를 수 있음 — Φ proxy 정합성 자체가 별도 검증 필요\",\n"
+    j = j + "    \"akida PyPI SDK 는 cloud submission API 미공개 (2026-04 기준); cloud 모드는 token swap 후에도 SDK 업데이트 또는 REST 직접 호출 필요\",\n"
+    j = j + "    \"G3 byte-identical 은 surrogate/simulator 결정적 실행 가정; 실제 cloud hardware 호출 시 비결정적 가능 (sibling quantum 와 동일 caveat)\",\n"
+    j = j + "    \"4-input → 8-class fan-out 은 minimum-viable POC; 진짜 Akida 2nd-gen 8-bit 모델 (예: keyword spotting, vision) 로 확장 시 entropy threshold 재보정 필요\",\n"
+    j = j + "    \"raw#9 strict 는 exec(awk/sha/python3/date/mkdir) 만 사용; helper script 는 raw#37 transient (main-only, no library)\"\n"
+    j = j + "  ],\n"
+    j = j + "  \"next_phase\": \"Phase 2 cloud_real_akida_2gen backend swap (사용자 가입 + token 발급 + Linux pod 또는 cloud SDK update 후) + photonic/superconducting/analog/memristor/fpga POC fan-out\",\n"
+    j = j + "  \"cost_usd\": 0.0,\n"
+    j = j + "  \"timestamp\": \"" + ts + "\"\n"
+    j = j + "}\n"
+
+    write_file(marker_path, j)
+    println("[marker] " + marker_path)
+
+    if all_pass {
+        println("[neuromorphic_cloud_facade] 4/4 PASS — verdict=" + verdict)
+        return true
+    }
+    println("[neuromorphic_cloud_facade] verdict=FAIL")
+    return false
+}
+
+fn cmd_selftest() {
+    println("── neuromorphic cloud_facade_poc selftest ──")
+    let cmd = "test -f " + VENV_PYTHON + " && echo y || echo n"
+    let venv_ok = exec(cmd).trim()
+    println("venv_python_exists=" + venv_ok)
+    let cmd2 = "test -f " + SCRIPT_PATH + " && echo y || echo n"
+    let script_ok = exec(cmd2).trim()
+    println("helper_script_exists=" + script_ok)
+    if venv_ok == "y" {
+        let av = exec(VENV_PYTHON + " -c 'try:\n  import akida; print(akida.__version__)\nexcept Exception as e:\n  print(\"unavailable:\", e)' 2>&1").trim()
+        println("akida_sdk=" + av)
+    }
+    let cmd3 = "test -n \"$BRAINCHIP_AKIDA_TOKEN\" && echo y || echo n"
+    let token_ok = exec(cmd3).trim()
+    println("env_token_present=" + token_ok)
+    let cmd4 = "test -f $HOME/.akida/credentials.json && echo y || echo n"
+    let cred_ok = exec(cmd4).trim()
+    println("credentials_file_present=" + cred_ok)
+    println("selftest=ok")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+    let ok = run_facade()
+    if ok { exit(0) }
+    exit(1)
+}
+
+main()

@@ -4,6 +4,13 @@
 //         benchmarks (spin_glass, power_efficiency, cross_platform, physics_consciousness),
 //         src (eeg_physics_bridge, body_physics_bridge, chip_architect, esp32_network),
 //         web (physics_server)
+//
+// SUBSTRATE_BACKEND DISPATCH (cycle: anima_physics_cloud_facade_integration_physics_hexa)
+//   사이블링 POC `anima-physics/quantum/cloud_facade_poc.hexa` 의 isolated proof 를
+//   physics.hexa 의 quantum_engine() 에 operational integration. backward-compat 보존
+//   (기존 quantum_engine(cells) signature 유지) + 신규 quantum_engine_dispatch(cells,
+//   backend) 추가. backend enum = SSOT (single definition site, 4 variant).
+//   raw#9 hexa-only strict, raw#10 honest (script 부재 시 stub 반환).
 
 struct PhysicsEngine {
     name: string,
@@ -21,6 +28,22 @@ struct ChipDesign {
     cost_usd: float
 }
 
+// substrate_backend enum (canonical SSOT) — string-tagged variants.
+// 본 정의는 anima-physics 전역 single source of truth. 중복 정의 금지.
+// G4_ENUM_CANONICAL gate: 정의 site = 1 (이 파일 한 곳).
+let SUBSTRATE_BACKEND_LOCAL_HEXA                  = "local_hexa"
+let SUBSTRATE_BACKEND_CLOUD_SIM_QISKIT_AER        = "cloud_sim_qiskit_aer"
+let SUBSTRATE_BACKEND_CLOUD_REAL_IBM_Q            = "cloud_real_ibm_q"
+let SUBSTRATE_BACKEND_CLOUD_SIM_STRAWBERRYFIELDS  = "cloud_sim_strawberryfields_fock"
+
+// dispatch 결과 (정직 표기: 실 invoke 여부 + backend 식별 + 정상 stub 여부).
+struct QuantumResult {
+    engine: PhysicsEngine,
+    backend: string,
+    invoked: bool,
+    stub_reason: string
+}
+
 pure fn engine_new(name: string, substrate: string) -> PhysicsEngine {
     PhysicsEngine { name: name, cells: 16, phi: 0.0, power_mw: 0.0, substrate: substrate }
 }
@@ -33,8 +56,72 @@ fn snn_engine(cells: int) -> PhysicsEngine {
 // TODO: port engines/izhikevich_consciousness.py — Izhikevich neuron model
 fn izhikevich_engine(cells: int) -> PhysicsEngine { engine_new("izhikevich", "neuromorphic") }
 
-// TODO: port engines/quantum_consciousness.py — quantum coherence consciousness
+// quantum_engine — backward-compat preserved signature (G1_BACKWARD_COMPAT).
+// 의미적 동등 보존: 기존 stub 결과와 byte-identical struct fields.
 fn quantum_engine(cells: int) -> PhysicsEngine { engine_new("quantum", "quantum") }
+
+// quantum_engine_dispatch — backend-aware variant (G2_DISPATCH_ROUTES + G3 operational).
+// backend == local_hexa  → 기존 stub 동작 그대로 (PhysicsEngine wrap, invoked=true).
+// backend == cloud_sim_qiskit_aer → sibling POC raw#37 helper script subprocess invoke.
+//                                    script 부재/qiskit_aer import 실패 시 stub_reason 명시.
+// backend == cloud_real_ibm_q  / cloud_sim_strawberryfields_fock → Phase 2 stub
+//                                    (sibling A/B 영역 — 본 cycle 미구현, marker.json 만 wire-up).
+fn quantum_engine_dispatch(cells: int, backend: string) -> QuantumResult {
+    let base = engine_new("quantum", "quantum")
+    if backend == SUBSTRATE_BACKEND_LOCAL_HEXA {
+        return QuantumResult { engine: base, backend: backend, invoked: true, stub_reason: "" }
+    }
+    if backend == SUBSTRATE_BACKEND_CLOUD_SIM_QISKIT_AER {
+        // sibling POC entry point (absolute path 회피 — repo-relative).
+        let venv_python = "anima-physics/.venv/bin/python3"
+        let script_path = "scripts/anima_physics_qiskit_aer_probe.py"
+        // 존재 확인. 부재 시 정직하게 stub 반환 (silent-fail 금지).
+        let chk_cmd = "test -f " + script_path + " && test -x " + venv_python + " && echo y || echo n"
+        let chk = exec(chk_cmd).trim()
+        if chk != "y" {
+            return QuantumResult {
+                engine: base, backend: backend, invoked: false,
+                stub_reason: "sibling_probe_script_or_venv_python_absent"
+            }
+        }
+        // raw#37 transient subprocess invoke (raw#9 strict 정당화: cloud sim
+        // 산출은 non-hexa 영역 = python qiskit-aer 라이브러리 의존).
+        let inv_cmd = venv_python + " " + script_path + " --circuit ghz --seed 42"
+        let stdout = exec(inv_cmd).trim()
+        if stdout == "" {
+            return QuantumResult {
+                engine: base, backend: backend, invoked: false,
+                stub_reason: "subprocess_returned_empty"
+            }
+        }
+        // 호출 성공 — engine 에 cells 만 갱신, 본 함수는 wire-up 검증만 책임.
+        let routed = PhysicsEngine {
+            name: "quantum", cells: cells, phi: base.phi,
+            power_mw: base.power_mw, substrate: "quantum"
+        }
+        return QuantumResult {
+            engine: routed, backend: backend, invoked: true,
+            stub_reason: ""
+        }
+    }
+    if backend == SUBSTRATE_BACKEND_CLOUD_REAL_IBM_Q {
+        return QuantumResult {
+            engine: base, backend: backend, invoked: false,
+            stub_reason: "phase_2_ibmq_runtime_api_key_required_sibling_a"
+        }
+    }
+    if backend == SUBSTRATE_BACKEND_CLOUD_SIM_STRAWBERRYFIELDS {
+        return QuantumResult {
+            engine: base, backend: backend, invoked: false,
+            stub_reason: "photonic_strawberryfields_sibling_b_owned"
+        }
+    }
+    // 알 수 없는 backend → stub + reason.
+    return QuantumResult {
+        engine: base, backend: backend, invoked: false,
+        stub_reason: "unknown_backend_enum_variant"
+    }
+}
 
 // TODO: port engines/photonic_consciousness.py — optical consciousness
 fn photonic_engine(cells: int) -> PhysicsEngine { engine_new("photonic", "photonic") }
