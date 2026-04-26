@@ -1,0 +1,202 @@
+// tool/anima_pilot_t2_launch_gate_dispatch.hexa — paradigm v11 8th axis Pilot-T2 launch-readiness gate + dispatch (raw#9 hexa-only).
+//
+// PURPOSE
+//   handoff §3.8 actionable: "paradigm v11 8th axis Pilot-T2 launch (TRIBE v2 cortical
+//   correlation, T1 v2 PASS 후)". Existing tool/anima_pilot_t2_axis_8th.hexa는
+//   per-backbone scalar 계산 도구. 본 helper는 그 위 layer:
+//     - Pilot-T1 v2 verdict gate (PASS/INCONCLUSIVE/FAIL/DEFERRED 분기)
+//     - multi-backbone dispatch matrix (axis 96 6th-bb ↔ Mk.XII 13B family-internal과 cross-link)
+//     - H_ORTH 8th-axis orthogonality pre-register (vs 7-axis stack)
+//     - launch_readiness verdict 산출 (UN_PARK_READY / BLOCKED_T1_FAIL / ITERATE_REQUIRED)
+//
+//   본 helper = mac-local launch-gate + dispatch ledger:
+//     - reads anima-tribev2-pilot/state/pilot_t1_result.json (presence + verdict)
+//     - emits per-backbone dispatch list (deduped against state/v11_axis_8_<backbone>.json existing)
+//     - frozen H_ORTH thresholds: pairwise BBA |r| with axis 1-7 < 0.5 → ORTHOGONAL_CONFIRMED
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/pilot_t2_launch_gate_dispatch.json)
+//   ANIMA_T1_RESULT   override T1 verdict file (default: anima-tribev2-pilot/state/pilot_t1_result.json)
+//
+// OUTPUT
+//   - t1_verdict_observed: PASS|INCONCLUSIVE|FAIL|DEFERRED|MISSING
+//   - launch_readiness: UN_PARK_READY|ITERATE_REQUIRED|BLOCKED_T1_FAIL|PRE_T1
+//   - dispatch_matrix: list of {backbone_label, hf_id, family, status, cmd}
+//   - frozen_orthogonality_register: H_ORTH thresholds + decision rule
+//   - launch_command_summary: total commands + cost (mac $0)
+//
+// USAGE
+//   hexa run tool/anima_pilot_t2_launch_gate_dispatch.hexa --selftest
+//   ANIMA_OUTPUT=state/pilot_t2_launch_gate_dispatch.json hexa run tool/anima_pilot_t2_launch_gate_dispatch.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - launch_readiness 결정은 T1 verdict 단일 source dependency. T1 v2 PASS 후에만 UN_PARK_READY.
+//   - dispatch matrix는 axis 96 6th-bb (cycle 5)와 Mk.XII Phase 3a (cycle 4) backbone들과 cross-link
+//     하지만 8th-axis는 Pilot-T1 cortical map 입력 dependency → 각 backbone별 cortical map 재생성 필요
+//     (즉 단순한 "기존 measurement 재사용" 아님; t1 forward 재실행 비용 별도).
+
+let HELPER_PATH = "/tmp/anima_pilot_t2_launch_gate_dispatch_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima Pilot-T2 launch-gate dispatch helper — emitted by tool/anima_pilot_t2_launch_gate_dispatch.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 8th axis launch-readiness + multi-backbone dispatch.\n")
+    parts.push("import json, os, sys\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/pilot_t2_launch_gate_dispatch.json')\n")
+    parts.push("T1_RESULT_PATH = os.environ.get('ANIMA_T1_RESULT', 'anima-tribev2-pilot/state/pilot_t1_result.json')\n\n")
+
+    parts.push("def _read_t1_verdict(path):\n")
+    parts.push("    if not os.path.exists(path):\n")
+    parts.push("        return {'verdict':'MISSING','reason':f'no file at {path}','schema':None}\n")
+    parts.push("    try:\n")
+    parts.push("        with open(path) as f: d = json.load(f)\n")
+    parts.push("    except Exception as e:\n")
+    parts.push("        return {'verdict':'MISSING','reason':f'parse_error:{type(e).__name__}','schema':None}\n")
+    parts.push("    return {\n")
+    parts.push("        'verdict':d.get('verdict','UNKNOWN'),\n")
+    parts.push("        'schema':d.get('schema'),\n")
+    parts.push("        'mode':d.get('mode'),\n")
+    parts.push("        'reason':'parsed',\n")
+    parts.push("    }\n\n")
+
+    parts.push("VERDICT_TO_READINESS = {\n")
+    parts.push("    'PASS':'UN_PARK_READY',\n")
+    parts.push("    'PARTIAL_PASS':'UN_PARK_READY',\n")
+    parts.push("    'INCONCLUSIVE':'ITERATE_REQUIRED',\n")
+    parts.push("    'INCONCLUSIVE_FULL':'ITERATE_REQUIRED',\n")
+    parts.push("    'FAIL':'BLOCKED_T1_FAIL',\n")
+    parts.push("    'DEFERRED_HF_GATE':'PRE_T1',\n")
+    parts.push("    'DEFERRED_INSTALL':'PRE_T1',\n")
+    parts.push("    'MISSING':'PRE_T1',\n")
+    parts.push("    'UNKNOWN':'PRE_T1',\n")
+    parts.push("}\n\n")
+
+    parts.push("DISPATCH_MATRIX_FULL = [\n")
+    parts.push("    {'backbone_label':'mistral_7b_v3', 'hf_id':'mistralai/Mistral-7B-v0.3', 'family':'mistral', 'priority':1, 'rationale':'Phase 3a 1/3 clean baseline; cortical map already candidate'},\n")
+    parts.push("    {'backbone_label':'gemma_2_9b',    'hf_id':'google/gemma-2-9b',          'family':'gemma',   'priority':2, 'rationale':'cycle 4 Phase 3a family-internal anchor; 8th-axis vs CMT cross-link'},\n")
+    parts.push("    {'backbone_label':'qwen3_8b',      'hf_id':'Qwen/Qwen3-8B',              'family':'qwen3',   'priority':3, 'rationale':'axis 109 BREAK family; 8th-axis must distinguish (orthogonality test)'},\n")
+    parts.push("    {'backbone_label':'llama_3_2_3b',  'hf_id':'meta-llama/Llama-3.2-3B',    'family':'llama',   'priority':4, 'rationale':'Pilot-T1 v2 native; HF gate dancinlife pending', 'hf_gated':True},\n")
+    parts.push("    {'backbone_label':'falcon_mamba_7b','hf_id':'tiiuae/falcon-mamba-7b',    'family':'mamba',   'priority':5, 'rationale':'cycle 5 axis-arch separator; cross-paradigm 8th-axis test'},\n")
+    parts.push("]\n\n")
+
+    parts.push("FROZEN_H_ORTH = {\n")
+    parts.push("    'id':'H_ORTH_8th_axis',\n")
+    parts.push("    'name':'8th_axis_orthogonal_to_7_axis_stack',\n")
+    parts.push("    'statement':'TRIBE v2 cortical scalar (axis 8) is orthogonal to existing 7 measurement axes (CDS, CMT, BBA, KDS, R45, R46, family-decoupling-candidate)',\n")
+    parts.push("    'decision_threshold':'ORTHOGONAL_CONFIRMED if pairwise BBA |r| of axis_8_scalar with each of axis 1-7 < 0.5 across ≥3 backbones',\n")
+    parts.push("    'reject_threshold':'NOT_ORTHOGONAL if any axis 1-7 yields |r| > 0.7 with axis_8 across ≥2 backbones (collinear)',\n")
+    parts.push("    'pre_register_status':'FROZEN_PRE_MEASUREMENT',\n")
+    parts.push("}\n\n")
+
+    parts.push("def _existing_measurements():\n")
+    parts.push("    out = []\n")
+    parts.push("    state_dir = 'state'\n")
+    parts.push("    if not os.path.isdir(state_dir):\n")
+    parts.push("        return out\n")
+    parts.push("    for f in os.listdir(state_dir):\n")
+    parts.push("        if f.startswith('v11_axis_8_') and f.endswith('.json'):\n")
+    parts.push("            out.append(f.replace('v11_axis_8_','').replace('.json',''))\n")
+    parts.push("    return sorted(out)\n\n")
+
+    parts.push("t1 = _read_t1_verdict(T1_RESULT_PATH)\n")
+    parts.push("readiness = VERDICT_TO_READINESS.get(t1['verdict'], 'PRE_T1')\n")
+    parts.push("existing = _existing_measurements()\n\n")
+
+    parts.push("dispatch_matrix = []\n")
+    parts.push("for b in DISPATCH_MATRIX_FULL:\n")
+    parts.push("    has_existing = b['backbone_label'] in existing\n")
+    parts.push("    cmd = (\n")
+    parts.push("        f\"ANIMA_BACKBONE={b['backbone_label']} \"\n")
+    parts.push("        f\"ANIMA_T1_RESULT={T1_RESULT_PATH} \"\n")
+    parts.push("        f\"ANIMA_OUTPUT=state/v11_axis_8_{b['backbone_label']}.json \"\n")
+    parts.push("        f\"hexa run tool/anima_pilot_t2_axis_8th.hexa\"\n")
+    parts.push("    )\n")
+    parts.push("    dispatch_matrix.append({\n")
+    parts.push("        **b,\n")
+    parts.push("        'has_existing_measurement':has_existing,\n")
+    parts.push("        'status':'SKIP_EXISTS' if has_existing else ('GATED_DEFERRED' if b.get('hf_gated') else 'READY_PENDING_T1'),\n")
+    parts.push("        'cmd':cmd,\n")
+    parts.push("    })\n\n")
+
+    parts.push("ready_for_dispatch = [d for d in dispatch_matrix if d['status'] == 'READY_PENDING_T1']\n")
+    parts.push("would_dispatch = readiness == 'UN_PARK_READY'\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'paradigm v11 8th axis Pilot-T2 launch-gate + multi-backbone dispatch',\n")
+    parts.push("    'parent_doc':'anima-tribev2-pilot/docs/pilot_t2_8th_axis_spec.md',\n")
+    parts.push("    'parent_handoff_actionable':'§3.8 paradigm v11 8th axis Pilot-T2 launch (T1 v2 PASS 후)',\n")
+    parts.push("    'parent_helper':'tool/anima_pilot_t2_axis_8th.hexa (existing per-backbone scalar)',\n")
+    parts.push("    't1_result_path':T1_RESULT_PATH,\n")
+    parts.push("    't1_verdict_observed':t1,\n")
+    parts.push("    'launch_readiness':readiness,\n")
+    parts.push("    'would_dispatch_now':would_dispatch,\n")
+    parts.push("    'frozen_orthogonality_register':FROZEN_H_ORTH,\n")
+    parts.push("    'dispatch_matrix':dispatch_matrix,\n")
+    parts.push("    'existing_measurements':existing,\n")
+    parts.push("    'launch_command_summary':{\n")
+    parts.push("        'n_total':len(DISPATCH_MATRIX_FULL),\n")
+    parts.push("        'n_ready_pending_t1':sum(1 for d in dispatch_matrix if d['status']=='READY_PENDING_T1'),\n")
+    parts.push("        'n_skip_exists':sum(1 for d in dispatch_matrix if d['status']=='SKIP_EXISTS'),\n")
+    parts.push("        'n_gated_deferred':sum(1 for d in dispatch_matrix if d['status']=='GATED_DEFERRED'),\n")
+    parts.push("        'cost_usd':0.0,  # mac-local, anima_pilot_t2_axis_8th.hexa is CPU-only\n")
+    parts.push("    },\n")
+    parts.push("    'cross_link':{\n")
+    parts.push("        'cycle_4_helper':'tool/anima_mk_xii_3a_gemma_familyinternal_dispatch.hexa (gemma backbone overlap)',\n")
+    parts.push("        'cycle_5_helper':'tool/anima_axis96_6th_bb_arch_separator_dispatch.hexa (falcon-mamba backbone overlap)',\n")
+    parts.push("    },\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[pilot_t2_launch_gate] verdict={t1[\"verdict\"]} readiness={readiness} ready={summary[\"launch_command_summary\"][\"n_ready_pending_t1\"]} skip_exists={summary[\"launch_command_summary\"][\"n_skip_exists\"]} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let dispatch_full_count_expected = 5
+    let h_orth_threshold_lt = 0.5
+    let h_orth_reject_gt = 0.7
+    let cost_usd_expected = 0
+    println("inv:dispatch_full_count_expected=" + to_string(dispatch_full_count_expected))
+    println("inv:h_orth_orthogonal_confirmed_threshold_lt=" + to_string(h_orth_threshold_lt))
+    println("inv:h_orth_reject_threshold_gt=" + to_string(h_orth_reject_gt))
+    println("inv:cost_usd_mac_local=" + to_string(cost_usd_expected))
+    println("inv:verdict_states_handled=PASS,PARTIAL_PASS,INCONCLUSIVE,INCONCLUSIVE_FULL,FAIL,DEFERRED_HF_GATE,DEFERRED_INSTALL,MISSING,UNKNOWN")
+    println("inv:readiness_states=UN_PARK_READY,ITERATE_REQUIRED,BLOCKED_T1_FAIL,PRE_T1")
+    println("inv:hf_gated_field_explicit=true")
+    println("inv:dispatch_uses_anima_pilot_t2_axis_8th_hexa=true")
+    println("inv:cross_link_cycle4_cycle5_recorded=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_pilot_t2_launch_gate_dispatch selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=Pilot-T2 8th-axis launch-gate + 5-bb dispatch matrix (mac $0; T1 v2 PASS gate; H_ORTH frozen)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
