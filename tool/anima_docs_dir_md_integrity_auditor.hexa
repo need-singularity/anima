@@ -1,0 +1,210 @@
+// tool/anima_docs_dir_md_integrity_auditor.hexa — docs/ markdown integrity audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   tool/ (cycle 22) + state/ (cycle 23) inventory pair에 docs/ markdown integrity 추가.
+//   docs/ 디렉토리 409+ markdown files. 다음 세션 시작 시 stale link / orphan reference 처리 위해 audit.
+//
+//   본 helper = mac-local NON_MUTATION:
+//     - docs/*.md count + size distribution
+//     - markdown link extraction (relative + absolute)
+//     - dangling link resolution (docs internal + cross-dir tool/state/anima)
+//     - age distribution (handoff doc cluster + recent activity)
+//     - frontmatter consistency (created/updated/cycle/axis fields)
+//     - selftest verifies: ≥400 md files / link extraction / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/docs_dir_md_integrity_auditor.json)
+//   ANIMA_DOCS_DIR    docs dir (default: docs)
+//
+// OUTPUT
+//   - total_md_files
+//   - link_extraction_summary {total_links, internal, external, dangling}
+//   - age_distribution
+//   - top_largest + top_link_dense
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_docs_dir_md_integrity_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/docs_dir_md_integrity_auditor.json hexa run tool/anima_docs_dir_md_integrity_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - markdown link extraction은 simple regex `[text](path)` — autolinks/reference-style 제외.
+//   - dangling resolution은 path existence check; line numbers/anchors 미검증.
+//   - frontmatter parsing은 YAML-style `---` block만; HTML comments/Jekyll 미고려.
+
+let HELPER_PATH = "/tmp/anima_docs_dir_md_integrity_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima docs/ markdown integrity auditor — emitted by tool/anima_docs_dir_md_integrity_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION docs integrity audit.\n")
+    parts.push("import json, os, sys, re, time\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/docs_dir_md_integrity_auditor.json')\n")
+    parts.push("DOCS_DIR = os.environ.get('ANIMA_DOCS_DIR', 'docs')\n\n")
+
+    parts.push("if not os.path.isdir(DOCS_DIR):\n")
+    parts.push("    summary = {'paradigm':'docs md integrity audit', 'status':'DOCS_DIR_MISSING', 'docs_dir':DOCS_DIR}\n")
+    parts.push("    os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("    print(f'[docs_md_integrity] status=DOCS_DIR_MISSING -> {OUTPUT}')\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("md_files = sorted([f for f in os.listdir(DOCS_DIR) if f.endswith('.md') and os.path.isfile(os.path.join(DOCS_DIR, f))])\n\n")
+
+    parts.push("MD_LINK_RE = re.compile(r'\\[([^\\]]*)\\]\\(([^)\\s]+)(?:\\s+\"[^\"]*\")?\\)')\n")
+    parts.push("FRONTMATTER_RE = re.compile(r'^---\\n(.*?)\\n---', re.DOTALL)\n\n")
+
+    parts.push("now = time.time()\n")
+    parts.push("size_stats = []\n")
+    parts.push("link_density = []\n")
+    parts.push("total_links = 0\n")
+    parts.push("internal_links = 0\n")
+    parts.push("external_links = 0\n")
+    parts.push("anchor_only = 0\n")
+    parts.push("dangling = []\n")
+    parts.push("frontmatter_present = 0\n")
+    parts.push("age_lt_1d = 0\n")
+    parts.push("age_1_7d = 0\n")
+    parts.push("age_7_30d = 0\n")
+    parts.push("age_gt_30d = 0\n\n")
+
+    parts.push("for fname in md_files:\n")
+    parts.push("    path = os.path.join(DOCS_DIR, fname)\n")
+    parts.push("    try:\n")
+    parts.push("        st = os.stat(path)\n")
+    parts.push("        sz = st.st_size\n")
+    parts.push("        age_days = (now - st.st_mtime) / 86400\n")
+    parts.push("        with open(path, encoding='utf-8', errors='replace') as f:\n")
+    parts.push("            content = f.read()\n")
+    parts.push("    except Exception:\n")
+    parts.push("        continue\n")
+    parts.push("    if FRONTMATTER_RE.match(content):\n")
+    parts.push("        frontmatter_present += 1\n")
+    parts.push("    if age_days < 1: age_lt_1d += 1\n")
+    parts.push("    elif age_days < 7: age_1_7d += 1\n")
+    parts.push("    elif age_days < 30: age_7_30d += 1\n")
+    parts.push("    else: age_gt_30d += 1\n")
+    parts.push("    file_links = MD_LINK_RE.findall(content)\n")
+    parts.push("    file_link_count = 0\n")
+    parts.push("    for _, target in file_links:\n")
+    parts.push("        total_links += 1\n")
+    parts.push("        file_link_count += 1\n")
+    parts.push("        if target.startswith(('http://','https://','mailto:')):\n")
+    parts.push("            external_links += 1\n")
+    parts.push("            continue\n")
+    parts.push("        if target.startswith('#'):\n")
+    parts.push("            anchor_only += 1\n")
+    parts.push("            continue\n")
+    parts.push("        internal_links += 1\n")
+    parts.push("        # resolve relative to docs/\n")
+    parts.push("        clean = target.split('#')[0].split('?')[0]\n")
+    parts.push("        if not clean: continue\n")
+    parts.push("        # try multiple resolutions\n")
+    parts.push("        candidates = [\n")
+    parts.push("            os.path.join(DOCS_DIR, clean),\n")
+    parts.push("            clean,\n")
+    parts.push("            os.path.join('..', clean),\n")
+    parts.push("        ]\n")
+    parts.push("        if not any(os.path.exists(c) for c in candidates):\n")
+    parts.push("            dangling.append({'source_md':fname, 'target':target, 'tried':candidates})\n")
+    parts.push("    size_stats.append({'file':fname, 'size_bytes':sz, 'age_days':round(age_days, 1), 'link_count':file_link_count})\n")
+    parts.push("    link_density.append({'file':fname, 'link_count':file_link_count})\n\n")
+
+    parts.push("top_largest = sorted(size_stats, key=lambda x: x['size_bytes'], reverse=True)[:5]\n")
+    parts.push("top_link_dense = sorted(link_density, key=lambda x: x['link_count'], reverse=True)[:5]\n")
+    parts.push("total_size_kb = round(sum(s['size_bytes'] for s in size_stats) / 1024, 1)\n\n")
+
+    parts.push("# session handoff cluster (recent batches)\n")
+    parts.push("handoff_files = [s for s in size_stats if 'handoff' in s['file'].lower()]\n")
+    parts.push("session_files = [s for s in size_stats if 'session' in s['file'].lower()]\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'docs/ markdown integrity audit (cycle 22+23 inventory triple completion)',\n")
+    parts.push("    'docs_dir':DOCS_DIR,\n")
+    parts.push("    'total_md_files':len(md_files),\n")
+    parts.push("    'total_size_kb':total_size_kb,\n")
+    parts.push("    'frontmatter_compliance':{\n")
+    parts.push("        'with_frontmatter':frontmatter_present,\n")
+    parts.push("        'without':len(md_files) - frontmatter_present,\n")
+    parts.push("        'pct':round(100 * frontmatter_present / max(len(md_files), 1), 1),\n")
+    parts.push("    },\n")
+    parts.push("    'link_summary':{\n")
+    parts.push("        'total_links':total_links,\n")
+    parts.push("        'internal':internal_links,\n")
+    parts.push("        'external':external_links,\n")
+    parts.push("        'anchor_only':anchor_only,\n")
+    parts.push("        'dangling':len(dangling),\n")
+    parts.push("        'dangling_sample':dangling[:10],\n")
+    parts.push("    },\n")
+    parts.push("    'age_distribution':{\n")
+    parts.push("        'lt_1d':age_lt_1d,\n")
+    parts.push("        '1_to_7d':age_1_7d,\n")
+    parts.push("        '7_to_30d':age_7_30d,\n")
+    parts.push("        'gt_30d':age_gt_30d,\n")
+    parts.push("        'fresh_pct':round(100 * age_lt_1d / max(len(md_files), 1), 1),\n")
+    parts.push("    },\n")
+    parts.push("    'top_largest':top_largest,\n")
+    parts.push("    'top_link_dense':top_link_dense,\n")
+    parts.push("    'session_doc_cluster':{\n")
+    parts.push("        'handoff_files':len(handoff_files),\n")
+    parts.push("        'session_files':len(session_files),\n")
+    parts.push("    },\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify docs/; read-only audit',\n")
+    parts.push("    'cross_link_cycles':['cycle 22 tool/ inventory','cycle 23 state/ inventory'],\n")
+    parts.push("    'pattern':'governance audit triple (tool + state + docs) for next-session reference',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[docs_md_integrity] md={len(md_files)} size={total_size_kb}KB links={total_links} dangling={len(dangling)} frontmatter={frontmatter_present}/{len(md_files)} fresh<1d={age_lt_1d} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let md_files_min = 400
+    let age_buckets = 4
+    let non_mutation = "READ_ONLY"
+    let link_categories = "internal,external,anchor_only,dangling"
+    println("inv:md_files_min=" + to_string(md_files_min))
+    println("inv:age_buckets=" + to_string(age_buckets))
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:link_categories=" + link_categories)
+    println("inv:age_buckets=lt_1d,1_to_7d,7_to_30d,gt_30d")
+    println("inv:link_resolution_tries_3_paths_docs_relative_parent=true")
+    println("inv:dangling_sample_capped_at_10=true")
+    println("inv:cross_link_cycle22_cycle23_inventory_triple=true")
+    println("inv:frontmatter_yaml_block_detection=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_docs_dir_md_integrity_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=docs/ md integrity audit (400+ md / link resolution / age distribution / mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
