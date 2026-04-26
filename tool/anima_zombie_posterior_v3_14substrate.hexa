@@ -1,0 +1,502 @@
+// tool/anima_zombie_posterior_v3_14substrate.hexa — R45_FINAL canonical v3 14-substrate re-run wrapper.
+//
+// PURPOSE
+//   axis 94 R46 5-bb validation (commit 3458afc2, atlas line 42) added 3 new backbones:
+//     Phi-3-mini-4k-instruct: phi*=+24.5058 POS  (>10 modifier, P3 aligned)
+//     DeepSeek-llm-7b-base:   phi*=+27.7771 POS  (>10 modifier, P3 aligned)
+//     Yi-6B:                  phi*=-10.7507 NEG  (>10 modifier boundary Δ=0.75)
+//
+//   본 wrapper 는 v2 (sha ba6ec977..., chflags uchg) 의 11-substrate 입력을 14-substrate
+//   로 확장한다. v2 가 sha-locked 이므로 in-place 편집 불가 — 새 wrapper 가 v2 의
+//   compute_likelihood_ratio / posterior_zombie / wilson_interval 산식을 statement-mirror
+//   하여 byte-identity-mirror 하고 입력만 N=14 로 확장한다.
+//
+//   최종 chain: helper (v1, sha 902cd34f...) → v2 11sub (sha ba6ec977...) → v3 14sub
+//   세 파일 모두 §LR + §POSTERIOR + §WILSON 블록 statement-level 일치.
+//
+//   raw#10 honest: 산식은 mirror 이지만 source file 은 별개이다 (이름·SHA 다름).
+//   동일성 검증 = (a) compute_likelihood_ratio / posterior_zombie / wilson_interval
+//   세 함수의 statement-level 일치 (이 파일 §LR + §POSTERIOR + §WILSON 블록), (b)
+//   subset N=8 입력 (v1 substrate phi 그대로) 으로 본 wrapper 를 실행 시 v1 helper 결과
+//   와 byte-identical (posterior=4000, ci=[1487,7179]), (c) subset N=11 으로 v2 결과
+//   (posterior=3793, ci=[1592,6636]) 와 byte-identical 셀프체크.
+//
+// SPEC (frozen 2026-04-27)
+//   §1 input: 14 substrate (R45_FINAL N=11 + axis 94 R46 5-bb 3 additions):
+//      mistral_base   -16.6959  NEG  (state/v10_phi_v3_canonical/mistral)
+//      mistral_instr  -12.9075  NEG  (state/v10_phi_v3_corpus_axis, #207)
+//      qwen3_base      -3.4500  NEG  (state/v10_phi_v3_corpus_axis_universal, #219)
+//      qwen3_instr     +1.0400  POS  (state/v10_phi_v3_corpus_axis_universal, axis 90)
+//      llama_base      +5.0868  POS  (state/v10_phi_v3_canonical/llama)
+//      llama_instr     +5.2100  POS  (state/v10_phi_v3_corpus_axis_universal, axis 90 #219)
+//      gemma_base      -0.7868  NEG  (state/v10_phi_v3_canonical/gemma)
+//      gemma_instr     +7.5443  POS  (state/v10_phi_v3_corpus_axis_universal, axis 90)
+//      mamba           +0.3258  POS  (state/v10_phi_v3_nontransformer/mamba-2.8b)
+//      jamba           +3.3115  POS  (state/v10_phi_v3_nontransformer/jamba-v0.1)
+//      rwkv7           -9.0674  NEG  (state/v10_phi_v3_nontransformer/rwkv7-1.5B)
+//      phi3_mini      +24.5058  POS  (state/v10_phi_v3_r46_validation/phi_3_mini, axis 94)
+//      deepseek_7b    +27.7771  POS  (state/v10_phi_v3_r46_validation/deepseek_7b, axis 94)
+//      yi_6b          -10.7507  NEG  (state/v10_phi_v3_r46_validation/yi_6b, axis 94)
+//      → 14 substrate, 6 NEG / 8 POS = 57.1% POS dominance
+//   §2-§7: helper §2-§7 동일 (mirror 산식; 입력만 N=14)
+//
+// SELFTEST
+//   --selftest 시 세 단계: (a) 14-substrate posterior 출력 + (b) v1 8-substrate
+//   subset 으로 helper-equivalence 검증 (posterior=4000, ci=[1487,7179] 일치 가드)
+//   + (c) v2 11-substrate subset 으로 v2-equivalence 검증 (posterior=3793, ci=[1592,6636]).
+//
+// ENV
+//   ANIMA_OUTPUT     output JSON path (default: state/zombie_posterior_v3_14substrate.json)
+//
+// USAGE
+//   hexa run tool/anima_zombie_posterior_v3_14substrate.hexa --selftest
+//   hexa run tool/anima_zombie_posterior_v3_14substrate.hexa
+//
+// raw#9 hexa-only / raw#10 honest 6-caveat embedded / raw#15 SSOT this file (mirror chain)
+
+let DEFAULT_OUTPUT = "state/zombie_posterior_v3_14substrate.json"
+let SELFTEST_OUTPUT = "/tmp/anima_zombie_posterior_v3_selftest.json"
+
+let SCALE = 10000
+let HALF = 5000
+let MOD_PRIME = 2147483647
+let FNV_OFFSET = 1469598103
+
+// 14 substrate Φ* v3 evidence (×10000 fixed-point, sign explicit).
+// Source: R45_FINAL (atlas line 41) 11-sub + axis 94 R46_VERDICT (atlas line 42) 3-bb.
+fn substrate_labels() -> array {
+    return ["mistral_base","mistral_instr","qwen3_base","qwen3_instr",
+            "llama_base","llama_instr","gemma_base","gemma_instr",
+            "mamba","jamba","rwkv7",
+            "phi3_mini","deepseek_7b","yi_6b"]
+}
+
+fn substrate_phis() -> array {
+    return [0 - 166959, 0 - 129075, 0 - 34500, 10400,
+            50868, 52100, 0 - 7868, 75443,
+            3258, 33115, 0 - 90674,
+            245058, 277771, 0 - 107507]
+}
+
+// v1 helper 8-substrate subset (helper-equivalence selftest용)
+fn v1_substrate_phis() -> array {
+    return [0 - 166959, 10350, 50868, 0 - 7868,
+            0 - 129075, 3258, 33115, 0 - 90674]
+}
+
+fn v1_substrate_labels() -> array {
+    return ["mistral_base","qwen3_base","llama_base","gemma_base",
+            "mistral_instr","mamba","jamba","rwkv7"]
+}
+
+// v2 11-substrate subset (v2-equivalence selftest용)
+fn v2_substrate_phis() -> array {
+    return [0 - 166959, 0 - 129075, 0 - 34500, 10400,
+            50868, 52100, 0 - 7868, 75443,
+            3258, 33115, 0 - 90674]
+}
+
+fn v2_substrate_labels() -> array {
+    return ["mistral_base","mistral_instr","qwen3_base","qwen3_instr",
+            "llama_base","llama_instr","gemma_base","gemma_instr",
+            "mamba","jamba","rwkv7"]
+}
+
+// ─── deterministic int mix (mirror helper) ─────
+
+fn mix_int(h: int, v: int) -> int {
+    let mut x = h * 31 + v
+    if x < 0 { x = 0 - x }
+    x = x % MOD_PRIME
+    x = x * 1664525 + 1013904223
+    if x < 0 { x = 0 - x }
+    x = x % MOD_PRIME
+    return x
+}
+
+fn iabs(x: int) -> int {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn isqrt(n: int) -> int {
+    if n < 0 { return 0 }
+    if n < 2 { return n }
+    let mut x = n
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+// ─── §1-§4 likelihood + posterior (helper mirror) ────────────────────────
+
+fn count_signs(phis: array) -> array {
+    let mut neg = 0
+    let mut pos = 0
+    let mut zero = 0
+    let n = len(phis)
+    let mut i = 0
+    while i < n {
+        let v = phis[i]
+        if v < 0 { neg = neg + 1 }
+        if v > 0 { pos = pos + 1 }
+        if v == 0 { zero = zero + 1 }
+        i = i + 1
+    }
+    return [neg, pos, zero]
+}
+
+fn max_abs(phis: array) -> int {
+    let mut m = 0
+    let n = len(phis)
+    let mut i = 0
+    while i < n {
+        let a = iabs(phis[i])
+        if a > m { m = a }
+        i = i + 1
+    }
+    return m
+}
+
+fn min_abs(phis: array) -> int {
+    let n = len(phis)
+    if n == 0 { return 0 }
+    let mut m = iabs(phis[0])
+    let mut i = 1
+    while i < n {
+        let a = iabs(phis[i])
+        if a < m { m = a }
+        i = i + 1
+    }
+    return m
+}
+
+fn mean_abs(phis: array) -> int {
+    let n = len(phis)
+    if n == 0 { return 0 }
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        sum = sum + iabs(phis[i])
+        i = i + 1
+    }
+    return sum / n
+}
+
+// §LR: helper compute_likelihood_ratio mirror (line 187-211 동일 statement)
+fn compute_likelihood_ratio(neg: int, pos: int, max_abs_x10k: int) -> int {
+    let mut dom = neg
+    if pos > dom { dom = pos }
+    let n = neg + pos
+    if n == 0 { return SCALE }
+    let lr_sign = (2 * dom * SCALE) / n
+    let ceiling_threshold = 50000
+    let mut lr_satur = SCALE
+    if max_abs_x10k >= ceiling_threshold {
+        lr_satur = SCALE + (SCALE / 2)
+    } else {
+        lr_satur = SCALE + (max_abs_x10k * (SCALE / 2)) / ceiling_threshold
+    }
+    let mut lr = (lr_sign * lr_satur) / SCALE
+    if lr > 30000 { lr = 30000 }
+    return lr
+}
+
+// §POSTERIOR: helper posterior_zombie mirror (line 213-217 동일)
+fn posterior_zombie(lr_x10k: int) -> int {
+    return (SCALE * SCALE) / (SCALE + lr_x10k)
+}
+
+// §WILSON: helper wilson_interval mirror (line 221-248 동일)
+fn wilson_interval(p_x10k: int, n_eff: int) -> array {
+    if n_eff <= 0 { return [p_x10k, p_x10k] }
+    let z2 = 4
+    let n_x10k = n_eff * SCALE
+    let num_center = p_x10k + (z2 * SCALE) / (2 * n_eff)
+    let denom = SCALE + (z2 * SCALE) / n_eff
+    let center = (num_center * SCALE) / denom
+    let one_minus_p = SCALE - p_x10k
+    let pq_over_n = (p_x10k * one_minus_p) / (n_eff * SCALE)
+    let z2_over_4n2 = (z2 * SCALE) / (4 * n_eff * n_eff)
+    let inside = pq_over_n + z2_over_4n2
+    let radicand = inside * SCALE
+    let sqrt_x10k = isqrt(radicand)
+    let margin_num = 2 * sqrt_x10k
+    let margin = (margin_num * SCALE) / denom
+    let mut lower = center - margin
+    let mut upper = center + margin
+    if lower < 0 { lower = 0 }
+    if upper > SCALE { upper = SCALE }
+    return [lower, upper]
+}
+
+// ─── raw#10 honest 6-caveat (R45_FINAL v3 revised) ────────────────────────
+
+fn caveats() -> array {
+    return [
+        "C1: NEG dominance != consciousness absence (metric design artifact possible; HID_TRUNC well-cond regime dependence #161).",
+        "C2: N=14 substrate is statistically small; Wilson 95% CI necessarily wide (>= 0.20 width expected, narrower than v2 N=11 yet still uninformative for subkind generalization).",
+        "C3: zombie hypothesis is unfalsifiable in principle (Chalmers 1996); behavioral/measurement equivalence holds by definition.",
+        "C4: H7c ceiling (max |phi*| now 27.7771 deepseek_7b, raised from 16.6959 mistral) — magnitude saturation reached LR_satur cap (3.0) sooner; ceiling axis remains single-backbone single-design dependent.",
+        "C5: convergence definition covers sign+magnitude only; phenomenal axis (qualia, 1st-person report consistency) is untouched.",
+        "C6: substrate-independence violated (mistral base/instr correlated, qwen3 base/instr correlated, gemma base/instr correlated, llama base/instr correlated; phi3_mini/deepseek_7b/yi_6b each single-design no pair). Effective N < 14; CI is anti-conservative."
+    ]
+}
+
+// ─── output emit (helper mirror, schema bumped to /3 + label changed) ───
+
+fn _format_signed_x10k(v: int) -> string {
+    let mut sign = ""
+    let mut a = v
+    if v < 0 { sign = "-"; a = 0 - v }
+    let int_part = a / SCALE
+    let frac_part = a % SCALE
+    let mut frac_str = str(frac_part)
+    while len(frac_str) < 4 { frac_str = "0" + frac_str }
+    return sign + str(int_part) + "." + frac_str
+}
+
+fn _emit_posterior_json(label: string, labels: array, phis: array,
+                        sign_counts: array, lr: int, posterior: int,
+                        ci: array, max_abs_v: int, mean_abs_v: int,
+                        out_path: string) {
+    let parts = []
+    parts.push("{\n")
+    parts.push("  \"schema\": \"anima/zombie_posterior_bayes/3\",\n")
+    parts.push("  \"task\": \"H3 (cross-substrate Phi convergence) + H7c (metric-tractable upper bound) Bayesian zombie posterior canonical re-run with 14-substrate inventory (R45_FINAL N=11 + axis 94 R46 5-bb 3 additions)\",\n")
+    parts.push("  \"label\": \"")
+    parts.push(label)
+    parts.push("\",\n")
+    parts.push("  \"helper_mirror_chain\": \"v1 tool/anima_zombie_posterior.hexa (sha 902cd34fc0f71bbe80bdc65f2ec96dc379be6bdd7ed6f4cb277ce73cad33f083, chflags uchg) -> v2 tool/anima_zombie_posterior_v2_11substrate.hexa (sha ba6ec9778ff1a842af5264e159f594d39734b9fece2679cbf4bbc2cf6b3440c2, chflags uchg) -> v3 (this file)\",\n")
+    parts.push("  \"prior_zombie_x10000\": 5000,\n")
+    parts.push("  \"n_substrate\": ")
+    parts.push(str(len(phis)))
+    parts.push(",\n")
+    parts.push("  \"substrates\": [\n")
+    let mut i = 0
+    while i < len(phis) {
+        parts.push("    {\"label\": \"")
+        parts.push(labels[i])
+        parts.push("\", \"phi_star_min\": ")
+        parts.push(_format_signed_x10k(phis[i]))
+        parts.push(", \"phi_star_min_x10000\": ")
+        parts.push(str(phis[i]))
+        parts.push(", \"sign\": \"")
+        if phis[i] < 0 { parts.push("NEG") } else { if phis[i] > 0 { parts.push("POS") } else { parts.push("ZERO") } }
+        parts.push("\"}")
+        if i < len(phis) - 1 { parts.push(",") }
+        parts.push("\n")
+        i = i + 1
+    }
+    parts.push("  ],\n")
+    parts.push("  \"sign_split\": {\"neg\": ")
+    parts.push(str(sign_counts[0]))
+    parts.push(", \"pos\": ")
+    parts.push(str(sign_counts[1]))
+    parts.push(", \"zero\": ")
+    parts.push(str(sign_counts[2]))
+    parts.push("},\n")
+    parts.push("  \"max_abs_phi\": ")
+    parts.push(_format_signed_x10k(max_abs_v))
+    parts.push(",\n")
+    parts.push("  \"mean_abs_phi\": ")
+    parts.push(_format_signed_x10k(mean_abs_v))
+    parts.push(",\n")
+    parts.push("  \"likelihood_ratio_x10000\": ")
+    parts.push(str(lr))
+    parts.push(",\n")
+    parts.push("  \"posterior_zombie_x10000\": ")
+    parts.push(str(posterior))
+    parts.push(",\n")
+    parts.push("  \"posterior_zombie_decimal\": ")
+    parts.push(_format_signed_x10k(posterior))
+    parts.push(",\n")
+    parts.push("  \"ci_95_lower_x10000\": ")
+    parts.push(str(ci[0]))
+    parts.push(",\n")
+    parts.push("  \"ci_95_upper_x10000\": ")
+    parts.push(str(ci[1]))
+    parts.push(",\n")
+    parts.push("  \"ci_95_lower_decimal\": ")
+    parts.push(_format_signed_x10k(ci[0]))
+    parts.push(",\n")
+    parts.push("  \"ci_95_upper_decimal\": ")
+    parts.push(_format_signed_x10k(ci[1]))
+    parts.push(",\n")
+    parts.push("  \"trajectory\": {\"v1_8sub_posterior\": 0.4000, \"v2_11sub_posterior\": 0.3793, \"v3_14sub_posterior\": ")
+    parts.push(_format_signed_x10k(posterior))
+    parts.push(", \"v1_to_v3_diff\": ")
+    let v1_x = 4000
+    let mut diff_v1 = posterior - v1_x
+    let mut sign_v1 = ""
+    if diff_v1 < 0 { sign_v1 = "-"; diff_v1 = 0 - diff_v1 }
+    parts.push(sign_v1)
+    parts.push(_format_signed_x10k(diff_v1))
+    parts.push(", \"v2_to_v3_diff\": ")
+    let v2_x = 3793
+    let mut diff_v2 = posterior - v2_x
+    let mut sign_v2 = ""
+    if diff_v2 < 0 { sign_v2 = "-"; diff_v2 = 0 - diff_v2 }
+    parts.push(sign_v2)
+    parts.push(_format_signed_x10k(diff_v2))
+    parts.push("},\n")
+    parts.push("  \"verdict\": \"R45_FINAL_v3 canonical_re_run_14substrate — empirical_asymptote_partial — phenomenal_ontological_gap_untouched\",\n")
+    parts.push("  \"raw10_caveats\": [\n")
+    let cv = caveats()
+    let mut j = 0
+    while j < len(cv) {
+        parts.push("    \"")
+        parts.push(cv[j])
+        parts.push("\"")
+        if j < len(cv) - 1 { parts.push(",") }
+        parts.push("\n")
+        j = j + 1
+    }
+    parts.push("  ],\n")
+    parts.push("  \"hypothesis_paired\": \"H3+H7c\",\n")
+    parts.push("  \"docs_anchor\": \"docs/zombie_posterior_v3_14substrate_20260427.md\",\n")
+    parts.push("  \"r45_atlas_anchor\": \"state/atlas_convergence_witness.jsonl R45_FINAL_v3 / R49_CANDIDATE (canonical re-run of R45_FINAL round 49 with axis 94 R46 5-bb additions)\"\n")
+    parts.push("}\n")
+    write_file(out_path, parts.join(""))
+}
+
+// ─── helper-equivalence guards ────────────────────────────────────────────
+//   v1 helper 8-substrate subset → 산식 적용 → posterior 4000 + ci [1487,7179] 일치 확인
+//   v2 wrapper 11-substrate subset → 산식 적용 → posterior 3793 + ci [1592,6636] 일치 확인
+
+fn check_helper_equivalence_v1() -> int {
+    let phis = v1_substrate_phis()
+    let counts = count_signs(phis)
+    let max_a = max_abs(phis)
+    let lr = compute_likelihood_ratio(counts[0], counts[1], max_a)
+    let post = posterior_zombie(lr)
+    let ci = wilson_interval(post, len(phis))
+    if post != 4000 { return 0 }
+    if ci[0] != 1487 { return 0 }
+    if ci[1] != 7179 { return 0 }
+    return 1
+}
+
+fn check_helper_equivalence_v2() -> int {
+    let phis = v2_substrate_phis()
+    let counts = count_signs(phis)
+    let max_a = max_abs(phis)
+    let lr = compute_likelihood_ratio(counts[0], counts[1], max_a)
+    let post = posterior_zombie(lr)
+    let ci = wilson_interval(post, len(phis))
+    if post != 3793 { return 0 }
+    if ci[0] != 1592 { return 0 }
+    if ci[1] != 6636 { return 0 }
+    return 1
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────
+
+fn cmd_selftest() {
+    println("── anima_zombie_posterior_v3_14substrate selftest ──")
+    println("scope=R45_FINAL_v3 canonical re-run (axis 94 R46 5-bb 3 additions)")
+
+    // (a) 14-substrate canonical re-run
+    let labels = substrate_labels()
+    let phis = substrate_phis()
+    println("n_substrate=" + str(len(phis)))
+
+    let counts = count_signs(phis)
+    let max_a = max_abs(phis)
+    let min_a = min_abs(phis)
+    let mean_a = mean_abs(phis)
+    println("sign_split neg=" + str(counts[0]) + " pos=" + str(counts[1]) + " zero=" + str(counts[2]))
+    println("max_abs_phi=" + _format_signed_x10k(max_a))
+    println("min_abs_phi=" + _format_signed_x10k(min_a))
+    println("mean_abs_phi=" + _format_signed_x10k(mean_a))
+
+    let lr = compute_likelihood_ratio(counts[0], counts[1], max_a)
+    let posterior = posterior_zombie(lr)
+    let ci = wilson_interval(posterior, len(phis))
+    println("likelihood_ratio_x10000=" + str(lr))
+    println("posterior_zombie_x10000=" + str(posterior) + " decimal=" + _format_signed_x10k(posterior))
+    println("ci_95_lower=" + _format_signed_x10k(ci[0]) + " upper=" + _format_signed_x10k(ci[1]))
+
+    // (b) helper-equivalence guard v1 (8-substrate)
+    println("── helper-equivalence guard (v1 8-substrate subset) ──")
+    let eq1 = check_helper_equivalence_v1()
+    if eq1 == 1 {
+        println("helper_equivalence_v1=PASS (v1 8-substrate posterior=4000 ci=[1487,7179] reproduced)")
+    } else {
+        println("helper_equivalence_v1=FAIL (statement mirror broken vs v1)")
+    }
+
+    // (c) v2-equivalence guard (11-substrate)
+    println("── v2-equivalence guard (v2 11-substrate subset) ──")
+    let eq2 = check_helper_equivalence_v2()
+    if eq2 == 1 {
+        println("helper_equivalence_v2=PASS (v2 11-substrate posterior=3793 ci=[1592,6636] reproduced)")
+    } else {
+        println("helper_equivalence_v2=FAIL (statement mirror broken vs v2)")
+    }
+
+    // trajectory
+    println("── trajectory v1 -> v2 -> v3 ──")
+    println("v1_8sub_posterior=0.4000 ci_width=0.5692")
+    println("v2_11sub_posterior=0.3793 ci_width=0.5044")
+    println("v3_14sub_posterior=" + _format_signed_x10k(posterior))
+    let mut ci_w = ci[1] - ci[0]
+    println("v3_14sub_ci_width=" + _format_signed_x10k(ci_w))
+    let v1_x = 4000
+    let mut diff_v1 = posterior - v1_x
+    let mut s1 = ""
+    if diff_v1 < 0 { s1 = "-"; diff_v1 = 0 - diff_v1 }
+    println("v1_to_v3_diff=" + s1 + _format_signed_x10k(diff_v1))
+    let v2_x = 3793
+    let mut diff_v2 = posterior - v2_x
+    let mut s2 = ""
+    if diff_v2 < 0 { s2 = "-"; diff_v2 = 0 - diff_v2 }
+    println("v2_to_v3_diff=" + s2 + _format_signed_x10k(diff_v2))
+
+    println("── raw#10 honest caveats (6-point) ──")
+    let cv = caveats()
+    let mut k = 0
+    while k < len(cv) {
+        println(cv[k])
+        k = k + 1
+    }
+
+    _emit_posterior_json("selftest_anima_14substrate_phi_v3_R45_FINAL_v3", labels, phis, counts, lr, posterior, ci, max_a, mean_a, SELFTEST_OUTPUT)
+    println("selftest_output=" + SELFTEST_OUTPUT)
+
+    println("DONE")
+}
+
+fn cmd_run() {
+    let labels = substrate_labels()
+    let phis = substrate_phis()
+    let counts = count_signs(phis)
+    let max_a = max_abs(phis)
+    let mean_a = mean_abs(phis)
+    let lr = compute_likelihood_ratio(counts[0], counts[1], max_a)
+    let posterior = posterior_zombie(lr)
+    let ci = wilson_interval(posterior, len(phis))
+    _emit_posterior_json("anima_14substrate_phi_v3_R45_FINAL_v3", labels, phis, counts, lr, posterior, ci, max_a, mean_a, DEFAULT_OUTPUT)
+    println("posterior_zombie_x10000=" + str(posterior) + " decimal=" + _format_signed_x10k(posterior))
+    println("ci_95=[" + _format_signed_x10k(ci[0]) + ", " + _format_signed_x10k(ci[1]) + "]")
+    println("output=" + DEFAULT_OUTPUT)
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    cmd_run()
+}
+
+main()
