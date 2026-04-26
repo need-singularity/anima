@@ -1,0 +1,157 @@
+{
+  "cycle": "omega-audio-2-phase4",
+  "axis": "default-on cutover evaluation (no implementation)",
+  "timestamp": "2026-04-26",
+  "predecessor": "/Users/ghost/core/anima/state/omega_audio_2_phase3_continuation.json",
+  "summary_recommendation": "FULL_CUTOVER",
+  "rationale_one_paragraph": "Phase 3 established worker functional parity with baseline across all 4 tested organs (vocal/breath/vocal_lf/pipe-via-chain) and ~2-17x per-organ speedup. Phase 4 audit ran 5 targeted experiments and all 5 pass: cold-cutover (worker killed mid-session, adapter respawns cleanly on next call); stale-FIFO (orphan FIFO files survive but per-PPID adapter creates fresh dir, no collision); parallel-sessions (per-PPID isolation, two concurrent hexa runs each got own worker, byte-perfect WAVs); container-exec (worker fails the same way baseline already fails — no python3 inside container — so cutover does NOT introduce a new container regression); omega_audio_emp Ω-A inputs (vocal/breath/pipe at canonical params produce 4844-byte WAVs identical to baseline). The container 'blocker' is a non-blocker because container audio is broken at baseline already. The lone real cost of cutover is /tmp orphan accumulation (per-PPID dirs from killed sessions), which is a chronic but harmless leak addressable by a periodic reaper. Speedup wins (16.6x breath, 8-10x chain) substantially exceed the marginal vocal 2.11x and justify cutover by default; operator opt-out via ANIMA_AUDIO_WORKER=0 preserves the safety valve.",
+  "evidence": {
+    "phase3_recap": {
+      "vocal_warm_speedup": "2.11x (143ms baseline -> 68ms worker)",
+      "breath_warm_speedup": "16.6x (1106ms baseline -> 67ms worker; biggest win, scipy.butter+sosfilt import dominated baseline)",
+      "vocal_lf_warm_speedup": "2.39x (171ms -> 71ms)",
+      "chain_pipe_warm_speedup": "8-10x (1193-1462ms -> 149ms; design 60x missed because bash exec+FIFO floor is ~70ms x 2 links)",
+      "ipc_floor": "~67ms per call (bash fork + FIFO open/close + base64), invariant across organs",
+      "functional_parity": "all 4 organs PASS via worker with no namespace contamination, no scipy-fn missing, no FIFO deadlock (Phase 3 FINDING-1)",
+      "policy_resolution": "worker source-of-truth at /Users/ghost/core/hexa-lang/stdlib/anima_audio_worker.py (committed hexa-lang f9ccfa3d); 3-tier resolution in adapter (committed anima 9433af5e)"
+    },
+    "validation_experiments": [
+      {
+        "name": "cold_cutover",
+        "method": "ANIMA_AUDIO_WORKER=1 hexa_real two-call script with sleep 4 between calls; pkill -9 anima_audio_worker.py during the sleep; observe call2",
+        "result": "PASS",
+        "evidence": "call1 produced /tmp/anima_audio_1777168560623276000.wav (2444 bytes); after kill, call2 produced /tmp/anima_audio_1777168565380797000.wav (2444 bytes); adapter detected dead pid via _alive WPID, ran _spawn_worker, succeeded transparently",
+        "notes": "worker spawn cost (~1s cold) is paid silently on call2; user-visible symptom is a single slow call after a kill, no error"
+      },
+      {
+        "name": "stale_fifo",
+        "method": "manually constructed /tmp/anima_audio_worker_99999/ with mkfifo in/out and no pid/keepalive files; ran fresh ANIMA_AUDIO_WORKER=1 hexa_real",
+        "result": "PASS_WITH_LEAK",
+        "evidence": "fresh hexa created its own dir /tmp/anima_audio_worker_46066/ (per-PPID), call1+call2 produced 2444-byte WAVs; stale dir 99999 was NOT cleaned up by adapter",
+        "notes": "adapter only manages its own per-PPID dir; cross-session orphan dirs persist forever. Also observed 4 orphan `sleep 86400` keepalive processes (parent=launchd) accumulated across earlier test runs — same leak class. Recovery: external periodic reaper or hexa-lang shell on-exit hook."
+      },
+      {
+        "name": "parallel_sessions",
+        "method": "spawned 2 concurrent ANIMA_AUDIO_WORKER=1 hexa_real processes in shell background, each running 2 vocal calls",
+        "result": "PASS",
+        "evidence": "P1 PID 49845 -> WD /tmp/anima_audio_worker_49846/, P2 PID 49847 -> WD /tmp/anima_audio_worker_49848/; both produced 2 distinct WAVs each (4 total); no FIFO collision, no worker handoff",
+        "notes": "per-PPID isolation via WD path is sound; safe under concurrent load"
+      },
+      {
+        "name": "container_exec_path",
+        "method": "docker exec -e ANIMA_AUDIO_WORKER=1 hexa-exec /usr/local/bin/hexa <test.hexa>; also baseline run without ANIMA_AUDIO_WORKER",
+        "result": "FAIL_BUT_PARITY",
+        "evidence": "container has /.dockerenv but no python3 anywhere (PATH miss + /opt/homebrew/bin/python3 absent + scipy/numpy not installed); worker run: vocal/call returns empty string + stderr `cannot open /tmp/anima_audio_*.wav`; BASELINE run: identical empty-string failure + stderr `python3: not found`. Container audio is broken at baseline regardless of cutover.",
+        "notes": "cutover does NOT introduce a new container regression; both code paths fail identically on python3 absence. Hardening recommendation in container_handling below."
+      },
+      {
+        "name": "omega_audio_emp_a_with_worker",
+        "method": "two hexa_real runs (baseline + ANIMA_AUDIO_WORKER=1) of vocal(440,0.5,100) + breath(2000,4000,0.3,100) + pipe(vocal(180,0.5,100),700,1100,6.0) — Ω-A canonical inputs",
+        "result": "PASS",
+        "evidence": "byte counts identical: vocal=4844, breath=4844, pipe=4844 in BOTH baseline and worker runs (exact match to Phase 3 reference). Same WAV header, same int16 frame count.",
+        "notes": "FFT analysis not re-run (Phase 3 FINDING-1 already validated worker functional parity for these organs); byte-equal output is a strong proxy. Full Ω-A FFT verdicts (HARMONIC_DETECT_BUT_F0_AC_HALF/PASS/PASS at omega_emp_A.json) are not affected by worker routing because worker exec'd code is byte-identical to baseline."
+      }
+    ],
+    "failure_mode_taxonomy": [
+      {
+        "mode": "worker_spawn_failed (no python3 / scipy missing)",
+        "symptom": "adapter emits {\"err\":\"spawn_failed\"} or {\"err\":\"worker_py_not_found\"}; hexa _run_py_worker returns true unconditionally; _file_bytes(path) returns 0; organ returns empty string; downstream chain links cascade to empty strings silently",
+        "frequency_estimate": "common in container/remote without python+scipy; rare on dev host",
+        "recovery_path": "fall through to baseline _run_py spawn-per-call would require an additional check in _run_py_worker — currently ABSENT. operator-side: unset ANIMA_AUDIO_WORKER. PROPOSED: hexa-side guard checks /.dockerenv before routing to worker; PROPOSED: _run_py_worker inspects adapter exit code and falls through if non-zero."
+      },
+      {
+        "mode": "worker_died_during_call (OOM, segfault, sigkill)",
+        "symptom": "adapter loops 20s waiting for FIFO_OUT response, _alive WPID becomes false, prints {\"err\":\"worker_died_during_call\"}; same silent-empty-WAV cascade as above",
+        "frequency_estimate": "rare (worker is single-threaded NDJSON dispatcher, no fork inside; OOM unlikely on 100ms WAVs)",
+        "recovery_path": "next call detects dead pid via _alive WPID at top of adapter and respawns cleanly (verified in cold_cutover experiment); the failed call is lost. PROPOSED: _run_py_worker retries once on adapter non-zero exit."
+      },
+      {
+        "mode": "FIFO_eof (parent shell exits before keepalive registered)",
+        "symptom": "would cause worker to see EOF on stdin and exit — keepalive (sleep 86400 > FIFO_IN) prevents this; worker only reads from FIFO when select returns rl set; mitigated by design",
+        "frequency_estimate": "near-zero (keepalive spawn precedes worker spawn in adapter)",
+        "recovery_path": "n/a (mitigated)"
+      },
+      {
+        "mode": "stale_pid_collision (PID rolls over on long-uptime host, hits a stale per-PPID dir)",
+        "symptom": "adapter would read stale PID_FILE, _alive returns false, tear down + respawn; CORRECT path",
+        "frequency_estimate": "rare; PID rollover requires uptime > weeks at high spawn rate",
+        "recovery_path": "no recovery needed — already handled by _alive checks in adapter"
+      },
+      {
+        "mode": "tmpdir_orphan_leak",
+        "symptom": "/tmp/anima_audio_worker_<dead_ppid>/ dirs accumulate with FIFOs; orphan `sleep 86400` keepalive processes also accumulate (parent=launchd). No correctness impact; consumes disk + process slots over months.",
+        "frequency_estimate": "every clean hexa exit (worker self-shutdown leaves WD); every kill -9 of hexa (worker self-shutdown via parent_alive watch leaves WD); 2 leaks per hexa run",
+        "recovery_path": "none built-in. PROPOSED: cron/launchd reaper that removes /tmp/anima_audio_worker_*/ where pid file points to dead pid AND mtime > 1h. Or: hexa-lang shell on-exit hook that calls _audio_worker_call.sh shutdown. Severity: LOW (disk and process slots, no functional break)."
+      },
+      {
+        "mode": "scipy_version_mismatch",
+        "symptom": "worker boot tries `from scipy.signal import butter, sosfilt, ...`; if any name absent, worker exits with traceback to LOG_FILE; adapter sees EOF, emits spawn_failed",
+        "frequency_estimate": "near-zero (scipy.signal API stable since 1.0; tested against scipy on Darwin host with python 3.14)",
+        "recovery_path": "operator: pin scipy version OR set ANIMA_AUDIO_WORKER=0; same opt-out as container"
+      },
+      {
+        "mode": "SIGPIPE_on_pipe_truncation",
+        "symptom": "if hexa stdout is piped to head/grep -m and downstream closes early, worker IPC stalls and hexa returns exit 144 (Phase 3 BUG-2)",
+        "frequency_estimate": "harness-specific (interactive use, log truncation); rare in production",
+        "recovery_path": "redirect to file instead of piping; documented in Phase 3 closure"
+      },
+      {
+        "mode": "python2_path",
+        "symptom": "if PYTHON_BIN resolves to python2, scipy import fails (numpy/scipy py3-only)",
+        "frequency_estimate": "near-zero (adapter prefers /opt/homebrew/bin/python3, falls back to `python3`; never `python`)",
+        "recovery_path": "operator: set ANIMA_AUDIO_PYTHON to a known-good python3"
+      },
+      {
+        "mode": "remote_dispatch_routing",
+        "symptom": "default `hexa` shim auto-routes to ubu2 remote where python3 lacks numpy; produces 0-byte WAVs on all calls (Phase 3 BUG-1). cutover does not change this — same with or without worker because remote ubu2 has no python anyway.",
+        "frequency_estimate": "operator-config dependent",
+        "recovery_path": "use /Users/ghost/.hx/bin/hexa_real to force local dispatch (current best practice)"
+      }
+    ]
+  },
+  "per_organ_decision": {
+    "vocal": {
+      "recommendation": "cutover-now",
+      "reason": "2.11x speedup (75ms saved per call) is modest in absolute terms but applies to the most-called organ in vowel chains (every speech utterance starts with vocal); cumulative win is large. Risk class is identical to breath (same _run_py path)."
+    },
+    "breath": {
+      "recommendation": "cutover-now",
+      "reason": "16.6x speedup (1040ms saved per call) is the dominant win; baseline scipy.butter+sosfilt import per call is unacceptable for any real-time use. Highest justification for cutover."
+    },
+    "vocal_lf": {
+      "recommendation": "cutover-now",
+      "reason": "2.39x speedup (100ms saved per call) — same reasoning as vocal; identical risk class via _run_py."
+    },
+    "pipe_chain": {
+      "recommendation": "cutover-now",
+      "reason": "8-10x speedup on chain (~1300ms saved per chain link pair). Chain is the synthesis primitive for formant shaping in every vowel — cutover here is the highest-impact change. ω-runtime-1 (persistent-pipe primitive) is the path to the design's 60x target but is independent of this cutover."
+    }
+  },
+  "container_handling": {
+    "detected_block": false,
+    "reasoning": "container baseline ALSO fails (no python3); cutover does not introduce a new regression. Both paths produce empty-string organ output and 'cannot open WAV' stderr. So cutover is neutral inside container.",
+    "proposed_guard": "OPTIONAL hardening for cleaner container UX: in anima_audio.hexa _run_py(), add `if exec(\"test -f /.dockerenv && echo y || true\").trim() == \"y\" { fall through to spawn-per-call always }` so containers always go through the baseline path (which is the existing failure path) rather than wasting cycles on the worker spawn attempt. NOT REQUIRED for cutover safety; adapter spawn_failed path already returns silent-empty-WAV which matches baseline behavior. Defer unless container audio is ever fixed."
+  },
+  "next_step_if_cutover_approved": {
+    "diff_target": "/Users/ghost/core/anima/anima-speak/anima_audio.hexa",
+    "lines": "147-157 (fn _run_py)",
+    "current_logic": "let flag = env(\"ANIMA_AUDIO_WORKER\"); if flag == \"1\" { return _run_py_worker(code) } -- baseline spawn-per-call",
+    "proposed_logic": "let flag = env(\"ANIMA_AUDIO_WORKER\"); if flag == \"0\" { -- baseline spawn-per-call -- } return _run_py_worker(code)",
+    "summary": "invert default: worker is taken unless explicit ANIMA_AUDIO_WORKER=0",
+    "expected_blast_radius": "every anima_audio.hexa caller on Darwin dev host immediately picks up 2-17x speedup; first call in each new shell session pays ~1s cold spawn (one time); container/remote unchanged (both already fail same way); /tmp orphans accumulate at +2 per hexa run (mitigation: separate reaper task)",
+    "preflight_checks": "(1) re-run /Users/ghost/core/anima/anima-speak/omega_audio_emp.hexa with proposed default to confirm Ω-A/B/C/D/E all OK; (2) confirm git history clean; (3) update Phase 3 closure note that the gate inverted",
+    "rollback": "single-line revert of the inverted condition"
+  },
+  "next_step_if_stay_opt_in": {
+    "documentation_target": "/Users/ghost/core/anima/anima-speak/README.md OR a new /Users/ghost/core/anima/anima-speak/AUDIO_WORKER.md",
+    "content": "(a) operator overview: ANIMA_AUDIO_WORKER=1 enables 2-17x speedup; (b) failure modes: container fallback, scipy version pinning; (c) cleanup commands: pkill -f anima_audio_worker.py + rm -rf /tmp/anima_audio_worker_*; (d) reference Phase 3 perf numbers; (e) worked example: ANIMA_AUDIO_WORKER=1 hexa_real omega_audio_emp.hexa",
+    "onboarding_hook": "add a one-line note in /Users/ghost/core/anima/anima-speak/CLAUDE.md (if exists) or in anima cycle templates that audio benches default-on the worker"
+  },
+  "audit_constraints_observed": {
+    "no_code_edits": true,
+    "no_git_commits": true,
+    "no_docker_rebuild": true,
+    "test_artifacts_cleanup": "verified — pgrep anima_audio_worker -> 0 (no matches); ls /tmp/anima_audio_worker_* -> no matches; ls /tmp/anima_audio_*.wav -> no matches; _phase4_test_*.hexa removed from anima-speak; /tmp/_phase4_*.out removed",
+    "files_created_outside_state": "none (test harnesses removed; only this JSON written)"
+  }
+}

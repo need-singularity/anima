@@ -1,0 +1,167 @@
+{
+  "cycle": "omega-runtime-1",
+  "axis": "hexa runtime persistent-pipe primitive — design doc unlocking ω-audio-2 60× chain target",
+  "timestamp": "2026-04-26",
+  "implementation_status": "DESIGN_ONLY",
+  "trigger": "ω-audio-2 Phase 3 measured 8-10× chain (vs 60× design target); residual floor is per-call fork+FIFO; cannot reduce without runtime change",
+  "predecessors": {
+    "phase3_continuation": "/Users/ghost/core/anima/state/omega_audio_2_phase3_continuation.json",
+    "worker_design": "/Users/ghost/core/anima/state/omega_audio_2_persistent_worker_design.json (Q3 explicitly defers a hexa-runtime persistent-pipe primitive)",
+    "current_consumer_shim": "/Users/ghost/core/anima/anima-speak/_audio_worker_call.sh (133 lines bash bridge that this primitive replaces)",
+    "current_worker_python": "/Users/ghost/core/hexa-lang/stdlib/anima_audio_worker.py (consumer-side; unchanged by this design)"
+  },
+  "current_state_summary": {
+    "exec_signature": "fn exec(cmd: string) -> string  // popen('r'); one-shot; reads child stdout to EOF; pclose discards exit",
+    "exec_with_status_signature": "fn exec_with_status(cmd: string) -> [string, int]  // popen + pclose; returns [stdout, exit_code]",
+    "exec_capture_signature": "fn exec_capture(cmd: string) -> [stdout, stderr, exit_code]  // pipe()+fork()+execvp('/bin/sh', '-c', cmd); read both pipes to EOF; waitpid; one-shot",
+    "exec_stream_signature": "fn exec_stream(cmd: string, on_line: fn(string)) -> int  // popen('r'); fgets() loop invoking hexa callback per line; returns exit; still one-shot, write-side not exposed",
+    "exec_replace_signature": "fn exec_replace(cmd: string)  // execvp() in current process; no return path",
+    "proc_spawn_supervised": "stdlib/proc.hexa fire-and-forget detached spawn for long-running daemons (lease+TTL). NOT bidirectional; no fd handle returned; cannot be repurposed",
+    "no_existing_persistent_child_primitive": true,
+    "key_observation": "All five exec* surfaces are popen-class one-shots. No primitive returns a live (pid, stdin_fd, stdout_fd) handle. exec_capture is the closest in mechanics (it already does pipe()+fork()+execvp() rather than popen()) and is the natural code donor for the new primitive."
+  },
+  "measured_floor_attribution": {
+    "chain_warm_observed_ms": 148.6,
+    "chain_target_ms": "≈20 (design's 60× over 1177ms baseline)",
+    "per_link_floor_ms_observed": "67-75 (observed in vocal_only and breath_only worker means)",
+    "links_per_chain": "2 (vocal source + pipe filter — each is one _run_py call → one _audio_worker_call.sh invocation)",
+    "floor_components_per_call_ms": {
+      "fork_exec_bash": "~8 (bash startup of _audio_worker_call.sh)",
+      "mkfifo_lookup_or_skip": "~1-2 (cached after first call)",
+      "open_FIFO_IN_for_write_blocking_on_keepalive_handoff": "~10-15",
+      "echo_REQ_via_/bin/echo_or_builtin": "~1-2",
+      "open_FIFO_OUT_for_read_with_select-style_loop": "~10-15",
+      "kill_-0_alive_check_per_iteration": "~1",
+      "/bin/cat_or_/bin/base64_inside_caller_path_when_building_CODE_B64": "~30-40 (base64 of 2-3KB python source via shell pipeline)",
+      "subtotal_observed_ms": "~67-75"
+    },
+    "what_a_persistent_pipe_eliminates": [
+      "all bash exec()-fork (~8ms × 1)",
+      "all FIFO open/close per call (~20-30ms × 1)",
+      "the entire /bin/cat | /bin/base64 caller-side encoding pipeline (~30-40ms × 1) — replaced by hexa-side string passthrough (or in-runtime base64 if we keep it for the protocol)",
+      "stale-state alive-check loops (~1-2ms)"
+    ],
+    "what_remains_after": [
+      "actual write(fd) syscall: ~0.05ms",
+      "actual read(fd) syscall + worker line-readline + JSON encode: ~1ms",
+      "worker python exec(compile(...)): 1.4ms (measured DSP)",
+      "WAV write to disk: ~5ms",
+      "subtotal: ~7-8ms per call → ~15ms per chain link → ~30ms per 2-link chain → roughly 40× over 1177ms baseline; closer to 60× when scipy lfilter cache stays warm in worker"
+    ],
+    "projected_speedup_if_implemented": "30-50× chain warm (vs current 8-10×); approaches but may not fully reach 60× target — remaining gap is WAV I/O and JSON framing, addressable in a follow-up via shared-mem or skipping JSON for hot paths"
+  },
+  "api_surface_proposal": {
+    "chosen_design": "(a) handle-based",
+    "rationale": "Iterator (b) reads cleanly but requires hexa-side method dispatch on a runtime opaque type — hexa's TAG system has TAG_VALSTRUCT but no native 'host-resource handle' tag, and adding one is bigger than the primitive itself. Implicit-cache (c) hides the lifecycle (when does the cached child die?), forces a single cmd→child mapping (no parallel workers for the same cmd), and makes error recovery ambiguous. Handle-based (a) maps 1:1 onto the existing exec_capture C pattern (pid + two pipes), uses the existing TAG_INT to carry the handle id (mirroring how POSIX file descriptors are exposed in many runtimes), and composes naturally with try/catch for error flow. Multiple handles trivially supported.",
+    "signatures": {
+      "spawn": "fn spawn(cmd: string) -> int  // returns handle id ≥ 0, or -1 on spawn failure (errno surfaced via exec_errno())",
+      "spawn_argv": "fn spawn_argv(argv: array<string>) -> int  // direct execvp, no /bin/sh — same security posture as exec_argv",
+      "send": "fn send(h: int, payload: string) -> int  // write(stdin_fd, payload); returns bytes written, or -1 on EPIPE / invalid handle",
+      "send_line": "fn send_line(h: int, payload: string) -> int  // convenience: send(h, payload + '\\n')",
+      "recv_line": "fn recv_line(h: int, timeout_ms: int) -> string  // read until '\\n' or timeout; returns line WITH trailing newline (matches exec_stream); empty string on EOF or timeout — disambiguate via recv_status(h)",
+      "recv_status": "fn recv_status(h: int) -> int  // 0 = ok, 1 = timeout, 2 = EOF/child-died, 3 = invalid handle — checked after recv_line returns empty",
+      "alive": "fn alive(h: int) -> bool  // kill(pid, 0) == 0 && handle slot still valid",
+      "close": "fn close(h: int) -> int  // close(stdin_fd); close(stdout_fd); SIGTERM pid; waitpid w/ 100ms grace; SIGKILL if needed; returns child exit code",
+      "set_nonblock": "fn set_nonblock(h: int, on: bool) -> bool  // fcntl O_NONBLOCK on stdout_fd; lets recv_line() poll without thread"
+    },
+    "namespace_proposal": "spawn / send / send_line / recv_line / recv_status / alive / close — all bare names in the hexa builtin table, mirroring exec / exec_capture / exec_stream. Avoids a 'child.' prefix to keep tab-stops cheap and match existing surface vocabulary.",
+    "type_safety_notes": "Handle is a plain int. Misuse (calling send on a closed handle) returns -1 + sets exec_errno; does not crash the runtime. Closed handle ids are NOT recycled within a process lifetime to make use-after-close detectable; handle-table grows by realloc when full (start at 16 slots, grow ×2 to 1024 cap = file-descriptor limit-aware).",
+    "parallelism": "Multiple persistent children supported (each gets a fresh handle). v1 is strictly synchronous per handle (one in-flight request); concurrency across handles is the user's problem (they pick which handle to send/recv). v2 could add recv_select(handles: array<int>, timeout_ms: int) -> int returning the index of the first ready handle.",
+    "error_model_alignment": "Matches exec_with_status / exec_capture which return arrays carrying exit codes rather than throwing. spawn returning -1 is the same convention as POSIX open() returning -1; hexa code can branch with `if h < 0 { ... }` symmetrically with how exec_with_status checks the second array element."
+  },
+  "lifecycle_semantics": {
+    "spawn_creates": "fork() + 2× pipe() (stdin and stdout); child sets dup2() to wire pipes to fd 0 / fd 1, closes parent ends, execvp()s the command. Stderr inherits parent stderr (matching exec_capture's split would double the fd cost; we keep stderr inherited because for the worker use case stderr is logging).",
+    "child_dies_when": [
+      "explicit close(h) — SIGTERM with 100ms grace, then SIGKILL, then waitpid",
+      "parent (hexa interp) exits cleanly — atexit handler closes all live handles in handle-table order (SIGTERM then SIGKILL after 100ms grace)",
+      "parent killed (SIGKILL) — no atexit runs; child becomes orphan but: (i) child likely sees EOF on stdin once kernel reaps the parent and reaps its pipe write-end → child reads 0 bytes → exits; (ii) anima_audio_worker.py specifically polls _parent_alive() every 5s as a backstop; (iii) if child does neither it leaks until OS reboot — accepted risk, matches current bash-shim behavior",
+      "child crashes — next send() returns -1 with EPIPE; next recv_line() returns '' with recv_status() = 2 (EOF/child-died); handle is auto-marked dead; close() is still required to free the slot and reap the zombie"
+    ],
+    "no_idle_timeout_in_primitive": "Idle timeout is policy, not mechanism. Push to user code — the worker python already has IDLE_TIMEOUT_S=300; the hexa side can call alive(h) opportunistically and respawn. Putting it in the primitive bakes a magic number into the runtime.",
+    "max_concurrent_handles": "soft cap = min(getrlimit(RLIMIT_NOFILE)/4, 1024). Each handle eats 2 fds (stdin pipe, stdout pipe). Spawn returns -1 when cap hit; exec_errno() surfaces EMFILE.",
+    "zombie_avoidance": "close() always waitpid()s. atexit handler also waitpid()s. SIGCHLD is NOT installed (would conflict with user code that sets handlers); we rely on close() being called or atexit running."
+  },
+  "error_model": {
+    "spawn_fail": "returns -1; sets thread-local exec_errno (errno from fork/execvp/pipe). Hexa code: `let h = spawn(cmd); if h < 0 { eprintln('spawn failed: ' + to_string(exec_errno())) }`",
+    "send_fail": "returns -1; common causes: EPIPE (child closed stdin), EBADF (handle closed/invalid). Hexa convention: `let n = send(h, msg); if n < 0 { /* respawn or bail */ }`",
+    "recv_timeout": "recv_line returns ''; recv_status() returns 1. Caller distinguishes timeout from EOF by calling recv_status() before checking empty string.",
+    "recv_eof_child_died": "recv_line returns ''; recv_status() returns 2. waitpid is performed inside recv_line on detecting EOF so the exit code is captured into the handle slot for the eventual close() to retrieve.",
+    "invalid_handle": "any op on h that is negative, never-spawned, or already-closed: returns -1 (send/close) or '' with recv_status=3 (recv).",
+    "no_throws": "primitive never throws. Matches exec_with_status / exec_capture convention. Throwing requires hexa try/catch frames in every call site, which the audio worker call sites are not currently structured for."
+  },
+  "implementation_sketch_runtime_c": {
+    "new_struct": "typedef struct { pid_t pid; int stdin_fd; int stdout_fd; int state; /* 0=free,1=live,2=dead-pending-close */ int last_exit; int last_recv_status; } HexaChild;",
+    "handle_table": "static HexaChild* g_children = NULL; static int g_children_cap = 0; static int g_children_count = 0; — array indexed by handle id, grown via realloc with ×2 policy starting at 16. Free slots are NOT reused within a process (monotonic id counter g_next_handle) to keep use-after-close detectable. Optional: for table compaction beyond 1024 slots, gate with a HEXA_CHILD_RECYCLE_HANDLES env var (default off).",
+    "fork_exec_pair_pseudocode": "HexaVal hexa_spawn(HexaVal cmd) {\n  if (!HX_IS_STR(cmd)) return hexa_int(-1);\n  int in_pipe[2], out_pipe[2];\n  if (pipe(in_pipe) != 0)  { _set_exec_errno(errno); return hexa_int(-1); }\n  if (pipe(out_pipe) != 0) { close(in_pipe[0]); close(in_pipe[1]); _set_exec_errno(errno); return hexa_int(-1); }\n  pid_t pid = fork();\n  if (pid < 0) { /* close all 4 fds */ _set_exec_errno(errno); return hexa_int(-1); }\n  if (pid == 0) {\n    dup2(in_pipe[0], 0); dup2(out_pipe[1], 1);\n    close(in_pipe[0]); close(in_pipe[1]);\n    close(out_pipe[0]); close(out_pipe[1]);\n    execl(\"/bin/sh\", \"sh\", \"-c\", HX_STR(cmd), (char*)NULL);\n    _exit(127);\n  }\n  // parent\n  close(in_pipe[0]); close(out_pipe[1]);\n  int slot = _alloc_child_slot();  // grows table if needed\n  if (slot < 0) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); close(in_pipe[1]); close(out_pipe[0]); _set_exec_errno(EMFILE); return hexa_int(-1); }\n  g_children[slot] = (HexaChild){pid, in_pipe[1], out_pipe[0], 1, 0, 0};\n  return hexa_int(slot);\n}",
+    "send_pseudocode": "HexaVal hexa_send(HexaVal h, HexaVal payload) {\n  HexaChild* c = _live_child(HX_INT(h));\n  if (!c || !HX_IS_STR(payload)) return hexa_int(-1);\n  const char* buf = HX_STR(payload); size_t n = strlen(buf);\n  ssize_t w = write(c->stdin_fd, buf, n);\n  if (w < 0) { c->state = 2; _set_exec_errno(errno); return hexa_int(-1); }\n  return hexa_int((long long)w);\n}",
+    "recv_line_pseudocode": "HexaVal hexa_recv_line(HexaVal h, HexaVal timeout_ms) {\n  HexaChild* c = _live_child(HX_INT(h));\n  if (!c) { /* set status=3 */ return hexa_str(\"\"); }\n  long long tmo = HX_IS_INT(timeout_ms) ? HX_INT(timeout_ms) : 5000;\n  // poll() with O_NONBLOCK off: read 1 byte at a time until '\\n' or timeout.\n  // Simpler v1: use select(stdout_fd, tmo) then blocking read up to '\\n'.\n  char* buf = malloc(4096); size_t cap=4096, len=0;\n  long long t0 = _now_ms();\n  while (1) {\n    long long elapsed = _now_ms() - t0;\n    if (elapsed >= tmo) { c->last_recv_status = 1; free(buf); return hexa_str(\"\"); }\n    fd_set rf; FD_ZERO(&rf); FD_SET(c->stdout_fd, &rf);\n    struct timeval tv = { (tmo-elapsed)/1000, ((tmo-elapsed)%1000)*1000 };\n    int s = select(c->stdout_fd+1, &rf, NULL, NULL, &tv);\n    if (s <= 0) continue;  // timeout slice; loop checks total\n    char ch; ssize_t r = read(c->stdout_fd, &ch, 1);\n    if (r == 0) {  // EOF — child closed stdout\n      int st; waitpid(c->pid, &st, WNOHANG);\n      c->last_exit = WIFEXITED(st) ? WEXITSTATUS(st) : (WIFSIGNALED(st) ? 128+WTERMSIG(st) : -1);\n      c->state = 2; c->last_recv_status = 2;\n      free(buf); return hexa_str(\"\");\n    }\n    if (r < 0) { c->last_recv_status = 2; free(buf); return hexa_str(\"\"); }\n    if (len+1 >= cap) { cap *= 2; buf = realloc(buf, cap); }\n    buf[len++] = ch;\n    if (ch == '\\n') { buf[len] = '\\0'; c->last_recv_status = 0; return hexa_str_own(buf); }\n  }\n}",
+    "close_pseudocode": "HexaVal hexa_close(HexaVal h) {\n  HexaChild* c = _slot(HX_INT(h));\n  if (!c || c->state == 0) return hexa_int(-1);\n  if (c->stdin_fd  >= 0) { close(c->stdin_fd);  c->stdin_fd  = -1; }\n  if (c->stdout_fd >= 0) { close(c->stdout_fd); c->stdout_fd = -1; }\n  if (c->state == 1 && c->pid > 0) {\n    kill(c->pid, SIGTERM);\n    for (int i=0; i<10; i++) {  // 100ms grace, 10ms slices\n      int st; pid_t r = waitpid(c->pid, &st, WNOHANG);\n      if (r == c->pid) { c->last_exit = WIFEXITED(st)?WEXITSTATUS(st):(WIFSIGNALED(st)?128+WTERMSIG(st):-1); break; }\n      _sleep_ms(10);\n    }\n    if (c->last_exit == 0 && /* not yet reaped */) { kill(c->pid, SIGKILL); waitpid(c->pid, NULL, 0); }\n  }\n  c->state = 0;  // slot becomes free (id still not recycled)\n  return hexa_int(c->last_exit);\n}",
+    "atexit_cleanup": "static void _hexa_child_atexit(void) {\n  for (int i=0; i<g_children_cap; i++) {\n    HexaChild* c = &g_children[i];\n    if (c->state == 1 && c->pid > 0) {\n      // mirror close() but with shorter grace — we're shutting down\n      if (c->stdin_fd >= 0) close(c->stdin_fd);\n      kill(c->pid, SIGTERM);\n      _sleep_ms(50);\n      kill(c->pid, SIGKILL);\n      waitpid(c->pid, NULL, WNOHANG);\n    }\n  }\n}\n// Registered once via atexit(_hexa_child_atexit) inside hexa_init_env or first hexa_spawn() call.",
+    "hexa_full_dispatch": "Add cases in the builtin dispatcher (see hexa_full.hexa around line 10219 for the exec_capture pattern). Each new builtin gets a TAG_FN shim (hx_spawn, hx_send, hx_recv_line, hx_close, hx_alive) registered the same way hx_exec_capture is at runtime.c:6990. Estimated ~6 new bt-73 shims + ~6 dispatch arms (~80 LOC in hexa_full.hexa).",
+    "loc_estimate": {
+      "runtime_c_new": "~250 LOC (struct + table + spawn/send/recv/close/alive + atexit + exec_errno helper)",
+      "hexa_full_hexa_new": "~80 LOC (6 dispatch arms)",
+      "shims_new": "~30 LOC (TAG_FN registration block, mirroring _hexa_init_exec_sha_fn_shims at runtime.c:6975)",
+      "selftest_new": "~100 LOC (hexa-side test that spawns `cat`, sends 3 lines, recvs them, closes; spawns broken child, asserts -1; spawns slow child, asserts timeout)",
+      "total": "~460 LOC (within the 'small-medium runtime feature' budget; comparable to exec_capture's footprint)"
+    }
+  },
+  "existing_tooling_overlap": {
+    "stdlib_proc_hexa": "fire-and-forget supervised spawn with lease+TTL — does NOT return a bidirectional handle. Strictly additive; the new primitive does not subsume proc.hexa (different use case: proc.hexa is for daemons we want to outlive the parent; spawn() is for child workers that die with us).",
+    "exec_capture_donor": "exec_capture (runtime.c:6010) already does pipe()+fork()+execvp() + dual-pipe drain + waitpid. spawn() reuses the same fork/dup2/execvp pattern — about 60% of the C is copy-able with edits. The only NEW mechanics are: (i) keeping the pipes open after fork instead of draining-then-closing, (ii) the handle table, (iii) write-side exposure.",
+    "exec_stream_pattern": "exec_stream installs a hexa callback per line — useful precedent for streaming output, but still popen-based and one-shot. The new spawn/recv_line model is more flexible because the hexa caller drives the read loop instead of yielding to a callback.",
+    "no_existing_long_lived_child_pattern_in_hexa_source": true,
+    "no_subsumption_needed": "All three (proc.hexa, exec_capture, exec_stream) keep their existing roles. spawn() is strictly additive."
+  },
+  "blast_assessment": {
+    "files_touched": [
+      "/Users/ghost/core/hexa-lang/self/runtime.c — add ~250 LOC (struct, handle table, spawn/send/recv_line/recv_status/alive/close/exec_errno C functions, atexit hook). Insert near exec_capture (line 6010) for visual locality.",
+      "/Users/ghost/core/hexa-lang/self/hexa_full.hexa — add ~80 LOC (6 builtin dispatch arms in the same block as exec_capture at line 10219; mirror its hx_<name>(args[...]) shim-call pattern).",
+      "/Users/ghost/core/hexa-lang/self/main.hexa — likely no change (spawn is a builtin, not a syntax keyword).",
+      "/Users/ghost/core/hexa-lang/stdlib/proc.hexa — optional: add a thin wrapper `proc_spawn_pipe(cmd)` that delegates to spawn() so the convention 'process primitives live in stdlib/proc' holds. Not load-bearing.",
+      "/Users/ghost/core/hexa-lang/stdlib/anima_audio_helpers.hexa (NEW, optional) — ~50 LOC convenience wrapper that owns the worker handle, encodes/decodes JSON, and exposes anima_audio_worker_call(code) -> bool to the consumer. Centralizes the protocol so anima_audio.hexa doesn't bake in NDJSON details."
+    ],
+    "build_chain": [
+      "regenerate /tmp/hexa_full_regen.c via `self/native/hexa_v2 self/hexa_full.hexa /tmp/hexa_full_regen.c` (the line-17 self-rebuild contract)",
+      "rebuild build/hexa_interp via clang (line 18 contract)",
+      "codesign hexa_interp (line 19; required on darwin for spawn syscall in some sandbox modes)",
+      "image rebake (the dispatcher image, if container-based hexa_real is used) — same dance as ω-runner-4 cycle this session",
+      "container restart if any agents hold an old hexa_interp open"
+    ],
+    "risk_classes": [
+      {"id": "B1", "class": "fd leak", "severity": "medium", "scenario": "spawn() succeeds but caller never close()s and hexa process keeps running (long-lived agent loop). 2 fds per leaked handle; hits RLIMIT_NOFILE (default 256 on darwin) at ~125 leaks.", "mitigation": "atexit cleanup catches process-exit case; soft cap on max handles; document that close() is mandatory; consider a `with_spawn(cmd, fn)` higher-order helper in stdlib that auto-closes."},
+      {"id": "B2", "class": "zombie pids", "severity": "medium", "scenario": "child exits but caller never close()s → defunct process accumulates. Mitigated by recv_line auto-waitpid on EOF detection; remaining gap is when caller stops calling recv at all.", "mitigation": "atexit reaps everything; optional periodic reap inside hexa_spawn() that walks the table calling waitpid(pid, &st, WNOHANG) on dead-marked slots."},
+      {"id": "B3", "class": "security — uncontrolled spawn from .hexa scripts", "severity": "low-medium", "scenario": "any .hexa script can spawn arbitrary subprocesses with the same trust as the hexa runtime. SAME risk as exec/exec_capture today — no escalation.", "mitigation": "no new privilege; document; if needed add HEXA_DISABLE_SPAWN env var that makes spawn() always return -1 (matches existing HEXA_DISABLE_EXEC pattern if any)."},
+      {"id": "B4", "class": "portability — pipe()/fork()/execvp()/select() behavior", "severity": "low", "scenario": "BSD vs Linux differ in PIPE_BUF (512 vs 4096) and select() fd_set max (1024 hard limit on linux without poll). For audio-worker traffic (sub-256-byte JSON) and ≤1024 children, both fit comfortably.", "mitigation": "use poll() instead of select() if implementation is straightforward; pipe writes stay <PIPE_BUF for atomicity (worker JSON requests are small)."},
+      {"id": "B5", "class": "deadlock — worker writes >PIPE_BUF before hexa reads", "severity": "medium-low", "scenario": "if worker emits a long line (>4KB on darwin) it blocks on write; hexa is blocked in send() waiting for ack. Doesn't apply to anima_audio (responses are <256 bytes) but bites a future LSP child whose responses can be MB-sized.", "mitigation": "v1 doc says 'recv_line for line-delimited protocols only; for bulk data, use exec_capture or a separate file channel'; v2 add recv_chunk(h, max_bytes) that drains in pieces."},
+      {"id": "B6", "class": "signal interference", "severity": "low", "scenario": "if hexa user code installs SIGCHLD handler, our waitpid() inside recv_line / close races with it.", "mitigation": "do not install SIGCHLD; document; v2 could use signalfd() on linux for race-free child reaping."},
+      {"id": "B7", "class": "use-after-close handle reuse", "severity": "low", "scenario": "hypothetical if we recycle handle ids — we explicitly DO NOT, so this is moot in v1.", "mitigation": "monotonic handle counter; slot reuse only behind opt-in env var."}
+    ],
+    "rollback_strategy": "feature is purely additive in runtime.c and hexa_full.hexa; revert via `git revert <commit>`; no on-disk state to clean. Worker .py and bash shim continue to work unchanged during rollout (anima_audio.hexa keeps WORKER_CALL_SH path until Phase B explicitly cuts over)."
+  },
+  "rollout_plan": {
+    "phase_A": "Implement primitive in runtime.c + hexa_full.hexa dispatch + 6 TAG_FN shims; write a hexa-side selftest in self/spawn_selftest.hexa that exercises spawn(`cat`)/send/recv_line/close, spawn(non-existent)/expect -1, spawn slow process/expect timeout, spawn 100 children/expect EMFILE around the cap. Exit gate: selftest passes; `./hexa run self/spawn_selftest.hexa` returns 0; valgrind shows zero leaked fds at exit.",
+    "phase_B": "Cutover anima_audio.hexa to use spawn() directly. Replace WORKER_CALL_SH bash invocation with: ensure_worker_handle() spawns python3 worker.py once; _run_py() encodes NDJSON inline (or via a stdlib JSON helper), send_line(h, request), recv_line(h, 20000), parse response. Delete _audio_worker_call.sh (133 lines) and the per-PPID FIFO/keepalive scaffolding. Behind ANIMA_AUDIO_WORKER_DIRECT=1 flag for one cycle of A/B comparison.",
+    "phase_C": "Re-run Phase 3 chain bench with ANIMA_AUDIO_WORKER_DIRECT=1. Target: chain warm mean ms ≤ 30 (from 148.6); 30-50× speedup on the 1177ms baseline. If <30× achieved, attribute the gap (likely WAV write or JSON encode/decode), file ω-runtime-2 follow-up. If ≥40× achieved, declare ω-audio-2 60× target met-with-asterisk and proceed to D.",
+    "phase_D": "Surface to other consumers. Candidates identified: (i) `hexa lsp` could swap exec_replace() for a persistent spawn() handle so the LSP doesn't restart on every JSON-RPC call; (ii) a persistent linter daemon for tool/r3_lint.py-class scripts; (iii) the omega_audio_emp probe runner; (iv) any anima cycle that calls python repeatedly (omega_cycle_atlas_ingest.hexa-style ingestion pipelines). Add convenience wrapper proc.spawn_json(cmd) in stdlib/proc.hexa for the NDJSON-per-line idiom."
+  },
+  "fallback_options_if_primitive_too_costly": [
+    {"option": "Unix domain socket (UDS) with worker as listener", "cost_to_implement": "low (worker.py adds 20 lines using socketserver; hexa side uses existing exec_capture or curl/nc workaround)", "speedup_recovered": "20-40× (saves fork+FIFO open but still pays connect() syscall ~5-10ms per call)", "downside": "still requires per-call connect; introduces socket-cleanup edge cases (stale .sock files); doesn't eliminate the bash shim, just shortens it", "verdict": "viable middle ground if runtime change is rejected"},
+    {"option": "Inline interpreter — embed python via libpython into hexa runtime (or rewrite DSP in C-level numpy bindings)", "cost_to_implement": "VERY HIGH (libpython embedding is a multi-week project; numpy C-API is unstable across versions; rewriting butter+lfilter+sosfilt in C is months of work and re-creates exactly the ctypes_shared_lib path the original design rejected)", "speedup_recovered": "60-100× (no IPC at all)", "downside": "scope creep; portability nightmare; segfaults take down hexa; binds hexa to a specific python version", "verdict": "REJECTED — same conclusion as ω-audio-2 design's ctypes_shared_lib row"},
+    {"option": "Accept current 8-10× as production setting", "cost_to_implement": "zero", "speedup_recovered": "8-10× (already shipped)", "downside": "ω-audio-2 60× design target stays unmet on chains; harder to argue 'POC delivered the design promise' in retro", "verdict": "acceptable if no other consumer needs persistent IPC; revisit only when a second consumer (LSP, linter) joins the queue"},
+    {"option": "Keep bash shim but optimize: (a) replace /bin/cat | /bin/base64 with a one-shot awk encoder; (b) keep FIFOs open via persistent reader inside helper; (c) move keepalive into the same shell process", "cost_to_implement": "medium (rewriting _audio_worker_call.sh)", "speedup_recovered": "15-25× (knocks ~30ms off the per-call floor by eliminating /bin/base64 fork)", "downside": "still pays bash exec()-fork (~8ms × 1) per call; hits a ceiling of ~25-30ms per chain link; doesn't help future consumers", "verdict": "viable as a Phase B-prime if Phase A primitive slips; documented for completeness"}
+  ],
+  "open_questions": [
+    "OQ1: should recv_line return the line WITH or WITHOUT trailing newline? exec_stream returns WITH (matches fgets); we propose WITH for consistency, but JSON parsers strip whitespace anyway. Decision: WITH (matches existing exec_stream).",
+    "OQ2: should send() be line-buffered or unbuffered? Pipes are byte streams; we propose unbuffered raw write() — caller appends '\\n' via send_line() helper if they want line framing. Worker-side python sys.stdin.readline() handles line buffering on its end.",
+    "OQ3: do we need a recv_chunk(h, max_bytes) primitive in v1, or is recv_line sufficient? For audio-worker NDJSON-per-line traffic, recv_line is sufficient. recv_chunk is a v2 follow-up gated on a second consumer needing it (LSP responses can be large).",
+    "OQ4: should the handle id be a TAG_INT or a fresh TAG_CHILD_HANDLE tag? TAG_INT is simpler (no hexa runtime tag-table change); the cost is that arithmetic on a handle is silently nonsensical. Decision: TAG_INT for v1; revisit if mistakes happen in practice.",
+    "OQ5: poll() vs select() for recv_line timeout? select() is in exec_capture already (more familiar to runtime.c readers); poll() is more correct for >1024 fds. v1 uses select() to match existing style; document the 1024 cap."
+  ],
+  "first_concrete_step_if_approved": "Edit /Users/ghost/core/hexa-lang/self/runtime.c around line 6107 (immediately after hexa_exec_capture) to add the HexaChild struct, handle-table globals (g_children, g_children_cap, g_next_handle), and the seven C functions: hexa_spawn, hexa_send, hexa_send_line, hexa_recv_line, hexa_recv_status, hexa_alive, hexa_close. Then around line 6975 (after _hexa_init_exec_sha_fn_shims) add a _hexa_init_spawn_fn_shims() block registering the TAG_FN globals. Then in hexa_full.hexa around line 10230 (after exec_capture dispatch arm) add the 6 dispatch arms. Then add atexit(_hexa_child_atexit) call inside hexa_init_env (locate via grep). Expected diff: ~360 LOC across 2 files, no breaking changes to existing surface. Selftest harness self/spawn_selftest.hexa is ~100 LOC additional.",
+  "report_summary_for_caller": {
+    "chosen_api_design": "(a) handle-based: spawn(cmd) -> int, send/send_line/recv_line/recv_status/alive/close. Handle id is TAG_INT; never recycled within process lifetime. Multiple persistent children supported.",
+    "biggest_implementation_risk": "B5 — pipe-write deadlock if a future consumer (not anima_audio) emits >4KB per line. Mitigation: v1 documents 'small-line protocols only', v2 adds recv_chunk(h, max_bytes). Secondary risk B1 — fd leak on missing close(); mitigated by atexit cleanup + soft cap + recommended with_spawn() helper.",
+    "projected_speedup_if_implemented": "Per-call floor drops from 67-75ms to ~7-8ms (eliminates bash exec ~8ms, FIFO open/close ~25ms, /bin/base64 fork ~30-40ms). Chain (2 links) drops from 148.6ms warm to ~30ms warm → 30-50× speedup over 1177ms baseline. Approaches the 60× design target; remaining gap to 60× is WAV I/O + JSON framing, addressable separately."
+  }
+}

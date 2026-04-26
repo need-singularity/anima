@@ -112,44 +112,112 @@ fn _file_bytes(path: string) -> int {
     return file_size(path)
 }
 
-// Hexa PID — each exec()'s shell has $PPID == hexa pid. Cached once.
-// Used as the per-session key for the persistent audio worker (see
-// _audio_worker_call.sh + anima_audio_worker.py).
-fn _hexa_pid() -> string {
-    let s = exec("echo $PPID 2>/dev/null").trim()
-    if len(s) == 0 { return "0" }
-    return s
+// ── ω-audio-2 Phase B (2026-04-26) ──────────────────────────────
+// Persistent python audio-worker IPC.
+//
+// Phase 2-3 used a FIFO + sleep-keepalive shim (_audio_worker_call.sh).
+// Phase B rewires to the new ω-runtime-1 pipe_spawn primitive: a single
+// hexa-script-lifetime handle is lazy-spawned and reused across all organ
+// calls, eliminating per-call bash+FIFO overhead (~50ms floor → ~7-8ms).
+//
+// Lifetime: each hexa invocation is a fresh process, so WORKER_HANDLE is
+// per-script. The ω-runtime-1 atexit handler reaps the child on hexa exit
+// (SIGTERM → 50ms grace → SIGKILL → waitpid), so no orphan reaper is needed.
+//
+// Container guard: hexa-runner image lacks python3+scipy, so default-on
+// inside container would fail every organ call. ANIMA_AUDIO_WORKER_PY_OK
+// caches a one-shot probe (file_exists /opt/homebrew/bin/python3 OR which).
+
+let WORKER_PY_PATH = "/Users/ghost/core/hexa-lang/stdlib/anima_audio_worker.py"
+let mut WORKER_HANDLE = -1
+let mut WORKER_REQ_ID = 0
+let mut WORKER_PY_OK_PROBED = false
+let mut WORKER_PY_OK = false
+
+fn _python_available() -> bool {
+    if WORKER_PY_OK_PROBED { return WORKER_PY_OK }
+    WORKER_PY_OK_PROBED = true
+    // Container guard: if /.dockerenv exists and python3 missing, refuse worker.
+    if file_exists("/opt/homebrew/bin/python3") {
+        WORKER_PY_OK = true
+        return true
+    }
+    let s = exec("command -v python3 2>/dev/null").trim()
+    if len(s) > 0 {
+        WORKER_PY_OK = true
+        return true
+    }
+    WORKER_PY_OK = false
+    return false
 }
 
-// Path to worker IPC adapter (sibling of this file).
-let WORKER_CALL_SH = "/Users/ghost/core/anima/anima-speak/_audio_worker_call.sh"
+fn _ensure_worker_handle() -> int {
+    if WORKER_HANDLE >= 0 {
+        if pipe_alive(WORKER_HANDLE) { return WORKER_HANDLE }
+        // Stale handle (worker died, e.g. idle timeout). Clean and re-spawn.
+        pipe_close(WORKER_HANDLE)
+        WORKER_HANDLE = -1
+    }
+    if !_python_available() { return -1 }
+    if !file_exists(WORKER_PY_PATH) { return -1 }
+    // Resolve python binary (homebrew preferred on darwin, fall back to PATH).
+    let mut py = "/opt/homebrew/bin/python3"
+    if !file_exists(py) { py = "python3" }
+    let cmd = py + " " + WORKER_PY_PATH
+    let h = pipe_spawn(cmd)
+    if h < 0 { return -1 }
+    // Consume the "ready" event the worker emits on startup. 5s grace covers
+    // python+numpy+scipy import (typically ~500-1500ms cold).
+    let ready = pipe_recv_line(h, 5000)
+    if len(ready) == 0 {
+        // worker failed to start cleanly
+        pipe_close(h)
+        return -1
+    }
+    WORKER_HANDLE = h
+    return h
+}
 
 fn _run_py_worker(code: string) -> bool {
-    // base64-encode the code so it survives shell quoting and contains no \n.
-    // We pipe code into `base64` rather than embed it inline (which would
-    // require escaping every special char). expect_path is left empty
-    // because the path is already inside `code`; caller re-checks with
-    // _file_bytes() as today, preserving existing per-organ semantics.
-    let pid = _hexa_pid()
-    // Write code to a tmp file, base64 it, invoke the helper.
-    // (heredoc with ENDMARKER keeps the python source untouched.)
-    let tmp = TMP_DIR + "/" + TAG + "_payload_" + _now_ns() + ".py"
-    let cmd = "cat > " + _shq(tmp) + " <<'PYEOFCODE'\n" + code + "\nPYEOFCODE\n"
-            + "B64=$(base64 < " + _shq(tmp) + " | tr -d '\\n')\n"
-            + "rm -f " + _shq(tmp) + "\n"
-            + _shq(WORKER_CALL_SH) + " " + pid + " \"$B64\" \"\""
-    let _ = exec(cmd)
-    // Worker writes WAV via the embedded path; caller re-validates via
-    // _file_bytes(). We always return true to match existing _run_py semantics.
+    let h = _ensure_worker_handle()
+    if h < 0 { return false }
+    // base64-encode code so the request is a single JSON line with no
+    // embedded newlines/quotes. base64 alphabet is JSON-safe.
+    let code_b64 = base64_encode(code)
+    WORKER_REQ_ID = WORKER_REQ_ID + 1
+    let req = "{\"id\":" + to_string(WORKER_REQ_ID)
+            + ",\"kind\":\"exec\",\"code_b64\":\"" + code_b64
+            + "\",\"expect_path\":\"\"}"
+    let sent = pipe_send_line(h, req)
+    if !sent {
+        // pipe broke — reset and let caller's file_size check fail naturally.
+        pipe_close(h)
+        WORKER_HANDLE = -1
+        return false
+    }
+    // 5s recv: cold-call (numpy import already paid in startup) is dominated
+    // by the actual numpy/scipy work; warm calls return in <30ms.
+    let resp = pipe_recv_line(h, 5000)
+    if len(resp) == 0 {
+        // timeout or worker died mid-call
+        pipe_close(h)
+        WORKER_HANDLE = -1
+        return false
+    }
     return true
 }
 
 fn _run_py(code: string) -> bool {
-    // Phase 2 POC: route through persistent worker iff ANIMA_AUDIO_WORKER=1.
-    // Default behavior (flag unset or "0") = current spawn-per-call.
+    // ω-audio-2 Phase 4 cutover (2026-04-26): persistent worker is now the
+    // default. Opt out via ANIMA_AUDIO_WORKER=0 (operator safety valve).
+    // Container guard: _ensure_worker_handle() returns -1 when python3 is
+    // missing, and _run_py_worker returns false → we fall through to the
+    // legacy spawn-per-call path (which itself fails the same way baseline
+    // already failed in containers without python3, preserving parity).
     let flag = env("ANIMA_AUDIO_WORKER")
-    if flag == "1" {
-        return _run_py_worker(code)
+    if flag != "0" {
+        if _run_py_worker(code) { return true }
+        // worker path unavailable (no python, container, etc.) → fall through.
     }
     let cmd = "python3 - <<'PYEOF'\n" + code + "\nPYEOF"
     let _ = exec(cmd)

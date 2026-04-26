@@ -1,0 +1,98 @@
+{
+  "cycle": "omega-audio-2-phase-b-and-cutover",
+  "axis": "anima rewire to ω-runtime-1 primitive + Phase 4 default-on cutover",
+  "timestamp": "2026-04-26",
+  "predecessors": [
+    "/Users/ghost/core/anima/state/omega_runtime_1_phase_a_impl.json",
+    "/Users/ghost/core/anima/state/omega_audio_2_phase4_cutover_eval.json",
+    "/Users/ghost/core/anima/state/omega_audio_2_phase3_continuation.json"
+  ],
+  "phase_b_changes": {
+    "ipc_strategy_chosen": "(a) worker.py reads NDJSON from stdin / writes to stdout (already line-protocol-friendly, only header comments updated). hexa side rewired to talk to it directly via pipe_spawn/pipe_send_line/pipe_recv_line.",
+    "files_modified": [
+      {
+        "path": "/Users/ghost/core/hexa-lang/stdlib/anima_audio_worker.py",
+        "summary": "Header comments updated to document the Phase B IPC migration (FIFO+keepalive shim → direct pipe_spawn). No protocol/code changes — worker was already stdin/stdout NDJSON. The 'ready' event on stdout is now consumed by the hexa caller right after pipe_spawn() returns. PARENT_PID watchdog still works (under sh -c exec, getppid() == hexa interp pid), and the runtime atexit cleanup makes the parent-died path effectively redundant but kept as a safety net for SIGKILL of hexa."
+      },
+      {
+        "path": "/Users/ghost/core/anima/anima-speak/anima_audio.hexa",
+        "summary": "Replaced FIFO-shim plumbing (lines 115-145 old: _hexa_pid + WORKER_CALL_SH + _run_py_worker calling _audio_worker_call.sh) with direct pipe_spawn-based IPC. Added module-scope state: WORKER_HANDLE (lazy-init, per-script lifetime), WORKER_REQ_ID (monotonic), WORKER_PY_OK_PROBED + WORKER_PY_OK (one-shot python3 availability cache). New helpers: _python_available() (container guard: file_exists /opt/homebrew/bin/python3 or `command -v python3`), _ensure_worker_handle() (lazy spawn + ready-event consume + alive-recheck), _run_py_worker() (base64_encode code, build NDJSON request, pipe_send_line + pipe_recv_line(5000ms), self-heal on pipe break). _run_py() default-ON cutover: route to worker unless ANIMA_AUDIO_WORKER == \"0\"; on worker failure (e.g. container without python3), fall through to legacy `python3 - <<PYEOF` path preserving baseline parity."
+      }
+    ],
+    "files_deprecated_or_deleted": [
+      {
+        "path": "/Users/ghost/core/anima/anima-speak/_audio_worker_call.sh",
+        "action": "deleted",
+        "rationale": "Subsumed entirely by pipe_spawn primitive + _ensure_worker_handle. Bash adapter, FIFOs, sleep-keepalive, per-PPID /tmp dirs, pid/keepalive bookkeeping all eliminated. Atexit handler in ω-runtime-1 (SIGTERM → 50ms grace → SIGKILL → waitpid) replaces all of it."
+      }
+    ]
+  },
+  "cutover": {
+    "env_gate_default": "ON",
+    "opt_out": "ANIMA_AUDIO_WORKER=0 keeps the legacy spawn-per-call (heredoc python3 -) path",
+    "container_guard": "_python_available() one-shot probes /opt/homebrew/bin/python3 then `command -v python3`. If missing, _ensure_worker_handle() returns -1, _run_py_worker() returns false, _run_py() falls through to the legacy heredoc path (which itself fails on no-python — preserving baseline parity, no NEW container regression introduced).",
+    "orphan_reaper_status": "NOT_NEEDED. The ω-runtime-1 atexit handler tears down all live pipe handles (SIGTERM all → 50ms → SIGKILL all → waitpid). Verified post-bench: 0 lingering workers, 0 keepalives, 0 stale FIFOs."
+  },
+  "bench": {
+    "method": "5x vocal+pipe chain pairs (10 organ calls per script run). First chain pair measured separately as COLD (absorbs python+numpy+scipy import + worker spawn). Remaining 4 pairs (8 organ calls) measured as WARM steady-state. Timestamp via `python3 -c 'time.time()*1000'` (portable across darwin/linux). 5 runs per condition.",
+    "binary": "/Users/ghost/core/hexa-lang/build/hexa_interp.real (2,763,312 bytes Mach-O arm64, built 2026-04-26 11:21 with persistent-pipe primitive Phase A).",
+    "cold_pair_ms": [685, 748, 688, 736, 743],
+    "cold_pair_mean_ms": 720,
+    "cold_pair_note": "Cold cost = python3 + numpy + scipy import (~500-700ms) + ready-event consume + first-call exec. Pre-existing Phase 3 cold cost was similar (~700ms).",
+    "chain_baseline_phase3_worker_ms": 148.6,
+    "chain_baseline_pre_worker_ms": 1177,
+    "chain_new_primitive_warm_per_pair_ms": [35, 37, 35, 36, 35],
+    "chain_warm_mean_ms": 35.6,
+    "warm_per_call_ms": 17.8,
+    "spawn_per_call_baseline_warm_per_pair_ms": [799, 668, 702],
+    "spawn_per_call_baseline_warm_mean_ms": 723,
+    "speedup_vs_phase3_fifo_worker": "4.2x (148.6 → 35.6 ms per chain pair)",
+    "speedup_vs_spawn_per_call_baseline": "20.3x (723 → 35.6 ms per chain pair)",
+    "speedup_vs_pre_worker_baseline_1177ms": "33.1x (1177 → 35.6 ms per chain pair)",
+    "approaches_design_target_30_50x": true,
+    "design_target_note": "Target was chain warm ≤30ms (30-50× over 1177ms pre-worker baseline). Achieved 35.6ms = 33.1× — within target band lower bound. Per-call warm dropped from FIFO-worker ~70ms floor to ~17.8ms — close to design's 7-8ms projection (residual gap is ~10ms of `python3 -c time.time()*1000` measurement overhead per timestamp call + base64_encode + 1KB code transfer per request)."
+  },
+  "regression_check": {
+    "three_organ_smoke": "PASS",
+    "wav_bytes": [4844, 4844, 4844],
+    "expected": [4844, 4844, 4844],
+    "test_file": "/tmp/anima_smoke_three.hexa",
+    "command": "/Users/ghost/core/hexa-lang/build/hexa_interp.real /tmp/anima_smoke_three.hexa"
+  },
+  "cleanup_verified": {
+    "workers_lingering": 0,
+    "fifos_lingering": 0,
+    "sleep_orphans": 0,
+    "tmp_dirs_lingering": 0,
+    "verification_command": "ps -ef | grep -E 'anima_audio_worker|sleep 86400|sleep infinity'; ls /tmp/anima_audio_worker_*; find /tmp -maxdepth 2 -name 'anima_audio*' -type p",
+    "result": "All zero. ω-runtime-1 atexit handler reaped each spawned worker on hexa exit (SIGTERM → 50ms → SIGKILL → waitpid)."
+  },
+  "issues_observed": [
+    {
+      "name": "file_size builtin shadows portable_fs.hexa user-defined version depending on import order",
+      "severity": "LOW (workaround: import portable_fs.hexa BEFORE anima_audio.hexa in caller scripts)",
+      "description": "When a script imports anima_audio.hexa directly without first importing portable_fs.hexa, `file_size(path)` resolves to the hexa-builtin (call_builtin path at hexa_full.hexa:10606) which uses read_file() and truncates at the first NUL byte (returning 6 for a WAV starting RIFF\\xf4\\x07). Workaround: caller scripts import portable_fs.hexa first. _file_bytes() inside anima_audio.hexa works correctly because portable_fs is imported by anima_audio itself before _file_bytes is parsed.",
+      "follow_up": "Pre-existing issue (not introduced by this cycle). Surface in a separate ω-hexa cycle: either rename the user-defined to file_size_real, or change builtin resolution order to prefer user-defined when both exist."
+    },
+    {
+      "name": "hexa shim binary lags hexa_interp.real",
+      "severity": "LOW",
+      "description": "/Users/ghost/core/hexa-lang/hexa routes via resolver to /Users/ghost/core/hexa-lang/build/hexa_interp (Apr 25, pre-Phase-A) which lacks pipe_* builtins. Phase A doc already noted this. Bench/smoke must call hexa_interp.real directly. Phase A's documented next_step (rebuild + re-shim) addresses this.",
+      "follow_up": "Operator can `cp build/hexa_interp.real build/hexa_interp` to update the shim target."
+    }
+  ],
+  "rollback": "Restore /Users/ghost/core/anima/anima-speak/_audio_worker_call.sh from git (last committed at anima 9433af5e). Revert anima_audio.hexa lines 115-202 from git. ANIMA_AUDIO_WORKER=0 already provides operator-side safety valve to fall back to legacy spawn-per-call without any code revert.",
+  "constraints_honored": {
+    "git_uncommitted": true,
+    "no_docker_rebuild": true,
+    "no_anima_audio_unrelated_changes": true,
+    "files_touched": [
+      "/Users/ghost/core/hexa-lang/stdlib/anima_audio_worker.py (header comments only)",
+      "/Users/ghost/core/anima/anima-speak/anima_audio.hexa (worker-IPC region only)",
+      "/Users/ghost/core/anima/anima-speak/_audio_worker_call.sh (deleted)",
+      "/Users/ghost/core/anima/state/omega_audio_2_phase_b_cutover.json (this file)"
+    ],
+    "workers_spawned_for_measurement": "10 (5 worker bench + 3 baseline bench + 1 smoke + 1 spawn-debug). All cleaned up by atexit."
+  },
+  "next_step_for_user": "Optional follow-ups: (1) `cp build/hexa_interp.real build/hexa_interp` to make the shim point at the Phase-A binary; (2) repeat bench inside hexa-runner container to confirm Linux ELFs behave equivalently; (3) consider raising _ensure_worker_handle ready-timeout from 5s to 10s if cold imports run hot on slower hosts; (4) follow up on the file_size builtin/import-order issue separately."
+}

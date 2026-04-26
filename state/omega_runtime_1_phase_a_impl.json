@@ -1,0 +1,71 @@
+{
+  "cycle": "omega-runtime-1-phase-a",
+  "axis": "persistent-pipe primitive implementation in hexa runtime",
+  "timestamp": "2026-04-26",
+  "files_modified": [
+    {
+      "path": "/Users/ghost/core/hexa-lang/self/native/persistent_pipe.c",
+      "loc_added": 425,
+      "summary": "NEW. Self-contained C implementation of all 5 builtins. HexaChild struct + static 64-slot handle table + getrlimit-based soft cap + atexit SIGTERM/SIGKILL cleanup. Functions: hexa_pipe_spawn (pipe+fork+execvp+dup2 plus 60ms early-exit probe to surface /bin/sh exit-127 as -1), hexa_pipe_send_line (write payload + '\\n' with EINTR retry), hexa_pipe_recv_line (poll(2)-based per-byte read until '\\n' or timeout, auto-waitpid on EOF), hexa_pipe_close (SIGTERM → 100ms grace via 10×10ms waitpid loop → SIGKILL → reap), hexa_pipe_alive (waitpid WNOHANG + kill(pid,0) probe). Five TAG_FN globals (hx_pipe_*) + _hexa_init_persistent_pipe_fn_shims registrar."
+    },
+    {
+      "path": "/Users/ghost/core/hexa-lang/self/runtime.c",
+      "loc_added": 16,
+      "summary": "Added #include \"native/persistent_pipe.c\" with header banner mirroring exec_argv_sha256 / net include block. Forward-declared _hexa_init_persistent_pipe_fn_shims and added the call inside _hexa_init_fn_shims after the exec_argv_sha256 init."
+    },
+    {
+      "path": "/Users/ghost/core/hexa-lang/self/hexa_full.hexa",
+      "loc_added": 55,
+      "summary": "Added 5 interp dispatch arms in call_builtin (after exec_capture arm at line 10219): pipe_spawn → val_int(to_int(hx_pipe_spawn(args[0].str_val))); pipe_send_line/pipe_close/pipe_alive → val_bool(to_int(...) != 0) wrapping the host TAG_FN result; pipe_recv_line → val_str(to_string(...)). Each wrapped in try/catch returning sentinel on error (-1, false, ''). Mirrors hx_exec_capture / hx_sha256 dispatch pattern."
+    },
+    {
+      "path": "/Users/ghost/core/hexa-lang/self/persistent_pipe_selftest.hexa",
+      "loc_added": 189,
+      "summary": "NEW. 7-test selftest harness exercising the full API surface. Each test exits cleanly via pipe_close. Uses python3 for portable ms timestamp (macOS `date` lacks %N) and `sleep` for sleep_ms helper."
+    }
+  ],
+  "api_implemented": {
+    "spawn": "fn pipe_spawn(cmd: string) -> int",
+    "send_line": "fn pipe_send_line(h: int, payload: string) -> bool",
+    "recv_line": "fn pipe_recv_line(h: int, timeout_ms: int) -> string",
+    "close": "fn pipe_close(h: int) -> bool",
+    "alive": "fn pipe_alive(h: int) -> bool"
+  },
+  "api_naming_deviation_note": "Builtins are named pipe_spawn / pipe_send_line / pipe_recv_line / pipe_close / pipe_alive (with `pipe_` prefix). Design proposed bare names spawn/send/send_line/recv_line/close/alive, but `spawn` is already a reserved hexa keyword (see hexa_full.hexa:121 `if word == \"spawn\" { return true }`) used by the Spawn-stmt parser. The pipe_* prefix avoids the collision and groups the five symbols by family (consistent with net_listen / net_accept / net_close namespace style at hexa_full.hexa:10352).",
+  "selftest_results": {
+    "T1_basic_roundtrip": "PASS",
+    "T2_spawn_error": "PASS",
+    "T3_async_response": "PASS",
+    "T4_close_then_recv": "PASS",
+    "T5_parallel_handles": "PASS",
+    "T6_timeout": "PASS",
+    "T7_alive_after_exit": "PASS"
+  },
+  "selftest_summary": "7 PASS / 0 FAIL. Run command: /Users/ghost/core/hexa-lang/build/hexa_interp.real /Users/ghost/core/hexa-lang/self/persistent_pipe_selftest.hexa",
+  "build": {
+    "host_interp_rebuilt": true,
+    "build_command": "HEXA_RESOLVER_NO_REROUTE=1 ~/core/hexa-lang/hexa tool/build_interp.hexa",
+    "result": "OK -> /Users/ghost/core/hexa-lang/build/hexa_interp.real (2,763,312 bytes Mach-O arm64). Smoke test passed. Codesign ad-hoc applied (Darwin)."
+  },
+  "deviations_from_design": [
+    "Naming: pipe_* prefix instead of bare spawn/send/etc (rationale above — spawn is a reserved keyword).",
+    "Reduced surface: Phase A ships only the 5 builtins required by the audio-worker consumer (spawn/send_line/recv_line/close/alive). Design listed 8 (spawn_argv, send (raw, no \\n), recv_status, set_nonblock omitted). recv_status is folded into recv_line returning '' on both timeout and EOF; consumers distinguish via pipe_alive(h) probe afterward. Defer 3 omitted to v2.",
+    "Capacity cap: hard-coded HXP_MAX_HANDLES=64 with a getrlimit(RLIMIT_NOFILE)/4 soft cap on top (returns -1 on overflow). Design suggested grow-by-realloc up to 1024 cap; 64 is sufficient for the immediate audio-worker consumer (1-2 handles) and leaves the realloc-grow path for v2.",
+    "Bool-return path: the 4 bool-returning builtins return hexa_int(0)/hexa_int(1) at the C layer (not hexa_bool). Reason: empirically the interp dispatch path through hexa_call2 + Val struct conversion lost the bool_val field in TAG_BOOL HexaVals returned from host TAG_FNs (sent=false even though write succeeded — verified via debug arm). Keeping ints + converting to val_bool inside the dispatch arm via `to_int(r) != 0` is the working pattern. Net surface is unchanged for callers (still see bool).",
+    "Spawn-error detection window: design left this implicit; we use a 6×10ms = 60ms probe loop after fork that waitpid-WNOHANGs the child, treating any non-zero early exit as spawn failure (-1). Catches /bin/sh -c 'nonexistent' returning 127. 60ms is the latency/correctness tradeoff — bash startup on darwin is typically ≤30ms.",
+    "stderr policy: child stderr inherited from parent (matches design's worker use-case rationale; not separately captured)."
+  ],
+  "biggest_issue_encountered": "TAG_BOOL returns from a host TAG_FN do not survive the interp's HexaVal→Val conversion — to_int(r) returned 0 for hexa_bool(1). Worked around by returning hexa_int(0/1) from the C layer and converting to val_bool at the dispatch-arm level via `to_int(r) != 0`. Net surface is unchanged.",
+  "secondary_issues": [
+    "macOS `date +%s%N` does not support nanoseconds — selftest's now_ms() helper now uses python3 for portable ms-since-epoch.",
+    "`./hexa` shim routes to docker by default — selftest must be invoked directly via build/hexa_interp.real (or HEXA_RESOLVER_NO_REROUTE=1) to exercise the new build."
+  ],
+  "constraints_honored": {
+    "anima_unchanged": true,
+    "docker_unchanged": true,
+    "linux_elfs_unchanged": true,
+    "git_uncommitted": true,
+    "host_interp_rebuilt_only": true
+  },
+  "next_step_for_user": "rebuild Linux ELFs (build_interp_linux + build_hexa_cli_linux) → docker image rebake → Phase B (anima rewire: cut anima_audio.hexa over from _audio_worker_call.sh shim to direct pipe_spawn/pipe_send_line/pipe_recv_line; gate behind ANIMA_AUDIO_WORKER_DIRECT=1 for one A/B cycle)."
+}
