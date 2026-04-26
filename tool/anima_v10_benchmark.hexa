@@ -1,0 +1,168 @@
+// tool/anima_v10_benchmark.hexa — Mk.XI v10 4-backbone v11 battery fan-out (raw#9 hexa-only).
+//
+// PURPOSE
+//   One-command launch of paradigm v11 6-axis battery across the canonical Mk.XI
+//   v10 LoRA 4-backbone ensemble (gemma=Hexad / mistral=Law / qwen3=Phi / llama=SelfRef).
+//   Emits 4 runpod_orchestrator command lines for parallel pod launches.
+//   Mac-local pure-hexa utility: no Python emit, no GPU, just shell command planning.
+//   Migration #22 (paradigm v11 ORCHESTRATION-LAYER 2nd helper, complements battery).
+//
+// OUTPUTS
+//   /tmp/anima_v10_benchmark_plan.sh — 4 background runpod commands + wait + aggregate
+//   /tmp/anima_v10_benchmark_plan.json — structured plan (backbone, slot, hf_id, output_dir)
+//
+// ENV
+//   ANIMA_LOCAL_OUT     local result dir prefix (default: state/v10_benchmark)
+//   ANIMA_GPU_TYPE      runpod GPU id (default: 'NVIDIA H100 80GB HBM3')
+//   ANIMA_BENCH_SKIP    forwarded to ANIMA_SKIP in pod (default: '' = run all 6 axes)
+//   ANIMA_DRY_RUN       1 = emit plan only, do not execute (default: 1)
+//
+// USAGE
+//   hexa run tool/anima_v10_benchmark.hexa --selftest
+//   hexa run tool/anima_v10_benchmark.hexa            # emits plan to /tmp
+//
+// raw#9 hexa-only / raw#15 SSOT this file (no Python emit — pure mac-local planner)
+
+let PLAN_SH   = "/tmp/anima_v10_benchmark_plan.sh"
+let PLAN_JSON = "/tmp/anima_v10_benchmark_plan.json"
+
+fn _build_plan() {
+    // Mk.XI v10 LoRA canonical 4-backbone ensemble
+    let backbones = [
+        ["gemma",   "Hexad",   "google/gemma-2-9b"],
+        ["mistral", "Law",     "mistralai/Mistral-7B-v0.3"],
+        ["qwen3",   "Phi",     "Qwen/Qwen3-8B"],
+        ["llama",   "SelfRef", "meta-llama/Meta-Llama-3.1-8B"],
+    ]
+    let mut local_out_prefix = env("ANIMA_LOCAL_OUT")
+    if local_out_prefix == "" { local_out_prefix = "state/v10_benchmark" }
+    let mut gpu_type = env("ANIMA_GPU_TYPE")
+    if gpu_type == "" { gpu_type = "NVIDIA H100 80GB HBM3" }
+    let bench_skip = env("ANIMA_BENCH_SKIP")
+
+    // Emit JSON plan
+    let json_parts = []
+    json_parts.push("{\n")
+    json_parts.push("  \"schema\": \"anima/v10_benchmark_plan/1\",\n")
+    json_parts.push("  \"gpu_type\": \"" + gpu_type + "\",\n")
+    json_parts.push("  \"local_out_prefix\": \"" + local_out_prefix + "\",\n")
+    json_parts.push("  \"bench_skip\": \"" + bench_skip + "\",\n")
+    json_parts.push("  \"backbones\": [\n")
+    let mut i = 0
+    while i < len(backbones) {
+        let bb = backbones[i]
+        json_parts.push("    {\"label\": \"" + bb[0] + "\", \"slot\": \"" + bb[1] + "\", \"hf_id\": \"" + bb[2] + "\", \"local_out\": \"" + local_out_prefix + "/" + bb[0] + "\"}")
+        if i + 1 < len(backbones) { json_parts.push(",\n") } else { json_parts.push("\n") }
+        i = i + 1
+    }
+    json_parts.push("  ]\n")
+    json_parts.push("}\n")
+    write_file(PLAN_JSON, json_parts.join(""))
+
+    // Emit shell plan
+    let sh = []
+    sh.push("#!/usr/bin/env bash\n")
+    sh.push("# anima v10 benchmark fan-out — emitted by tool/anima_v10_benchmark.hexa\n")
+    sh.push("# raw#9 strict: dispatches anima_v11_battery via anima_runpod_orchestrator per backbone.\n")
+    sh.push("set -euo pipefail\n")
+    sh.push("\n")
+    sh.push("LOCAL_OUT_PREFIX=\"${ANIMA_LOCAL_OUT:-" + local_out_prefix + "}\"\n")
+    sh.push("GPU_TYPE=\"${ANIMA_GPU_TYPE:-" + gpu_type + "}\"\n")
+    sh.push("BENCH_SKIP=\"${ANIMA_BENCH_SKIP:-" + bench_skip + "}\"\n")
+    sh.push("HEXA_RESOLVER_NO_REROUTE=1 hexa run tool/anima_v11_battery.hexa --selftest >/dev/null\n")
+    sh.push("HELPER_PATH=\"/tmp/anima_v11_battery_helper.hexa_tmp\"\n")
+    sh.push("test -f \"$HELPER_PATH\" || { echo 'helper not emitted' >&2; exit 1; }\n")
+    sh.push("mkdir -p \"$LOCAL_OUT_PREFIX\"\n")
+    sh.push("\n")
+    sh.push("declare -a BB_LABELS=(")
+    let mut j = 0
+    while j < len(backbones) { sh.push("\"" + backbones[j][0] + "\" "); j = j + 1 }
+    sh.push(")\n")
+    sh.push("declare -a BB_HFIDS=(")
+    j = 0
+    while j < len(backbones) { sh.push("\"" + backbones[j][2] + "\" "); j = j + 1 }
+    sh.push(")\n")
+    sh.push("declare -a BB_SLOTS=(")
+    j = 0
+    while j < len(backbones) { sh.push("\"" + backbones[j][1] + "\" "); j = j + 1 }
+    sh.push(")\n")
+    sh.push("\n")
+    sh.push("PIDS=()\n")
+    sh.push("for IDX in \"${!BB_LABELS[@]}\"; do\n")
+    sh.push("  LABEL=\"${BB_LABELS[$IDX]}\"\n")
+    sh.push("  HFID=\"${BB_HFIDS[$IDX]}\"\n")
+    sh.push("  SLOT=\"${BB_SLOTS[$IDX]}\"\n")
+    sh.push("  LOCAL_DIR=\"$LOCAL_OUT_PREFIX/$LABEL\"\n")
+    sh.push("  mkdir -p \"$LOCAL_DIR\"\n")
+    sh.push("  POD_CMD=\"export ANIMA_BASE='$HFID' ANIMA_OUTPUT_DIR=/workspace/out ANIMA_SKIP='$BENCH_SKIP' && cd /workspace && python3 battery.py\"\n")
+    sh.push("  echo \"[v10-bench] launching $LABEL ($SLOT) pod ...\"\n")
+    sh.push("  HEXA_RESOLVER_NO_REROUTE=1 hexa run tool/anima_runpod_orchestrator.hexa run \\\n")
+    sh.push("    --gpu-id \"$GPU_TYPE\" \\\n")
+    sh.push("    --image \"runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04\" \\\n")
+    sh.push("    --upload \"$HELPER_PATH:/workspace/battery.py\" \\\n")
+    sh.push("    --pip-install \"transformers peft accelerate\" \\\n")
+    sh.push("    --command \"$POD_CMD\" \\\n")
+    sh.push("    --download \"/workspace/out:$LOCAL_DIR\" \\\n")
+    sh.push("    > \"$LOCAL_DIR/runpod.log\" 2>&1 &\n")
+    sh.push("  PIDS+=($!)\n")
+    sh.push("done\n")
+    sh.push("\n")
+    sh.push("echo \"[v10-bench] 4 pods launched, PIDs: ${PIDS[*]}\"\n")
+    sh.push("echo \"[v10-bench] waiting for all to complete ...\"\n")
+    sh.push("FAILED=0\n")
+    sh.push("for PID in \"${PIDS[@]}\"; do\n")
+    sh.push("  if ! wait \"$PID\"; then FAILED=$((FAILED+1)); fi\n")
+    sh.push("done\n")
+    sh.push("echo \"[v10-bench] complete: $((4-FAILED))/4 pods succeeded\"\n")
+    sh.push("\n")
+    sh.push("# Aggregate: emit aggregate v11_signature comparison\n")
+    sh.push("SIG_FILES=\"\"\n")
+    sh.push("for IDX in \"${!BB_LABELS[@]}\"; do\n")
+    sh.push("  LABEL=\"${BB_LABELS[$IDX]}\"\n")
+    sh.push("  SIG=\"$LOCAL_OUT_PREFIX/$LABEL/v11_signature.json\"\n")
+    sh.push("  test -f \"$SIG\" && SIG_FILES=\"$SIG_FILES $SIG\" || echo \"missing: $SIG\"\n")
+    sh.push("done\n")
+    sh.push("if [ -n \"$SIG_FILES\" ]; then\n")
+    sh.push("  echo \"\"\n")
+    sh.push("  echo \"[v10-bench] composite per backbone:\"\n")
+    sh.push("  for SIG in $SIG_FILES; do\n")
+    sh.push("    BB=$(basename $(dirname \"$SIG\"))\n")
+    sh.push("    GMEAN=$(jq -r '.composite_geometric_mean' \"$SIG\" 2>/dev/null || echo '?')\n")
+    sh.push("    WEAK=$(jq -r '.weakest_axis' \"$SIG\" 2>/dev/null || echo '?')\n")
+    sh.push("    NAX=$(jq -r '.n_axes_present' \"$SIG\" 2>/dev/null || echo '?')\n")
+    sh.push("    printf '  %-10s gmean=%s weakest=%s axes=%s\\n' \"$BB\" \"$GMEAN\" \"$WEAK\" \"$NAX\"\n")
+    sh.push("  done\n")
+    sh.push("fi\n")
+    sh.push("echo \"[v10-bench] DONE → $LOCAL_OUT_PREFIX/<label>/{b_tom,mcca,phi_star,cmt,cds,sae_steer_bypass,v11_signature}.json\"\n")
+
+    write_file(PLAN_SH, sh.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_v10_benchmark selftest ──")
+    _build_plan()
+    println("selftest=ok")
+    println("plan_emitted_sh=" + PLAN_SH)
+    println("plan_emitted_json=" + PLAN_JSON)
+    println("backbones=4 (gemma=Hexad / mistral=Law / qwen3=Phi / llama=SelfRef)")
+    println("dispatch=parallel via anima_runpod_orchestrator + ANIMA_BENCH_SKIP forwarding")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    _build_plan()
+    if selftest { cmd_selftest(); exit(0) }
+    println("emitted_sh=" + PLAN_SH)
+    println("emitted_json=" + PLAN_JSON)
+    println("DONE")
+}
+
+main()

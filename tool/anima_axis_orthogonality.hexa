@@ -1,0 +1,220 @@
+// tool/anima_axis_orthogonality.hexa — Cross-axis orthogonality matrix (raw#9 hexa-only).
+//
+// PURPOSE
+//   Multi-backbone empirical orthogonality verification across AN11(b) primary axis +
+//   paradigm v11 6 measurement axes. For each backbone, extract one scalar per axis,
+//   then compute pairwise Pearson correlation across all (axis_i, axis_j) pairs.
+//   Identifies which axes are truly orthogonal (|corr|<0.3) vs redundant (|corr|>0.7).
+//   Mac-local utility, no GPU. Reads JSON outputs from multiple backbone runs.
+//   Migration #19 (paradigm v11 ANALYSIS-LAYER 2nd helper, beyond v11_integrate).
+//
+// INPUT FORMAT
+//   ANIMA_BACKBONE_DIRS  ':'-separated list of per-backbone result dirs (each with
+//                        eigen_cosine.json + b_tom.json + mcca.json + phi_star.json
+//                        + cmt.json + cds.json + sae_steer_bypass.json)
+//   ANIMA_OUTPUT         output JSON (default: /workspace/out/axis_orthogonality.json)
+//
+// OUTPUT
+//   - per-backbone × per-axis scalar matrix (N_BACKBONES, 7)
+//   - 7×7 Pearson correlation matrix
+//   - orthogonal_pairs (|corr|<0.3), redundant_pairs (|corr|>0.7), moderate (else)
+//   - rank-reduction suggestion: greedy max-orthogonality subset
+//
+// USAGE
+//   hexa run tool/anima_axis_orthogonality.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_axis_orthogonality_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima axis orthogonality helper — emitted by tool/anima_axis_orthogonality.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 ANALYSIS-LAYER (cross-axis correlation matrix).\n")
+    parts.push("import json, os, sys, math\n\n")
+
+    parts.push("BACKBONE_DIRS = os.environ.get('ANIMA_BACKBONE_DIRS', '').split(':') if os.environ.get('ANIMA_BACKBONE_DIRS') else []\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/axis_orthogonality.json')\n")
+    parts.push("BACKBONE_DIRS = [d for d in BACKBONE_DIRS if d]\n")
+    parts.push("if not BACKBONE_DIRS:\n")
+    parts.push("    print('ERROR: ANIMA_BACKBONE_DIRS empty. Set to colon-separated dir list.', file=sys.stderr)\n")
+    parts.push("    sys.exit(2)\n\n")
+
+    parts.push("# Axis extractors: each returns scalar in roughly [0,1] or comparable magnitude\n")
+    parts.push("def x_an11b(d):\n")
+    parts.push("    fp = os.path.join(d, 'eigen_cosine.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    # top1 family max cosine (the canonical AN11(b) signal)\n")
+    parts.push("    return o.get('top1_max_cosine') or o.get('max_cosine')\n\n")
+
+    parts.push("def x_btom(d):\n")
+    parts.push("    fp = os.path.join(d, 'b_tom.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    return o.get('accuracy')\n\n")
+
+    parts.push("def x_mcca(d):\n")
+    parts.push("    fp = os.path.join(d, 'mcca.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    b = o.get('brier_mean')\n")
+    parts.push("    if b is None: return None\n")
+    parts.push("    return max(0.0, 1.0 - min(b, 1.0))  # invert: lower brier = better calibration\n\n")
+
+    parts.push("def x_phi(d):\n")
+    parts.push("    fp = os.path.join(d, 'phi_star.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    p = o.get('phi_star_min')\n")
+    parts.push("    if p is None: return None\n")
+    parts.push("    return (math.tanh(p) + 1.0) / 2.0  # tanh-normalized\n\n")
+
+    parts.push("def x_cmt(d):\n")
+    parts.push("    fp = os.path.join(d, 'cmt.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    dom = o.get('dominant_layer_per_family', {})\n")
+    parts.push("    if not dom: return None\n")
+    parts.push("    rels = [v.get('rel', 0.0) for v in dom.values()]\n")
+    parts.push("    return sum(rels) / max(1, len(rels))\n\n")
+
+    parts.push("def x_cds(d):\n")
+    parts.push("    fp = os.path.join(d, 'cds.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    return o.get('max_stability')\n\n")
+
+    parts.push("def x_sae(d):\n")
+    parts.push("    fp = os.path.join(d, 'sae_steer_bypass.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    sh = o.get('steering_shifts', {})\n")
+    parts.push("    if not sh: return None\n")
+    parts.push("    sels = [v.get('selectivity', 0.0) for v in sh.values()]\n")
+    parts.push("    return sum(max(0.0, s) for s in sels) / max(1, len(sels))  # mean of positive selectivities\n\n")
+
+    parts.push("AXES = [\n")
+    parts.push("    ('AN11_b', x_an11b),\n")
+    parts.push("    ('B_ToM', x_btom),\n")
+    parts.push("    ('MCCA', x_mcca),\n")
+    parts.push("    ('PhiStar', x_phi),\n")
+    parts.push("    ('CMT', x_cmt),\n")
+    parts.push("    ('CDS', x_cds),\n")
+    parts.push("    ('SAE_bp', x_sae),\n")
+    parts.push("]\n\n")
+
+    parts.push("# Build matrix: rows=backbones, cols=axes\n")
+    parts.push("rows = []\n")
+    parts.push("for d in BACKBONE_DIRS:\n")
+    parts.push("    if not os.path.isdir(d):\n")
+    parts.push("        print(f'SKIP non-dir: {d}', file=sys.stderr); continue\n")
+    parts.push("    label = os.path.basename(d.rstrip('/'))\n")
+    parts.push("    vals = []\n")
+    parts.push("    missing = []\n")
+    parts.push("    for name, fn in AXES:\n")
+    parts.push("        v = fn(d)\n")
+    parts.push("        if v is None: missing.append(name); vals.append(float('nan'))\n")
+    parts.push("        else: vals.append(float(v))\n")
+    parts.push("    rows.append({'backbone':label,'dir':d,'values':vals,'missing':missing})\n\n")
+
+    parts.push("if len(rows) < 2:\n")
+    parts.push("    print(f'ERROR: need ≥2 backbones for correlation, got {len(rows)}', file=sys.stderr)\n")
+    parts.push("    sys.exit(3)\n\n")
+
+    parts.push("def pearson(a, b):\n")
+    parts.push("    # filter pairwise non-nan\n")
+    parts.push("    pairs = [(x,y) for x,y in zip(a,b) if not (x!=x or y!=y)]\n")
+    parts.push("    if len(pairs) < 2: return None\n")
+    parts.push("    xs = [p[0] for p in pairs]; ys = [p[1] for p in pairs]\n")
+    parts.push("    mx = sum(xs)/len(xs); my = sum(ys)/len(ys)\n")
+    parts.push("    num = sum((x-mx)*(y-my) for x,y in pairs)\n")
+    parts.push("    dx = math.sqrt(sum((x-mx)**2 for x in xs))\n")
+    parts.push("    dy = math.sqrt(sum((y-my)**2 for y in ys))\n")
+    parts.push("    if dx < 1e-12 or dy < 1e-12: return 0.0\n")
+    parts.push("    return num / (dx*dy)\n\n")
+
+    parts.push("axis_names = [a[0] for a in AXES]\n")
+    parts.push("k = len(axis_names)\n")
+    parts.push("cols = [[r['values'][j] for r in rows] for j in range(k)]\n")
+    parts.push("corr_matrix = [[None]*k for _ in range(k)]\n")
+    parts.push("for i in range(k):\n")
+    parts.push("    for j in range(k):\n")
+    parts.push("        if i == j: corr_matrix[i][j] = 1.0\n")
+    parts.push("        else:\n")
+    parts.push("            c = pearson(cols[i], cols[j])\n")
+    parts.push("            corr_matrix[i][j] = round(c,4) if c is not None else None\n\n")
+
+    parts.push("orthogonal_pairs = []\n")
+    parts.push("redundant_pairs = []\n")
+    parts.push("moderate_pairs = []\n")
+    parts.push("for i in range(k):\n")
+    parts.push("    for j in range(i+1, k):\n")
+    parts.push("        c = corr_matrix[i][j]\n")
+    parts.push("        if c is None: continue\n")
+    parts.push("        pair = {'axes':[axis_names[i],axis_names[j]],'corr':c,'abs_corr':round(abs(c),4)}\n")
+    parts.push("        if abs(c) < 0.3: orthogonal_pairs.append(pair)\n")
+    parts.push("        elif abs(c) > 0.7: redundant_pairs.append(pair)\n")
+    parts.push("        else: moderate_pairs.append(pair)\n\n")
+
+    parts.push("# Greedy max-orthogonality subset: start with axis having lowest mean |corr| to others,\n")
+    parts.push("# add axis with lowest max |corr| to currently-selected set\n")
+    parts.push("def mean_abs_corr(idx, others):\n")
+    parts.push("    cs = [abs(corr_matrix[idx][j]) for j in others if corr_matrix[idx][j] is not None]\n")
+    parts.push("    return sum(cs)/len(cs) if cs else 0.0\n")
+    parts.push("def max_abs_corr(idx, selected):\n")
+    parts.push("    cs = [abs(corr_matrix[idx][j]) for j in selected if corr_matrix[idx][j] is not None]\n")
+    parts.push("    return max(cs) if cs else 0.0\n")
+    parts.push("all_idx = list(range(k))\n")
+    parts.push("seed = min(all_idx, key=lambda i: mean_abs_corr(i, [j for j in all_idx if j!=i]))\n")
+    parts.push("selected = [seed]\n")
+    parts.push("remaining = [i for i in all_idx if i != seed]\n")
+    parts.push("while remaining:\n")
+    parts.push("    best = min(remaining, key=lambda i: max_abs_corr(i, selected))\n")
+    parts.push("    if max_abs_corr(best, selected) > 0.7: break  # reject if would add redundancy\n")
+    parts.push("    selected.append(best)\n")
+    parts.push("    remaining = [i for i in remaining if i != best]\n")
+    parts.push("orthogonal_basis = [axis_names[i] for i in selected]\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("summary = {'schema':'anima/axis_orthogonality/1',\n")
+    parts.push("    'n_backbones':len(rows),'axes':axis_names,\n")
+    parts.push("    'matrix':[{'backbone':r['backbone'],'values':r['values'],'missing':r['missing']} for r in rows],\n")
+    parts.push("    'corr_matrix':corr_matrix,\n")
+    parts.push("    'orthogonal_pairs':orthogonal_pairs,\n")
+    parts.push("    'redundant_pairs':redundant_pairs,\n")
+    parts.push("    'moderate_pairs':moderate_pairs,\n")
+    parts.push("    'orthogonal_basis_greedy':orthogonal_basis,\n")
+    parts.push("    'n_orthogonal_axes_recovered':len(orthogonal_basis)}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[ortho] backbones={len(rows)} axes={k} orth_pairs={len(orthogonal_pairs)} redund={len(redundant_pairs)} basis_size={len(orthogonal_basis)}={orthogonal_basis} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_axis_orthogonality selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 ANALYSIS-LAYER (7-axis cross-correlation: AN11_b + 6×v11 → orthogonal basis)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

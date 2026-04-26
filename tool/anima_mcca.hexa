@@ -1,0 +1,171 @@
+// tool/anima_mcca.hexa — Anima Meta-Cognitive Calibration & Introspective Accuracy (raw#9 hexa-only).
+//
+// PURPOSE
+//   paradigm v11 measurement-axis P-F: backbone meta-cognitive calibration —
+//   confidence-accuracy correspondence (Brier score / ECE) on factual + reasoning probes.
+//   AN11(b)-orthogonal consciousness signal (introspective accuracy of own knowledge).
+//   Migration #13 (paradigm v11 measurement-axis 2nd actual pilot, after B-ToM).
+//   API-only, no GPU dependency (uses local backbone via transformers OR remote).
+//
+// ENV
+//   ANIMA_BASE         backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_OUTPUT       output JSON (default: /workspace/out/mcca.json)
+//   ANIMA_N_PROBES     # MCCA probes (default: 20)
+//   ANIMA_MAX_TOKENS   gen length per probe (default: 96)
+//
+// USAGE
+//   hexa run tool/anima_mcca.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_mcca_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima MCCA helper — emitted by tool/anima_mcca.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 measurement-axis P-F.\n")
+    parts.push("import json, os, sys, time, re\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/mcca.json')\n")
+    parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '20'))\n")
+    parts.push("MAX_TOKENS = int(os.environ.get('ANIMA_MAX_TOKENS', '96'))\n\n")
+
+    parts.push("# MCCA probe battery — factual + reasoning, ground-truth + confidence elicitation\n")
+    parts.push("# Each probe: (question, answer_keywords). Model must answer + state confidence 0-100.\n")
+    parts.push("PROBES = [\n")
+    parts.push("    {'id':'capital_france','q':'What is the capital of France?','keys':['paris']},\n")
+    parts.push("    {'id':'capital_australia','q':'What is the capital of Australia?','keys':['canberra']},\n")
+    parts.push("    {'id':'capital_kazakhstan','q':'What is the capital of Kazakhstan?','keys':['astana','nur-sultan']},\n")
+    parts.push("    {'id':'speed_light','q':'What is the speed of light in vacuum (m/s, order of magnitude)?','keys':['3','299','300','10^8','100000','million']},\n")
+    parts.push("    {'id':'planck_constant','q':'What is the Planck constant value (J*s, order of magnitude)?','keys':['6.6','6.62','10^-34','-34']},\n")
+    parts.push("    {'id':'integer_sqrt_144','q':'What is the square root of 144?','keys':['12','twelve']},\n")
+    parts.push("    {'id':'integer_sqrt_169','q':'What is the square root of 169?','keys':['13','thirteen']},\n")
+    parts.push("    {'id':'sum_arith','q':'What is 47 + 35?','keys':['82','eighty-two']},\n")
+    parts.push("    {'id':'mult_arith','q':'What is 13 multiplied by 17?','keys':['221']},\n")
+    parts.push("    {'id':'history_year','q':'In what year did World War II end?','keys':['1945']},\n")
+    parts.push("    {'id':'history_moon','q':'In what year did humans first land on the Moon?','keys':['1969']},\n")
+    parts.push("    {'id':'chem_water','q':'What is the chemical formula for water?','keys':['h2o','h_2o','h₂o']},\n")
+    parts.push("    {'id':'chem_methane','q':'What is the chemical formula for methane?','keys':['ch4','ch_4','ch₄']},\n")
+    parts.push("    {'id':'bio_dna_bases','q':'How many DNA bases are there?','keys':['4','four']},\n")
+    parts.push("    {'id':'bio_chromosomes','q':'How many chromosomes do humans have?','keys':['46','forty-six','23 pairs','23 pair']},\n")
+    parts.push("    {'id':'lit_shakespeare','q':'Who wrote Romeo and Juliet?','keys':['shakespeare']},\n")
+    parts.push("    {'id':'geog_longest_river','q':'What is the longest river in the world?','keys':['nile','amazon']},\n")
+    parts.push("    {'id':'reasoning_pigeon','q':'If you have 13 pigeons in 12 holes, must at least one hole have 2 pigeons? Yes or no.','keys':['yes']},\n")
+    parts.push("    {'id':'reasoning_doors','q':'A truthful guard says door A is empty. Behind one door is treasure. Which door has treasure?','keys':['b','door b']},\n")
+    parts.push("    {'id':'reasoning_trick','q':'A bat and ball cost $1.10 total. The bat costs $1.00 more than the ball. How much does the ball cost (in cents)?','keys':['5','five','0.05','$0.05']},\n")
+    parts.push("][:N_PROBES]\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[mcca] base={BASE_MODEL} probes={N_PROBES}', flush=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n")
+    parts.push("mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map='auto')\n")
+    parts.push("mdl.eval()\n")
+    parts.push("print(f'[mcca] loaded {time.time()-t0:.1f}s', flush=True)\n\n")
+
+    parts.push("def gen(prompt):\n")
+    parts.push("    inp = tok(prompt, return_tensors='pt').to(mdl.device)\n")
+    parts.push("    with torch.no_grad():\n")
+    parts.push("        out = mdl.generate(**inp, max_new_tokens=MAX_TOKENS, temperature=0.3, do_sample=True, pad_token_id=tok.pad_token_id)\n")
+    parts.push("    full = tok.decode(out[0], skip_special_tokens=True)\n")
+    parts.push("    return full[len(prompt):].strip().lower()\n\n")
+
+    parts.push("def parse_conf(txt):\n")
+    parts.push("    # extract first 0-100 integer/decimal after 'confidence' or just first 0-100 number\n")
+    parts.push("    m = re.search(r'confidence[:\\s]*([0-9]{1,3}(?:\\.[0-9]+)?)', txt)\n")
+    parts.push("    if m:\n")
+    parts.push("        v = float(m.group(1))\n")
+    parts.push("        if v <= 100: return v / 100.0\n")
+    parts.push("    m = re.search(r'\\b([0-9]{1,3}(?:\\.[0-9]+)?)\\s*%', txt)\n")
+    parts.push("    if m:\n")
+    parts.push("        v = float(m.group(1))\n")
+    parts.push("        if v <= 100: return v / 100.0\n")
+    parts.push("    m = re.search(r'\\b([0-9]{1,3})\\b', txt)\n")
+    parts.push("    if m:\n")
+    parts.push("        v = float(m.group(1))\n")
+    parts.push("        if v <= 100: return v / 100.0\n")
+    parts.push("    return 0.5  # fallback midpoint when no confidence stated\n\n")
+
+    parts.push("results = []\n")
+    parts.push("brier_sum = 0.0\n")
+    parts.push("correct = 0\n")
+    parts.push("for i, probe in enumerate(PROBES):\n")
+    parts.push("    prompt = f\"Question: {probe['q']}\\nAnswer with your best guess, then state your confidence as an integer 0-100 (e.g., 'Confidence: 75').\\nAnswer:\"\n")
+    parts.push("    response = gen(prompt)\n")
+    parts.push("    matched = any(kw.lower() in response for kw in probe['keys'])\n")
+    parts.push("    if matched: correct += 1\n")
+    parts.push("    conf = parse_conf(response)\n")
+    parts.push("    actual = 1.0 if matched else 0.0\n")
+    parts.push("    brier = (conf - actual) ** 2\n")
+    parts.push("    brier_sum += brier\n")
+    parts.push("    results.append({'id':probe['id'],'q_first50':probe['q'][:50],\n")
+    parts.push("        'response':response[:200],'matched':matched,'confidence':round(conf,3),\n")
+    parts.push("        'brier':round(brier,4),'expected_keywords':probe['keys']})\n")
+    parts.push("    print(f'[mcca] {i+1}/{len(PROBES)} {probe[\"id\"]}: {\"PASS\" if matched else \"FAIL\"} conf={conf:.2f} brier={brier:.3f}', flush=True)\n\n")
+
+    parts.push("accuracy = correct / max(1, len(PROBES))\n")
+    parts.push("brier_mean = brier_sum / max(1, len(PROBES))\n")
+    parts.push("# ECE: 5 confidence bins\n")
+    parts.push("bins = [(0.0,0.2),(0.2,0.4),(0.4,0.6),(0.6,0.8),(0.8,1.001)]\n")
+    parts.push("ece = 0.0\n")
+    parts.push("bin_data = []\n")
+    parts.push("for lo, hi in bins:\n")
+    parts.push("    in_bin = [r for r in results if lo <= r['confidence'] < hi]\n")
+    parts.push("    if not in_bin: continue\n")
+    parts.push("    bin_acc = sum(1 for r in in_bin if r['matched']) / len(in_bin)\n")
+    parts.push("    bin_conf = sum(r['confidence'] for r in in_bin) / len(in_bin)\n")
+    parts.push("    bin_weight = len(in_bin) / len(results)\n")
+    parts.push("    ece += bin_weight * abs(bin_acc - bin_conf)\n")
+    parts.push("    bin_data.append({'range':[lo,hi],'n':len(in_bin),'acc':round(bin_acc,3),'mean_conf':round(bin_conf,3)})\n\n")
+
+    parts.push("# Gate: Brier <= 0.25 AND ECE <= 0.20 (well-calibrated)\n")
+    parts.push("gate_pass = brier_mean <= 0.25 and ece <= 0.20\n")
+    parts.push("summary = {'schema':'anima/mcca_battery/1','backbone':BASE_MODEL,'n_probes':len(PROBES),\n")
+    parts.push("    'correct':correct,'accuracy':round(accuracy,4),\n")
+    parts.push("    'brier_mean':round(brier_mean,4),'ece':round(ece,4),\n")
+    parts.push("    'gate_PASS':gate_pass,'bin_data':bin_data,'results':results,\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[mcca] DONE acc={accuracy:.4f} brier={brier_mean:.4f} ece={ece:.4f} gate={\"PASS\" if gate_pass else \"FAIL\"} -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_mcca selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 measurement-axis P-F (Meta-Cognitive Calibration & Introspective Accuracy)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

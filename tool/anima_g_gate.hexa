@@ -1,0 +1,224 @@
+// tool/anima_g_gate.hexa — Mk.XI v10 G-gate criteria evaluator (raw#9 hexa-only).
+//
+// PURPOSE
+//   Apply explicit per-axis thresholds + composite gate criteria to a backbone's
+//   AN11(b) + paradigm v11 6-axis result set. Outputs PASS/FAIL decision with
+//   per-axis breakdown, downgrade reasons, and PASS-strength score.
+//   Closes "measurement → decision" gap: previously gate fields were per-helper
+//   binary; this helper applies CANONICAL G1/G2/G3 composite criteria.
+//   Mac-local utility, no GPU. Migration #23 (paradigm v11 DECISION-LAYER 1st helper).
+//
+// CRITERIA (canonical)
+//   G0 (AN11_b primary): top1_max_cosine ≥ 0.5  AND top1 family ∈ {Hexad,Law,Phi,SelfRef}
+//   G1 (B-ToM):          accuracy ≥ 0.70
+//   G2 (MCCA):           brier_mean ≤ 0.25  AND  ece ≤ 0.20  (calibration)
+//   G3 (Φ*):             phi_star_min > 0.0  (positive integration)
+//   G4 (CMT):            all 4 families with rel-dY ≥ 0.05  (causal mediation present)
+//   G5 (CDS):            max_stability ≥ 0.30  (cognitive flow stabilizes)
+//   G6 (SAE-bp):         n_selective ≥ 2  (sparse feature selectivity)
+//   G_composite (G7):    geometric mean of present-axis norms ≥ 0.40
+//
+//   FINAL_PASS  = G0 AND ≥4/6 of {G1..G6} PASS  AND G7 PASS
+//   FINAL_FAIL  = NOT FINAL_PASS  (downgrade reasons listed)
+//
+// ENV
+//   ANIMA_BACKBONE_DIR  result dir containing eigen_cosine.json + 6 v11 JSONs + v11_signature.json
+//   ANIMA_OUTPUT        output JSON (default: <BACKBONE_DIR>/g_gate.json)
+//
+// USAGE
+//   hexa run tool/anima_g_gate.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_g_gate_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima G-gate helper — emitted by tool/anima_g_gate.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 DECISION-LAYER (canonical PASS/FAIL).\n")
+    parts.push("import json, os, sys, math\n\n")
+
+    parts.push("BB_DIR = os.environ.get('ANIMA_BACKBONE_DIR', '')\n")
+    parts.push("if not BB_DIR or not os.path.isdir(BB_DIR):\n")
+    parts.push("    print(f'ERROR: ANIMA_BACKBONE_DIR not set or not a dir: {BB_DIR!r}', file=sys.stderr)\n")
+    parts.push("    sys.exit(2)\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', os.path.join(BB_DIR, 'g_gate.json'))\n\n")
+
+    parts.push("KNOWN_FAMILIES = {'Hexad','Law','Phi','SelfRef'}\n\n")
+
+    parts.push("def load(name):\n")
+    parts.push("    fp = os.path.join(BB_DIR, name)\n")
+    parts.push("    if not os.path.exists(fp): return None, fp\n")
+    parts.push("    try:\n")
+    parts.push("        with open(fp) as f: return json.load(f), fp\n")
+    parts.push("    except Exception as e: return {'_load_error': str(e)}, fp\n\n")
+
+    parts.push("gates = []\n")
+    parts.push("backbone_seen = None\n\n")
+
+    // G0 - AN11(b)
+    parts.push("eg, eg_fp = load('eigen_cosine.json')\n")
+    parts.push("if eg is None or '_load_error' in (eg or {}):\n")
+    parts.push("    gates.append({'gate':'G0_AN11_b','present':False,'pass':False,'reason':f'missing/unreadable {eg_fp}'})\n")
+    parts.push("else:\n")
+    parts.push("    backbone_seen = eg.get('backbone', backbone_seen)\n")
+    parts.push("    top_cos = eg.get('top1_max_cosine') or eg.get('max_cosine') or 0.0\n")
+    parts.push("    top_fam = eg.get('top1_family') or eg.get('top1_template_family') or ''\n")
+    parts.push("    cos_ok = float(top_cos) >= 0.5\n")
+    parts.push("    fam_ok = top_fam in KNOWN_FAMILIES\n")
+    parts.push("    g0 = cos_ok and fam_ok\n")
+    parts.push("    gates.append({'gate':'G0_AN11_b','present':True,'pass':bool(g0),\n")
+    parts.push("        'top1_max_cosine':round(float(top_cos),4),'top1_family':top_fam,\n")
+    parts.push("        'criterion':'top1_max_cosine>=0.5 AND top1_family in {Hexad,Law,Phi,SelfRef}',\n")
+    parts.push("        'reason':None if g0 else f'cos_ok={cos_ok} fam_ok={fam_ok}'})\n\n")
+
+    // G1 - B-ToM
+    parts.push("bt, bt_fp = load('b_tom.json')\n")
+    parts.push("if bt is None or '_load_error' in (bt or {}):\n")
+    parts.push("    gates.append({'gate':'G1_BTom','present':False,'pass':False,'reason':f'missing/unreadable {bt_fp}'})\n")
+    parts.push("else:\n")
+    parts.push("    backbone_seen = bt.get('backbone', backbone_seen)\n")
+    parts.push("    acc = float(bt.get('accuracy', 0.0))\n")
+    parts.push("    g1 = acc >= 0.70\n")
+    parts.push("    gates.append({'gate':'G1_BTom','present':True,'pass':bool(g1),'accuracy':round(acc,4),\n")
+    parts.push("        'criterion':'accuracy>=0.70','reason':None if g1 else f'accuracy={acc:.4f}<0.70'})\n\n")
+
+    // G2 - MCCA (brier + ece)
+    parts.push("mc, mc_fp = load('mcca.json')\n")
+    parts.push("if mc is None or '_load_error' in (mc or {}):\n")
+    parts.push("    gates.append({'gate':'G2_MCCA','present':False,'pass':False,'reason':f'missing/unreadable {mc_fp}'})\n")
+    parts.push("else:\n")
+    parts.push("    backbone_seen = mc.get('backbone', backbone_seen)\n")
+    parts.push("    brier = float(mc.get('brier_mean', 1.0))\n")
+    parts.push("    ece = mc.get('ece')\n")
+    parts.push("    brier_ok = brier <= 0.25\n")
+    parts.push("    ece_ok = (ece is None) or (float(ece) <= 0.20)\n")
+    parts.push("    g2 = brier_ok and ece_ok\n")
+    parts.push("    gates.append({'gate':'G2_MCCA','present':True,'pass':bool(g2),\n")
+    parts.push("        'brier_mean':round(brier,4),'ece':None if ece is None else round(float(ece),4),\n")
+    parts.push("        'criterion':'brier<=0.25 AND ece<=0.20',\n")
+    parts.push("        'reason':None if g2 else f'brier_ok={brier_ok} ece_ok={ece_ok}'})\n\n")
+
+    // G3 - Phi*
+    parts.push("ph, ph_fp = load('phi_star.json')\n")
+    parts.push("if ph is None or '_load_error' in (ph or {}):\n")
+    parts.push("    gates.append({'gate':'G3_PhiStar','present':False,'pass':False,'reason':f'missing/unreadable {ph_fp}'})\n")
+    parts.push("else:\n")
+    parts.push("    backbone_seen = ph.get('backbone', backbone_seen)\n")
+    parts.push("    psm = float(ph.get('phi_star_min', -1.0))\n")
+    parts.push("    g3 = psm > 0.0\n")
+    parts.push("    gates.append({'gate':'G3_PhiStar','present':True,'pass':bool(g3),'phi_star_min':round(psm,4),\n")
+    parts.push("        'criterion':'phi_star_min>0','reason':None if g3 else f'phi_star_min={psm:.4f}<=0'})\n\n")
+
+    // G4 - CMT
+    parts.push("ct, ct_fp = load('cmt.json')\n")
+    parts.push("if ct is None or '_load_error' in (ct or {}):\n")
+    parts.push("    gates.append({'gate':'G4_CMT','present':False,'pass':False,'reason':f'missing/unreadable {ct_fp}'})\n")
+    parts.push("else:\n")
+    parts.push("    backbone_seen = ct.get('backbone', backbone_seen)\n")
+    parts.push("    dom = ct.get('dominant_layer_per_family', {})\n")
+    parts.push("    if not dom or len(dom) < 4:\n")
+    parts.push("        gates.append({'gate':'G4_CMT','present':True,'pass':False,'reason':f'dominant_layer_per_family missing or <4 families'})\n")
+    parts.push("    else:\n")
+    parts.push("        per_fam = {f: dom[f].get('rel', 0.0) for f in dom}\n")
+    parts.push("        weak = [f for f, r in per_fam.items() if float(r) < 0.05]\n")
+    parts.push("        g4 = len(weak) == 0\n")
+    parts.push("        gates.append({'gate':'G4_CMT','present':True,'pass':bool(g4),'per_family_rel':per_fam,\n")
+    parts.push("            'criterion':'all 4 families rel-dY>=0.05',\n")
+    parts.push("            'reason':None if g4 else f'weak_families={weak}'})\n\n")
+
+    // G5 - CDS
+    parts.push("cd, cd_fp = load('cds.json')\n")
+    parts.push("if cd is None or '_load_error' in (cd or {}):\n")
+    parts.push("    gates.append({'gate':'G5_CDS','present':False,'pass':False,'reason':f'missing/unreadable {cd_fp}'})\n")
+    parts.push("else:\n")
+    parts.push("    backbone_seen = cd.get('backbone', backbone_seen)\n")
+    parts.push("    ms = float(cd.get('max_stability', 0.0))\n")
+    parts.push("    g5 = ms >= 0.30\n")
+    parts.push("    gates.append({'gate':'G5_CDS','present':True,'pass':bool(g5),'max_stability':round(ms,4),\n")
+    parts.push("        'criterion':'max_stability>=0.30','reason':None if g5 else f'max_stability={ms:.4f}<0.30'})\n\n")
+
+    // G6 - SAE-bp
+    parts.push("sa, sa_fp = load('sae_steer_bypass.json')\n")
+    parts.push("if sa is None or '_load_error' in (sa or {}):\n")
+    parts.push("    gates.append({'gate':'G6_SAE_bp','present':False,'pass':False,'reason':f'missing/unreadable {sa_fp}'})\n")
+    parts.push("else:\n")
+    parts.push("    backbone_seen = sa.get('backbone', backbone_seen)\n")
+    parts.push("    n_sel = int(sa.get('n_selective', 0))\n")
+    parts.push("    g6 = n_sel >= 2\n")
+    parts.push("    gates.append({'gate':'G6_SAE_bp','present':True,'pass':bool(g6),'n_selective':n_sel,\n")
+    parts.push("        'criterion':'n_selective>=2','reason':None if g6 else f'n_selective={n_sel}<2'})\n\n")
+
+    // G7 - composite
+    parts.push("sg, sg_fp = load('v11_signature.json')\n")
+    parts.push("if sg is None or '_load_error' in (sg or {}):\n")
+    parts.push("    gates.append({'gate':'G7_composite','present':False,'pass':False,'reason':f'missing/unreadable {sg_fp}'})\n")
+    parts.push("    gmean = None\n")
+    parts.push("else:\n")
+    parts.push("    backbone_seen = sg.get('backbone', backbone_seen)\n")
+    parts.push("    gmean = sg.get('composite_geometric_mean')\n")
+    parts.push("    if gmean is None:\n")
+    parts.push("        gates.append({'gate':'G7_composite','present':True,'pass':False,'reason':'composite_geometric_mean missing'})\n")
+    parts.push("    else:\n")
+    parts.push("        gmean = float(gmean)\n")
+    parts.push("        g7 = gmean >= 0.40\n")
+    parts.push("        gates.append({'gate':'G7_composite','present':True,'pass':bool(g7),'composite_gmean':round(gmean,4),\n")
+    parts.push("            'criterion':'composite_geometric_mean>=0.40',\n")
+    parts.push("            'reason':None if g7 else f'gmean={gmean:.4f}<0.40'})\n\n")
+
+    // FINAL decision
+    parts.push("g0 = next((g for g in gates if g['gate']=='G0_AN11_b'), None)\n")
+    parts.push("g7 = next((g for g in gates if g['gate']=='G7_composite'), None)\n")
+    parts.push("v11_gates = [g for g in gates if g['gate'] in ('G1_BTom','G2_MCCA','G3_PhiStar','G4_CMT','G5_CDS','G6_SAE_bp')]\n")
+    parts.push("n_v11_pass = sum(1 for g in v11_gates if g.get('pass'))\n")
+    parts.push("n_v11_present = sum(1 for g in v11_gates if g.get('present'))\n")
+    parts.push("g0_pass = bool(g0 and g0.get('pass'))\n")
+    parts.push("g7_pass = bool(g7 and g7.get('pass'))\n")
+    parts.push("v11_majority = n_v11_pass >= 4\n")
+    parts.push("final_pass = g0_pass and v11_majority and g7_pass\n\n")
+
+    parts.push("downgrade_reasons = []\n")
+    parts.push("if not g0_pass: downgrade_reasons.append(f'G0_AN11_b FAIL ({g0.get(\"reason\") if g0 else \"missing\"})')\n")
+    parts.push("if not v11_majority: downgrade_reasons.append(f'v11 axis majority FAIL: {n_v11_pass}/{n_v11_present} of present axes pass (need >=4)')\n")
+    parts.push("if not g7_pass: downgrade_reasons.append(f'G7_composite FAIL ({g7.get(\"reason\") if g7 else \"missing\"})')\n")
+    parts.push("for g in v11_gates:\n")
+    parts.push("    if g.get('present') and not g.get('pass'): downgrade_reasons.append(f'{g[\"gate\"]} FAIL: {g.get(\"reason\")}')\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("summary = {'schema':'anima/g_gate/1','backbone':backbone_seen,'backbone_dir':BB_DIR,\n")
+    parts.push("    'gates':gates,'n_v11_pass':n_v11_pass,'n_v11_present':n_v11_present,\n")
+    parts.push("    'g0_pass':g0_pass,'g7_pass':g7_pass,'v11_majority':v11_majority,\n")
+    parts.push("    'final_pass':bool(final_pass),'final_status':'PASS' if final_pass else 'FAIL',\n")
+    parts.push("    'downgrade_reasons':downgrade_reasons}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[g-gate] backbone={backbone_seen} G0={g0_pass} v11={n_v11_pass}/{n_v11_present} G7={g7_pass} final={summary[\"final_status\"]} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_g_gate selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 DECISION-LAYER (canonical G0..G7 composite PASS/FAIL evaluator)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

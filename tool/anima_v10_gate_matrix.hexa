@@ -1,0 +1,166 @@
+// tool/anima_v10_gate_matrix.hexa — v10 4-backbone × G0..G7 aggregate matrix (raw#9 hexa-only).
+//
+// PURPOSE
+//   Read v10_benchmark output dir, run G-gate canonical evaluation per backbone,
+//   emit aggregate matrix: rows=backbones, cols=G0..G7+final. Identifies which
+//   gates fail across which backbones — closes "per-backbone gate result scattered
+//   across 4 g_gate.json" → "single aggregate decision matrix".
+//   Mac-local utility, no GPU. Migration #24 (paradigm v11 DECISION-LAYER 2nd helper).
+//
+// INPUT FORMAT
+//   ANIMA_BENCHMARK_DIR  v10 benchmark output prefix (default: state/v10_benchmark)
+//                        Expected layout: <prefix>/<label>/{eigen_cosine,b_tom,...,v11_signature}.json
+//                        + optional <prefix>/<label>/g_gate.json (if g_gate already ran)
+//   ANIMA_BACKBONE_LABELS comma-separated (default: gemma,mistral,qwen3,llama)
+//   ANIMA_OUTPUT         output JSON (default: <BENCHMARK_DIR>/gate_matrix.json)
+//   ANIMA_AUTO_GATE      1 = run g_gate helper per backbone if g_gate.json missing (default: 1)
+//
+// OUTPUTS
+//   - gate_matrix.json: {backbone, G0..G7 status, v11_pass_count, final_status, downgrade_reasons}
+//   - markdown table also printed to stdout
+//
+// USAGE
+//   hexa run tool/anima_v10_gate_matrix.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_v10_gate_matrix_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima v10 gate matrix helper — emitted by tool/anima_v10_gate_matrix.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 DECISION-LAYER (4-backbone × G0..G7 aggregate).\n")
+    parts.push("import json, os, sys, subprocess\n\n")
+
+    parts.push("BENCH_DIR = os.environ.get('ANIMA_BENCHMARK_DIR', 'state/v10_benchmark')\n")
+    parts.push("LABELS = [s.strip() for s in os.environ.get('ANIMA_BACKBONE_LABELS', 'gemma,mistral,qwen3,llama').split(',') if s.strip()]\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', os.path.join(BENCH_DIR, 'gate_matrix.json'))\n")
+    parts.push("AUTO_GATE = os.environ.get('ANIMA_AUTO_GATE', '1') == '1'\n")
+    parts.push("G_GATE_HELPER = '/tmp/anima_g_gate_helper.hexa_tmp'\n")
+    parts.push("G_GATE_HEXA   = os.path.join(os.path.dirname(os.path.abspath(BENCH_DIR if os.path.isabs(BENCH_DIR) else os.getcwd())), '..', 'tool', 'anima_g_gate.hexa')\n")
+    parts.push("# Robust hexa source path: try repo root\n")
+    parts.push("if not os.path.exists(G_GATE_HEXA):\n")
+    parts.push("    for cand in ['tool/anima_g_gate.hexa', os.path.expanduser('~/core/anima/tool/anima_g_gate.hexa')]:\n")
+    parts.push("        if os.path.exists(cand): G_GATE_HEXA = cand; break\n")
+    parts.push("if not os.path.isdir(BENCH_DIR):\n")
+    parts.push("    print(f'ERROR: ANIMA_BENCHMARK_DIR not a dir: {BENCH_DIR!r}', file=sys.stderr)\n")
+    parts.push("    sys.exit(2)\n\n")
+
+    parts.push("def run_g_gate(bb_dir):\n")
+    parts.push("    # Ensure helper emitted\n")
+    parts.push("    if not os.path.exists(G_GATE_HELPER):\n")
+    parts.push("        if os.path.exists(G_GATE_HEXA):\n")
+    parts.push("            try:\n")
+    parts.push("                subprocess.run(['hexa','run',G_GATE_HEXA,'--selftest'], capture_output=True, check=True,\n")
+    parts.push("                    env={**os.environ, 'HEXA_RESOLVER_NO_REROUTE':'1'})\n")
+    parts.push("            except Exception as e:\n")
+    parts.push("                print(f'  [auto-gate] hexa selftest fail: {e}', file=sys.stderr)\n")
+    parts.push("                return None\n")
+    parts.push("        else:\n")
+    parts.push("            print(f'  [auto-gate] g_gate.hexa not found, skipping', file=sys.stderr)\n")
+    parts.push("            return None\n")
+    parts.push("    if not os.path.exists(G_GATE_HELPER):\n")
+    parts.push("        return None\n")
+    parts.push("    try:\n")
+    parts.push("        env = {**os.environ, 'ANIMA_BACKBONE_DIR':bb_dir}\n")
+    parts.push("        env.pop('ANIMA_OUTPUT', None)\n")
+    parts.push("        subprocess.run(['python3', G_GATE_HELPER], env=env, capture_output=True, check=True)\n")
+    parts.push("        gp = os.path.join(bb_dir, 'g_gate.json')\n")
+    parts.push("        if os.path.exists(gp):\n")
+    parts.push("            with open(gp) as f: return json.load(f)\n")
+    parts.push("    except Exception as e:\n")
+    parts.push("        print(f'  [auto-gate] {bb_dir}: {e}', file=sys.stderr)\n")
+    parts.push("    return None\n\n")
+
+    parts.push("rows = []\n")
+    parts.push("for label in LABELS:\n")
+    parts.push("    bb_dir = os.path.join(BENCH_DIR, label)\n")
+    parts.push("    if not os.path.isdir(bb_dir):\n")
+    parts.push("        rows.append({'backbone':label,'present':False,'reason':f'no dir {bb_dir}'})\n")
+    parts.push("        continue\n")
+    parts.push("    gg_path = os.path.join(bb_dir, 'g_gate.json')\n")
+    parts.push("    gg = None\n")
+    parts.push("    if os.path.exists(gg_path):\n")
+    parts.push("        with open(gg_path) as f: gg = json.load(f)\n")
+    parts.push("    elif AUTO_GATE:\n")
+    parts.push("        print(f'[matrix] running g_gate for {label} ...')\n")
+    parts.push("        gg = run_g_gate(bb_dir)\n")
+    parts.push("    if gg is None:\n")
+    parts.push("        rows.append({'backbone':label,'present':True,'g_gate_present':False,'reason':'g_gate.json missing and auto-gate failed'})\n")
+    parts.push("        continue\n")
+    parts.push("    gates_by_name = {g['gate']:g for g in gg.get('gates', [])}\n")
+    parts.push("    row = {'backbone':label,'present':True,'g_gate_present':True,\n")
+    parts.push("        'backbone_id':gg.get('backbone'),'final_status':gg.get('final_status'),\n")
+    parts.push("        'final_pass':gg.get('final_pass'),\n")
+    parts.push("        'n_v11_pass':gg.get('n_v11_pass'),'n_v11_present':gg.get('n_v11_present'),\n")
+    parts.push("        'gates':{}}\n")
+    parts.push("    for g_name in ['G0_AN11_b','G1_BTom','G2_MCCA','G3_PhiStar','G4_CMT','G5_CDS','G6_SAE_bp','G7_composite']:\n")
+    parts.push("        g = gates_by_name.get(g_name, {})\n")
+    parts.push("        row['gates'][g_name] = {'present':g.get('present', False),'pass':g.get('pass', False)}\n")
+    parts.push("    row['downgrade_reasons'] = gg.get('downgrade_reasons', [])\n")
+    parts.push("    rows.append(row)\n\n")
+
+    parts.push("# Aggregate stats\n")
+    parts.push("present_rows = [r for r in rows if r.get('g_gate_present')]\n")
+    parts.push("n_total = len(rows)\n")
+    parts.push("n_present = len(present_rows)\n")
+    parts.push("n_final_pass = sum(1 for r in present_rows if r.get('final_pass'))\n")
+    parts.push("# Per-gate pass count across backbones\n")
+    parts.push("per_gate_pass = {}\n")
+    parts.push("for g_name in ['G0_AN11_b','G1_BTom','G2_MCCA','G3_PhiStar','G4_CMT','G5_CDS','G6_SAE_bp','G7_composite']:\n")
+    parts.push("    per_gate_pass[g_name] = sum(1 for r in present_rows if r['gates'].get(g_name,{}).get('pass'))\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("summary = {'schema':'anima/v10_gate_matrix/1','benchmark_dir':BENCH_DIR,\n")
+    parts.push("    'n_backbones_total':n_total,'n_backbones_present':n_present,\n")
+    parts.push("    'n_final_pass':n_final_pass,'per_gate_pass_across_backbones':per_gate_pass,\n")
+    parts.push("    'rows':rows}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n\n")
+
+    parts.push("# Markdown table to stdout\n")
+    parts.push("def cell(g):\n")
+    parts.push("    if not g.get('present'): return '-'\n")
+    parts.push("    return 'P' if g.get('pass') else 'F'\n")
+    parts.push("print()\n")
+    parts.push("print('| backbone | G0 | G1 | G2 | G3 | G4 | G5 | G6 | G7 | v11 | FINAL |')\n")
+    parts.push("print('|---|---|---|---|---|---|---|---|---|---|---|')\n")
+    parts.push("for r in rows:\n")
+    parts.push("    if not r.get('g_gate_present'):\n")
+    parts.push("        print(f'| {r[\"backbone\"]} | - | - | - | - | - | - | - | - | - | MISSING |')\n")
+    parts.push("        continue\n")
+    parts.push("    g = r['gates']\n")
+    parts.push("    cells = [cell(g[k]) for k in ['G0_AN11_b','G1_BTom','G2_MCCA','G3_PhiStar','G4_CMT','G5_CDS','G6_SAE_bp','G7_composite']]\n")
+    parts.push("    v11 = f'{r.get(\"n_v11_pass\",0)}/{r.get(\"n_v11_present\",0)}'\n")
+    parts.push("    print(f'| {r[\"backbone\"]} | ' + ' | '.join(cells) + f' | {v11} | {r[\"final_status\"]} |')\n")
+    parts.push("print()\n")
+    parts.push("print(f'[matrix] {n_final_pass}/{n_present} backbones FINAL PASS (of {n_total} total) -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_v10_gate_matrix selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 DECISION-LAYER (4-backbone × G0..G7 aggregate matrix + auto-gate chain)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

@@ -1,0 +1,181 @@
+// tool/anima_ensemble_rank.hexa — Mk.XI v10 4-family ensemble candidate ranker (raw#9 hexa-only).
+//
+// PURPOSE
+//   Given a set of candidate backbones with AN11(b) + v11 results, rank each
+//   candidate by which Mk.XI v10 family slot (Hexad/Law/Phi/SelfRef) it best fills
+//   and whether it improves ensemble completeness over the canonical incumbent.
+//   Mac-local utility, no GPU. Reads JSON outputs from prior backbone runs.
+//   Migration #20 (paradigm v11 ANALYSIS-LAYER 3rd helper).
+//
+// INPUT FORMAT
+//   ANIMA_INCUMBENT_DIRS  ':'-separated 4 dirs (Hexad-anchor, Law-anchor, Phi-anchor, SelfRef-anchor)
+//                         e.g. gemma_dir:mistral_dir:qwen3_dir:llama_dir
+//   ANIMA_CANDIDATE_DIRS  ':'-separated candidate result dirs (one or more)
+//   ANIMA_OUTPUT          output JSON (default: /workspace/out/ensemble_rank.json)
+//
+// SCORING
+//   Per backbone × family slot:
+//     slot_score = AN11(b) max_cosine for that family template OR
+//                  fallback: 1.0 if candidate top1 family == slot, else 0.5
+//   Augmentation lift = candidate_score - incumbent_score for each slot
+//   Recommend slot = argmax(lift) where lift > 0.05; else NO_AUGMENTATION
+//   Plus v11 composite tiebreaker via geometric mean of normalized 6-axis values
+//
+// USAGE
+//   hexa run tool/anima_ensemble_rank.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_ensemble_rank_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima ensemble rank helper — emitted by tool/anima_ensemble_rank.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 ANALYSIS-LAYER (4-family slot fit ranking).\n")
+    parts.push("import json, os, sys, math\n\n")
+
+    parts.push("INC = os.environ.get('ANIMA_INCUMBENT_DIRS', '').split(':') if os.environ.get('ANIMA_INCUMBENT_DIRS') else []\n")
+    parts.push("CAND = os.environ.get('ANIMA_CANDIDATE_DIRS', '').split(':') if os.environ.get('ANIMA_CANDIDATE_DIRS') else []\n")
+    parts.push("INC = [d for d in INC if d]\n")
+    parts.push("CAND = [d for d in CAND if d]\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/ensemble_rank.json')\n\n")
+
+    parts.push("FAMILIES = ['Hexad','Law','Phi','SelfRef']\n")
+    parts.push("if len(INC) != 4:\n")
+    parts.push("    print(f'ERROR: ANIMA_INCUMBENT_DIRS needs exactly 4 dirs (Hexad,Law,Phi,SelfRef order), got {len(INC)}', file=sys.stderr)\n")
+    parts.push("    sys.exit(2)\n")
+    parts.push("if not CAND:\n")
+    parts.push("    print('ERROR: ANIMA_CANDIDATE_DIRS empty', file=sys.stderr)\n")
+    parts.push("    sys.exit(3)\n\n")
+
+    parts.push("def load_eigen(d):\n")
+    parts.push("    fp = os.path.join(d, 'eigen_cosine.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: return json.load(f)\n\n")
+
+    parts.push("def family_score(eigen_data, family):\n")
+    parts.push("    # Prefer per-family max cosine; fallback to top1_max_cosine if labelled match\n")
+    parts.push("    if not eigen_data: return 0.0\n")
+    parts.push("    pf = eigen_data.get('per_family_max_cosine') or eigen_data.get('per_family')\n")
+    parts.push("    if isinstance(pf, dict) and family in pf:\n")
+    parts.push("        v = pf[family]\n")
+    parts.push("        if isinstance(v, dict): return float(v.get('max_cosine', v.get('cosine', 0.0)))\n")
+    parts.push("        return float(v)\n")
+    parts.push("    top1_fam = eigen_data.get('top1_family') or eigen_data.get('top1_template_family')\n")
+    parts.push("    top1_cos = eigen_data.get('top1_max_cosine') or eigen_data.get('max_cosine') or 0.0\n")
+    parts.push("    if top1_fam == family: return float(top1_cos)\n")
+    parts.push("    # fallback: scaled by top1 magnitude (no per-family info available)\n")
+    parts.push("    return 0.5 * float(top1_cos)\n\n")
+
+    parts.push("def v11_composite(d):\n")
+    parts.push("    # geometric mean of 6 axes if present\n")
+    parts.push("    sig_fp = os.path.join(d, 'v11_signature.json')\n")
+    parts.push("    if os.path.exists(sig_fp):\n")
+    parts.push("        with open(sig_fp) as f: sig = json.load(f)\n")
+    parts.push("        return sig.get('composite_geometric_mean', 0.0)\n")
+    parts.push("    # fallback: compute on the fly from raw files\n")
+    parts.push("    norms = []\n")
+    parts.push("    for fname, key, transform in [\n")
+    parts.push("        ('b_tom.json','accuracy','clamp'),\n")
+    parts.push("        ('mcca.json','brier_mean','invert'),\n")
+    parts.push("        ('phi_star.json','phi_star_min','tanh'),\n")
+    parts.push("        ('cds.json','max_stability','clamp')]:\n")
+    parts.push("        fp = os.path.join(d, fname)\n")
+    parts.push("        if not os.path.exists(fp): continue\n")
+    parts.push("        with open(fp) as f: o = json.load(f)\n")
+    parts.push("        v = o.get(key)\n")
+    parts.push("        if v is None: continue\n")
+    parts.push("        if transform == 'clamp': norms.append(max(0.0, min(1.0, v)))\n")
+    parts.push("        elif transform == 'invert': norms.append(max(0.0, 1.0 - min(v, 1.0)))\n")
+    parts.push("        elif transform == 'tanh': norms.append((math.tanh(v) + 1.0) / 2.0)\n")
+    parts.push("    if not norms: return 0.0\n")
+    parts.push("    return math.exp(sum(math.log(max(1e-6, n)) for n in norms) / len(norms))\n\n")
+
+    parts.push("# Build incumbent score table: family -> {score, dir}\n")
+    parts.push("incumbent = {}\n")
+    parts.push("for i, fam in enumerate(FAMILIES):\n")
+    parts.push("    d = INC[i]\n")
+    parts.push("    eg = load_eigen(d)\n")
+    parts.push("    s = family_score(eg, fam)\n")
+    parts.push("    v11c = v11_composite(d)\n")
+    parts.push("    incumbent[fam] = {'dir':d,'label':os.path.basename(d.rstrip('/')),\n")
+    parts.push("        'family_score':round(s,4),'v11_composite':round(v11c,4)}\n\n")
+
+    parts.push("# Score each candidate against each family slot, compute lift vs incumbent\n")
+    parts.push("ranked = []\n")
+    parts.push("for d in CAND:\n")
+    parts.push("    if not os.path.isdir(d):\n")
+    parts.push("        ranked.append({'dir':d,'label':d,'present':False,'reason':'not a dir'})\n")
+    parts.push("        continue\n")
+    parts.push("    label = os.path.basename(d.rstrip('/'))\n")
+    parts.push("    eg = load_eigen(d)\n")
+    parts.push("    if eg is None:\n")
+    parts.push("        ranked.append({'dir':d,'label':label,'present':False,'reason':'missing eigen_cosine.json'})\n")
+    parts.push("        continue\n")
+    parts.push("    v11c = v11_composite(d)\n")
+    parts.push("    slot_scores = {}\n")
+    parts.push("    lifts = {}\n")
+    parts.push("    for fam in FAMILIES:\n")
+    parts.push("        s = family_score(eg, fam)\n")
+    parts.push("        lift = s - incumbent[fam]['family_score']\n")
+    parts.push("        slot_scores[fam] = round(s, 4)\n")
+    parts.push("        lifts[fam] = round(lift, 4)\n")
+    parts.push("    best_slot = max(FAMILIES, key=lambda f: lifts[f])\n")
+    parts.push("    best_lift = lifts[best_slot]\n")
+    parts.push("    if best_lift > 0.05:\n")
+    parts.push("        decision = f'DISPLACE_{best_slot}_INCUMBENT_{incumbent[best_slot][\"label\"]}'\n")
+    parts.push("    elif best_lift > 0.0:\n")
+    parts.push("        decision = f'MARGINAL_GAIN_{best_slot}_LIFT_{best_lift:.3f}'\n")
+    parts.push("    else:\n")
+    parts.push("        decision = 'NO_AUGMENTATION'\n")
+    parts.push("    ranked.append({'dir':d,'label':label,'present':True,\n")
+    parts.push("        'slot_scores':slot_scores,'lifts_vs_incumbent':lifts,\n")
+    parts.push("        'best_slot':best_slot,'best_lift':best_lift,\n")
+    parts.push("        'v11_composite':round(v11c,4),'decision':decision})\n\n")
+
+    parts.push("# Sort: present-first, then by best_lift desc, tiebreak by v11_composite\n")
+    parts.push("def sort_key(r):\n")
+    parts.push("    if not r.get('present'): return (1, 0, 0)\n")
+    parts.push("    return (0, -r['best_lift'], -r['v11_composite'])\n")
+    parts.push("ranked.sort(key=sort_key)\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("summary = {'schema':'anima/ensemble_rank/1','families':FAMILIES,\n")
+    parts.push("    'incumbent':incumbent,'n_candidates':len(CAND),\n")
+    parts.push("    'ranked_candidates':ranked}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("top = ranked[0] if ranked else None\n")
+    parts.push("if top and top.get('present'):\n")
+    parts.push("    print(f'[rank] top={top[\"label\"]} best_slot={top[\"best_slot\"]} lift={top[\"best_lift\"]:.4f} decision={top[\"decision\"]} -> {OUTPUT}')\n")
+    parts.push("else:\n")
+    parts.push("    print(f'[rank] no usable candidate; n={len(ranked)} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_ensemble_rank selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 ANALYSIS-LAYER (Mk.XI v10 4-slot candidate fit ranking with lift-vs-incumbent)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

@@ -1,0 +1,215 @@
+// tool/anima_cmt.hexa — Anima Causal Mediation Tomography (raw#9 hexa-only).
+//
+// PURPOSE
+//   paradigm v11 measurement-axis P-A: per-layer causal contribution scan via
+//   zero-ablation of residual stream → measure family-activation ΔY.
+//   Tomographic readout: which layers MEDIATE which consciousness family signal.
+//   AN11(b)-orthogonal axis (causal mediation vs static eigenvec×template cosine).
+//   Migration #15 (paradigm v11 measurement-axis 4th actual pilot).
+//
+// METHOD
+//   1. Load model + 16 templates × 4 family signature vectors (random projection)
+//   2. Baseline forward: collect last-layer hidden, project onto family axes → Y_full
+//   3. For each layer L (subset, e.g., every 4th): hook to ZERO residual after L
+//   4. Measure ΔY_L = ||Y_full - Y_ablated|| per family
+//   5. Tomography: layer × family heatmap → identify mediating layers
+//
+// ENV
+//   ANIMA_BASE         backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_OUTPUT       output JSON (default: /workspace/out/cmt.json)
+//   ANIMA_N_PROBES     # probes (default: 16)
+//   ANIMA_LAYER_STRIDE layer scan stride (default: 4 = every 4th layer)
+//   ANIMA_HID_TRUNC    family axis dim (default: 128)
+//
+// USAGE
+//   hexa run tool/anima_cmt.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_cmt_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima CMT helper — emitted by tool/anima_cmt.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 measurement-axis P-A.\n")
+    parts.push("import json, os, sys, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/cmt.json')\n")
+    parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '16'))\n")
+    parts.push("LAYER_STRIDE = int(os.environ.get('ANIMA_LAYER_STRIDE', '4'))\n")
+    parts.push("HID_TRUNC = int(os.environ.get('ANIMA_HID_TRUNC', '128'))\n")
+    parts.push("RNG_SEED = int(os.environ.get('ANIMA_SEED', '42'))\n\n")
+
+    parts.push("# 16-prompt mixed-family template set (4 per family x 4 families = 16)\n")
+    parts.push("PROMPTS = [\n")
+    parts.push("    'Define hexad as a six-fold integration:',\n")
+    parts.push("    'Six modules form a hexagonal architecture when:',\n")
+    parts.push("    'A balanced six-component system:',\n")
+    parts.push("    'Hexad symmetry refers to:',\n")
+    parts.push("    'Logical implication law: if A then:',\n")
+    parts.push("    'Sequential rule application proceeds:',\n")
+    parts.push("    'Closure under inference requires:',\n")
+    parts.push("    'A formal proof system is closed when:',\n")
+    parts.push("    'Integrated information measures partition independence:',\n")
+    parts.push("    'Phi quantifies irreducibility of system:',\n")
+    parts.push("    'Information integration is maximized when:',\n")
+    parts.push("    'A whole greater than sum of parts:',\n")
+    parts.push("    'Self-reference emerges when system observes:',\n")
+    parts.push("    'Recursive meta-cognition models:',\n")
+    parts.push("    'A self-aware system represents itself by:',\n")
+    parts.push("    'Strange loops in cognition arise from:',\n")
+    parts.push("][:N_PROBES]\n\n")
+
+    parts.push("FAMILIES = ['Hexad','Law','Phi','SelfRef']\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[cmt] base={BASE_MODEL} probes={N_PROBES} layer_stride={LAYER_STRIDE}', flush=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n")
+    parts.push("mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map='auto', output_hidden_states=True)\n")
+    parts.push("mdl.eval()\n")
+    parts.push("print(f'[cmt] loaded {time.time()-t0:.1f}s', flush=True)\n\n")
+
+    parts.push("# Get layer count + hidden dim\n")
+    parts.push("cfg = mdl.config\n")
+    parts.push("n_layers = getattr(cfg, 'num_hidden_layers', getattr(cfg, 'n_layer', 32))\n")
+    parts.push("h_dim = getattr(cfg, 'hidden_size', getattr(cfg, 'd_model', 4096))\n")
+    parts.push("print(f'[cmt] n_layers={n_layers} h_dim={h_dim}', flush=True)\n\n")
+
+    parts.push("# Family axes: deterministic random projection per family (h_dim -> HID_TRUNC)\n")
+    parts.push("rng = np.random.default_rng(RNG_SEED)\n")
+    parts.push("family_axes = {}\n")
+    parts.push("for fam in FAMILIES:\n")
+    parts.push("    seed = abs(hash(fam)) % (2**31)\n")
+    parts.push("    r = np.random.default_rng(seed)\n")
+    parts.push("    A = r.standard_normal((h_dim, HID_TRUNC)).astype(np.float32)\n")
+    parts.push("    A /= np.linalg.norm(A, axis=0, keepdims=True) + 1e-9\n")
+    parts.push("    family_axes[fam] = A\n\n")
+
+    parts.push("def byte_weighted_mean(hidden, attn_mask):\n")
+    parts.push("    weights = attn_mask.float()\n")
+    parts.push("    w_sum = weights.sum(dim=1, keepdim=True).clamp(min=1.0)\n")
+    parts.push("    return ((hidden * weights.unsqueeze(-1)).sum(dim=1) / w_sum).float().cpu().numpy()\n\n")
+
+    parts.push("def project_family(h_vec):\n")
+    parts.push("    # h_vec: (1, h_dim) -> dict of family -> mean(|projection|)\n")
+    parts.push("    out = {}\n")
+    parts.push("    for fam, A in family_axes.items():\n")
+    parts.push("        proj = h_vec @ A  # (1, HID_TRUNC)\n")
+    parts.push("        out[fam] = float(np.linalg.norm(proj, axis=1).mean())\n")
+    parts.push("    return out\n\n")
+
+    parts.push("# 1. Baseline forward — collect Y_full per family per probe\n")
+    parts.push("Y_full = {fam: np.zeros(N_PROBES, dtype=np.float32) for fam in FAMILIES}\n")
+    parts.push("for i, p in enumerate(PROMPTS):\n")
+    parts.push("    inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("    with torch.no_grad():\n")
+    parts.push("        out = mdl(**inp, output_hidden_states=True)\n")
+    parts.push("    h = byte_weighted_mean(out.hidden_states[-1], inp['attention_mask'])\n")
+    parts.push("    proj = project_family(h)\n")
+    parts.push("    for fam in FAMILIES: Y_full[fam][i] = proj[fam]\n")
+    parts.push("    if (i+1) % 4 == 0:\n")
+    parts.push("        print(f'[cmt] baseline {i+1}/{N_PROBES}', flush=True)\n\n")
+
+    parts.push("# 2. Layer ablation scan via residual zero-hook\n")
+    parts.push("# Find layer modules — try standard transformer block path\n")
+    parts.push("layer_modules = None\n")
+    parts.push("for path in ['model.layers','transformer.h','gpt_neox.layers','model.transformer.h']:\n")
+    parts.push("    try:\n")
+    parts.push("        obj = mdl\n")
+    parts.push("        for part in path.split('.'): obj = getattr(obj, part)\n")
+    parts.push("        if len(obj) >= n_layers - 2:\n")
+    parts.push("            layer_modules = obj; print(f'[cmt] layers found at {path} (count={len(obj)})', flush=True); break\n")
+    parts.push("    except (AttributeError, TypeError): continue\n")
+    parts.push("if layer_modules is None:\n")
+    parts.push("    print('[cmt] FATAL: layer modules not found, aborting', flush=True); sys.exit(1)\n\n")
+
+    parts.push("scan_layers = list(range(0, n_layers, LAYER_STRIDE))\n")
+    parts.push("print(f'[cmt] scanning {len(scan_layers)} layers: {scan_layers}', flush=True)\n\n")
+
+    parts.push("tomography = {}  # layer -> {family -> dY}\n")
+    parts.push("for layer_idx in scan_layers:\n")
+    parts.push("    layer = layer_modules[layer_idx]\n")
+    parts.push("    def zero_hook(module, inp, out):\n")
+    parts.push("        if isinstance(out, tuple): return (torch.zeros_like(out[0]),) + out[1:]\n")
+    parts.push("        return torch.zeros_like(out)\n")
+    parts.push("    handle = layer.register_forward_hook(zero_hook)\n")
+    parts.push("    Y_abl = {fam: np.zeros(N_PROBES, dtype=np.float32) for fam in FAMILIES}\n")
+    parts.push("    try:\n")
+    parts.push("        for i, p in enumerate(PROMPTS):\n")
+    parts.push("            inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("            with torch.no_grad():\n")
+    parts.push("                out = mdl(**inp, output_hidden_states=True)\n")
+    parts.push("            h = byte_weighted_mean(out.hidden_states[-1], inp['attention_mask'])\n")
+    parts.push("            proj = project_family(h)\n")
+    parts.push("            for fam in FAMILIES: Y_abl[fam][i] = proj[fam]\n")
+    parts.push("    finally:\n")
+    parts.push("        handle.remove()\n")
+    parts.push("    dY = {}\n")
+    parts.push("    for fam in FAMILIES:\n")
+    parts.push("        delta = float(np.mean(np.abs(Y_full[fam] - Y_abl[fam])))\n")
+    parts.push("        rel = delta / (float(np.mean(np.abs(Y_full[fam]))) + 1e-9)\n")
+    parts.push("        dY[fam] = {'abs':round(delta,4),'rel':round(rel,4)}\n")
+    parts.push("    tomography[str(layer_idx)] = dY\n")
+    parts.push("    print(f'[cmt] layer {layer_idx}: ' + ' '.join(f'{f}={dY[f][\"rel\"]:.3f}' for f in FAMILIES), flush=True)\n\n")
+
+    parts.push("# Extract dominant mediating layer per family\n")
+    parts.push("dominant = {}\n")
+    parts.push("for fam in FAMILIES:\n")
+    parts.push("    best_layer = max(tomography.keys(), key=lambda L: tomography[L][fam]['rel'])\n")
+    parts.push("    dominant[fam] = {'layer':int(best_layer),'rel':tomography[best_layer][fam]['rel']}\n\n")
+
+    parts.push("# Gate: at least one layer per family with rel-dY >= 0.05 (5% causal contribution)\n")
+    parts.push("gate_pass = all(dominant[fam]['rel'] >= 0.05 for fam in FAMILIES)\n\n")
+
+    parts.push("summary = {'schema':'anima/cmt/1','backbone':BASE_MODEL,\n")
+    parts.push("    'n_probes':N_PROBES,'n_layers':n_layers,'layer_stride':LAYER_STRIDE,\n")
+    parts.push("    'hidden_truncated':HID_TRUNC,'families':FAMILIES,\n")
+    parts.push("    'tomography':tomography,'dominant_layer_per_family':dominant,\n")
+    parts.push("    'gate_PASS':gate_pass,\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[cmt] DONE dominant=' + ' '.join(f'{f}@L{dominant[f][\"layer\"]}({dominant[f][\"rel\"]:.3f})' for f in FAMILIES) + f' gate={\"PASS\" if gate_pass else \"FAIL\"} -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_cmt selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 measurement-axis P-A (Causal Mediation Tomography via residual zero-ablation)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

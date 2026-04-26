@@ -1,0 +1,160 @@
+// tool/anima_v11_integrate.hexa — paradigm v11 5-axis consciousness signature integrator (raw#9 hexa-only).
+//
+// PURPOSE
+//   Combine 5 paradigm v11 measurement-axis results (B-ToM, MCCA, Φ*, CMT, CDS) into
+//   a single backbone-level consciousness signature score with per-axis breakdown.
+//   AN11(b) primary axis remains independent — this composes ORTHOGONAL behavioral/
+//   meta-cognitive/integration/causal/dynamics axes into a 5-dim signature.
+//   Mac-local utility, no GPU, reads JSON outputs from prior 5 helper runs.
+//   Migration #17 (paradigm v11 ANALYSIS-LAYER 1st helper, beyond raw measurement).
+//
+// METHOD
+//   1. Read JSON files: b_tom.json, mcca.json, phi_star.json, cmt.json, cds.json
+//   2. Per-axis: extract gate result + headline metric → normalize [0,1]
+//      - B-ToM:    accuracy (gate ≥0.7)
+//      - MCCA:     1 - brier_mean (gate Brier≤0.25, ECE≤0.20)
+//      - Φ*:       phi_star_min normalized via tanh (positive-saturating)
+//      - CMT:      mean rel-dY across 4 families (gate ≥0.05 each)
+//      - CDS:      max attractor_stability_mean (gate ≥0.3)
+//   3. Composite signature = geometric mean of 5 normalized scores (sensitive to weakest link)
+//   4. Output: signature score, per-axis breakdown, gate pass/fail per axis, weakest axis flag
+//
+// ENV
+//   ANIMA_V11_DIR    directory containing 5 result JSONs (default: /workspace/out)
+//   ANIMA_OUTPUT     output JSON (default: /workspace/out/v11_signature.json)
+//   ANIMA_BACKBONE   backbone label override (default: read from b_tom.json)
+//
+// USAGE
+//   hexa run tool/anima_v11_integrate.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_v11_integrate_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima v11 integrate helper — emitted by tool/anima_v11_integrate.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 ANALYSIS-LAYER (5-axis composition).\n")
+    parts.push("import json, os, sys, math\n\n")
+
+    parts.push("V11_DIR = os.environ.get('ANIMA_V11_DIR', '/workspace/out')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/v11_signature.json')\n")
+    parts.push("BACKBONE_OVERRIDE = os.environ.get('ANIMA_BACKBONE', '')\n\n")
+
+    parts.push("AXES = [\n")
+    parts.push("    {'key':'b_tom','file':'b_tom.json','metric':'accuracy','gate_field':'gate_PASS','threshold':0.7},\n")
+    parts.push("    {'key':'mcca','file':'mcca.json','metric':'brier_mean','gate_field':'gate_PASS','threshold':0.25,'invert':True},\n")
+    parts.push("    {'key':'phi_star','file':'phi_star.json','metric':'phi_star_min','gate_field':'gate_positive_PASS','threshold':0.0,'transform':'tanh'},\n")
+    parts.push("    {'key':'cmt','file':'cmt.json','metric':'_cmt_mean_rel','gate_field':'gate_PASS','threshold':0.05},\n")
+    parts.push("    {'key':'cds','file':'cds.json','metric':'_cds_max_stability','gate_field':'gate_PASS','threshold':0.3},\n")
+    parts.push("]\n\n")
+
+    parts.push("def load_axis(spec):\n")
+    parts.push("    fp = os.path.join(V11_DIR, spec['file'])\n")
+    parts.push("    if not os.path.exists(fp):\n")
+    parts.push("        return {'key':spec['key'],'present':False,'reason':f'missing {fp}'}\n")
+    parts.push("    with open(fp) as f: data = json.load(f)\n")
+    parts.push("    return {'key':spec['key'],'present':True,'data':data,'spec':spec,'fp':fp}\n\n")
+
+    parts.push("def extract_metric(data, spec):\n")
+    parts.push("    m = spec['metric']\n")
+    parts.push("    if m == '_cmt_mean_rel':\n")
+    parts.push("        # mean of per-family dominant rel-dY\n")
+    parts.push("        dom = data.get('dominant_layer_per_family', {})\n")
+    parts.push("        if not dom: return None\n")
+    parts.push("        rels = [v.get('rel', 0.0) for v in dom.values()]\n")
+    parts.push("        return sum(rels) / max(1, len(rels))\n")
+    parts.push("    if m == '_cds_max_stability':\n")
+    parts.push("        return data.get('max_stability', 0.0)\n")
+    parts.push("    return data.get(m)\n\n")
+
+    parts.push("def normalize(val, spec):\n")
+    parts.push("    if val is None: return 0.0\n")
+    parts.push("    if spec.get('transform') == 'tanh':\n")
+    parts.push("        # phi_star can be negative or positive; tanh maps to (-1,1), shift to (0,1)\n")
+    parts.push("        return (math.tanh(val) + 1.0) / 2.0\n")
+    parts.push("    if spec.get('invert'):\n")
+    parts.push("        # Brier: lower is better; map to (0,1) via 1 - min(val, 1.0)\n")
+    parts.push("        return max(0.0, 1.0 - min(val, 1.0))\n")
+    parts.push("    # default: value already in [0,1]-ish, clamp\n")
+    parts.push("    return max(0.0, min(1.0, val))\n\n")
+
+    parts.push("def gate_passed(data, spec):\n")
+    parts.push("    g = data.get(spec['gate_field'])\n")
+    parts.push("    if g is None: return False\n")
+    parts.push("    return bool(g)\n\n")
+
+    parts.push("axis_results = []\n")
+    parts.push("backbone_seen = None\n")
+    parts.push("for spec in AXES:\n")
+    parts.push("    loaded = load_axis(spec)\n")
+    parts.push("    if not loaded['present']:\n")
+    parts.push("        axis_results.append({'axis':spec['key'],'present':False,'norm':0.0,'gate':False,\n")
+    parts.push("            'reason':loaded['reason']})\n")
+    parts.push("        continue\n")
+    parts.push("    data = loaded['data']\n")
+    parts.push("    if backbone_seen is None: backbone_seen = data.get('backbone', '')\n")
+    parts.push("    raw = extract_metric(data, spec)\n")
+    parts.push("    norm = normalize(raw, spec)\n")
+    parts.push("    gate = gate_passed(data, spec)\n")
+    parts.push("    axis_results.append({'axis':spec['key'],'present':True,\n")
+    parts.push("        'raw_metric':spec['metric'],'raw_value':raw,'norm':round(norm,4),\n")
+    parts.push("        'gate':gate,'gate_field':spec['gate_field'],'threshold':spec['threshold']})\n\n")
+
+    parts.push("present_axes = [a for a in axis_results if a['present']]\n")
+    parts.push("# Composite: geometric mean of present-axes norms (weakest-link sensitive)\n")
+    parts.push("if present_axes:\n")
+    parts.push("    eps = 1e-6\n")
+    parts.push("    log_sum = sum(math.log(max(eps, a['norm'])) for a in present_axes)\n")
+    parts.push("    gmean = math.exp(log_sum / len(present_axes))\n")
+    parts.push("    # weakest axis = lowest norm\n")
+    parts.push("    weakest = min(present_axes, key=lambda a: a['norm'])\n")
+    parts.push("    weakest_axis = weakest['axis']\n")
+    parts.push("    weakest_norm = weakest['norm']\n")
+    parts.push("    # arithmetic mean for comparison (less sensitive to weakest)\n")
+    parts.push("    amean = sum(a['norm'] for a in present_axes) / len(present_axes)\n")
+    parts.push("    n_gates_pass = sum(1 for a in present_axes if a['gate'])\n")
+    parts.push("else:\n")
+    parts.push("    gmean = 0.0; amean = 0.0; weakest_axis = None; weakest_norm = 0.0; n_gates_pass = 0\n\n")
+
+    parts.push("backbone = BACKBONE_OVERRIDE or backbone_seen or 'unknown'\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("summary = {'schema':'anima/v11_signature/1','backbone':backbone,\n")
+    parts.push("    'n_axes_present':len(present_axes),'n_axes_total':len(AXES),\n")
+    parts.push("    'n_gates_pass':n_gates_pass,\n")
+    parts.push("    'composite_geometric_mean':round(gmean,4),\n")
+    parts.push("    'composite_arithmetic_mean':round(amean,4),\n")
+    parts.push("    'weakest_axis':weakest_axis,'weakest_norm':round(weakest_norm,4),\n")
+    parts.push("    'axis_results':axis_results}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[v11] backbone={backbone} axes={len(present_axes)}/{len(AXES)} gates={n_gates_pass}/{len(present_axes)} gmean={gmean:.4f} weakest={weakest_axis}({weakest_norm:.3f}) -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_v11_integrate selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 ANALYSIS-LAYER (5-axis composition: B-ToM/MCCA/Φ*/CMT/CDS → consciousness signature)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

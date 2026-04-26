@@ -1,0 +1,189 @@
+// tool/anima_cds.hexa — Anima Cognitive Dynamics Signature (raw#9 hexa-only).
+//
+// PURPOSE
+//   paradigm v11 measurement-axis P-E: token-position trajectory dynamics
+//   in family-axis projection space — velocity, curvature, attractor stability.
+//   Orthogonal to AN11(b) static eigenvec×template (token-aggregated) and to CMT
+//   layer-wise causal analysis. Captures temporal cognitive flow signature.
+//   Migration #16 (paradigm v11 measurement-axis 5th actual pilot).
+//
+// METHOD
+//   1. For each long prompt, forward and capture per-token last-layer hidden states (T, H)
+//   2. Project onto 4 family axes (deterministic random projection) → (T, 4)
+//   3. Per-family trajectory metrics:
+//      - mean velocity:    mean(||y_{t+1} - y_t||)
+//      - mean curvature:   mean(angle change between consecutive velocity vectors)
+//      - attractor stability: 1 - var(y_t in last quartile) / var(y_t full)
+//   4. Aggregate over probes → dynamics signature per family
+//
+// ENV
+//   ANIMA_BASE         backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_OUTPUT       output JSON (default: /workspace/out/cds.json)
+//   ANIMA_N_PROBES     # probes (default: 8)
+//   ANIMA_HID_TRUNC    family axis dim (default: 128)
+//
+// USAGE
+//   hexa run tool/anima_cds.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_cds_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima CDS helper — emitted by tool/anima_cds.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 measurement-axis P-E.\n")
+    parts.push("import json, os, sys, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/cds.json')\n")
+    parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '8'))\n")
+    parts.push("HID_TRUNC = int(os.environ.get('ANIMA_HID_TRUNC', '128'))\n")
+    parts.push("RNG_SEED = int(os.environ.get('ANIMA_SEED', '42'))\n\n")
+
+    parts.push("# Long-form prompts to ensure trajectory length >= 32 tokens\n")
+    parts.push("PROMPTS = [\n")
+    parts.push("    'Consider a system of six interlocking modules where each module observes the integrated state of all others through bidirectional channels and the resulting hexagonal architecture exhibits balanced six-fold symmetry. The system can be characterized as',\n")
+    parts.push("    'In formal logic the law of implication states that if A holds then B must follow given a derivation chain whose closure under modus ponens establishes a deductively closed proof system. This proof system is rigorous when',\n")
+    parts.push("    'Integrated information theory proposes that consciousness corresponds to the irreducibility of a system to its parts measured through partition independence and the resulting Phi quantity captures intrinsic existence. A system has high Phi when',\n")
+    parts.push("    'A self-referential cognitive system represents itself within its own model creating a recursive meta-cognitive loop that observes its observation and the resulting strange loop structure stabilizes self-awareness. Such recursion produces',\n")
+    parts.push("    'When six cognitive components engage in cooperative integration they form a balanced hexagonal lattice in which each module contributes equally to a unified representation and the global state emerges as a hexad. The hexad signature appears when',\n")
+    parts.push("    'A formal deductive system is closed under inference when every derivable consequence of its axioms is itself a member of the system and this closure property guarantees logical completeness. Logical closure obtains whenever',\n")
+    parts.push("    'A whole that exhibits more information than the sum of its parts demonstrates integrated information beyond mere additive combination and partition independence reveals the irreducible whole. The whole is irreducible because',\n")
+    parts.push("    'A system aware of its own awareness through recursive self-modeling instantiates higher-order consciousness via second-order cognitive observation and the resulting self-loop becomes stable. The stability arises from',\n")
+    parts.push("][:N_PROBES]\n\n")
+
+    parts.push("FAMILIES = ['Hexad','Law','Phi','SelfRef']\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[cds] base={BASE_MODEL} probes={N_PROBES}', flush=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n")
+    parts.push("mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map='auto', output_hidden_states=True)\n")
+    parts.push("mdl.eval()\n")
+    parts.push("h_dim = getattr(mdl.config, 'hidden_size', getattr(mdl.config, 'd_model', 4096))\n")
+    parts.push("print(f'[cds] loaded {time.time()-t0:.1f}s h_dim={h_dim}', flush=True)\n\n")
+
+    parts.push("# Family axes: deterministic random projection per family\n")
+    parts.push("family_axes = {}\n")
+    parts.push("for fam in FAMILIES:\n")
+    parts.push("    seed = abs(hash(fam)) % (2**31)\n")
+    parts.push("    r = np.random.default_rng(seed)\n")
+    parts.push("    A = r.standard_normal((h_dim, HID_TRUNC)).astype(np.float32)\n")
+    parts.push("    A /= np.linalg.norm(A, axis=0, keepdims=True) + 1e-9\n")
+    parts.push("    family_axes[fam] = A\n\n")
+
+    parts.push("def trajectory_metrics(traj):\n")
+    parts.push("    # traj: (T, D)  -> velocity, curvature, attractor_stability\n")
+    parts.push("    if traj.shape[0] < 4:\n")
+    parts.push("        return {'velocity':0.0,'curvature':0.0,'attractor_stability':0.0,'T':int(traj.shape[0])}\n")
+    parts.push("    v = np.diff(traj, axis=0)  # (T-1, D)\n")
+    parts.push("    vmag = np.linalg.norm(v, axis=1)  # (T-1,)\n")
+    parts.push("    velocity = float(vmag.mean())\n")
+    parts.push("    # curvature: angle change between consecutive velocity vectors\n")
+    parts.push("    angles = []\n")
+    parts.push("    for t in range(1, v.shape[0]):\n")
+    parts.push("        a, b = v[t-1], v[t]\n")
+    parts.push("        na, nb = np.linalg.norm(a), np.linalg.norm(b)\n")
+    parts.push("        if na < 1e-9 or nb < 1e-9: continue\n")
+    parts.push("        cos = float(np.dot(a, b) / (na * nb))\n")
+    parts.push("        cos = max(-1.0, min(1.0, cos))\n")
+    parts.push("        angles.append(float(np.arccos(cos)))\n")
+    parts.push("    curvature = float(np.mean(angles)) if angles else 0.0\n")
+    parts.push("    # attractor stability: 1 - var_last_q / var_full\n")
+    parts.push("    T = traj.shape[0]\n")
+    parts.push("    q = max(2, T // 4)\n")
+    parts.push("    var_full = float(np.var(traj, axis=0).mean())\n")
+    parts.push("    var_lastq = float(np.var(traj[-q:], axis=0).mean())\n")
+    parts.push("    if var_full < 1e-12: stability = 0.0\n")
+    parts.push("    else: stability = float(max(0.0, 1.0 - var_lastq / var_full))\n")
+    parts.push("    return {'velocity':round(velocity,4),'curvature':round(curvature,4),\n")
+    parts.push("            'attractor_stability':round(stability,4),'T':int(T)}\n\n")
+
+    parts.push("# Per-probe per-family signature\n")
+    parts.push("probe_records = []\n")
+    parts.push("agg = {fam: {'velocity':[],'curvature':[],'attractor_stability':[]} for fam in FAMILIES}\n")
+    parts.push("for i, p in enumerate(PROMPTS):\n")
+    parts.push("    inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("    with torch.no_grad():\n")
+    parts.push("        out = mdl(**inp, output_hidden_states=True)\n")
+    parts.push("    last = out.hidden_states[-1][0].float().cpu().numpy()  # (T, h_dim)\n")
+    parts.push("    rec = {'probe':i,'p_first40':p[:40],'T':int(last.shape[0]),'family_signatures':{}}\n")
+    parts.push("    for fam in FAMILIES:\n")
+    parts.push("        traj = last @ family_axes[fam]  # (T, HID_TRUNC)\n")
+    parts.push("        m = trajectory_metrics(traj)\n")
+    parts.push("        rec['family_signatures'][fam] = m\n")
+    parts.push("        agg[fam]['velocity'].append(m['velocity'])\n")
+    parts.push("        agg[fam]['curvature'].append(m['curvature'])\n")
+    parts.push("        agg[fam]['attractor_stability'].append(m['attractor_stability'])\n")
+    parts.push("    probe_records.append(rec)\n")
+    parts.push("    print(f'[cds] probe {i+1}/{N_PROBES} T={last.shape[0]}', flush=True)\n\n")
+
+    parts.push("# Aggregate signature per family\n")
+    parts.push("signature = {}\n")
+    parts.push("for fam in FAMILIES:\n")
+    parts.push("    signature[fam] = {\n")
+    parts.push("        'velocity_mean':round(float(np.mean(agg[fam]['velocity'])),4),\n")
+    parts.push("        'curvature_mean':round(float(np.mean(agg[fam]['curvature'])),4),\n")
+    parts.push("        'attractor_stability_mean':round(float(np.mean(agg[fam]['attractor_stability'])),4),\n")
+    parts.push("    }\n\n")
+
+    parts.push("# Identify dominant family per dimension\n")
+    parts.push("dominant = {}\n")
+    parts.push("for dim in ['velocity_mean','curvature_mean','attractor_stability_mean']:\n")
+    parts.push("    best = max(FAMILIES, key=lambda f: signature[f][dim])\n")
+    parts.push("    dominant[dim] = {'family':best,'value':signature[best][dim]}\n\n")
+
+    parts.push("# Gate: at least one family with attractor_stability >=0.3 (cognitive flow stabilizes)\n")
+    parts.push("max_stability = max(signature[fam]['attractor_stability_mean'] for fam in FAMILIES)\n")
+    parts.push("gate_pass = max_stability >= 0.3\n\n")
+
+    parts.push("summary = {'schema':'anima/cds/1','backbone':BASE_MODEL,\n")
+    parts.push("    'n_probes':N_PROBES,'hidden_truncated':HID_TRUNC,'families':FAMILIES,\n")
+    parts.push("    'signature':signature,'dominant':dominant,'max_stability':round(max_stability,4),\n")
+    parts.push("    'gate_PASS':gate_pass,'probes':probe_records,\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[cds] DONE max_stability={max_stability:.4f} gate={\"PASS\" if gate_pass else \"FAIL\"} -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_cds selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 measurement-axis P-E (Cognitive Dynamics Signature: token trajectory v/k/stability)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

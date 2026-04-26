@@ -1,0 +1,255 @@
+// tool/anima_sae_steer_bypass.hexa — Anima SAE-STEER bypass via random sparse features (raw#9 hexa-only).
+//
+// PURPOSE
+//   paradigm v11 measurement-axis P-B': SAE-STEER replacement that bypasses
+//   transformer_lens dependency (broken since transformers>=4.45 BertForPreTraining
+//   import incompatibility). Uses random sparse feature projection + family-axis
+//   selectivity scoring instead of pre-trained gemma-scope SAE.
+//   Completes paradigm v11 measurement-axis 6/6 (after B-ToM / MCCA / Φ* / CMT / CDS).
+//   Migration #18 (paradigm v11 measurement-axis 6th actual pilot).
+//
+// METHOD
+//   1. Forward 16 templates × HF transformers, capture last-layer residual (T, H)
+//   2. Random sparse projection W (H, N_FEATURES), sparsity 5% → produces feature activations
+//   3. Per-feature × per-family selectivity: corr(feature_activation, family_axis_projection)
+//   4. Top-K features per family by selectivity → "discovered" sparse-coding axes
+//   5. Steer: add α × W[:, top_features] back to residual at last layer; remeasure family
+//   6. Output: per-family steering shift, selectivity scores, top-K feature indices
+//
+// ENV
+//   ANIMA_BASE         backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_OUTPUT       output JSON (default: /workspace/out/sae_steer_bypass.json)
+//   ANIMA_N_PROBES     # probes (default: 16)
+//   ANIMA_N_FEATURES   sparse feature dict size (default: 4096)
+//   ANIMA_TOPK         top-K features per family (default: 32)
+//   ANIMA_HID_TRUNC    family axis dim (default: 128)
+//   ANIMA_ALPHA        steering coefficient (default: 1.0)
+//
+// USAGE
+//   hexa run tool/anima_sae_steer_bypass.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_sae_steer_bypass_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima SAE-STEER bypass helper — emitted by tool/anima_sae_steer_bypass.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 measurement-axis P-B' (transformer_lens-free).\n")
+    parts.push("import json, os, sys, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/sae_steer_bypass.json')\n")
+    parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '16'))\n")
+    parts.push("N_FEATURES = int(os.environ.get('ANIMA_N_FEATURES', '4096'))\n")
+    parts.push("TOPK = int(os.environ.get('ANIMA_TOPK', '32'))\n")
+    parts.push("HID_TRUNC = int(os.environ.get('ANIMA_HID_TRUNC', '128'))\n")
+    parts.push("ALPHA = float(os.environ.get('ANIMA_ALPHA', '1.0'))\n")
+    parts.push("RNG_SEED = int(os.environ.get('ANIMA_SEED', '42'))\n")
+    parts.push("SPARSITY = 0.05  # 5% nonzero per feature column\n\n")
+
+    parts.push("PROMPTS = [\n")
+    parts.push("    'Define hexad as a six-fold integration:',\n")
+    parts.push("    'Six modules form a hexagonal architecture when:',\n")
+    parts.push("    'A balanced six-component system:',\n")
+    parts.push("    'Hexad symmetry refers to:',\n")
+    parts.push("    'Logical implication law: if A then:',\n")
+    parts.push("    'Sequential rule application proceeds:',\n")
+    parts.push("    'Closure under inference requires:',\n")
+    parts.push("    'A formal proof system is closed when:',\n")
+    parts.push("    'Integrated information measures partition independence:',\n")
+    parts.push("    'Phi quantifies irreducibility of system:',\n")
+    parts.push("    'Information integration is maximized when:',\n")
+    parts.push("    'A whole greater than sum of parts:',\n")
+    parts.push("    'Self-reference emerges when system observes:',\n")
+    parts.push("    'Recursive meta-cognition models:',\n")
+    parts.push("    'A self-aware system represents itself by:',\n")
+    parts.push("    'Strange loops in cognition arise from:',\n")
+    parts.push("][:N_PROBES]\n\n")
+
+    parts.push("FAMILIES = ['Hexad','Law','Phi','SelfRef']\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[sae-bp] base={BASE_MODEL} probes={N_PROBES} features={N_FEATURES} topk={TOPK} alpha={ALPHA}', flush=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n")
+    parts.push("mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map='auto', output_hidden_states=True)\n")
+    parts.push("mdl.eval()\n")
+    parts.push("h_dim = getattr(mdl.config, 'hidden_size', getattr(mdl.config, 'd_model', 4096))\n")
+    parts.push("print(f'[sae-bp] loaded {time.time()-t0:.1f}s h_dim={h_dim}', flush=True)\n\n")
+
+    parts.push("# Random sparse feature dictionary W: (h_dim, N_FEATURES) with SPARSITY nonzeros per col\n")
+    parts.push("rng = np.random.default_rng(RNG_SEED)\n")
+    parts.push("W = np.zeros((h_dim, N_FEATURES), dtype=np.float32)\n")
+    parts.push("nz_per_col = max(1, int(h_dim * SPARSITY))\n")
+    parts.push("for j in range(N_FEATURES):\n")
+    parts.push("    rows = rng.choice(h_dim, size=nz_per_col, replace=False)\n")
+    parts.push("    W[rows, j] = rng.standard_normal(nz_per_col).astype(np.float32)\n")
+    parts.push("    W[:, j] /= np.linalg.norm(W[:, j]) + 1e-9\n")
+    parts.push("print(f'[sae-bp] sparse W built: {N_FEATURES} cols × {nz_per_col} nz/col', flush=True)\n\n")
+
+    parts.push("# Family axes: deterministic random projection per family\n")
+    parts.push("family_axes = {}\n")
+    parts.push("for fam in FAMILIES:\n")
+    parts.push("    seed = abs(hash(fam)) % (2**31)\n")
+    parts.push("    r = np.random.default_rng(seed)\n")
+    parts.push("    A = r.standard_normal((h_dim, HID_TRUNC)).astype(np.float32)\n")
+    parts.push("    A /= np.linalg.norm(A, axis=0, keepdims=True) + 1e-9\n")
+    parts.push("    family_axes[fam] = A\n\n")
+
+    parts.push("def byte_weighted_mean(hidden, attn_mask):\n")
+    parts.push("    weights = attn_mask.float()\n")
+    parts.push("    w_sum = weights.sum(dim=1, keepdim=True).clamp(min=1.0)\n")
+    parts.push("    return ((hidden * weights.unsqueeze(-1)).sum(dim=1) / w_sum).float().cpu().numpy()\n\n")
+
+    parts.push("def project_family(h_vec):\n")
+    parts.push("    out = {}\n")
+    parts.push("    for fam, A in family_axes.items():\n")
+    parts.push("        proj = h_vec @ A\n")
+    parts.push("        out[fam] = float(np.linalg.norm(proj, axis=1).mean())\n")
+    parts.push("    return out\n\n")
+
+    parts.push("# Pass 1: collect per-probe last-layer hidden + family projections + feature acts\n")
+    parts.push("hiddens = []  # list of (h_dim,) per probe (token-aggregated)\n")
+    parts.push("Y_full = {fam: np.zeros(N_PROBES, dtype=np.float32) for fam in FAMILIES}\n")
+    parts.push("feat_acts = np.zeros((N_PROBES, N_FEATURES), dtype=np.float32)\n")
+    parts.push("for i, p in enumerate(PROMPTS):\n")
+    parts.push("    inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("    with torch.no_grad():\n")
+    parts.push("        out = mdl(**inp, output_hidden_states=True)\n")
+    parts.push("    h = byte_weighted_mean(out.hidden_states[-1], inp['attention_mask'])\n")
+    parts.push("    hiddens.append(h[0])\n")
+    parts.push("    proj = project_family(h)\n")
+    parts.push("    for fam in FAMILIES: Y_full[fam][i] = proj[fam]\n")
+    parts.push("    # ReLU(h @ W): sparse feature activations\n")
+    parts.push("    f = np.maximum(0.0, h[0] @ W)\n")
+    parts.push("    feat_acts[i] = f\n")
+    parts.push("    if (i+1) % 4 == 0:\n")
+    parts.push("        print(f'[sae-bp] pass1 {i+1}/{N_PROBES}', flush=True)\n\n")
+
+    parts.push("# Selectivity: corr(feat_acts[:, j], Y_full[fam]) per (j, fam)\n")
+    parts.push("# normalize columns of feat_acts\n")
+    parts.push("fa = feat_acts - feat_acts.mean(axis=0, keepdims=True)\n")
+    parts.push("fa_std = fa.std(axis=0) + 1e-9\n")
+    parts.push("fa_z = fa / fa_std\n")
+    parts.push("top_features_per_family = {}\n")
+    parts.push("selectivity_per_family = {}\n")
+    parts.push("for fam in FAMILIES:\n")
+    parts.push("    y = Y_full[fam] - Y_full[fam].mean()\n")
+    parts.push("    y_std = y.std() + 1e-9\n")
+    parts.push("    y_z = y / y_std\n")
+    parts.push("    corr = (fa_z.T @ y_z) / N_PROBES  # (N_FEATURES,)\n")
+    parts.push("    top_idx = np.argsort(-np.abs(corr))[:TOPK]\n")
+    parts.push("    top_features_per_family[fam] = top_idx.tolist()\n")
+    parts.push("    selectivity_per_family[fam] = round(float(np.abs(corr[top_idx]).mean()), 4)\n")
+    parts.push("    print(f'[sae-bp] {fam} topK selectivity mean={selectivity_per_family[fam]:.4f}', flush=True)\n\n")
+
+    parts.push("# Steering: for each family, build steer vec = sum(W[:, top_idx]) and add α to last hidden\n")
+    parts.push("# Re-forward with hook on last-layer output\n")
+    parts.push("layer_modules = None\n")
+    parts.push("for path in ['model.layers','transformer.h','gpt_neox.layers']:\n")
+    parts.push("    try:\n")
+    parts.push("        obj = mdl\n")
+    parts.push("        for part in path.split('.'): obj = getattr(obj, part)\n")
+    parts.push("        layer_modules = obj; break\n")
+    parts.push("    except (AttributeError, TypeError): continue\n")
+    parts.push("if layer_modules is None:\n")
+    parts.push("    print('[sae-bp] FATAL: layer modules not found', flush=True); sys.exit(1)\n")
+    parts.push("last_layer = layer_modules[-1]\n\n")
+
+    parts.push("steer_shifts = {}\n")
+    parts.push("for fam in FAMILIES:\n")
+    parts.push("    top_idx = np.array(top_features_per_family[fam])\n")
+    parts.push("    steer_vec = W[:, top_idx].sum(axis=1).astype(np.float32)\n")
+    parts.push("    steer_norm = float(np.linalg.norm(steer_vec))\n")
+    parts.push("    if steer_norm > 1e-9: steer_vec = steer_vec / steer_norm\n")
+    parts.push("    steer_t = torch.tensor(steer_vec * ALPHA, dtype=torch.bfloat16, device=mdl.device)\n")
+    parts.push("    def steer_hook(module, inp, out, sv=steer_t):\n")
+    parts.push("        if isinstance(out, tuple): h_out = out[0]\n")
+    parts.push("        else: h_out = out\n")
+    parts.push("        # add steer vec broadcast over (B, T, H)\n")
+    parts.push("        h_new = h_out + sv.view(1, 1, -1)\n")
+    parts.push("        if isinstance(out, tuple): return (h_new,) + out[1:]\n")
+    parts.push("        return h_new\n")
+    parts.push("    handle = last_layer.register_forward_hook(steer_hook)\n")
+    parts.push("    Y_steer = {f: np.zeros(N_PROBES, dtype=np.float32) for f in FAMILIES}\n")
+    parts.push("    try:\n")
+    parts.push("        for i, p in enumerate(PROMPTS):\n")
+    parts.push("            inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("            with torch.no_grad():\n")
+    parts.push("                out = mdl(**inp, output_hidden_states=True)\n")
+    parts.push("            h = byte_weighted_mean(out.hidden_states[-1], inp['attention_mask'])\n")
+    parts.push("            proj = project_family(h)\n")
+    parts.push("            for f in FAMILIES: Y_steer[f][i] = proj[f]\n")
+    parts.push("    finally:\n")
+    parts.push("        handle.remove()\n")
+    parts.push("    # Per-family shift due to steering toward fam\n")
+    parts.push("    shifts = {}\n")
+    parts.push("    for f in FAMILIES:\n")
+    parts.push("        delta = float(np.mean(Y_steer[f] - Y_full[f]))\n")
+    parts.push("        rel = delta / (float(np.mean(np.abs(Y_full[f]))) + 1e-9)\n")
+    parts.push("        shifts[f] = {'abs':round(delta,4),'rel':round(rel,4)}\n")
+    parts.push("    target_rel = shifts[fam]['rel']\n")
+    parts.push("    others_rel = [shifts[f]['rel'] for f in FAMILIES if f != fam]\n")
+    parts.push("    selectivity = target_rel - float(np.mean(others_rel))\n")
+    parts.push("    steer_shifts[fam] = {'shifts':shifts,'target_rel':target_rel,\n")
+    parts.push("        'others_mean_rel':round(float(np.mean(others_rel)),4),\n")
+    parts.push("        'selectivity':round(selectivity,4)}\n")
+    parts.push("    print(f'[sae-bp] steer {fam}: target={target_rel:.3f} others={float(np.mean(others_rel)):.3f} selectivity={selectivity:.3f}', flush=True)\n\n")
+
+    parts.push("# Gate: at least 2 of 4 families with selectivity > 0 (steering shifts target more than others)\n")
+    parts.push("n_selective = sum(1 for fam in FAMILIES if steer_shifts[fam]['selectivity'] > 0)\n")
+    parts.push("gate_pass = n_selective >= 2\n\n")
+
+    parts.push("summary = {'schema':'anima/sae_steer_bypass/1','backbone':BASE_MODEL,\n")
+    parts.push("    'n_probes':N_PROBES,'n_features':N_FEATURES,'topk':TOPK,'alpha':ALPHA,'sparsity':SPARSITY,\n")
+    parts.push("    'families':FAMILIES,\n")
+    parts.push("    'selectivity_per_family':selectivity_per_family,\n")
+    parts.push("    'steering_shifts':steer_shifts,\n")
+    parts.push("    'top_features_per_family':top_features_per_family,\n")
+    parts.push("    'n_selective':n_selective,'gate_PASS':gate_pass,\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[sae-bp] DONE n_selective={n_selective}/4 gate={\"PASS\" if gate_pass else \"FAIL\"} -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_sae_steer_bypass selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 measurement-axis P-B' (SAE-STEER bypass: random sparse features, no transformer_lens)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

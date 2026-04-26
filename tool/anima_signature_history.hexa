@@ -1,0 +1,208 @@
+// tool/anima_signature_history.hexa — backbone signature drift tracker (raw#9 hexa-only).
+//
+// PURPOSE
+//   Track v11_signature.json snapshots across timestamps for a backbone, compute
+//   per-axis Δ over time, flag regressions (Δ < -threshold) vs improvements
+//   (Δ > +threshold). Closes longitudinal evidence gap: paradigm v11 stack
+//   produces snapshot scores but no time-series view of signature drift.
+//   Mac-local utility, no GPU. Migration #25 (paradigm v11 LONGITUDINAL-LAYER 1st helper).
+//
+// INPUT FORMAT
+//   ANIMA_HISTORY_DIR    history dir (default: state/v11_history)
+//                        Expected layout: <prefix>/<backbone>/<YYYYMMDD_HHMMSS>/v11_signature.json
+//                        + per-axis JSONs (b_tom, mcca, etc.) for axis-level deltas
+//   ANIMA_BACKBONE       which backbone to track (default: 'all' = scan all subdirs)
+//   ANIMA_OUTPUT         output JSON (default: <HISTORY_DIR>/signature_drift.json)
+//   ANIMA_REGRESSION_TH  Δ threshold for regression flag (default: -0.05)
+//   ANIMA_IMPROVEMENT_TH Δ threshold for improvement flag (default: +0.05)
+//
+// OUTPUTS
+//   - signature_drift.json: per-backbone time series + Δ trend per axis + regression flags
+//   - markdown summary table to stdout
+//
+// USAGE
+//   hexa run tool/anima_signature_history.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_signature_history_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima signature history helper — emitted by tool/anima_signature_history.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 LONGITUDINAL-LAYER (drift tracker).\n")
+    parts.push("import json, os, sys, math, re\n\n")
+
+    parts.push("HIST_DIR = os.environ.get('ANIMA_HISTORY_DIR', 'state/v11_history')\n")
+    parts.push("BACKBONE = os.environ.get('ANIMA_BACKBONE', 'all')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', os.path.join(HIST_DIR, 'signature_drift.json'))\n")
+    parts.push("REG_TH = float(os.environ.get('ANIMA_REGRESSION_TH', '-0.05'))\n")
+    parts.push("IMP_TH = float(os.environ.get('ANIMA_IMPROVEMENT_TH', '0.05'))\n")
+    parts.push("if not os.path.isdir(HIST_DIR):\n")
+    parts.push("    print(f'ERROR: ANIMA_HISTORY_DIR not a dir: {HIST_DIR!r}', file=sys.stderr)\n")
+    parts.push("    sys.exit(2)\n\n")
+
+    parts.push("# Axis extractors (same shape as v11_integrate/orthogonality)\n")
+    parts.push("def x_an11b(d):\n")
+    parts.push("    fp = os.path.join(d, 'eigen_cosine.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    return o.get('top1_max_cosine') or o.get('max_cosine')\n")
+    parts.push("def x_btom(d):\n")
+    parts.push("    fp = os.path.join(d, 'b_tom.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: return json.load(f).get('accuracy')\n")
+    parts.push("def x_mcca(d):\n")
+    parts.push("    fp = os.path.join(d, 'mcca.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    b = o.get('brier_mean')\n")
+    parts.push("    return None if b is None else max(0.0, 1.0 - min(b,1.0))\n")
+    parts.push("def x_phi(d):\n")
+    parts.push("    fp = os.path.join(d, 'phi_star.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    p = o.get('phi_star_min')\n")
+    parts.push("    return None if p is None else (math.tanh(p)+1.0)/2.0\n")
+    parts.push("def x_cmt(d):\n")
+    parts.push("    fp = os.path.join(d, 'cmt.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    dom = o.get('dominant_layer_per_family', {})\n")
+    parts.push("    if not dom: return None\n")
+    parts.push("    rels = [v.get('rel',0.0) for v in dom.values()]\n")
+    parts.push("    return sum(rels)/len(rels) if rels else None\n")
+    parts.push("def x_cds(d):\n")
+    parts.push("    fp = os.path.join(d, 'cds.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: return json.load(f).get('max_stability')\n")
+    parts.push("def x_sae(d):\n")
+    parts.push("    fp = os.path.join(d, 'sae_steer_bypass.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    sh = o.get('steering_shifts', {})\n")
+    parts.push("    if not sh: return None\n")
+    parts.push("    sels = [v.get('selectivity',0.0) for v in sh.values()]\n")
+    parts.push("    return sum(max(0.0,s) for s in sels)/len(sels)\n")
+    parts.push("def x_composite(d):\n")
+    parts.push("    fp = os.path.join(d, 'v11_signature.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: return json.load(f).get('composite_geometric_mean')\n\n")
+
+    parts.push("AXES = [('AN11_b',x_an11b),('B_ToM',x_btom),('MCCA',x_mcca),('PhiStar',x_phi),\n")
+    parts.push("        ('CMT',x_cmt),('CDS',x_cds),('SAE_bp',x_sae),('Composite',x_composite)]\n\n")
+
+    parts.push("# Discover backbones\n")
+    parts.push("if BACKBONE == 'all':\n")
+    parts.push("    backbones = sorted([d for d in os.listdir(HIST_DIR) if os.path.isdir(os.path.join(HIST_DIR, d))])\n")
+    parts.push("else:\n")
+    parts.push("    backbones = [BACKBONE]\n\n")
+
+    parts.push("# Timestamp pattern: YYYYMMDD_HHMMSS or any sortable name\n")
+    parts.push("TS_RE = re.compile(r'^(\\d{8}_\\d{6}|\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z?|\\d{14})')\n\n")
+
+    parts.push("backbone_records = []\n")
+    parts.push("for bb in backbones:\n")
+    parts.push("    bb_dir = os.path.join(HIST_DIR, bb)\n")
+    parts.push("    if not os.path.isdir(bb_dir):\n")
+    parts.push("        continue\n")
+    parts.push("    snapshots = sorted([d for d in os.listdir(bb_dir) if os.path.isdir(os.path.join(bb_dir, d))])\n")
+    parts.push("    if not snapshots:\n")
+    parts.push("        backbone_records.append({'backbone':bb,'n_snapshots':0,'reason':'no snapshot subdirs'})\n")
+    parts.push("        continue\n")
+    parts.push("    series = []\n")
+    parts.push("    for ts in snapshots:\n")
+    parts.push("        snap_dir = os.path.join(bb_dir, ts)\n")
+    parts.push("        snap = {'ts':ts,'dir':snap_dir,'axes':{}}\n")
+    parts.push("        for name, fn in AXES:\n")
+    parts.push("            snap['axes'][name] = fn(snap_dir)\n")
+    parts.push("        series.append(snap)\n")
+    parts.push("    # per-axis Δ chain: snap[i+1].axis - snap[i].axis\n")
+    parts.push("    deltas = []\n")
+    parts.push("    for i in range(1, len(series)):\n")
+    parts.push("        prev, curr = series[i-1], series[i]\n")
+    parts.push("        d_axes = {}\n")
+    parts.push("        for name, _ in AXES:\n")
+    parts.push("            p = prev['axes'].get(name); c = curr['axes'].get(name)\n")
+    parts.push("            if p is None or c is None: d_axes[name] = None\n")
+    parts.push("            else: d_axes[name] = round(float(c) - float(p), 4)\n")
+    parts.push("        deltas.append({'from_ts':prev['ts'],'to_ts':curr['ts'],'delta_axes':d_axes})\n")
+    parts.push("    # latest vs first overall trend\n")
+    parts.push("    overall = {}\n")
+    parts.push("    if len(series) >= 2:\n")
+    parts.push("        first, last = series[0], series[-1]\n")
+    parts.push("        for name, _ in AXES:\n")
+    parts.push("            p = first['axes'].get(name); c = last['axes'].get(name)\n")
+    parts.push("            if p is None or c is None: overall[name] = None\n")
+    parts.push("            else: overall[name] = round(float(c) - float(p), 4)\n")
+    parts.push("    # regression / improvement flags on overall (vs first snapshot)\n")
+    parts.push("    regressions = [name for name, d in overall.items() if d is not None and d <= REG_TH]\n")
+    parts.push("    improvements = [name for name, d in overall.items() if d is not None and d >= IMP_TH]\n")
+    parts.push("    backbone_records.append({\n")
+    parts.push("        'backbone':bb,'n_snapshots':len(series),\n")
+    parts.push("        'first_ts':series[0]['ts'] if series else None,\n")
+    parts.push("        'last_ts':series[-1]['ts'] if series else None,\n")
+    parts.push("        'series':series,'pairwise_deltas':deltas,\n")
+    parts.push("        'overall_delta_first_to_last':overall,\n")
+    parts.push("        'regression_axes':regressions,'improvement_axes':improvements,\n")
+    parts.push("        'regression_threshold':REG_TH,'improvement_threshold':IMP_TH})\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("summary = {'schema':'anima/signature_history/1','history_dir':HIST_DIR,\n")
+    parts.push("    'n_backbones':len(backbone_records),\n")
+    parts.push("    'regression_threshold':REG_TH,'improvement_threshold':IMP_TH,\n")
+    parts.push("    'backbones':backbone_records}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n\n")
+
+    parts.push("# Markdown summary to stdout\n")
+    parts.push("print()\n")
+    parts.push("for r in backbone_records:\n")
+    parts.push("    if r.get('n_snapshots', 0) < 2:\n")
+    parts.push("        print(f'## {r[\"backbone\"]}: {r.get(\"n_snapshots\",0)} snapshot(s) — need ≥2 for trend')\n")
+    parts.push("        continue\n")
+    parts.push("    print(f'## {r[\"backbone\"]} ({r[\"n_snapshots\"]} snapshots: {r[\"first_ts\"]} → {r[\"last_ts\"]})')\n")
+    parts.push("    od = r['overall_delta_first_to_last']\n")
+    parts.push("    print('| axis | Δ (first→last) | trend |')\n")
+    parts.push("    print('|---|---|---|')\n")
+    parts.push("    for name, _ in AXES:\n")
+    parts.push("        d = od.get(name)\n")
+    parts.push("        if d is None: trend = 'n/a'\n")
+    parts.push("        elif d <= REG_TH: trend = '⬇ REG'\n")
+    parts.push("        elif d >= IMP_TH: trend = '⬆ IMP'\n")
+    parts.push("        else: trend = '· flat'\n")
+    parts.push("        ds = 'n/a' if d is None else f'{d:+.4f}'\n")
+    parts.push("        print(f'| {name} | {ds} | {trend} |')\n")
+    parts.push("    if r['regression_axes']: print(f'**REGRESSIONS**: {r[\"regression_axes\"]}')\n")
+    parts.push("    if r['improvement_axes']: print(f'**IMPROVEMENTS**: {r[\"improvement_axes\"]}')\n")
+    parts.push("    print()\n")
+    parts.push("print(f'[history] {len(backbone_records)} backbones tracked -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_signature_history selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 LONGITUDINAL-LAYER (per-backbone signature drift over time + regression flags)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

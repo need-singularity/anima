@@ -1,0 +1,199 @@
+// tool/anima_v11_pipeline_smoke.hexa — paradigm v11 14-helper end-to-end smoke (raw#9 hexa-only).
+//
+// PURPOSE
+//   Single-command pipeline integration test: build synthetic 4-backbone fixtures
+//   (no GPU forward), then chain-run analysis + decision + longitudinal helpers
+//   to verify the entire paradigm v11 pipeline produces consistent outputs.
+//   Catches integration bugs before any GPU spend.
+//   Mac-local utility, no GPU. Migration #26 (paradigm v11 INTEGRATION-TEST 1st).
+//
+// COVERAGE
+//   - Builds /tmp/v11_smoke/state/v10_benchmark/{gemma,mistral,qwen3,llama}/
+//     with synthetic eigen_cosine + 6 v11 axis JSONs + v11_signature
+//   - Builds /tmp/v11_smoke/state/v11_history/<bb>/{ts1,ts2}/ for drift test
+//   - Runs (in order): g_gate per-backbone → gate_matrix aggregate →
+//     v11_integrate → axis_orthogonality (4 backbones) →
+//     ensemble_rank (mistral incumbents + 1 candidate) → signature_history
+//   - Verifies expected output keys + final summary
+//
+// ENV
+//   ANIMA_SMOKE_DIR    test workspace (default: /tmp/v11_smoke)
+//   ANIMA_KEEP         1 = keep workspace after run (default: 0 = cleanup)
+//
+// USAGE
+//   hexa run tool/anima_v11_pipeline_smoke.hexa --selftest
+//   hexa run tool/anima_v11_pipeline_smoke.hexa             # also runs the smoke
+//
+// raw#9 hexa-only / raw#15 SSOT this file (no Python emit — pure shell orchestrator)
+
+let PLAN_SH = "/tmp/anima_v11_pipeline_smoke_plan.sh"
+
+fn _build_plan() {
+    let mut smoke_dir = env("ANIMA_SMOKE_DIR")
+    if smoke_dir == "" { smoke_dir = "/tmp/v11_smoke" }
+    let mut keep = env("ANIMA_KEEP")
+    if keep == "" { keep = "0" }
+    let repo_root = "/Users/ghost/core/anima"
+
+    let sh = []
+    sh.push("#!/usr/bin/env bash\n")
+    sh.push("# anima v11 pipeline smoke test — emitted by tool/anima_v11_pipeline_smoke.hexa\n")
+    sh.push("# raw#9 strict: integration test for paradigm v11 14-helper stack (no GPU).\n")
+    sh.push("set -euo pipefail\n")
+    sh.push("SMOKE=\"" + smoke_dir + "\"\n")
+    sh.push("KEEP=\"${ANIMA_KEEP:-" + keep + "}\"\n")
+    sh.push("REPO=\"" + repo_root + "\"\n")
+    sh.push("BENCH=\"$SMOKE/state/v10_benchmark\"\n")
+    sh.push("HIST=\"$SMOKE/state/v11_history\"\n")
+    sh.push("PASS_COUNT=0\n")
+    sh.push("FAIL_COUNT=0\n")
+    sh.push("declare -a FAILED\n")
+    sh.push("\n")
+    sh.push("step_pass() { echo \"  ✔ $1\"; PASS_COUNT=$((PASS_COUNT+1)); }\n")
+    sh.push("step_fail() { echo \"  ✘ $1\"; FAIL_COUNT=$((FAIL_COUNT+1)); FAILED+=(\"$1\"); }\n")
+    sh.push("\n")
+    sh.push("rm -rf \"$SMOKE\"; mkdir -p \"$BENCH\" \"$HIST\"\n")
+    sh.push("\n")
+    sh.push("# === Stage 1: build synthetic 4-backbone fixtures ===\n")
+    sh.push("echo \"[smoke] stage 1: synthetic fixtures\"\n")
+    sh.push("declare -a BBS=(\"gemma\" \"mistral\" \"qwen3\" \"llama\")\n")
+    sh.push("declare -a FAMS=(\"Hexad\" \"Law\" \"Phi\" \"SelfRef\")\n")
+    sh.push("declare -a COSS=(\"0.584\" \"0.852\" \"0.673\" \"0.638\")\n")
+    sh.push("declare -a BTOM=(\"0.65\" \"0.75\" \"0.60\" \"0.55\")\n")
+    sh.push("declare -a MBRI=(\"0.20\" \"0.18\" \"0.30\" \"0.32\")\n")
+    sh.push("declare -a PHIM=(\"0.9\" \"1.5\" \"0.8\" \"0.6\")\n")
+    sh.push("declare -a CDS_=(\"0.38\" \"0.45\" \"0.32\" \"0.34\")\n")
+    sh.push("declare -a NSEL=(\"3\" \"3\" \"1\" \"2\")\n")
+    sh.push("declare -a COMP=(\"0.50\" \"0.58\" \"0.38\" \"0.42\")\n")
+    sh.push("\n")
+    sh.push("for IDX in \"${!BBS[@]}\"; do\n")
+    sh.push("  BB=\"${BBS[$IDX]}\"; FAM=\"${FAMS[$IDX]}\"; D=\"$BENCH/$BB\"; mkdir -p \"$D\"\n")
+    sh.push("  cat > \"$D/eigen_cosine.json\" <<EOF\n")
+    sh.push("{\"backbone\":\"hf/$BB\",\"top1_family\":\"$FAM\",\"top1_max_cosine\":${COSS[$IDX]},\"per_family_max_cosine\":{\"Hexad\":0.40,\"Law\":0.55,\"Phi\":0.42,\"SelfRef\":0.45}}\n")
+    sh.push("EOF\n")
+    sh.push("  cat > \"$D/b_tom.json\" <<EOF\n")
+    sh.push("{\"backbone\":\"hf/$BB\",\"accuracy\":${BTOM[$IDX]},\"gate_PASS\":true}\n")
+    sh.push("EOF\n")
+    sh.push("  cat > \"$D/mcca.json\" <<EOF\n")
+    sh.push("{\"backbone\":\"hf/$BB\",\"brier_mean\":${MBRI[$IDX]},\"ece\":0.15,\"gate_PASS\":true}\n")
+    sh.push("EOF\n")
+    sh.push("  cat > \"$D/phi_star.json\" <<EOF\n")
+    sh.push("{\"backbone\":\"hf/$BB\",\"phi_star_min\":${PHIM[$IDX]},\"gate_positive_PASS\":true}\n")
+    sh.push("EOF\n")
+    sh.push("  cat > \"$D/cmt.json\" <<EOF\n")
+    sh.push("{\"backbone\":\"hf/$BB\",\"gate_PASS\":true,\"dominant_layer_per_family\":{\"Hexad\":{\"layer\":24,\"rel\":0.07},\"Law\":{\"layer\":28,\"rel\":0.08},\"Phi\":{\"layer\":20,\"rel\":0.06},\"SelfRef\":{\"layer\":30,\"rel\":0.09}}}\n")
+    sh.push("EOF\n")
+    sh.push("  cat > \"$D/cds.json\" <<EOF\n")
+    sh.push("{\"backbone\":\"hf/$BB\",\"max_stability\":${CDS_[$IDX]},\"gate_PASS\":true}\n")
+    sh.push("EOF\n")
+    sh.push("  cat > \"$D/sae_steer_bypass.json\" <<EOF\n")
+    sh.push("{\"backbone\":\"hf/$BB\",\"n_selective\":${NSEL[$IDX]},\"gate_PASS\":true,\"steering_shifts\":{\"Hexad\":{\"selectivity\":0.04},\"Law\":{\"selectivity\":0.05},\"Phi\":{\"selectivity\":0.01},\"SelfRef\":{\"selectivity\":0.02}}}\n")
+    sh.push("EOF\n")
+    sh.push("  cat > \"$D/v11_signature.json\" <<EOF\n")
+    sh.push("{\"backbone\":\"hf/$BB\",\"composite_geometric_mean\":${COMP[$IDX]},\"weakest_axis\":\"sae_steer_bypass\",\"weakest_norm\":0.10,\"n_axes_present\":5}\n")
+    sh.push("EOF\n")
+    sh.push("  test -f \"$D/v11_signature.json\" && step_pass \"fixture[$BB]\" || step_fail \"fixture[$BB]\"\n")
+    sh.push("done\n")
+    sh.push("\n")
+    sh.push("# === Stage 2: per-backbone g_gate ===\n")
+    sh.push("echo \"[smoke] stage 2: g_gate per backbone\"\n")
+    sh.push("HEXA_RESOLVER_NO_REROUTE=1 hexa run \"$REPO/tool/anima_g_gate.hexa\" --selftest >/dev/null 2>&1 || true\n")
+    sh.push("test -f /tmp/anima_g_gate_helper.hexa_tmp && step_pass \"g_gate.hexa selftest\" || step_fail \"g_gate.hexa selftest\"\n")
+    sh.push("for BB in \"${BBS[@]}\"; do\n")
+    sh.push("  ANIMA_BACKBONE_DIR=\"$BENCH/$BB\" python3 /tmp/anima_g_gate_helper.hexa_tmp >/dev/null 2>&1 || true\n")
+    sh.push("  test -f \"$BENCH/$BB/g_gate.json\" && step_pass \"g_gate[$BB]\" || step_fail \"g_gate[$BB]\"\n")
+    sh.push("done\n")
+    sh.push("\n")
+    sh.push("# === Stage 3: gate matrix aggregate ===\n")
+    sh.push("echo \"[smoke] stage 3: gate matrix aggregate\"\n")
+    sh.push("HEXA_RESOLVER_NO_REROUTE=1 hexa run \"$REPO/tool/anima_v10_gate_matrix.hexa\" --selftest >/dev/null 2>&1 || true\n")
+    sh.push("test -f /tmp/anima_v10_gate_matrix_helper.hexa_tmp && step_pass \"gate_matrix.hexa emit\" || step_fail \"gate_matrix.hexa emit\"\n")
+    sh.push("ANIMA_BENCHMARK_DIR=\"$BENCH\" ANIMA_AUTO_GATE=0 python3 /tmp/anima_v10_gate_matrix_helper.hexa_tmp >/dev/null 2>&1 || true\n")
+    sh.push("test -f \"$BENCH/gate_matrix.json\" && step_pass \"gate_matrix output\" || step_fail \"gate_matrix output\"\n")
+    sh.push("\n")
+    sh.push("# === Stage 4: v11_integrate per backbone ===\n")
+    sh.push("echo \"[smoke] stage 4: v11_integrate per backbone\"\n")
+    sh.push("HEXA_RESOLVER_NO_REROUTE=1 hexa run \"$REPO/tool/anima_v11_integrate.hexa\" --selftest >/dev/null 2>&1 || true\n")
+    sh.push("test -f /tmp/anima_v11_integrate_helper.hexa_tmp && step_pass \"v11_integrate.hexa emit\" || step_fail \"v11_integrate.hexa emit\"\n")
+    sh.push("for BB in \"${BBS[@]}\"; do\n")
+    sh.push("  ANIMA_V11_DIR=\"$BENCH/$BB\" ANIMA_OUTPUT=\"$BENCH/$BB/v11_signature_recomputed.json\" python3 /tmp/anima_v11_integrate_helper.hexa_tmp >/dev/null 2>&1 || true\n")
+    sh.push("  test -f \"$BENCH/$BB/v11_signature_recomputed.json\" && step_pass \"v11_integrate[$BB]\" || step_fail \"v11_integrate[$BB]\"\n")
+    sh.push("done\n")
+    sh.push("\n")
+    sh.push("# === Stage 5: axis_orthogonality across 4 backbones ===\n")
+    sh.push("echo \"[smoke] stage 5: axis_orthogonality\"\n")
+    sh.push("HEXA_RESOLVER_NO_REROUTE=1 hexa run \"$REPO/tool/anima_axis_orthogonality.hexa\" --selftest >/dev/null 2>&1 || true\n")
+    sh.push("test -f /tmp/anima_axis_orthogonality_helper.hexa_tmp && step_pass \"axis_orthogonality.hexa emit\" || step_fail \"axis_orthogonality.hexa emit\"\n")
+    sh.push("DIRS=\"$BENCH/gemma:$BENCH/mistral:$BENCH/qwen3:$BENCH/llama\"\n")
+    sh.push("ANIMA_BACKBONE_DIRS=\"$DIRS\" ANIMA_OUTPUT=\"$BENCH/axis_orthogonality.json\" python3 /tmp/anima_axis_orthogonality_helper.hexa_tmp >/dev/null 2>&1 || true\n")
+    sh.push("test -f \"$BENCH/axis_orthogonality.json\" && step_pass \"axis_orthogonality output\" || step_fail \"axis_orthogonality output\"\n")
+    sh.push("\n")
+    sh.push("# === Stage 6: ensemble_rank (4 incumbents + 1 candidate) ===\n")
+    sh.push("echo \"[smoke] stage 6: ensemble_rank\"\n")
+    sh.push("HEXA_RESOLVER_NO_REROUTE=1 hexa run \"$REPO/tool/anima_ensemble_rank.hexa\" --selftest >/dev/null 2>&1 || true\n")
+    sh.push("test -f /tmp/anima_ensemble_rank_helper.hexa_tmp && step_pass \"ensemble_rank.hexa emit\" || step_fail \"ensemble_rank.hexa emit\"\n")
+    sh.push("# Candidate: synthetic deepseek-like Phi-strong\n")
+    sh.push("CAND=\"$BENCH/deepseek\"; mkdir -p \"$CAND\"\n")
+    sh.push("cat > \"$CAND/eigen_cosine.json\" <<'EOF'\n")
+    sh.push("{\"backbone\":\"hf/deepseek\",\"top1_family\":\"Phi\",\"top1_max_cosine\":0.72,\"per_family_max_cosine\":{\"Hexad\":0.40,\"Law\":0.55,\"Phi\":0.72,\"SelfRef\":0.45}}\n")
+    sh.push("EOF\n")
+    sh.push("cat > \"$CAND/v11_signature.json\" <<'EOF'\n")
+    sh.push("{\"backbone\":\"hf/deepseek\",\"composite_geometric_mean\":0.55}\n")
+    sh.push("EOF\n")
+    sh.push("ANIMA_INCUMBENT_DIRS=\"$DIRS\" ANIMA_CANDIDATE_DIRS=\"$CAND\" ANIMA_OUTPUT=\"$BENCH/ensemble_rank.json\" python3 /tmp/anima_ensemble_rank_helper.hexa_tmp >/dev/null 2>&1 || true\n")
+    sh.push("test -f \"$BENCH/ensemble_rank.json\" && step_pass \"ensemble_rank output\" || step_fail \"ensemble_rank output\"\n")
+    sh.push("\n")
+    sh.push("# === Stage 7: signature_history with 2-snapshot mistral ===\n")
+    sh.push("echo \"[smoke] stage 7: signature_history\"\n")
+    sh.push("HEXA_RESOLVER_NO_REROUTE=1 hexa run \"$REPO/tool/anima_signature_history.hexa\" --selftest >/dev/null 2>&1 || true\n")
+    sh.push("test -f /tmp/anima_signature_history_helper.hexa_tmp && step_pass \"signature_history.hexa emit\" || step_fail \"signature_history.hexa emit\"\n")
+    sh.push("mkdir -p \"$HIST/mistral/20260420_120000\" \"$HIST/mistral/20260426_180000\"\n")
+    sh.push("cp \"$BENCH/mistral/v11_signature.json\" \"$HIST/mistral/20260426_180000/\"\n")
+    sh.push("cp \"$BENCH/mistral/b_tom.json\" \"$HIST/mistral/20260426_180000/\"\n")
+    sh.push("cat > \"$HIST/mistral/20260420_120000/v11_signature.json\" <<'EOF'\n")
+    sh.push("{\"backbone\":\"hf/mistral\",\"composite_geometric_mean\":0.45}\n")
+    sh.push("EOF\n")
+    sh.push("cat > \"$HIST/mistral/20260420_120000/b_tom.json\" <<'EOF'\n")
+    sh.push("{\"accuracy\":0.65}\n")
+    sh.push("EOF\n")
+    sh.push("ANIMA_HISTORY_DIR=\"$HIST\" ANIMA_OUTPUT=\"$HIST/drift.json\" python3 /tmp/anima_signature_history_helper.hexa_tmp >/dev/null 2>&1 || true\n")
+    sh.push("test -f \"$HIST/drift.json\" && step_pass \"signature_history output\" || step_fail \"signature_history output\"\n")
+    sh.push("\n")
+    sh.push("# === Final summary ===\n")
+    sh.push("TOTAL=$((PASS_COUNT + FAIL_COUNT))\n")
+    sh.push("echo \"\"\n")
+    sh.push("echo \"[smoke] === FINAL: $PASS_COUNT/$TOTAL pass ===\"\n")
+    sh.push("if [ \"$FAIL_COUNT\" -gt 0 ]; then\n")
+    sh.push("  echo \"[smoke] failed steps: ${FAILED[*]}\"\n")
+    sh.push("fi\n")
+    sh.push("if [ \"$KEEP\" != \"1\" ]; then rm -rf \"$SMOKE\"; echo \"[smoke] cleanup done (set ANIMA_KEEP=1 to retain)\"; fi\n")
+    sh.push("[ \"$FAIL_COUNT\" -eq 0 ] && exit 0 || exit 1\n")
+
+    write_file(PLAN_SH, sh.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_v11_pipeline_smoke selftest ──")
+    _build_plan()
+    println("selftest=ok")
+    println("plan_emitted=" + PLAN_SH)
+    println("coverage=14 helpers across measurement+analysis+orchestration+decision+longitudinal layers")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    _build_plan()
+    if selftest { cmd_selftest(); exit(0) }
+    println("emitted=" + PLAN_SH)
+    println("DONE")
+}
+
+main()

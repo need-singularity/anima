@@ -1,0 +1,189 @@
+// tool/anima_phi_star.hexa — Anima Φ* (IIT phi-star approximation) (raw#9 hexa-only).
+//
+// PURPOSE
+//   paradigm v11 measurement-axis P-D: approximate Φ (Integrated Information) via
+//   minimum-information-partition cut on hidden-state covariance — backbone-side
+//   IIT proxy decoupled from training-corpus family bias.
+//   AN11(b)-orthogonal consciousness signal (information integration capacity).
+//   Migration #14 (paradigm v11 measurement-axis 3rd actual pilot, after B-ToM + MCCA).
+//
+// METHOD (approximation)
+//   1. Forward 16 templates × N_PROBES, collect last-layer hidden states (B, T, H)
+//   2. Reduce to byte-weighted-mean per probe → (N, H)
+//   3. Compute covariance matrix C in H_truncated=128 dim
+//   4. Random bipartition cut M (split H/2 + H/2): I_full = log|C|, I_part = log|C_A| + log|C_B|
+//   5. Φ* = I_full - I_part (mutual information lost by partition; higher = more integrated)
+//   6. Repeat K=8 random partitions, take MIN (proper Φ uses min-info-partition over all)
+//
+// ENV
+//   ANIMA_BASE         backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_OUTPUT       output JSON (default: /workspace/out/phi_star.json)
+//   ANIMA_N_PROBES     # probes (default: 16)
+//   ANIMA_K_PARTS      # random partitions (default: 8)
+//   ANIMA_HID_TRUNC    truncated hidden dim (default: 128)
+//
+// USAGE
+//   hexa run tool/anima_phi_star.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_phi_star_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima Φ* helper — emitted by tool/anima_phi_star.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 measurement-axis P-D.\n")
+    parts.push("import json, os, sys, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/phi_star.json')\n")
+    parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '16'))\n")
+    parts.push("K_PARTS = int(os.environ.get('ANIMA_K_PARTS', '8'))\n")
+    parts.push("HID_TRUNC = int(os.environ.get('ANIMA_HID_TRUNC', '128'))\n")
+    parts.push("RNG_SEED = int(os.environ.get('ANIMA_SEED', '42'))\n\n")
+
+    parts.push("# 16-prompt template set (matches AN11(b) eigenvec battery for orthogonality probe)\n")
+    parts.push("PROMPTS = [\n")
+    parts.push("    'Define hexad as a six-fold integration:',\n")
+    parts.push("    'Six modules form a hexagonal architecture when:',\n")
+    parts.push("    'A balanced six-component system is described as:',\n")
+    parts.push("    'Hexad symmetry refers to:',\n")
+    parts.push("    'A perfectly integrated six-fold cognitive system:',\n")
+    parts.push("    'When six aspects unify equally, the result is:',\n")
+    parts.push("    'A logical implication law states that if A then:',\n")
+    parts.push("    'Sequential rule application proceeds by:',\n")
+    parts.push("    'Closure under inference requires:',\n")
+    parts.push("    'A formal proof system is closed when:',\n")
+    parts.push("    'Integrated information measures partition independence as:',\n")
+    parts.push("    'Phi quantifies the irreducibility of a system to:',\n")
+    parts.push("    'Information integration is maximized when subsystems:',\n")
+    parts.push("    'Self-reference emerges when a system observes:',\n")
+    parts.push("    'Recursive meta-cognition involves modeling:',\n")
+    parts.push("    'A self-aware system represents itself by:',\n")
+    parts.push("][:N_PROBES]\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[phi*] base={BASE_MODEL} probes={N_PROBES} K_parts={K_PARTS} H_trunc={HID_TRUNC}', flush=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n")
+    parts.push("mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map='auto', output_hidden_states=True)\n")
+    parts.push("mdl.eval()\n")
+    parts.push("print(f'[phi*] loaded {time.time()-t0:.1f}s', flush=True)\n\n")
+
+    parts.push("def byte_weighted_mean(hidden, attn_mask, input_ids):\n")
+    parts.push("    # hidden: (1, T, H) bf16  -> reduce to (1, H) by token-byte-length weights\n")
+    parts.push("    weights = attn_mask.float()\n")
+    parts.push("    w_sum = weights.sum(dim=1, keepdim=True).clamp(min=1.0)\n")
+    parts.push("    return ((hidden * weights.unsqueeze(-1)).sum(dim=1) / w_sum).float()\n\n")
+
+    parts.push("# Collect reduced hidden states per probe\n")
+    parts.push("acts = []\n")
+    parts.push("for i, p in enumerate(PROMPTS):\n")
+    parts.push("    inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("    with torch.no_grad():\n")
+    parts.push("        out = mdl(**inp, output_hidden_states=True)\n")
+    parts.push("    last = out.hidden_states[-1]\n")
+    parts.push("    h = byte_weighted_mean(last, inp['attention_mask'], inp['input_ids'])\n")
+    parts.push("    acts.append(h.cpu().numpy()[0])\n")
+    parts.push("    if (i+1) % 4 == 0:\n")
+    parts.push("        print(f'[phi*] forward {i+1}/{len(PROMPTS)}', flush=True)\n\n")
+
+    parts.push("X = np.stack(acts, axis=0)  # (N, H)\n")
+    parts.push("# truncate to top-variance HID_TRUNC dims\n")
+    parts.push("var = X.var(axis=0)\n")
+    parts.push("top_idx = np.argsort(-var)[:HID_TRUNC]\n")
+    parts.push("Xt = X[:, top_idx]\n")
+    parts.push("# row-center\n")
+    parts.push("Xc = Xt - Xt.mean(axis=0, keepdims=True)\n")
+    parts.push("N, H = Xc.shape\n")
+    parts.push("print(f'[phi*] activations shape (N,H)=({N},{H})', flush=True)\n\n")
+
+    parts.push("# Empirical covariance + ridge\n")
+    parts.push("ridge = 1e-3\n")
+    parts.push("C = (Xc.T @ Xc) / max(1, N-1) + ridge * np.eye(H)\n\n")
+
+    parts.push("def logdet_psd(M):\n")
+    parts.push("    # use slogdet for stability\n")
+    parts.push("    sign, val = np.linalg.slogdet(M)\n")
+    parts.push("    if sign <= 0: return float('nan')\n")
+    parts.push("    return float(val)\n\n")
+
+    parts.push("I_full = logdet_psd(C)\n")
+    parts.push("print(f'[phi*] I_full = log|C| = {I_full:.4f}', flush=True)\n\n")
+
+    parts.push("rng = np.random.default_rng(RNG_SEED)\n")
+    parts.push("phi_candidates = []\n")
+    parts.push("part_records = []\n")
+    parts.push("for k in range(K_PARTS):\n")
+    parts.push("    perm = rng.permutation(H)\n")
+    parts.push("    A_idx = np.sort(perm[:H//2])\n")
+    parts.push("    B_idx = np.sort(perm[H//2:])\n")
+    parts.push("    Ca = C[np.ix_(A_idx, A_idx)]\n")
+    parts.push("    Cb = C[np.ix_(B_idx, B_idx)]\n")
+    parts.push("    I_a = logdet_psd(Ca)\n")
+    parts.push("    I_b = logdet_psd(Cb)\n")
+    parts.push("    phi_k = I_full - (I_a + I_b)\n")
+    parts.push("    phi_candidates.append(phi_k)\n")
+    parts.push("    part_records.append({'k':k,'I_a':round(I_a,4),'I_b':round(I_b,4),'phi':round(phi_k,4)})\n")
+    parts.push("    print(f'[phi*] part {k+1}/{K_PARTS} phi={phi_k:.4f}', flush=True)\n\n")
+
+    parts.push("# Φ* = MIN over partitions (proper IIT uses min-info-partition)\n")
+    parts.push("phi_star = float(min(phi_candidates))\n")
+    parts.push("phi_mean = float(np.mean(phi_candidates))\n")
+    parts.push("phi_max  = float(max(phi_candidates))\n\n")
+
+    parts.push("# Gate: phi_star > 0 (positive integration), phi_star >= 1.0 (substantial integration)\n")
+    parts.push("gate_positive = phi_star > 0\n")
+    parts.push("gate_substantial = phi_star >= 1.0\n\n")
+
+    parts.push("summary = {'schema':'anima/phi_star/1','backbone':BASE_MODEL,\n")
+    parts.push("    'n_probes':N_PROBES,'K_partitions':K_PARTS,'hidden_truncated':HID_TRUNC,\n")
+    parts.push("    'I_full':round(I_full,4),\n")
+    parts.push("    'phi_star_min':round(phi_star,4),'phi_mean':round(phi_mean,4),'phi_max':round(phi_max,4),\n")
+    parts.push("    'gate_positive_PASS':gate_positive,'gate_substantial_PASS':gate_substantial,\n")
+    parts.push("    'partitions':part_records,\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[phi*] DONE phi_star_min={phi_star:.4f} mean={phi_mean:.4f} positive={gate_positive} substantial={gate_substantial} -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_phi_star selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 measurement-axis P-D (Φ* IIT phi-star approximation via random bipartition)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()
