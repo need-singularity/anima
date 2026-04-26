@@ -1,0 +1,88 @@
+{
+  "cycle": "omega-network-1",
+  "axis": "reconnect-backoff-calibration",
+  "timestamp": "2026-04-26",
+  "scope": "nexus/scripts/bin/hexa_remote :: _run_ssh_with_reconnect (raw#41 external-resource-roaming)",
+  "current_calibration": {
+    "backoff_sequence_seconds": [1, 2, 4],
+    "max_retries_default": 3,
+    "tunable_env": "HEXA_REMOTE_RECONNECT_MAX",
+    "disable_env": "HEXA_REMOTE_NO_RECONNECT=1",
+    "total_worst_case_backoff_seconds": 7,
+    "plus_ssh_setup_estimate_seconds": "3-8 per attempt (ConnectTimeout=8 default, ServerAliveInterval=30) → ceiling ~10-15s end-to-end before chain advance",
+    "retry_eligibility": "stderr regex (Connection timed out / Operation timed out / Network unreachable / No route to host / Connection reset / Connection closed by / kex_exchange_identification / banner exchange / Could not resolve hostname / Name or service not known) OR ssh rc=255 (transport)"
+  },
+  "audit_findings": {
+    "ssh_blip_typical_timing": {
+      "banner_handshake_recovery": "kex_exchange_identification / banner exchange typically self-heals in 1-3s on sshd restart or transient packet loss",
+      "tcp_syn_loss_recovery": "Linux default first-SYN retransmit at ~1s, second at ~3s, total ConnectTimeout=8s ceiling — 1s backoff is well-aligned",
+      "dns_recovery": "resolv.conf flap or upstream NS blip typically resolves <500ms; 1s first-backoff comfortably covers",
+      "routing_reconvergence": "BGP/route-flap on midnetwork can take 10-30s — current 7s ceiling DOES NOT cover; would need attempt 4 (8s) + attempt 5 (16s) = 31s total. Empirically rare on hetzner Frankfurt link"
+    },
+    "fallthrough_cost_vs_retry_cost": {
+      "fallthrough_path": "_probe_host (300ms TCP probe) + ssh setup on next host (~3-8s) + repeat REMOTE_CMD setup (cd, exports). For heavy-compute already routed to hetzner, fall-through to ubu1/ubu2 means RAM cap MemoryMax=20G vs 80G → likely rc=137 OOM downstream. Fall-through is EXPENSIVE for heavy class.",
+      "retry_path": "Same host, no rsync repeat (REMOTE_CMD already built), 1-7s wall + new ssh setup ~3-8s. Cheaper than chain advance for heavy class.",
+      "verdict": "current calibration is biased correctly for heavy-compute (favor retry over fall-through). Lights bypass means lights workloads would tolerate either."
+    },
+    "max_retries_3_assessment": "Adequate for SSH-banner / TCP-SYN / DNS-flap classes. Marginal for routing reconvergence (~30s class). Raising to 5 (12s + 16s = +28s wall) would cover routing but doubles worst-case latency budget on dead hosts; preflight already filters most dead hosts so the hit is rare.",
+    "missing_data": "no /tmp/hexa_remote_reconnect.log existed prior to this cycle. No empirical histogram of (attempt_n, success?) — cannot data-drive A vs B calibration."
+  },
+  "options_evaluated": {
+    "A_extend_max_to_5": {
+      "change": "raise HEXA_REMOTE_RECONNECT_MAX default 3 → 5; backoff continues 8s, 16s",
+      "pro": "covers routing reconvergence class (10-30s)",
+      "con": "+28s worst case on truly dead hosts; doubles latency budget; no empirical evidence routing-flap is happening",
+      "verdict": "premature without data"
+    },
+    "B_tighten_to_0.5_1_2": {
+      "change": "backoff 0.5s/1s/2s, max 3 (3.5s worst)",
+      "pro": "faster fall-through to next host",
+      "con": "0.5s likely under-shoots TCP first-SYN retransmit (~1s); for heavy-compute fall-through is expensive (RAM-class mismatch); BSD sleep(1) accepts fractional but POSIX sleep does not — portability snag",
+      "verdict": "premature without data; portability concern"
+    },
+    "C_instrument_log_no_change": {
+      "change": "append TSV per attempt to /tmp/hexa_remote_reconnect.log; behavior unchanged",
+      "pro": "zero behavior risk; unblocks data-driven future calibration; raw#41 spirit (instrument first, tune second)",
+      "con": "defers decision; small disk write per ssh dispatch",
+      "verdict": "CHOSEN — minimum-change, maximum-future-leverage"
+    }
+  },
+  "calibration_chosen": {
+    "option": "C",
+    "rationale": "No empirical data exists on retry success distribution. Tuning A or B would be guess-driven. Option C instruments the function with structured TSV logging so a future cycle (omega-network-1.next, scheduled when log accumulates ≥50 retry events) can read the histogram of (err_class, attempt_n, outcome) and decide A vs B with evidence. Conservative engineering: measure first, tune second."
+  },
+  "changes_applied": {
+    "file": "/Users/ghost/core/nexus/scripts/bin/hexa_remote",
+    "function": "_run_ssh_with_reconnect (lines ~1218-1310)",
+    "lines_changed_approx": "1215-1273 → 1215-1310 (+ ~37 lines net)",
+    "before_summary": "Single while loop: ssh → check rc → check stderr regex → sleep → repeat. No structured logging; only stderr human-readable line on retry.",
+    "after_summary": "Same control flow + nested _recon_log_emit helper appending TSV per outcome. New env: HEXA_REMOTE_RECONNECT_LOG (default 1), HEXA_REMOTE_RECONNECT_LOG_PATH (default /tmp/hexa_remote_reconnect.log). Outcomes logged: SUCCESS, RETRY, EXHAUSTED, NONRETRY_EXIT, DISABLED. err_class enum: NONE/TIMEOUT/UNREACHABLE/RESET/KEX/DNS/OTHER.",
+    "tsv_schema": "iso_ts \\t host \\t attempt_n \\t max \\t rc \\t err_class \\t outcome \\t backoff_s",
+    "behavior_invariant": "TRUE — backoff sequence (1,2,4), max=3, regex match set, retry/non-retry decisions all unchanged. Log emit failures swallowed (|| true) so dispatch path can never break on disk-full / perm error.",
+    "new_env_vars": ["HEXA_REMOTE_RECONNECT_LOG (0=disable)", "HEXA_REMOTE_RECONNECT_LOG_PATH (default /tmp/hexa_remote_reconnect.log)"]
+  },
+  "validation": {
+    "syntax_check": "bash -n /Users/ghost/core/nexus/scripts/bin/hexa_remote → SYNTAX_PASS",
+    "unit_test_emit": "extracted _recon_log_emit into isolated test, fired 5 synthetic events (SUCCESS, RETRY×2, EXHAUSTED, NONRETRY_EXIT) — all emitted correct TSV rows with ISO timestamp",
+    "unit_test_disabled_branch": "extracted DISABLED branch with mocked _run_ssh_once returning 64 — emitted single DISABLED row, returned rc=64. Verified emit reachable on the early-return path.",
+    "live_ssh_smoke": "DEFERRED per constraint 'NO live ssh hammering'. The function is invoked on every hexa_remote dispatch — next legitimate hexa call to hetzner/ubu1 will exercise the SUCCESS path and append one row. Bogus-host test deferred to user discretion (would emit EXHAUSTED row).",
+    "behavior_diff_proof": "no edits to backoff math (_backoff=1, *=2), no edits to _max default (3), no edits to regex set, no edits to ssh -o flags. Only additive: helper function + log-emit calls + variable initialization."
+  },
+  "rollback": {
+    "method_a_revert_block": "git diff HEAD -- nexus/scripts/bin/hexa_remote then git checkout HEAD -- nexus/scripts/bin/hexa_remote (uncommitted change as of this cycle)",
+    "method_b_runtime_disable": "export HEXA_REMOTE_RECONNECT_LOG=0 — disables emit without code change; backoff behavior unaffected (was unchanged anyway)",
+    "method_c_log_purge": "rm -f /tmp/hexa_remote_reconnect.log — log is append-only; safe to delete at any time"
+  },
+  "next_cycle_trigger": {
+    "name": "omega-network-1.next (data-driven calibration)",
+    "precondition": "/tmp/hexa_remote_reconnect.log accumulates ≥50 lines with outcome ∈ {RETRY, EXHAUSTED, SUCCESS}",
+    "analysis_recipe": "awk -F'\\t' '{print $6,$7}' | sort | uniq -c — get (err_class, outcome) histogram. If RETRY dominates with attempt_n=1-2 SUCCESS within 3 retries, keep current. If EXHAUSTED with attempt_n=3 frequent → option A (extend to 5). If RETRY rare and chain-advance frequent on first failure → option B (tighten).",
+    "estimated_data_arrival": "~1-2 weeks of normal hexa_remote usage at observed dispatch frequency"
+  },
+  "constraints_honored": {
+    "edits_scope": "ONLY /Users/ghost/core/nexus/scripts/bin/hexa_remote — confirmed via single Edit call",
+    "no_live_ssh_hammering": "TRUE — only isolated unit tests with mocked _run_ssh_once; no actual ssh invocation",
+    "no_git_commit": "TRUE — change left uncommitted in working tree",
+    "no_docker_rebuild": "TRUE — no docker invocations"
+  }
+}
