@@ -1,0 +1,223 @@
+#!hexa strict
+// tool/proof_carrying_extract.hexa — regenerate state/proof_carrying/anima_roadmap.json
+//
+// @tool(slug="proof_carrying_extract", desc="raw#10 proof-carrying SSOT extractor — parses .roadmap proof+evidence fields → state/proof_carrying/anima_roadmap.json (schema anima.proof_carrying.v1). Pure regenerator (idempotent; emits the same JSON for the same .roadmap input).")
+// @usage(hexa tool/proof_carrying_extract.hexa [--roadmap <path>] [--out <path>])
+// @usage(hexa tool/proof_carrying_extract.hexa --selftest)
+// @example(hexa tool/proof_carrying_extract.hexa)
+// @exit_codes(0=success, 1=parse/write failure, 5=selftest fail)
+// @omega-saturation-exempt("operational utility — single-pass extractor; convergence applies to .roadmap content, not the regenerator")
+//
+// PURPOSE
+//   Walks `.roadmap`, identifies every `roadmap N <status> "<title>"` block,
+//   collects each block's `proof` and `evidence` lines, classifies every
+//   ref into one of {file_path, commit_sha, prose}, and emits a single
+//   JSON SSOT. Together with tool/proof_carrying_lint.hexa, this closes
+//   the raw#10 proof-carrying loop:
+//
+//     .roadmap (narrative)  →  proof_carrying_extract  →
+//     state/proof_carrying/anima_roadmap.json  →  proof_carrying_lint  →
+//     verified residual  →  state/lint_cron_history (cron-tracked)
+//
+// IMPLEMENTATION
+//   The regex+classify logic is delegated to inline python3 — hexa stage1
+//   has no native regex with capture groups, and porting the 80-line
+//   parser to pure hexa would balloon to ~500 lines of substring math
+//   for marginal gain. python3 is universally available on the host
+//   (used in the same role by tool/proof_carrying_lint.hexa).
+
+let ROADMAP_DEFAULT = "/Users/ghost/core/anima/.roadmap"
+let OUT_DEFAULT     = "/Users/ghost/core/anima/state/proof_carrying/anima_roadmap.json"
+
+fn _exec_silent(cmd: string) -> string {
+    try { return exec(cmd) } catch e { return "" }
+}
+
+fn _file_exists(p: string) -> bool {
+    let r = _exec_silent("test -f '" + p + "' && echo Y || echo N").trim()
+    return r == "Y"
+}
+
+fn _shell_q(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn cmd_selftest() -> int {
+    println("[proof_carrying_extract selftest]")
+    // Build a tiny synthetic .roadmap and verify the JSON shape.
+    let tmp = _exec_silent("d=\"/tmp/proof_carry_extract_st_$$\"; mkdir -p \"$d/state/proof_carrying\" \"$d/tool\"; touch \"$d/tool/foo.hexa\"; cat > \"$d/.roadmap\" <<'EOF'\n# header\nroadmap 1 done \"alpha\"\n  track          x\n  proof          tool/foo.hexa\n  evidence       commit:abc1234 + tool/foo.hexa\n  reaches        CP1\n\nroadmap 2 active \"beta\"\n  track          y\n  evidence       prose witness without path\nEOF\necho \"$d\"").trim()
+    if tmp == "" {
+        println("[proof_carrying_extract selftest] FAIL tmp setup")
+        return 5
+    }
+    let out_path = tmp + "/state/proof_carrying/anima_roadmap.json"
+    let rc = _do_extract(tmp + "/.roadmap", out_path, tmp)
+    if rc != 0 {
+        _exec_silent("rm -rf '" + tmp + "' 2>/dev/null")
+        println("[proof_carrying_extract selftest] FAIL extract rc=" + to_string(rc))
+        return 5
+    }
+    let raw = _exec_silent("cat '" + out_path + "' 2>/dev/null")
+    if !raw.contains("\"schema\": \"anima.proof_carrying.v1\"") {
+        _exec_silent("rm -rf '" + tmp + "' 2>/dev/null")
+        println("[proof_carrying_extract selftest] FAIL schema missing")
+        return 5
+    }
+    if !raw.contains("\"rule_slug\": \"roadmap_1\"") {
+        _exec_silent("rm -rf '" + tmp + "' 2>/dev/null")
+        println("[proof_carrying_extract selftest] FAIL roadmap_1 missing")
+        return 5
+    }
+    if !raw.contains("\"type\": \"commit_sha\"") {
+        _exec_silent("rm -rf '" + tmp + "' 2>/dev/null")
+        println("[proof_carrying_extract selftest] FAIL commit_sha not classified")
+        return 5
+    }
+    if !raw.contains("\"type\": \"prose\"") {
+        _exec_silent("rm -rf '" + tmp + "' 2>/dev/null")
+        println("[proof_carrying_extract selftest] FAIL prose not classified")
+        return 5
+    }
+    _exec_silent("rm -rf '" + tmp + "' 2>/dev/null")
+    println("[proof_carrying_extract selftest] OK")
+    return 0
+}
+
+fn _do_extract(roadmap: string, out: string, anima_root: string) -> int {
+    if !_file_exists(roadmap) {
+        println("proof_carrying_extract: FAIL — roadmap not found at " + roadmap)
+        return 1
+    }
+    let py = "import json,os,re,sys\n" +
+        "ROADMAP=" + _shell_q_py(roadmap) + "\n" +
+        "OUT=" + _shell_q_py(out) + "\n" +
+        "ROOT=" + _shell_q_py(anima_root) + "\n" +
+        "ENTRY=re.compile(r'^roadmap (\\d+) (done|active|planned|blocked|deferred) \"(.+)\"\\s*$')\n" +
+        "FIELD=re.compile(r'^  ([a-z_-]+)\\s+(.+?)\\s*$')\n" +
+        "entries=[]; cur=None\n" +
+        "with open(ROADMAP, encoding='utf-8') as f:\n" +
+        "    for ln in f:\n" +
+        "        m=ENTRY.match(ln)\n" +
+        "        if m:\n" +
+        "            if cur: entries.append(cur)\n" +
+        "            cur={'rule_slug':f'roadmap_{m.group(1)}','roadmap_id':int(m.group(1))," +
+        "'status':m.group(2),'title':m.group(3),'track':None,'phase':None," +
+        "'proof_paths':[],'evidence_refs':[],'completed':None,'eta':None}\n" +
+        "            continue\n" +
+        "        if cur is None: continue\n" +
+        "        fm=FIELD.match(ln)\n" +
+        "        if not fm: continue\n" +
+        "        k,v=fm.group(1),fm.group(2)\n" +
+        "        if k=='proof': cur['proof_paths'].append(v)\n" +
+        "        elif k=='evidence': cur['evidence_refs'].append(v)\n" +
+        "        elif k=='track': cur['track']=v\n" +
+        "        elif k=='phase': cur['phase']=v\n" +
+        "        elif k=='completed': cur['completed']=v\n" +
+        "        elif k=='eta': cur['eta']=v\n" +
+        "if cur: entries.append(cur)\n" +
+        "def classify(ref):\n" +
+        "    parts=[]\n" +
+        "    for chunk in re.split(r'\\s*\\+\\s+', ref):\n" +
+        "        chunk=chunk.strip()\n" +
+        "        if not chunk: continue\n" +
+        "        cm=re.match(r'^commit:([0-9a-f]{7,40})\\s*$', chunk)\n" +
+        "        if cm:\n" +
+        "            parts.append({'type':'commit_sha','value':cm.group(1)}); continue\n" +
+        "        hm=re.match(r'^\\(([0-9a-f]{7,40})\\)\\s*$', chunk)\n" +
+        "        if hm:\n" +
+        "            parts.append({'type':'commit_sha','value':hm.group(1)}); continue\n" +
+        "        if re.search(r'\\.(json|hexa|md|txt|jsonl|py|ts|sh)\\b', chunk) or \\\n" +
+        "           chunk.startswith(('state/','tool/','config/','docs/','verifier/'," +
+        "'scripts/','shared/','tests/','edu/','self/','bench/')):\n" +
+        "            path=chunk.split(' ',1)[0]\n" +
+        "            note=chunk[len(path):].strip()\n" +
+        "            ent={'type':'file_path','value':path}\n" +
+        "            if note: ent['note']=note\n" +
+        "            parts.append(ent); continue\n" +
+        "        parts.append({'type':'prose','value':chunk})\n" +
+        "    return parts\n" +
+        "def vp(p):\n" +
+        "    if not p: return None\n" +
+        "    return os.path.exists(p if p.startswith('/') else os.path.join(ROOT,p))\n" +
+        "from datetime import datetime\n" +
+        "today=datetime.utcnow().strftime('%Y-%m-%d')\n" +
+        "out_records=[]; n_p=n_e=n_pp=n_pm=0\n" +
+        "for e in entries:\n" +
+        "    if not e['proof_paths'] and not e['evidence_refs']: continue\n" +
+        "    proofs=[]\n" +
+        "    for p in e['proof_paths']:\n" +
+        "        for c in classify(p):\n" +
+        "            if c['type']=='file_path':\n" +
+        "                ok=vp(c['value']); c['verified_present']=bool(ok)\n" +
+        "                if ok: n_pp+=1\n" +
+        "                else: n_pm+=1\n" +
+        "            proofs.append(c)\n" +
+        "        n_p+=1\n" +
+        "    ev=[]\n" +
+        "    for evref in e['evidence_refs']:\n" +
+        "        for c in classify(evref):\n" +
+        "            if c['type']=='file_path':\n" +
+        "                ok=vp(c['value']); c['verified_present']=bool(ok)\n" +
+        "                if ok: n_pp+=1\n" +
+        "                else: n_pm+=1\n" +
+        "            ev.append(c)\n" +
+        "        n_e+=1\n" +
+        "    out_records.append({'rule_slug':e['rule_slug'],'claim':e['title']," +
+        "'status':e['status'],'track':e['track'],'phase':e['phase']," +
+        "'completed':e['completed'],'eta':e['eta'],'proofs':proofs,'evidences':ev})\n" +
+        "payload={'schema':'anima.proof_carrying.v1','ssot_for':'.roadmap'," +
+        "'generated_at':today,'verifier':'tool/proof_carrying_lint.hexa'," +
+        "'summary':{'entry_count':len(out_records),'proof_field_count':n_p," +
+        "'evidence_field_count':n_e,'file_paths_present':n_pp,'file_paths_missing':n_pm}," +
+        "'records':out_records}\n" +
+        "os.makedirs(os.path.dirname(OUT),exist_ok=True)\n" +
+        "tmp=OUT+'.tmp'\n" +
+        "with open(tmp,'w',encoding='utf-8') as f: json.dump(payload,f,indent=2,ensure_ascii=False)\n" +
+        "os.replace(tmp,OUT)\n" +
+        "print(f'wrote {OUT}')\n" +
+        "print(f'  entries: {len(out_records)}')\n" +
+        "print(f'  proof refs: {n_p}')\n" +
+        "print(f'  evidence refs: {n_e}')\n" +
+        "print(f'  paths present/missing: {n_pp}/{n_pm}')\n"
+    let cmd = "python3 -c " + _shell_q(py)
+    let out_text = _exec_silent(cmd)
+    if out_text == "" {
+        println("proof_carrying_extract: FAIL — extractor produced no output")
+        return 1
+    }
+    println(out_text.trim())
+    if !_file_exists(out) {
+        println("proof_carrying_extract: FAIL — output file not written")
+        return 1
+    }
+    return 0
+}
+
+fn _shell_q_py(s: string) -> string {
+    // Wrap path as python triple-quoted string for embedding inline.
+    // Paths are abs Mac paths — no embedded quotes.
+    return "r'" + s + "'"
+}
+
+fn _usage() {
+    eprintln("usage: hexa tool/proof_carrying_extract.hexa [--roadmap <path>] [--out <path>]")
+    eprintln("       hexa tool/proof_carrying_extract.hexa --selftest")
+}
+
+fn main() {
+    let argv = args()
+    let mut i = 2
+    let mut roadmap = ROADMAP_DEFAULT
+    let mut out = OUT_DEFAULT
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--selftest" || a == "selftest" { exit(cmd_selftest()) }
+        if a == "--help" || a == "-h" { _usage(); exit(0) }
+        if a == "--roadmap" && i + 1 < len(argv) { roadmap = argv[i + 1]; i = i + 2; continue }
+        if a == "--out"     && i + 1 < len(argv) { out     = argv[i + 1]; i = i + 2; continue }
+        i = i + 1
+    }
+    exit(_do_extract(roadmap, out, "/Users/ghost/core/anima"))
+}
+
+main()
