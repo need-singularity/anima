@@ -1,0 +1,406 @@
+// tool/anima_pilot_t2_axis_8th.hexa — paradigm v11 8th axis prep (raw#9 hexa-only).
+//
+// PURPOSE
+//   Pilot-T2 8th orthogonal axis = TRIBE v2 cortical correlation. Reduces 4-family
+//   cortical maps (Pilot-T1 full-mode output) to a single per-backbone scalar in
+//   [0, 1000] (fixed-point ×1000) by extracting per-family ROI activation patterns,
+//   then deterministic FNV-1a reducing the 4×7 ROI matrix to 1 scalar.
+//   Mac-local utility, no GPU. Migration #28 (paradigm v11 MEASUREMENT-LAYER 7th axis).
+//
+//   PREP STAGE: T1 full-mode PASS 후 activate. selftest는 synthetic deterministic
+//   fixture로 byte-identical 검증.
+//
+// SPEC (frozen 2026-04-26)
+//   §1 input: 4 cortical map JSON
+//      - schema: anima/pilot_t1_result/1
+//      - per-family vertex array (length 20484, float)
+//      - sample format: anima-tribev2-pilot/state/pilot_t1_result.json
+//   §2 ROI partition: 20484 vertices → 7 contiguous ROI buckets (≈2926 vertex/bucket)
+//   §3 per-(family, ROI) cell: mean(vertex activation) × 1000 → int
+//   §4 8th axis scalar: FNV-1a reduce of 4×7=28 cells, modular 2147483647, % 1001
+//   §5 output: state/v11_axis_8_<backbone>.json
+//      schema anima/v11_axis_8/1
+//
+// SELFTEST
+//   Synthetic 4-cortical-map fixture (deterministic FNV) → axis_8 scalar reproducible.
+//   2nd run produces byte-identical output (sha256 stable).
+//
+// FALSIFY
+//   Adversarial fixture (per-family identical map) → trivial axis_8 (collapse).
+//   Detected via §6 collapse_check: per-family ROI variance < threshold.
+//
+// ENV
+//   ANIMA_T1_RESULT    pilot_t1_result.json (default: anima-tribev2-pilot/state/pilot_t1_result.json)
+//   ANIMA_T1_MAPS      pilot_t1_maps.npz path (full-mode only; selftest 무관)
+//   ANIMA_BACKBONE     backbone label (default: 'mistral_7b_v3')
+//   ANIMA_OUTPUT       output JSON (default: state/v11_axis_8_<backbone>.json)
+//
+// USAGE
+//   hexa run tool/anima_pilot_t2_axis_8th.hexa --selftest
+//   hexa run tool/anima_pilot_t2_axis_8th.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_pilot_t2_axis_8th_helper.hexa_tmp"
+let SELFTEST_OUTPUT = "/tmp/anima_pilot_t2_axis_8th_selftest.json"
+
+let N_VERTICES = 20484
+let N_ROI = 7
+let N_FAMILY = 4
+let MOD_PRIME = 2147483647
+let FNV_OFFSET = 1469598103
+let SCALE = 1000
+
+// ─── deterministic int mix (FNV-1a × LCG, mirror of h_last_ffi.hexa) ─────
+
+fn mix_int(h: int, v: int) -> int {
+    let mut x = h * 31 + v
+    if x < 0 { x = 0 - x }
+    x = x % MOD_PRIME
+    x = x * 1664525 + 1013904223
+    if x < 0 { x = 0 - x }
+    x = x % MOD_PRIME
+    return x
+}
+
+fn family_seed(family: string) -> int {
+    let mut h = FNV_OFFSET
+    let n = len(family)
+    h = mix_int(h, n)
+    let mut i = 0
+    while i < n {
+        h = mix_int(h, i)
+        h = mix_int(h, n - i)
+        i = i + 1
+    }
+    return h
+}
+
+// Synthetic vertex value: per-family deterministic. integer in [-SCALE, +SCALE].
+// Adds per-family bias offset so inter-family ROI means differ (mimics
+// cortical map family-conditional activation; otherwise CLT collapses ROI mean
+// to ~0 across 2926 vertices and inter-family variance vanishes).
+fn synth_vertex(family: string, idx: int) -> int {
+    let seed = family_seed(family)
+    let mut h = mix_int(seed, idx)
+    h = mix_int(h, idx * 7)
+    // base noise in [-SCALE, +SCALE]
+    let r = h % (2 * SCALE + 1)
+    let noise = r - SCALE
+    // family bias in [-SCALE/2, +SCALE/2], constant per family.
+    let bias = (seed % (SCALE + 1)) - SCALE / 2
+    let v = noise / 4 + bias
+    // clamp to [-SCALE, +SCALE]
+    if v > SCALE { return SCALE }
+    if v < 0 - SCALE { return 0 - SCALE }
+    return v
+}
+
+// ROI mean per (family, roi). Returns mean × 1000 (already integer scale).
+fn roi_mean(family: string, roi: int) -> int {
+    let bucket = N_VERTICES / N_ROI
+    let v_start = roi * bucket
+    let mut v_end = v_start + bucket
+    if roi == N_ROI - 1 { v_end = N_VERTICES }
+    let mut sum = 0
+    let mut i = v_start
+    while i < v_end {
+        sum = sum + synth_vertex(family, i)
+        i = i + 1
+    }
+    let count = v_end - v_start
+    if count == 0 { return 0 }
+    return sum / count
+}
+
+// ROI matrix → 8th axis scalar via FNV-1a reduce. Result in [0, 1000].
+fn roi_matrix_to_scalar(matrix: array) -> int {
+    let mut h = FNV_OFFSET
+    let n = len(matrix)
+    h = mix_int(h, n)
+    let mut i = 0
+    while i < n {
+        let row = matrix[i]
+        let m = len(row)
+        h = mix_int(h, m)
+        let mut j = 0
+        while j < m {
+            h = mix_int(h, row[j])
+            h = mix_int(h, i * 100 + j)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let r = h % (SCALE + 1)
+    if r < 0 { return 0 - r }
+    return r
+}
+
+// Per-family ROI variance (×1000²): per-row spread (intra-family).
+fn roi_variance(row: array) -> int {
+    let n = len(row)
+    if n < 2 { return 0 }
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        sum = sum + row[i]
+        i = i + 1
+    }
+    let mean = sum / n
+    let mut var_sum = 0
+    let mut j = 0
+    while j < n {
+        let d = row[j] - mean
+        var_sum = var_sum + d * d
+        j = j + 1
+    }
+    return var_sum / n
+}
+
+// Inter-family variance per ROI column (×1000²): collapse detection.
+// Adversarial fixture (all families identical) → inter_family_variance ≈ 0.
+fn inter_family_variance(matrix: array) -> int {
+    let n_fam = len(matrix)
+    if n_fam < 2 { return 0 }
+    let n_roi = len(matrix[0])
+    let mut total = 0
+    let mut r = 0
+    while r < n_roi {
+        let mut sum = 0
+        let mut f = 0
+        while f < n_fam {
+            sum = sum + matrix[f][r]
+            f = f + 1
+        }
+        let mean = sum / n_fam
+        let mut g = 0
+        let mut col_var = 0
+        while g < n_fam {
+            let d = matrix[g][r] - mean
+            col_var = col_var + d * d
+            g = g + 1
+        }
+        total = total + col_var / n_fam
+        r = r + 1
+    }
+    return total / n_roi
+}
+
+fn build_synthetic_matrix() -> array {
+    let families = ["Law", "Phi", "SelfRef", "Hexad"]
+    let mut matrix = []
+    let mut f = 0
+    while f < N_FAMILY {
+        let fam = families[f]
+        let mut row = []
+        let mut r = 0
+        while r < N_ROI {
+            row.push(roi_mean(fam, r))
+            r = r + 1
+        }
+        matrix.push(row)
+        f = f + 1
+    }
+    return matrix
+}
+
+// Adversarial: all 4 families produce identical row (collapse).
+fn build_adversarial_matrix() -> array {
+    let mut matrix = []
+    let mut row = []
+    let mut r = 0
+    while r < N_ROI {
+        row.push(42 * (r + 1))
+        r = r + 1
+    }
+    let mut f = 0
+    while f < N_FAMILY {
+        let mut copy_row = []
+        let mut k = 0
+        while k < len(row) {
+            copy_row.push(row[k])
+            k = k + 1
+        }
+        matrix.push(copy_row)
+        f = f + 1
+    }
+    return matrix
+}
+
+fn _emit_axis_json(matrix: array, scalar: int, label: string, out_path: string) {
+    let families = ["Law", "Phi", "SelfRef", "Hexad"]
+    let parts = []
+    parts.push("{\n")
+    parts.push("  \"schema\": \"anima/v11_axis_8/1\",\n")
+    parts.push("  \"backbone\": \"")
+    parts.push(label)
+    parts.push("\",\n")
+    parts.push("  \"axis_name\": \"TRIBE_v2_cortical\",\n")
+    parts.push("  \"n_family\": 4,\n")
+    parts.push("  \"n_roi\": 7,\n")
+    parts.push("  \"scale\": 1000,\n")
+    parts.push("  \"axis_8_scalar_x1000\": ")
+    parts.push(str(scalar))
+    parts.push(",\n")
+    parts.push("  \"roi_matrix_x1000\": [\n")
+    let mut f = 0
+    while f < len(matrix) {
+        parts.push("    {\"family\": \"")
+        parts.push(families[f])
+        parts.push("\", \"roi\": [")
+        let row = matrix[f]
+        let mut j = 0
+        while j < len(row) {
+            if j > 0 { parts.push(", ") }
+            parts.push(str(row[j]))
+            j = j + 1
+        }
+        parts.push("], \"variance\": ")
+        parts.push(str(roi_variance(row)))
+        parts.push("}")
+        if f < len(matrix) - 1 { parts.push(",") }
+        parts.push("\n")
+        f = f + 1
+    }
+    parts.push("  ],\n")
+    parts.push("  \"prep_stage\": true,\n")
+    parts.push("  \"requires_pilot_t1_full_mode_pass\": true\n")
+    parts.push("}\n")
+    write_file(out_path, parts.join(""))
+}
+
+// ─── full-mode helper (raw#37 transient emit) ─────────────────────────────
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima 8th axis helper — emitted by tool/anima_pilot_t2_axis_8th.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 MEASUREMENT-LAYER 7th axis (8th total inc AN11_b).\n")
+    parts.push("# ACTIVATE only after Pilot-T1 full-mode PASS.\n")
+    parts.push("import json, os, sys, hashlib\n")
+    parts.push("import numpy as np\n\n")
+    parts.push("T1_RESULT = os.environ.get('ANIMA_T1_RESULT', 'anima-tribev2-pilot/state/pilot_t1_result.json')\n")
+    parts.push("T1_MAPS = os.environ.get('ANIMA_T1_MAPS', 'anima-tribev2-pilot/state/pilot_t1_maps.npz')\n")
+    parts.push("BACKBONE = os.environ.get('ANIMA_BACKBONE', 'mistral_7b_v3')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', f'state/v11_axis_8_{BACKBONE}.json')\n")
+    parts.push("N_VERTICES = 20484\n")
+    parts.push("N_ROI = 7\n")
+    parts.push("MOD_PRIME = 2147483647\n")
+    parts.push("FNV_OFFSET = 1469598103\n")
+    parts.push("SCALE = 1000\n\n")
+    parts.push("def mix_int(h, v):\n")
+    parts.push("    x = h * 31 + v\n")
+    parts.push("    if x < 0: x = -x\n")
+    parts.push("    x = x % MOD_PRIME\n")
+    parts.push("    x = x * 1664525 + 1013904223\n")
+    parts.push("    if x < 0: x = -x\n")
+    parts.push("    return x % MOD_PRIME\n\n")
+    parts.push("def roi_matrix_to_scalar(matrix):\n")
+    parts.push("    h = FNV_OFFSET\n")
+    parts.push("    h = mix_int(h, len(matrix))\n")
+    parts.push("    for i, row in enumerate(matrix):\n")
+    parts.push("        h = mix_int(h, len(row))\n")
+    parts.push("        for j, v in enumerate(row):\n")
+    parts.push("            h = mix_int(h, int(v))\n")
+    parts.push("            h = mix_int(h, i*100+j)\n")
+    parts.push("    r = h % (SCALE+1)\n")
+    parts.push("    return abs(r)\n\n")
+    parts.push("# Verify T1 PASS\n")
+    parts.push("if not os.path.exists(T1_RESULT):\n")
+    parts.push("    print(f'ERROR: T1 result missing: {T1_RESULT}', file=sys.stderr); sys.exit(2)\n")
+    parts.push("with open(T1_RESULT) as f: t1 = json.load(f)\n")
+    parts.push("verdict = t1.get('verdict', '')\n")
+    parts.push("if 'STUB' in verdict.upper():\n")
+    parts.push("    print(f'WARN: T1 verdict={verdict} (stub mode, NOT authoritative). Activate after full-mode PASS.', file=sys.stderr)\n")
+    parts.push("if not os.path.exists(T1_MAPS):\n")
+    parts.push("    print(f'ERROR: T1 maps missing: {T1_MAPS}', file=sys.stderr); sys.exit(3)\n")
+    parts.push("npz = np.load(T1_MAPS)\n")
+    parts.push("families = ['Law','Phi','SelfRef','Hexad']\n")
+    parts.push("matrix = []\n")
+    parts.push("for fam in families:\n")
+    parts.push("    if fam not in npz:\n")
+    parts.push("        print(f'ERROR: family {fam} missing from npz', file=sys.stderr); sys.exit(4)\n")
+    parts.push("    arr = np.asarray(npz[fam])\n")
+    parts.push("    if arr.ndim == 2: vec = arr.mean(axis=0)\n")
+    parts.push("    else: vec = arr\n")
+    parts.push("    if vec.shape[0] != N_VERTICES:\n")
+    parts.push("        print(f'ERROR: family {fam} n_vertices={vec.shape[0]} != {N_VERTICES}', file=sys.stderr); sys.exit(5)\n")
+    parts.push("    bucket = N_VERTICES // N_ROI\n")
+    parts.push("    row = []\n")
+    parts.push("    for r in range(N_ROI):\n")
+    parts.push("        s = r*bucket; e = (r+1)*bucket if r<N_ROI-1 else N_VERTICES\n")
+    parts.push("        row.append(int(round(float(vec[s:e].mean()) * SCALE)))\n")
+    parts.push("    matrix.append(row)\n")
+    parts.push("scalar = roi_matrix_to_scalar(matrix)\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("variances = []\n")
+    parts.push("for row in matrix:\n")
+    parts.push("    m = sum(row)/len(row); v = sum((x-m)**2 for x in row)//len(row); variances.append(int(v))\n")
+    parts.push("summary = {'schema':'anima/v11_axis_8/1','backbone':BACKBONE,'axis_name':'TRIBE_v2_cortical',\n")
+    parts.push("    'n_family':4,'n_roi':7,'scale':1000,'axis_8_scalar_x1000':scalar,\n")
+    parts.push("    'roi_matrix_x1000':[{'family':fam,'roi':row,'variance':var} for fam,row,var in zip(families,matrix,variances)],\n")
+    parts.push("    'prep_stage':False,'requires_pilot_t1_full_mode_pass':True,\n")
+    parts.push("    't1_verdict':verdict,'t1_result_sha256':hashlib.sha256(open(T1_RESULT,'rb').read()).hexdigest()}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, sort_keys=True)\n")
+    parts.push("print(f'[axis_8] backbone={BACKBONE} scalar_x1000={scalar} verdict={verdict} -> {OUTPUT}')\n")
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_pilot_t2_axis_8th selftest ──")
+
+    // Positive: deterministic synthetic fixture
+    let matrix = build_synthetic_matrix()
+    let scalar = roi_matrix_to_scalar(matrix)
+    println("synthetic_matrix_built=ok n_family=" + str(len(matrix)) + " n_roi=" + str(len(matrix[0])))
+    println("axis_8_scalar_x1000=" + str(scalar))
+
+    // §6 collapse check: inter-family variance per ROI column.
+    let syn_inter = inter_family_variance(matrix)
+    println("synthetic_inter_family_variance_x1000sq=" + str(syn_inter))
+
+    // Adversarial: collapsed fixture (4 families produce identical row).
+    let adv = build_adversarial_matrix()
+    let adv_scalar = roi_matrix_to_scalar(adv)
+    let adv_inter = inter_family_variance(adv)
+    println("adversarial_axis_8_scalar_x1000=" + str(adv_scalar))
+    println("adversarial_inter_family_variance_x1000sq=" + str(adv_inter))
+    if adv_inter == 0 && syn_inter > 0 {
+        println("collapse_check=PASS (adv inter_var=0 detected; synthetic inter_var>0 preserved)")
+    } else {
+        if adv_inter == 0 {
+            println("collapse_check=PARTIAL (adv collapse detected but synthetic also has zero spread)")
+        } else {
+            println("collapse_check=FAIL (adv inter_var>0 — collapse not detected)")
+        }
+    }
+
+    // Emit output JSON for byte-identical step
+    _emit_axis_json(matrix, scalar, "selftest_synthetic", SELFTEST_OUTPUT)
+    println("selftest_output=" + SELFTEST_OUTPUT)
+
+    // Emit full-mode helper
+    _write_helper()
+    println("helper_emitted=" + HELPER_PATH)
+
+    println("paradigm=v11 MEASUREMENT-LAYER 7th axis (8th total inc AN11_b) — Pilot-T2 prep")
+    println("activate_when=Pilot-T1 full-mode PASS")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

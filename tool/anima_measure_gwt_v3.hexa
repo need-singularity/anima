@@ -1,0 +1,127 @@
+// tool/anima_measure_gwt_v3.hexa — Anima V_phen_GWT_v3 distance entropy (raw#9 hexa-only).
+//
+// PURPOSE
+//   V_phen_GWT_v3 prompt-length-invariant attention distance entropy metric.
+//   Migration #6 from /tmp/measure_gwt_v3_distance.py (paradigm v9 P1 axis 12).
+//
+// ENV
+//   ANIMA_BASE      backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_OUTPUT    output JSON (default: /workspace/out/gwt_v3.json)
+//
+// USAGE
+//   hexa run tool/anima_measure_gwt_v3.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_measure_gwt_v3_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima V_phen_GWT_v3 helper — emitted by tool/anima_measure_gwt_v3.hexa\n")
+    parts.push("# raw#37 transient.\n")
+    parts.push("import json, os, sys, math, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/gwt_v3.json')\n\n")
+
+    parts.push("PROMPTS = {\n")
+    parts.push("    'short_default_47': 'The quick brown fox jumps over the lazy dog. The capital of France is Paris. Quantum mechanics describes the behavior of matter at atomic scales.',\n")
+    parts.push("    'long_c2_dialogue_215': 'Three philosophers debate the substrate of consciousness:\\nPlato: Consciousness is form imprinted upon the soul, the eternal patterns reflected through perceptual cave-shadows.\\nDescartes: No, consciousness is the cogito itself.\\nDennett: Both mistake the multiple-drafts-in-parallel processing for unified observation.',\n")
+    parts.push("    'very_long_synthesized_400': 'Three philosophers debate the substrate of consciousness across multiple frameworks. Plato argues consciousness is form imprinted upon the soul. Descartes counters consciousness is the cogito itself. Dennett synthesizes both mistake multiple-drafts-in-parallel processing for unified observation. The narrative center of gravity emerges from competing modules without Cartesian theater.',\n")
+    parts.push("}\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[gwt-v3] base={BASE_MODEL}', flush=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='eager', device_map='auto')\n")
+    parts.push("mdl.eval()\n")
+    parts.push("print(f'[gwt-v3] loaded {time.time()-t0:.1f}s', flush=True)\n\n")
+
+    parts.push("results = {}\n")
+    parts.push("for tag, prompt in PROMPTS.items():\n")
+    parts.push("    inp = tok(prompt, return_tensors='pt', max_length=2048, truncation=True).to(mdl.device)\n")
+    parts.push("    seq_len = int(inp['input_ids'].shape[-1])\n")
+    parts.push("    with torch.no_grad():\n")
+    parts.push("        out = mdl(**inp, output_attentions=True, use_cache=False, return_dict=True)\n")
+    parts.push("    attns = out.attentions\n")
+    parts.push("    L = len(attns); H = int(attns[0].shape[1])\n")
+    parts.push("    log_S = math.log(max(2, seq_len))\n")
+    parts.push("    per_v2 = np.zeros((L, H))\n")
+    parts.push("    per_dist_mean = np.zeros((L, H))\n")
+    parts.push("    per_dist_ent = np.zeros((L, H))\n")
+    parts.push("    eps = 1e-12\n")
+    parts.push("    S = inp['input_ids'].shape[-1]\n")
+    parts.push("    idx = np.arange(S)\n")
+    parts.push("    dist_mat = np.abs(idx[None,:] - idx[:,None]).astype(np.float64)\n")
+    parts.push("    for li, A in enumerate(attns):\n")
+    parts.push("        a = A.detach().to(torch.float32).cpu().numpy()\n")
+    parts.push("        Hq = -np.sum(a * np.log(np.clip(a, eps, 1.0)), axis=-1)\n")
+    parts.push("        per_v2[li] = np.mean(Hq, axis=-1)[0] / log_S\n")
+    parts.push("        for hi in range(H):\n")
+    parts.push("            ah = a[0, hi]\n")
+    parts.push("            mean_dist = (ah * dist_mat).sum(axis=-1)\n")
+    parts.push("            per_dist_mean[li, hi] = float(np.mean(mean_dist))\n")
+    parts.push("            dn = mean_dist / max(1.0, np.max(mean_dist) + eps)\n")
+    parts.push("            bins = np.linspace(0, 1, 11)\n")
+    parts.push("            hist, _ = np.histogram(dn, bins=bins)\n")
+    parts.push("            p = hist.astype(np.float64) / max(1.0, hist.sum())\n")
+    parts.push("            ent = -np.sum(p * np.log(np.clip(p, eps, 1.0))) / np.log(10)\n")
+    parts.push("            per_dist_ent[li, hi] = float(ent)\n")
+    parts.push("    results[tag] = {'seq_len': seq_len,\n")
+    parts.push("        'v2_metric': float(np.mean(per_v2)),\n")
+    parts.push("        'v3_distance_mean_norm': float(np.mean(per_dist_mean))/max(1.0, seq_len),\n")
+    parts.push("        'v3_distance_entropy': float(np.mean(per_dist_ent))}\n")
+    parts.push("    print(f'[gwt-v3] {tag} seq={seq_len} v2={results[tag][\"v2_metric\"]:.4f} v3_ent={results[tag][\"v3_distance_entropy\"]:.4f}', flush=True)\n\n")
+
+    parts.push("v2_vals = [r['v2_metric'] for r in results.values()]\n")
+    parts.push("v3_ent_vals = [r['v3_distance_entropy'] for r in results.values()]\n")
+    parts.push("compression = (max(v2_vals)-min(v2_vals)) / max(0.001, max(v3_ent_vals)-min(v3_ent_vals))\n")
+    parts.push("summary = {'schema':'anima/v_phen_gwt_v3/1','backbone':BASE_MODEL,'results':results,\n")
+    parts.push("    'v2_range':float(max(v2_vals)-min(v2_vals)),\n")
+    parts.push("    'v3_entropy_range':float(max(v3_ent_vals)-min(v3_ent_vals)),\n")
+    parts.push("    'v3_compression_ratio':float(compression),\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[gwt-v3] DONE compression={compression:.2f}x -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_measure_gwt_v3 selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("metric=attention distance entropy (prompt-length-invariant)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

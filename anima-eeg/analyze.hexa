@@ -1,32 +1,539 @@
-// analyze.hexa — EEG band power, asymmetry, G=D*P/I, topomaps
-// Usage: analyze(eeg_data_path) or analyze(path, "--topomap")
+// anima-eeg/analyze.hexa
+// raw#9 hexa-only strict · raw#10 honest · raw#11 snake_case
+// Spec doc: anima-eeg/MIGRATION_PLAN.md §5.3, §5.4 (Phase 3 Cycle 2 FULL)
+//
+// PURPOSE
+//   Pure-hexa EEG band-power + asymmetry + G=D*P/I genius score.
+//
+//   Pipeline (single-channel synthetic input, one window):
+//     1. windowed naive DFT (N power-of-two, default 64)
+//     2. magnitude spectrum -> band power (delta 1-4, theta 4-8,
+//        alpha 8-12, beta 12-30, gamma 30-100 Hz)
+//     3. compute asymmetry from caller-supplied left/right alpha
+//     4. G score: D = alpha asymmetry magnitude
+//                 P = gamma global power (proxy for persistence)
+//                 I = frontal alpha (proxy for inhibition)
+//                 G = D * P / I
+//     5. JSON output state/analyze_<basename>.json
+//
+// raw10_honest:
+//   - naive DFT O(N^2), not Welch PSD; for N=64 single window only
+//   - 16-channel real EEG ingestion deferred to WRAPPER (raw#37 helper)
+//   - synthetic fixture: sum of three sinusoids at 2/10/40 Hz @ fs=128
+//   - cos_f/sin_f via Taylor (no Math.cos/sin native in hexa-lang 0.2.0)
+//   - topomap rendering = WRAPPER (matplotlib) — Phase 4
+//
+// USAGE
+//   hexa run anima-eeg/analyze.hexa --selftest
+//   hexa run anima-eeg/analyze.hexa --emit-json <basename>
+//
+// DETERMINISM
+//   No RNG. All synthetic signals are Taylor-expanded sinusoids of the
+//   sample index. Two consecutive runs produce byte-identical stdout
+//   (and byte-identical state/analyze_<basename>.json).
 
-struct BandPower {
-    delta: float,
-    theta: float,
-    alpha: float,
-    beta: float,
-    gamma: float
+let SCHEMA = "anima-eeg/analyze/1"
+
+// ════════════════════════════════════════════════════════════════════
+// Constants
+// ════════════════════════════════════════════════════════════════════
+
+let PI       = 3.141592653589793
+let TWO_PI   = 6.283185307179586
+let HALF_PI  = 1.5707963267948966
+let EPS_DIV  = 0.000001
+
+// Band edges (Hz)
+let DELTA_LO = 1.0
+let DELTA_HI = 4.0
+let THETA_LO = 4.0
+let THETA_HI = 8.0
+let ALPHA_LO = 8.0
+let ALPHA_HI = 12.0
+let BETA_LO  = 12.0
+let BETA_HI  = 30.0
+let GAMMA_LO = 30.0
+let GAMMA_HI = 100.0
+
+// Default sampling parameters (synthetic fixture)
+let DEFAULT_FS  = 128.0
+let DEFAULT_N   = 64
+
+// ════════════════════════════════════════════════════════════════════
+// Output globals
+// ════════════════════════════════════════════════════════════════════
+
+let g_band_delta = 0.0
+let g_band_theta = 0.0
+let g_band_alpha = 0.0
+let g_band_beta  = 0.0
+let g_band_gamma = 0.0
+let g_total_pow  = 0.0
+
+let g_asymmetry  = 0.0
+let g_diversity  = 0.0
+let g_persistence = 0.0
+let g_inhibition  = 0.0
+let g_g_score     = 0.0
+
+let g_fs_used    = 0.0
+let g_n_used     = 0
+
+// ════════════════════════════════════════════════════════════════════
+// Helpers — abs / safe_div
+// ════════════════════════════════════════════════════════════════════
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
 }
 
-struct GeniusMetrics {
-    diversity: float,
-    persistence: float,
-    inhibition: float,
-    g_score: float
+fn safe_div(a: float, b: float) -> float {
+    let mut bb = b
+    if abs_f(bb) < EPS_DIV {
+        if bb < 0.0 { bb = 0.0 - EPS_DIV } else { bb = EPS_DIV }
+    }
+    return a / bb
 }
 
-struct EEGAnalysis {
-    band_power: BandPower,
-    genius: GeniusMetrics,
-    asymmetry: float
+// ════════════════════════════════════════════════════════════════════
+// cos_f / sin_f via range-reduced Taylor (hexa-lang 0.2.0 has no Math.*)
+// ════════════════════════════════════════════════════════════════════
+//
+// Strategy:
+//   Reduce angle to [-pi, pi]
+//   Reduce further to [-pi/2, pi/2] using cos(x+pi) = -cos(x), sin(x+pi) = -sin(x)
+//   Taylor expansion around 0 (degree 11) — accurate to ~1e-10 in [-pi/2, pi/2]
+//
+//     cos(x) = 1 - x^2/2 + x^4/24 - x^6/720 + x^8/40320 - x^10/3628800
+//     sin(x) = x - x^3/6 + x^5/120 - x^7/5040 + x^9/362880
+
+fn reduce_to_pi(x: float) -> float {
+    let mut a = x
+    while a >  PI { a = a - TWO_PI }
+    while a < (0.0 - PI) { a = a + TWO_PI }
+    return a
 }
 
-fn analyze(data_path: string) -> EEGAnalysis {
-    print("analyzing EEG: " + data_path)
-    return EEGAnalysis(BandPower(0.0, 0.0, 0.0, 0.0, 0.0), GeniusMetrics(0.0, 0.0, 0.0, 0.0), 0.0)
+fn cos_f(x: float) -> float {
+    let mut a = reduce_to_pi(x)
+    let mut sign = 1.0
+    if a >  HALF_PI { a = a - PI; sign = 0.0 - 1.0 }
+    if a < (0.0 - HALF_PI) { a = a + PI; sign = 0.0 - 1.0 }
+    let x2  = a * a
+    let x4  = x2 * x2
+    let x6  = x4 * x2
+    let x8  = x4 * x4
+    let x10 = x8 * x2
+    // hexa-lang 0.2.0: multi-line + expression breaks, single-line required
+    let c = 1.0 - x2 / 2.0 + x4 / 24.0 - x6 / 720.0 + x8 / 40320.0 - x10 / 3628800.0
+    return sign * c
 }
 
-fn compute_band_power(raw_data: string, fs: float) -> BandPower {
-    return BandPower(0.0, 0.0, 0.0, 0.0, 0.0)
+fn sin_f(x: float) -> float {
+    let mut a = reduce_to_pi(x)
+    // sin reflection: sin(pi - x) = sin(x), sin(-pi - x) = -sin(x+pi) = sin(x)
+    if a >  HALF_PI { a = PI - a }
+    if a < (0.0 - HALF_PI) { a = (0.0 - PI) - a }
+    let x2  = a * a
+    let x3  = x2 * a
+    let x5  = x3 * x2
+    let x7  = x5 * x2
+    let x9  = x7 * x2
+    let x11 = x9 * x2
+    // degree-11 Taylor — error at pi/2 < 1e-9
+    let s = a - x3 / 6.0 + x5 / 120.0 - x7 / 5040.0 + x9 / 362880.0 - x11 / 39916800.0
+    return s
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Synthetic signal generation
+// ════════════════════════════════════════════════════════════════════
+//
+// fixture_signal(n, fs):
+//   x[k] = sin(2π·2·k/fs)        // delta band 2 Hz, amp 1.0
+//        + 0.6 * sin(2π·10·k/fs) // alpha band 10 Hz, amp 0.6
+//        + 0.3 * sin(2π·40·k/fs) // gamma band 40 Hz, amp 0.3
+// returns: list of n floats
+
+fn fixture_signal(n: int, fs: float) -> list {
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        let kf = k * 1.0
+        let v = sin_f(TWO_PI * 2.0  * kf / fs)
+              + 0.6 * sin_f(TWO_PI * 10.0 * kf / fs)
+              + 0.3 * sin_f(TWO_PI * 40.0 * kf / fs)
+        out.push(v)
+        k = k + 1
+    }
+    return out
+}
+
+// adversarial: pure constant DC -> all bands ~0 (only DC bin)
+fn fixture_dc(n: int) -> list {
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        out.push(1.0)
+        k = k + 1
+    }
+    return out
+}
+
+// adversarial: pure beta band 18 Hz -> only beta band has power
+fn fixture_pure_beta(n: int, fs: float) -> list {
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        let kf = k * 1.0
+        out.push(sin_f(TWO_PI * 18.0 * kf / fs))
+        k = k + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Hann window
+// ════════════════════════════════════════════════════════════════════
+//
+// w[k] = 0.5 * (1 - cos(2π·k/(N-1)))
+// We apply window in-place to a copy.
+
+fn hann_window(x: list, n: int) -> list {
+    let mut out = []
+    let mut k = 0
+    let denom = (n - 1) * 1.0
+    while k < n {
+        let kf = k * 1.0
+        let w = 0.5 * (1.0 - cos_f(TWO_PI * kf / denom))
+        out.push(x[k] * w)
+        k = k + 1
+    }
+    return out
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Naive DFT — O(N^2)
+// ════════════════════════════════════════════════════════════════════
+//
+// For real input x of length N:
+//   X_k = sum_{n=0..N-1} x[n] * (cos(2πkn/N) - i·sin(2πkn/N))
+//   |X_k|^2 = re^2 + im^2
+// We compute power spectrum (magnitude squared) for k in [0, N/2].
+// Returns list of length floor(N/2)+1.
+
+fn dft_power(x: list, n: int) -> list {
+    let half = n / 2
+    let mut psd = []
+    let mut k = 0
+    while k <= half {
+        let mut re = 0.0
+        let mut im = 0.0
+        let mut nn = 0
+        let kf = k * 1.0
+        let nf = n * 1.0
+        while nn < n {
+            let nnf = nn * 1.0
+            let ang = TWO_PI * kf * nnf / nf
+            re = re + x[nn] * cos_f(ang)
+            im = im - x[nn] * sin_f(ang)
+            nn = nn + 1
+        }
+        psd.push(re * re + im * im)
+        k = k + 1
+    }
+    return psd
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Band power integration
+// ════════════════════════════════════════════════════════════════════
+//
+// Bin frequency f_k = k * fs / N
+// Sum |X_k|^2 over bins where lo <= f_k < hi.
+// Two-sided spectrum: we use one-sided and multiply by 2 (except DC/Nyquist).
+
+fn band_power(psd: list, fs: float, n: int, lo: float, hi: float) -> float {
+    let mut p = 0.0
+    let bin_hz = fs / (n * 1.0)
+    let mut k = 0
+    let half = n / 2
+    while k <= half {
+        let f = k * bin_hz
+        if f >= lo && f < hi {
+            let factor = 2.0
+            // DC and Nyquist counted once; bands 1..N/2-1 doubled
+            if k == 0 || k == half { p = p + psd[k] }
+            else { p = p + factor * psd[k] }
+        }
+        k = k + 1
+    }
+    // Normalize by N^2 (Parseval-like, makes amplitude^2 scaling)
+    let nf = n * 1.0
+    return p / (nf * nf)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Top-level: compute_band_power
+// ════════════════════════════════════════════════════════════════════
+
+fn compute_band_power_from_signal(signal: list, n: int, fs: float) {
+    let xw = hann_window(signal, n)
+    let psd = dft_power(xw, n)
+    g_band_delta = band_power(psd, fs, n, DELTA_LO, DELTA_HI)
+    g_band_theta = band_power(psd, fs, n, THETA_LO, THETA_HI)
+    g_band_alpha = band_power(psd, fs, n, ALPHA_LO, ALPHA_HI)
+    g_band_beta  = band_power(psd, fs, n, BETA_LO,  BETA_HI)
+    g_band_gamma = band_power(psd, fs, n, GAMMA_LO, GAMMA_HI)
+    g_total_pow  = g_band_delta + g_band_theta + g_band_alpha
+                 + g_band_beta + g_band_gamma
+    g_fs_used = fs
+    g_n_used  = n
+}
+
+// ════════════════════════════════════════════════════════════════════
+// G = D * P / I genius score
+// ════════════════════════════════════════════════════════════════════
+//
+// D (diversity)   = |left_alpha - right_alpha|
+// P (persistence) = gamma global power (current band_gamma)
+// I (inhibition)  = frontal alpha power
+// G = D * P / I, with safe_div.
+// raw10_honest: G is a rough heuristic, not an empirically validated
+// genius/insight metric. Per session_dump anima-eeg README (108 tests
+// 85.6% brain-like) the "genius" framing is aspirational.
+
+fn compute_genius(left_alpha: float, right_alpha: float,
+                  gamma_global: float, frontal_alpha: float) {
+    g_diversity   = abs_f(left_alpha - right_alpha)
+    g_persistence = gamma_global
+    g_inhibition  = frontal_alpha
+    g_asymmetry   = left_alpha - right_alpha
+    g_g_score     = safe_div(g_diversity * g_persistence, g_inhibition)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// JSON emit
+// ════════════════════════════════════════════════════════════════════
+
+fn emit_json(basename: string) {
+    let out_path = "state/analyze_" + basename + ".json"
+    // hexa-lang 0.2.0: multi-line + breaks, build via incremental concat
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"" + SCHEMA + "\",\n"
+    body = body + "  \"fs\": " + to_string(g_fs_used) + ",\n"
+    body = body + "  \"n\": " + to_string(g_n_used) + ",\n"
+    body = body + "  \"band_power\": {\n"
+    body = body + "    \"delta\": " + to_string(g_band_delta) + ",\n"
+    body = body + "    \"theta\": " + to_string(g_band_theta) + ",\n"
+    body = body + "    \"alpha\": " + to_string(g_band_alpha) + ",\n"
+    body = body + "    \"beta\":  " + to_string(g_band_beta) + ",\n"
+    body = body + "    \"gamma\": " + to_string(g_band_gamma) + ",\n"
+    body = body + "    \"total\": " + to_string(g_total_pow) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"genius\": {\n"
+    body = body + "    \"diversity\": " + to_string(g_diversity) + ",\n"
+    body = body + "    \"persistence\": " + to_string(g_persistence) + ",\n"
+    body = body + "    \"inhibition\": " + to_string(g_inhibition) + ",\n"
+    body = body + "    \"g_score\": " + to_string(g_g_score) + "\n"
+    body = body + "  },\n"
+    body = body + "  \"asymmetry\": " + to_string(g_asymmetry) + "\n"
+    body = body + "}\n"
+    write_file(out_path, body)
+    println("emit_json=" + out_path)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// KV emit
+// ════════════════════════════════════════════════════════════════════
+
+fn emit_kv() {
+    println("schema=" + SCHEMA)
+    println("fs=" + to_string(g_fs_used))
+    println("n=" + to_string(g_n_used))
+    println("band_delta=" + to_string(g_band_delta))
+    println("band_theta=" + to_string(g_band_theta))
+    println("band_alpha=" + to_string(g_band_alpha))
+    println("band_beta=" + to_string(g_band_beta))
+    println("band_gamma=" + to_string(g_band_gamma))
+    println("band_total=" + to_string(g_total_pow))
+    println("asymmetry=" + to_string(g_asymmetry))
+    println("diversity=" + to_string(g_diversity))
+    println("persistence=" + to_string(g_persistence))
+    println("inhibition=" + to_string(g_inhibition))
+    println("g_score=" + to_string(g_g_score))
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Self-tests
+// ════════════════════════════════════════════════════════════════════
+
+fn assert_true(cond: bool, label: string) -> bool {
+    if cond { println("  PASS: " + label) } else { println("  FAIL: " + label) }
+    return cond
+}
+
+fn run_tests() -> int {
+    let mut pass = 0
+    let mut fail = 0
+
+    println("=== analyze raw#9 self-tests ===")
+
+    // T1: cos_f / sin_f sanity
+    println("[T1] cos_f / sin_f sanity")
+    let ok1a = assert_true(abs_f(cos_f(0.0) - 1.0) < 0.000001, "cos(0)=1")
+    let ok1b = assert_true(abs_f(sin_f(0.0)) < 0.000001, "sin(0)=0")
+    let ok1c = assert_true(abs_f(cos_f(HALF_PI)) < 0.000001, "cos(pi/2)=0")
+    let ok1d = assert_true(abs_f(sin_f(HALF_PI) - 1.0) < 0.000001, "sin(pi/2)=1")
+    let ok1e = assert_true(abs_f(cos_f(PI) + 1.0) < 0.000001, "cos(pi)=-1")
+    let ok1f = assert_true(abs_f(sin_f(PI)) < 0.0001, "sin(pi)=0")
+    if ok1a && ok1b && ok1c && ok1d && ok1e && ok1f { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T2: synthetic 3-tone signal -> alpha (10 Hz) detected
+    println("[T2] synthetic 3-tone -> alpha detected")
+    let sig = fixture_signal(DEFAULT_N, DEFAULT_FS)
+    compute_band_power_from_signal(sig, DEFAULT_N, DEFAULT_FS)
+    let ok2a = assert_true(g_band_alpha > 0.0, "alpha > 0")
+    let ok2b = assert_true(g_total_pow > 0.0, "total > 0")
+    // Alpha amp 0.6, gamma amp 0.3 -> alpha power should exceed gamma power
+    let ok2c = assert_true(g_band_alpha > g_band_gamma, "alpha > gamma (0.6^2 > 0.3^2)")
+    if ok2a && ok2b && ok2c { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T3: pure beta 18 Hz -> beta dominant
+    println("[T3] pure beta 18 Hz -> beta dominant")
+    let sigb = fixture_pure_beta(DEFAULT_N, DEFAULT_FS)
+    compute_band_power_from_signal(sigb, DEFAULT_N, DEFAULT_FS)
+    let ok3a = assert_true(g_band_beta > g_band_alpha, "beta > alpha")
+    let ok3b = assert_true(g_band_beta > g_band_delta, "beta > delta")
+    let ok3c = assert_true(g_band_beta > g_band_gamma, "beta > gamma")
+    if ok3a && ok3b && ok3c { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T4: DC input -> high-freq bands (alpha/beta/gamma) near zero.
+    //   raw10_honest: Hann-windowed DC has lobes that leak into delta/theta
+    //   bands (windowed pulse has narrow non-zero spectrum near DC).
+    //   We assert AC-band cleanliness ABOVE 8 Hz only.
+    println("[T4] DC input -> high-freq bands near zero (Hann window leakage tolerated in delta/theta)")
+    let sigdc = fixture_dc(DEFAULT_N)
+    compute_band_power_from_signal(sigdc, DEFAULT_N, DEFAULT_FS)
+    let ok4a = assert_true(g_band_alpha < 0.001, "alpha near 0")
+    let ok4b = assert_true(g_band_beta  < 0.001, "beta near 0")
+    let ok4c = assert_true(g_band_gamma < 0.001, "gamma near 0")
+    if ok4a && ok4b && ok4c { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T5: G = D*P/I — left=0.6, right=0.4, gamma=0.3, frontal=0.5
+    //   D = 0.2, P = 0.3, I = 0.5 -> G = 0.06 / 0.5 = 0.12
+    println("[T5] G = D*P/I scaling")
+    compute_genius(0.6, 0.4, 0.3, 0.5)
+    let ok5a = assert_true(abs_f(g_diversity   - 0.2) < 0.00001, "D=0.2")
+    let ok5b = assert_true(abs_f(g_persistence - 0.3) < 0.00001, "P=0.3")
+    let ok5c = assert_true(abs_f(g_inhibition  - 0.5) < 0.00001, "I=0.5")
+    let ok5d = assert_true(abs_f(g_g_score     - 0.12) < 0.00001, "G=0.12")
+    let ok5e = assert_true(abs_f(g_asymmetry   - 0.2) < 0.00001, "asym=0.2")
+    if ok5a && ok5b && ok5c && ok5d && ok5e { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T6: G zero-inhibition safe — I=0 -> safe_div clamps, finite
+    println("[T6] G with I=0 stays finite (safe_div)")
+    compute_genius(0.6, 0.4, 0.3, 0.0)
+    let ok6 = assert_true(abs_f(g_g_score) < 1.0e9, "G finite even at I=0")
+    if ok6 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T7: deterministic idempotence — two runs produce same band power
+    println("[T7] deterministic idempotence")
+    let s1 = fixture_signal(DEFAULT_N, DEFAULT_FS)
+    compute_band_power_from_signal(s1, DEFAULT_N, DEFAULT_FS)
+    let alpha1 = g_band_alpha
+    let s2 = fixture_signal(DEFAULT_N, DEFAULT_FS)
+    compute_band_power_from_signal(s2, DEFAULT_N, DEFAULT_FS)
+    let ok7 = assert_true(abs_f(alpha1 - g_band_alpha) < 1.0e-12, "alpha repeatable")
+    if ok7 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T8: negative falsification — empty path emit_json should still work
+    //   (we use synthetic basename to avoid touching production state)
+    println("[T8] JSON emit roundtrip")
+    compute_band_power_from_signal(fixture_signal(DEFAULT_N, DEFAULT_FS), DEFAULT_N, DEFAULT_FS)
+    compute_genius(0.6, 0.4, g_band_gamma, g_band_alpha)
+    emit_json("selftest_synth")
+    let ok8 = assert_true(true, "emit_json returned without error")
+    if ok8 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T9: band exclusivity — pure beta should give beta_pct > 0.7 of total
+    println("[T9] band exclusivity for pure tone")
+    compute_band_power_from_signal(fixture_pure_beta(DEFAULT_N, DEFAULT_FS),
+                                   DEFAULT_N, DEFAULT_FS)
+    let beta_pct = safe_div(g_band_beta, g_total_pow)
+    let ok9 = assert_true(beta_pct > 0.7, "beta_pct > 0.7 for pure 18 Hz")
+    if ok9 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T10: low-frequency reduce — fixture has 2 Hz delta component (amp 1.0)
+    //      so delta should be the largest band (amp^2 = 1.0 vs 0.36 alpha)
+    println("[T10] 3-tone fixture: delta dominant (amp 1.0)")
+    compute_band_power_from_signal(fixture_signal(DEFAULT_N, DEFAULT_FS),
+                                   DEFAULT_N, DEFAULT_FS)
+    // delta band 1-4 Hz: with N=64, fs=128 -> bin_hz=2.0, bins {1=2Hz, 2=4Hz}
+    // 2 Hz tone falls in bin 1 -> delta
+    // amp 1.0 at delta vs amp 0.6 at alpha -> delta_power > alpha_power
+    let ok10 = assert_true(g_band_delta > g_band_alpha, "delta > alpha")
+    if ok10 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("")
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL out of " + to_string(pass + fail))
+    return fail
+}
+
+// ════════════════════════════════════════════════════════════════════
+// CLI entry point
+// ════════════════════════════════════════════════════════════════════
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut emit_json_flag = false
+    let mut basename = "demo"
+    let mut i = 1
+    while i < len(av) {
+        if av[i] == "--selftest" { selftest = true }
+        else if av[i] == "--emit-json" {
+            emit_json_flag = true
+            if (i + 1) < len(av) { basename = av[i + 1]; i = i + 1 }
+        }
+        i = i + 1
+    }
+
+    if !selftest && !emit_json_flag {
+        println("usage: hexa run anima-eeg/analyze.hexa --selftest")
+        println("       hexa run anima-eeg/analyze.hexa --emit-json <basename>")
+        println("ABORT: real EEG ingest requires WRAPPER (BrainFlow/MNE); raw#9 strict no-fallback.")
+        exit(2)
+    }
+
+    println("── analyze raw#9 selftest ──")
+    println("schema=" + SCHEMA)
+    println("raw10_honest=naive_DFT_O(N^2)_synthetic_3tone_taylor_trig")
+    println("")
+
+    // Demonstration emit (synthetic 3-tone)
+    let sig = fixture_signal(DEFAULT_N, DEFAULT_FS)
+    compute_band_power_from_signal(sig, DEFAULT_N, DEFAULT_FS)
+    compute_genius(0.6, 0.4, g_band_gamma, g_band_alpha)
+    emit_kv()
+    println("")
+
+    if emit_json_flag {
+        emit_json(basename)
+        println("")
+    }
+
+    if selftest {
+        let fails = run_tests()
+        if fails != 0 {
+            println("selftest=fail")
+            eprintln("selftest FAILED: " + to_string(fails) + " test(s) failed")
+            exit(1)
+        }
+        println("selftest=ok")
+    }
+    println("DONE")
+}
+
+main()

@@ -1,0 +1,941 @@
+// tool/p_s_projector_proto.hexa — ALM ↔ CLM Bridge L1 P_S projector prototype (hexa-native).
+//
+// Hexa-native port of tool/p_s_projector_proto.py (now retired 2026-04-26 Ω-rules P4 Phase 6).
+// Port follows the Track-1 design: Jacobi SVD via single awk subprocess; other numpy ops
+// (mean axis=0, vstack, norm, matmul, argmax, bincount, broadcast subtract) implemented as
+// small per-op awk batches, mirroring the proven an11_c_jsd_h_last.hexa pattern.
+//
+// PURPOSE
+//   Close the L1 weakest-link "d=4096 → d=16 PCA evidence 0" gap from
+//   docs/alm_clm_bridge_abstraction_layers_20260425.md.
+//
+//   Implements P_S = V_PCA_top16 @ E_cell^T as the composed projector that maps
+//   transformer hidden states (currently 256-d byte_weighted_mean reduction of the full
+//   4096-d Qwen3-8B hidden) into the 16-d cell template basis fixed at
+//   .meta2-cert/cell-eigenvec-16.json (raw#9 SSOT).
+//
+// PRE-REGISTERED PREDICATE (raw#0, raw#12 — frozen)
+//   PASS  iff   top-16 PCA energy ratio  ≥  0.95
+//   AUX        per-path energy ratio reported (no veto, evidence only)
+//
+// NUMERICAL EQUIVALENCE TARGET
+//   Reproduce state/p_s_projector_proto_r6.json (the .py-baseline cert) within 1e-6
+//   relative tolerance on:
+//     - predicate value (energy_ratio)
+//     - top-16 singular values
+//     - per-path energy ratios
+//     - reconstruction relative error
+//     - 100-step round-trip drift
+//   v16_orthogonality_max_off_diag must remain < 1e-10.
+//
+// SIGN CONVENTION (raw#10 honest)
+//   V columns can sign-flip vs LAPACK; we canonicalize each V column so that the entry
+//   of largest absolute magnitude is non-negative. This deterministically resolves the
+//   ±V ambiguity without altering subspace.  The cert SHA will differ from the .py
+//   baseline (different sign convention + minor floating-point reorderings); numerical
+//   equivalence is the contract, not byte-equality.
+//
+// SVD STRATEGY
+//   Hc is (64, 256) so rank ≤ 64.  Form Gram G = Hc @ Hc^T (64×64, symmetric PSD), then
+//   eigendecompose G via classical cyclic Jacobi (single awk subprocess).
+//     - eigenvalues λ_i sorted descending → σ_i = sqrt(λ_i)
+//     - U_i = i-th eigenvector of G (left singular vector of Hc)
+//     - V_i = Hc^T @ U_i / σ_i  (right singular vector of Hc, length 256)
+//   Top-16 V columns form V16 (256×16). This is the standard "thin SVD via Gram"
+//   path; numerical loss is restricted to tiny σ which we discard.
+//
+// raw#9   hexa-native (jq + awk + sha256sum + date subprocesses only)
+// raw#10  proof-carrying (deterministic Jacobi; predicate value reported as-measured)
+// raw#11  snake_case
+// raw#12  pre-registered predicate (ENERGY_THRESHOLD = 0.95, frozen above)
+// raw#15  no-hardcode (threshold + paths + round as constants)
+
+let ENERGY_THRESHOLD = 0.95
+let ROOT = exec("pwd").trim()
+let EIGENVEC_SSOT = ROOT + "/.meta2-cert/cell-eigenvec-16.json"
+let H_LAST_TMPL_PREFIX = ROOT + "/state/h_last_raw_p"
+let H_LAST_TMPL_SUFFIX_BASE = "_TRAINED_r"
+let OUT_DEFAULT_PREFIX = ROOT + "/state/p_s_projector_proto_r"
+
+let JACOBI_MAX_SWEEPS = 100
+let JACOBI_TOL = 1.0e-14
+
+// Tmp paths.
+let TMP_GRAM = "/tmp/p_s_proj_gram.txt"
+let TMP_AWK = "/tmp/p_s_proj_jacobi.awk"
+let TMP_OUT = "/tmp/p_s_proj_jacobi_out.txt"
+let TMP_BATCH_IN = "/tmp/p_s_proj_batch_in.txt"
+let TMP_BATCH_OUT = "/tmp/p_s_proj_batch_out.txt"
+
+// === helpers ===
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn file_exists(path: string) -> bool {
+    let r = exec("test -f " + shell_escape(path) + " && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn json_escape(s: string) -> string {
+    let r1 = s.replace("\\", "\\\\")
+    return r1.replace("\"", "\\\"")
+}
+
+fn sha256_hex(s: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(s) + " | sha256sum | cut -c1-64"
+    return exec(cmd).trim()
+}
+
+fn jq_str(path: string, expr: string) -> string {
+    let cmd = "jq -r " + shell_escape(expr) + " " + shell_escape(path) + " 2>/dev/null"
+    let r = exec(cmd).trim()
+    if r == "null" { return "" }
+    return r
+}
+
+fn jq_int(path: string, expr: string) -> int {
+    let s = jq_str(path, expr)
+    if len(s) == 0 { return -1 }
+    return to_int(s)
+}
+
+fn parse_csv_floats(line: string) -> array {
+    let parts = line.split(",")
+    let mut out = []
+    let mut i = 0
+    while i < len(parts) {
+        out.push(to_float(parts[i].trim()))
+        i = i + 1
+    }
+    return out
+}
+
+// Write a 2-D row-major matrix (list of rows) to a file, one row per line, space-separated.
+fn write_matrix(path: string, M: array) -> int {
+    let mut content = ""
+    let mut i = 0
+    while i < len(M) {
+        let row = M[i]
+        let mut j = 0
+        while j < len(row) {
+            if j > 0 { content = content + " " }
+            content = content + to_string(row[j])
+            j = j + 1
+        }
+        content = content + "\n"
+        i = i + 1
+    }
+    let cmd = "cat > " + shell_escape(path) + " <<'HEXA_MAT_EOF'\n" + content + "HEXA_MAT_EOF"
+    let _ = exec(cmd)
+    return len(M)
+}
+
+// === awk batch ops (per Track-1 design) ===
+
+// Note: hexa runtime provides native sqrt() (full IEEE-754 precision, no awk subprocess).
+// Earlier draft used awk_sqrt() but that round-tripped through to_string which truncates
+// to 6 significant figures, undermining Gram-Schmidt orthonormalization.
+
+// Full-precision (17-digit) string formatting helper. hexa's to_string truncates floats
+// to 6 significant figures (%g default); cert numerics need IEEE-754 round-trip safety.
+fn fp(x: float) -> string {
+    return format("{:.17}", x)
+}
+
+// Compute mean over axis 0 of an (m × n) matrix M (list of rows).  Returns length-n array.
+fn mean_axis0(M: array, m: int, n: int) -> array {
+    let mut out = []
+    let mut j = 0
+    while j < n {
+        let mut s = 0.0
+        let mut i = 0
+        while i < m {
+            s = s + M[i][j]
+            i = i + 1
+        }
+        out.push(s / to_float(to_string(m)))
+        j = j + 1
+    }
+    return out
+}
+
+// Subtract a length-n vector mu from every row of M (in place returned as new matrix).
+fn broadcast_sub(M: array, mu: array, m: int, n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < m {
+        let row = M[i]
+        let mut nr = []
+        let mut j = 0
+        while j < n {
+            nr.push(row[j] - mu[j])
+            j = j + 1
+        }
+        out.push(nr)
+        i = i + 1
+    }
+    return out
+}
+
+// Frobenius norm of a flat array (used on rows / matrices).
+fn frob_norm_flat(arr: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(arr) {
+        s = s + arr[i] * arr[i]
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+fn frob_norm_matrix(M: array) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(M) {
+        let row = M[i]
+        let mut j = 0
+        while j < len(row) {
+            s = s + row[j] * row[j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+// Compute Gram matrix G = A @ A^T where A is (m × n).  Returns m × m flat row-major.
+// Single-pass awk batch: write A row-major to file, awk computes G[i,j] = Σ_k A[i,k] * A[j,k].
+fn compute_gram(A: array, m: int, n: int) -> array {
+    let _ = write_matrix(TMP_GRAM, A)
+    let awk_program = "BEGIN { while ((getline line < INFILE) > 0) {"
+        + " split(line, f, \" \"); row++;"
+        + " for (j = 1; j <= n; j++) M[row, j] = f[j] + 0 }"
+        + " for (i = 1; i <= m; i++) for (j = 1; j <= m; j++) {"
+        + " s = 0;"
+        + " for (k = 1; k <= n; k++) s += M[i, k] * M[j, k];"
+        + " printf \"%.17g%s\", s, (j < m ? \",\" : \"\\n\") } }"
+    let cmd = "awk -v INFILE=" + TMP_GRAM + " -v m=" + to_string(m) + " -v n=" + to_string(n)
+            + " '" + awk_program + "'"
+    let out = exec(cmd).trim()
+    let lines = out.split("\n")
+    let mut G = []
+    let mut i = 0
+    while i < len(lines) {
+        G.push(parse_csv_floats(lines[i]))
+        i = i + 1
+    }
+    return G
+}
+
+// Cyclic Jacobi eigendecomposition of symmetric n × n matrix G via single awk subprocess.
+// Input G as list of rows.  Output: [eigenvalues_desc_array, eigenvectors_matrix_cols, sweeps_used]
+//   eigenvalues_desc_array : length-n array of eigenvalues sorted descending
+//   eigenvectors_matrix    : list of n rows, each length n; column j = eigenvector for eigenvalues[j]
+//   sweeps_used            : int, number of sweeps performed (for honesty cert)
+fn jacobi_eigh(G: array, n: int) -> array {
+    let _ = write_matrix(TMP_GRAM, G)
+    let awk_program = "BEGIN {\n"
+        + "  while ((getline line < INFILE) > 0) {\n"
+        + "    gsub(/,/, \" \", line); split(line, f, \" \"); row++\n"
+        + "    for (j = 1; j <= n; j++) A[row, j] = f[j] + 0\n"
+        + "  }\n"
+        + "  for (i = 1; i <= n; i++) for (j = 1; j <= n; j++) V[i, j] = (i == j ? 1 : 0)\n"
+        + "  sweeps_used = 0\n"
+        + "  for (sweep = 1; sweep <= max_sweeps; sweep++) {\n"
+        + "    sweeps_used = sweep\n"
+        + "    off = 0\n"
+        + "    for (p = 1; p <= n - 1; p++) for (q = p + 1; q <= n; q++) off += A[p,q]*A[p,q]\n"
+        + "    if (off < tol*tol) break\n"
+        + "    for (p = 1; p <= n - 1; p++) for (q = p + 1; q <= n; q++) {\n"
+        + "      apq = A[p, q]\n"
+        + "      if (apq == 0) continue\n"
+        + "      app = A[p, p]; aqq = A[q, q]\n"
+        + "      theta = (aqq - app) / (2.0 * apq)\n"
+        + "      if (theta >= 0) t =  1.0 / ( theta + sqrt(1.0 + theta*theta))\n"
+        + "      else            t = -1.0 / (-theta + sqrt(1.0 + theta*theta))\n"
+        + "      c = 1.0 / sqrt(1.0 + t*t); s = c * t\n"
+        + "      A[p, p] = app - t * apq\n"
+        + "      A[q, q] = aqq + t * apq\n"
+        + "      A[p, q] = 0; A[q, p] = 0\n"
+        + "      for (i = 1; i <= n; i++) {\n"
+        + "        if (i != p && i != q) {\n"
+        + "          aip = A[i, p]; aiq = A[i, q]\n"
+        + "          A[i, p] = c*aip - s*aiq; A[p, i] = A[i, p]\n"
+        + "          A[i, q] = s*aip + c*aiq; A[q, i] = A[i, q]\n"
+        + "        }\n"
+        + "        vip = V[i, p]; viq = V[i, q]\n"
+        + "        V[i, p] = c*vip - s*viq\n"
+        + "        V[i, q] = s*vip + c*viq\n"
+        + "      }\n"
+        + "    }\n"
+        + "  }\n"
+        + "  for (j = 1; j <= n; j++) { ev[j] = A[j, j]; ord[j] = j }\n"
+        + "  for (a = 2; a <= n; a++) { key = ev[ord[a]]; ka = ord[a]; b = a - 1;\n"
+        + "    while (b >= 1 && ev[ord[b]] < key) { ord[b+1] = ord[b]; b-- } ord[b+1] = ka }\n"
+        + "  printf \"SWEEPS %d\\n\", sweeps_used\n"
+        + "  for (j = 1; j <= n; j++) printf \"%.17g%s\", ev[ord[j]], (j < n ? \",\" : \"\\n\")\n"
+        + "  for (i = 1; i <= n; i++) { for (j = 1; j <= n; j++) printf \"%.17g%s\", V[i, ord[j]], (j < n ? \",\" : \"\\n\") }\n"
+        + "}\n"
+    let cmd_write_awk = "cat > " + TMP_AWK + " <<'HEXA_AWK_EOF'\n" + awk_program + "HEXA_AWK_EOF"
+    let _ = exec(cmd_write_awk)
+    let cmd_run = "awk -v INFILE=" + TMP_GRAM + " -v n=" + to_string(n)
+                + " -v max_sweeps=" + to_string(JACOBI_MAX_SWEEPS)
+                + " -v tol=" + to_string(JACOBI_TOL) + " -f " + TMP_AWK
+    let out = exec(cmd_run).trim()
+    let lines = out.split("\n")
+    // Line 0: "SWEEPS k"
+    let sweeps_parts = lines[0].split(" ")
+    let sweeps_used = to_int(sweeps_parts[1].trim())
+    // Line 1: eigenvalues CSV
+    let eigenvalues = parse_csv_floats(lines[1])
+    // Lines 2..(2+n-1): rows of V
+    let mut V = []
+    let mut r = 2
+    while r < 2 + n {
+        V.push(parse_csv_floats(lines[r]))
+        r = r + 1
+    }
+    return [eigenvalues, V, sweeps_used]
+}
+
+// Matrix multiply C = A^T @ U_col / sigma  (used to build right singular vectors from left)
+// A: (m × n) row-major list-of-rows. U_col: length-m vector. sigma: scalar.
+// Returns length-n vector V_col = (A^T @ U_col) / sigma.
+fn matmul_ATu_div(A: array, m: int, n: int, U_col: array, sigma: float) -> array {
+    let mut out = []
+    let mut j = 0
+    let inv_sigma = 1.0 / sigma
+    while j < n {
+        let mut s = 0.0
+        let mut i = 0
+        while i < m {
+            s = s + A[i][j] * U_col[i]
+            i = i + 1
+        }
+        out.push(s * inv_sigma)
+        j = j + 1
+    }
+    return out
+}
+
+// Sign-canonicalize a vector v: if entry of largest absolute magnitude is negative, flip.
+fn sign_canonicalize(v: array) -> array {
+    let mut max_abs = 0.0
+    let mut max_idx = 0
+    let mut i = 0
+    while i < len(v) {
+        let a = if v[i] < 0.0 { -v[i] } else { v[i] }
+        if a > max_abs { max_abs = a; max_idx = i }
+        i = i + 1
+    }
+    if v[max_idx] < 0.0 {
+        let mut out = []
+        let mut k = 0
+        while k < len(v) {
+            out.push(-v[k])
+            k = k + 1
+        }
+        return out
+    }
+    return v
+}
+
+// Matrix multiply (M × P)^T inputs: A is (m×k), B is (k×n) — returns m×n list of rows.
+fn mat_mul(A: array, m: int, k: int, B: array, n: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < m {
+        let mut row = []
+        let mut j = 0
+        while j < n {
+            let mut s = 0.0
+            let mut t = 0
+            while t < k {
+                s = s + A[i][t] * B[t][j]
+                t = t + 1
+            }
+            row.push(s)
+            j = j + 1
+        }
+        out.push(row)
+        i = i + 1
+    }
+    return out
+}
+
+// Vector-matrix: x (len n) @ M (n×p) -> length p.
+fn vec_mat(x: array, M: array, n: int, p: int) -> array {
+    let mut out = []
+    let mut j = 0
+    while j < p {
+        let mut s = 0.0
+        let mut i = 0
+        while i < n {
+            s = s + x[i] * M[i][j]
+            i = i + 1
+        }
+        out.push(s)
+        j = j + 1
+    }
+    return out
+}
+
+// Compute V16 (n×16) from full eigen-decomp of (m×m) Gram of A (m×n).
+// Returns [V16, S_top16, sweeps_used].
+fn compute_v16_and_s(Hc: array, m: int, n: int) -> array {
+    let G = compute_gram(Hc, m, n)
+    let eigh_out = jacobi_eigh(G, m)
+    let eigenvalues = eigh_out[0]
+    let U_rows = eigh_out[1]      // U as rows: U_rows[i][j] = U[i, j]
+    let sweeps_used = eigh_out[2]
+
+    // Singular values = sqrt(eigenvalues), but clip negatives to 0 (numerical noise).
+    let mut S_full = []
+    let mut k = 0
+    while k < m {
+        let lam = eigenvalues[k]
+        let lam_pos = if lam < 0.0 { 0.0 } else { lam }
+        S_full.push(sqrt(lam_pos))
+        k = k + 1
+    }
+
+    // Build V16: V[:, j] = Hc^T @ U[:, j] / S_full[j]   for j in 0..16
+    let mut V16_rows = []
+    // Initialize with n empty rows.
+    let mut rinit = 0
+    while rinit < n {
+        let mut zeros = []
+        let mut zj = 0
+        while zj < 16 { zeros.push(0.0); zj = zj + 1 }
+        V16_rows.push(zeros)
+        rinit = rinit + 1
+    }
+    let mut j = 0
+    while j < 16 {
+        // U_col_j: extract column j from U_rows (which is m×m as rows).
+        let mut U_col = []
+        let mut i = 0
+        while i < m {
+            U_col.push(U_rows[i][j])
+            i = i + 1
+        }
+        let sigma = S_full[j]
+        let safe_sigma = if sigma < 1.0e-30 { 1.0e-30 } else { sigma }
+        let V_col_raw = matmul_ATu_div(Hc, m, n, U_col, safe_sigma)
+        let V_col = sign_canonicalize(V_col_raw)
+        // Place V_col into column j of V16_rows.
+        let mut r = 0
+        while r < n {
+            V16_rows[r][j] = V_col[r]
+            r = r + 1
+        }
+        j = j + 1
+    }
+
+    // Modified Gram-Schmidt orthonormalization on V16 columns to restore numerical
+    // orthogonality (Gram-via-eigh path otherwise leaks ~1e-5 due to sqrt(λ) and
+    // amplification at small σ). Run TWO passes ("Gram-Schmidt twice is enough" / Kahan):
+    // single pass leaves ~1e-5 residual, double pass takes it to ~1e-15.
+    let mut pass = 0
+    while pass < 2 {
+        let mut gs_col = 0
+        while gs_col < 16 {
+            // Subtract projections onto previously orthonormalized columns 0..gs_col-1.
+            let mut prev = 0
+            while prev < gs_col {
+                let mut dot = 0.0
+                let mut rr = 0
+                while rr < n {
+                    dot = dot + V16_rows[rr][gs_col] * V16_rows[rr][prev]
+                    rr = rr + 1
+                }
+                let mut rr2 = 0
+                while rr2 < n {
+                    V16_rows[rr2][gs_col] = V16_rows[rr2][gs_col] - dot * V16_rows[rr2][prev]
+                    rr2 = rr2 + 1
+                }
+                prev = prev + 1
+            }
+            // Normalize.
+            let mut norm_sq = 0.0
+            let mut rn = 0
+            while rn < n {
+                norm_sq = norm_sq + V16_rows[rn][gs_col] * V16_rows[rn][gs_col]
+                rn = rn + 1
+            }
+            let nrm = sqrt(norm_sq)
+            let safe_nrm = if nrm < 1.0e-30 { 1.0e-30 } else { nrm }
+            let inv_n = 1.0 / safe_nrm
+            let mut rd = 0
+            while rd < n {
+                V16_rows[rd][gs_col] = V16_rows[rd][gs_col] * inv_n
+                rd = rd + 1
+            }
+            gs_col = gs_col + 1
+        }
+        pass = pass + 1
+    }
+
+    // Build top-16 S array.
+    let mut S_top16 = []
+    let mut sj = 0
+    while sj < 16 {
+        S_top16.push(S_full[sj])
+        sj = sj + 1
+    }
+
+    // Total energy = sum of all eigenvalues (clipped non-negative) = sum σ^2.
+    let mut total_energy = 0.0
+    let mut te = 0
+    while te < m {
+        let lam = eigenvalues[te]
+        let lam_pos = if lam < 0.0 { 0.0 } else { lam }
+        total_energy = total_energy + lam_pos
+        te = te + 1
+    }
+    let mut top16_energy = 0.0
+    let mut t16 = 0
+    while t16 < 16 {
+        top16_energy = top16_energy + S_top16[t16] * S_top16[t16]
+        t16 = t16 + 1
+    }
+
+    return [V16_rows, S_top16, sweeps_used, total_energy, top16_energy]
+}
+
+// === main flow ===
+
+fn parse_args(argv: array) -> array {
+    let mut round_id = "6"
+    let mut out_path = ""
+    let mut i = 0
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--round" {
+            if i + 1 < len(argv) { round_id = argv[i + 1]; i = i + 1 }
+        } else if a == "--out" {
+            if i + 1 < len(argv) { out_path = argv[i + 1]; i = i + 1 }
+        }
+        i = i + 1
+    }
+    return [round_id, out_path]
+}
+
+let raw_args = args()
+let parsed = parse_args(raw_args)
+let ROUND_ID = parsed[0]
+let mut OUT_PATH = parsed[1]
+if len(OUT_PATH) == 0 {
+    OUT_PATH = OUT_DEFAULT_PREFIX + ROUND_ID + ".json"
+}
+
+let TS_ISO = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+// Validate inputs.
+if !file_exists(EIGENVEC_SSOT) {
+    eprintln("[P_S] INPUT_ERR cell_eigenvec_missing: " + EIGENVEC_SSOT)
+    exit(2)
+}
+
+// Load h_last for paths 1..4.
+let path_ids_decl = ["p1", "p2", "p3", "p4"]
+let mut H_blocks = []
+let mut metas = []
+let mut p = 1
+while p <= 4 {
+    let path = H_LAST_TMPL_PREFIX + to_string(p) + H_LAST_TMPL_SUFFIX_BASE + ROUND_ID + ".json"
+    if !file_exists(path) {
+        eprintln("[P_S] INPUT_ERR h_last_missing: " + path)
+        exit(2)
+    }
+    let n_entries = jq_int(path, ".entries | length")
+    let base_model = jq_str(path, ".base_model")
+    let lora_rank = jq_int(path, ".lora_rank")
+    let steps = jq_int(path, ".steps")
+    let hidden_dim_truncated = jq_int(path, ".hidden_dim_truncated")
+    let reduction = jq_str(path, ".reduction")
+    let path_id_raw = jq_str(path, ".path_id")
+    let path_id = if len(path_id_raw) == 0 { "p" + to_string(p) } else { path_id_raw }
+
+    // Extract all entries' h vectors as CSV via jq, one entry at a time.
+    let mut block = []
+    let mut e = 0
+    while e < n_entries {
+        let csv = jq_str(path, ".entries[" + to_string(e) + "].h | @csv")
+        let row = parse_csv_floats(csv)
+        block.push(row)
+        e = e + 1
+    }
+    H_blocks.push(block)
+
+    // Frobenius norm of this block.
+    let frob = frob_norm_matrix(block)
+
+    metas.push([path_id, base_model, lora_rank, steps, hidden_dim_truncated, reduction, n_entries, frob])
+    p = p + 1
+}
+
+// vstack: concatenate rows.
+let mut H_stack = []
+let mut bidx = 0
+while bidx < len(H_blocks) {
+    let blk = H_blocks[bidx]
+    let mut r = 0
+    while r < len(blk) {
+        H_stack.push(blk[r])
+        r = r + 1
+    }
+    bidx = bidx + 1
+}
+
+let M = len(H_stack)
+let N = len(H_stack[0])
+
+println("[P_S] H_stack shape = (" + to_string(M) + ", " + to_string(N) + ")")
+
+// Load cell basis E (16×16).
+let cell_dim = jq_int(EIGENVEC_SSOT, ".dim")
+let cell_template_count = jq_int(EIGENVEC_SSOT, ".template_count")
+let cell_slug = jq_str(EIGENVEC_SSOT, ".slug")
+let cell_det_sha = jq_str(EIGENVEC_SSOT, ".deterministic_sha")
+let cell_orth_mean = jq_str(EIGENVEC_SSOT, ".orthogonality.mean_off_diagonal")
+let cell_orth_max = jq_str(EIGENVEC_SSOT, ".orthogonality.max_off_diagonal")
+let cell_orth_tol = jq_str(EIGENVEC_SSOT, ".orthogonality.tolerance")
+let cell_orth_verified = jq_str(EIGENVEC_SSOT, ".orthogonality.verified_100pct")
+
+let mut E = []
+let mut ei = 0
+while ei < 16 {
+    let csv = jq_str(EIGENVEC_SSOT, ".eigenvecs[" + to_string(ei) + "] | @csv")
+    E.push(parse_csv_floats(csv))
+    ei = ei + 1
+}
+
+// Center: mu = mean(H_stack, axis=0); Hc = H_stack - mu.
+let mu = mean_axis0(H_stack, M, N)
+let Hc = broadcast_sub(H_stack, mu, M, N)
+
+println("[P_S] computing Gram + Jacobi eigh...")
+let svd_out = compute_v16_and_s(Hc, M, N)
+let V16 = svd_out[0]
+let S_top16 = svd_out[1]
+let sweeps_used = svd_out[2]
+let total_energy = svd_out[3]
+let top16_energy = svd_out[4]
+
+println("[P_S] jacobi sweeps_used=" + to_string(sweeps_used))
+// Energy ratio + predicate.
+let energy_ratio = if total_energy > 0.0 { top16_energy / total_energy } else { 0.0 }
+let energy_pass = energy_ratio >= ENERGY_THRESHOLD
+let verdict = if energy_pass { "PASS" } else { "FAIL" }
+
+// V16 orthogonality: V16^T @ V16 should be I_16. Compute G16 = V16^T @ V16.
+// V16 is N × 16; V16^T @ V16 is 16 × 16.
+let mut V_orth_max = 0.0
+let mut a = 0
+while a < 16 {
+    let mut b = 0
+    while b < 16 {
+        let mut s = 0.0
+        let mut k = 0
+        while k < N {
+            s = s + V16[k][a] * V16[k][b]
+            k = k + 1
+        }
+        let target = if a == b { 1.0 } else { 0.0 }
+        let d = s - target
+        let abs_d = if d < 0.0 { -d } else { d }
+        if abs_d > V_orth_max { V_orth_max = abs_d }
+        b = b + 1
+    }
+    a = a + 1
+}
+
+// P_S = V16 @ E^T  (N × 16). E is 16×16 row-major: E[i][j].
+// (V16 @ E^T)[i][j] = Σ_k V16[i][k] * E[j][k]
+let mut P_S = []
+let mut pi = 0
+while pi < N {
+    let mut row = []
+    let mut pj = 0
+    while pj < 16 {
+        let mut s = 0.0
+        let mut pk = 0
+        while pk < 16 {
+            s = s + V16[pi][pk] * E[pj][pk]
+            pk = pk + 1
+        }
+        row.push(s)
+        pj = pj + 1
+    }
+    P_S.push(row)
+    pi = pi + 1
+}
+
+// Per-path evidence.
+let mut per_path = []
+let mut cursor = 0
+let mut mp = 0
+while mp < len(metas) {
+    let meta = metas[mp]
+    let n_block = meta[6]
+    // Hp = Hc[cursor : cursor+n_block]
+    let mut Hp = []
+    let mut hi = 0
+    while hi < n_block {
+        Hp.push(Hc[cursor + hi])
+        hi = hi + 1
+    }
+    // Z = Hp @ P_S  (n_block × 16)
+    let Z = mat_mul(Hp, n_block, N, P_S, 16)
+    // e_in = ||Hp||_F^2 ; e_out = ||Z||_F^2
+    let e_in_norm = frob_norm_matrix(Hp)
+    let e_out_norm = frob_norm_matrix(Z)
+    let e_in = e_in_norm * e_in_norm
+    let e_out = e_out_norm * e_out_norm
+    let ratio_p = if e_in > 0.0 { e_out / e_in } else { 0.0 }
+
+    // argmax over |Z[:, :5]| per row → bincount minlength=5.
+    let mut bins = [0, 0, 0, 0, 0]
+    let mut zi = 0
+    while zi < n_block {
+        let row = Z[zi]
+        let mut best_idx = 0
+        let mut best_val = -1.0
+        let mut zj = 0
+        while zj < 5 {
+            let v = row[zj]
+            let av = if v < 0.0 { -v } else { v }
+            if av > best_val { best_val = av; best_idx = zj }
+            zj = zj + 1
+        }
+        bins[best_idx] = bins[best_idx] + 1
+        zi = zi + 1
+    }
+    per_path.push([meta[0], ratio_p, bins, meta[7]])
+    cursor = cursor + n_block
+    mp = mp + 1
+}
+
+// 100-step round-trip drift on first prompt of p1.
+let h0 = H_stack[0]
+let h0_norm = frob_norm_flat(h0)
+// h_iter starts as copy of h0.
+let mut h_iter = []
+let mut hii = 0
+while hii < N { h_iter.push(h0[hii]); hii = hii + 1 }
+let mut drift_max = 0.0
+let mut drift_final = 0.0
+let mut step = 0
+while step < 100 {
+    // z = (h_iter - mu) @ P_S  (length 16)
+    let mut centered = []
+    let mut ci = 0
+    while ci < N { centered.push(h_iter[ci] - mu[ci]); ci = ci + 1 }
+    let z = vec_mat(centered, P_S, N, 16)
+    // h_iter = z @ P_S^T + mu  (length N)
+    // (z @ P_S^T)[i] = Σ_k z[k] * P_S[i][k]
+    let mut new_h = []
+    let mut ni = 0
+    while ni < N {
+        let mut s = 0.0
+        let mut nk = 0
+        while nk < 16 {
+            s = s + z[nk] * P_S[ni][nk]
+            nk = nk + 1
+        }
+        new_h.push(s + mu[ni])
+        ni = ni + 1
+    }
+    // diff = h_iter - h0 ; norm; ratio.
+    let mut diff = []
+    let mut di = 0
+    while di < N { diff.push(new_h[di] - h0[di]); di = di + 1 }
+    let dnorm = frob_norm_flat(diff)
+    let drel = if h0_norm > 0.0 { dnorm / h0_norm } else { 0.0 }
+    if drel > drift_max { drift_max = drel }
+    drift_final = drel
+    h_iter = new_h
+    step = step + 1
+}
+
+// Reconstruction: H_recon = (Hc @ P_S) @ P_S^T + mu  (full stack), then ||H_stack - H_recon||/||H_stack||
+let HcP = mat_mul(Hc, M, N, P_S, 16)
+// (HcP @ P_S^T)[i][j] = Σ_k HcP[i][k] * P_S[j][k]
+let mut diff_total_sq = 0.0
+let mut h_total_sq = 0.0
+let mut ri = 0
+while ri < M {
+    let mut rj = 0
+    while rj < N {
+        let mut s = 0.0
+        let mut rk = 0
+        while rk < 16 {
+            s = s + HcP[ri][rk] * P_S[rj][rk]
+            rk = rk + 1
+        }
+        let recon_val = s + mu[rj]
+        let d = H_stack[ri][rj] - recon_val
+        diff_total_sq = diff_total_sq + d * d
+        h_total_sq = h_total_sq + H_stack[ri][rj] * H_stack[ri][rj]
+        rj = rj + 1
+    }
+    ri = ri + 1
+}
+let recon_rel_err = if h_total_sq > 0.0 { sqrt(diff_total_sq) / sqrt(h_total_sq) } else { 0.0 }
+
+// === Build cert JSON ===
+
+// h_last_provenance block.
+let mut prov_blocks = []
+let mut pb = 0
+while pb < len(metas) {
+    let m = metas[pb]
+    let block_json = "    {\n"
+        + "      \"path_id\": \"" + json_escape(m[0]) + "\",\n"
+        + "      \"base_model\": \"" + json_escape(m[1]) + "\",\n"
+        + "      \"lora_rank\": " + to_string(m[2]) + ",\n"
+        + "      \"steps\": " + to_string(m[3]) + ",\n"
+        + "      \"hidden_dim_truncated\": " + to_string(m[4]) + ",\n"
+        + "      \"reduction\": \"" + json_escape(m[5]) + "\",\n"
+        + "      \"n_entries\": " + to_string(m[6]) + ",\n"
+        + "      \"frob_norm\": " + fp(m[7]) + "\n"
+        + "    }"
+    prov_blocks.push(block_json)
+    pb = pb + 1
+}
+let prov_block = prov_blocks.join(",\n")
+
+// pca_singular_values_top16 list.
+let mut sv_strs = []
+let mut svi = 0
+while svi < 16 {
+    sv_strs.push("    " + fp(S_top16[svi]))
+    svi = svi + 1
+}
+let sv_block = sv_strs.join(",\n")
+
+// per_path_evidence block.
+let mut pp_blocks = []
+let mut ppi = 0
+while ppi < len(per_path) {
+    let pp = per_path[ppi]
+    let bins = pp[2]
+    let mut bin_strs = []
+    let mut bi = 0
+    while bi < len(bins) { bin_strs.push("        " + to_string(bins[bi])); bi = bi + 1 }
+    let bin_block = bin_strs.join(",\n")
+    let pp_json = "    {\n"
+        + "      \"path_id\": \"" + json_escape(pp[0]) + "\",\n"
+        + "      \"energy_ratio_centered\": " + fp(pp[1]) + ",\n"
+        + "      \"argmax5_dist\": [\n" + bin_block + "\n      ],\n"
+        + "      \"frob_norm_input\": " + fp(pp[3]) + "\n"
+        + "    }"
+    pp_blocks.push(pp_json)
+    ppi = ppi + 1
+}
+let pp_block = pp_blocks.join(",\n")
+
+// cell_basis_provenance block — pass-through.
+let cell_prov = "{\n"
+    + "    \"slug\": \"" + json_escape(cell_slug) + "\",\n"
+    + "    \"dim\": " + to_string(cell_dim) + ",\n"
+    + "    \"template_count\": " + to_string(cell_template_count) + ",\n"
+    + "    \"deterministic_sha\": \"" + json_escape(cell_det_sha) + "\",\n"
+    + "    \"orthogonality\": {\n"
+    + "      \"mean_off_diagonal\": " + cell_orth_mean + ",\n"
+    + "      \"max_off_diagonal\": " + cell_orth_max + ",\n"
+    + "      \"tolerance\": " + cell_orth_tol + ",\n"
+    + "      \"verified_100pct\": " + cell_orth_verified + "\n"
+    + "    }\n"
+    + "  }"
+
+// Hash payload (excludes ts + cert_sha256). Use fp() for floats to ensure deterministic
+// IEEE-754 round-trip; SHA otherwise depends on %g truncation.
+let hash_payload = "{"
+    + "\"schema\":\"anima/p_s_projector_proto/1\","
+    + "\"round\":\"" + ROUND_ID + "\","
+    + "\"energy_ratio\":\"" + fp(energy_ratio) + "\","
+    + "\"verdict\":\"" + verdict + "\","
+    + "\"top16_sigma_sum\":\"" + fp(top16_energy) + "\","
+    + "\"recon_rel_err\":\"" + fp(recon_rel_err) + "\","
+    + "\"drift_max\":\"" + fp(drift_max) + "\","
+    + "\"v_orth_max\":\"" + fp(V_orth_max) + "\","
+    + "\"impl\":\"hexa-jacobi-gram-awk\""
+    + "}"
+let cert_sha = sha256_hex(hash_payload)
+
+let cert_body = "{\n"
+    + "  \"schema\": \"anima/p_s_projector_proto/1\",\n"
+    + "  \"ts\": \"" + TS_ISO + "\",\n"
+    + "  \"round\": \"" + ROUND_ID + "\",\n"
+    + "  \"intent\": \"L1 weakest-link evidence: PCA top-16 energy preservation predicate\",\n"
+    + "  \"raw_strict\": [0, 9, 11, 12, 15],\n"
+    + "  \"spec_doc\": \"docs/alm_clm_bridge_p_s_projector_spec_20260425.md\",\n"
+    + "  \"depends_on\": [\n"
+    + "    \".meta2-cert/cell-eigenvec-16.json\",\n"
+    + "    \"tool/cell_token_bridge_proto.hexa\",\n"
+    + "    \"edu/cell_token_bridge_spec_20260421.md\"\n"
+    + "  ],\n"
+    + "  \"impl\": {\n"
+    + "    \"language\": \"hexa\",\n"
+    + "    \"file\": \"tool/p_s_projector_proto.hexa\",\n"
+    + "    \"svd_method\": \"Gram(A A^T) cyclic Jacobi eigh via single awk subprocess; V = A^T U / sigma\",\n"
+    + "    \"jacobi_max_sweeps\": " + to_string(JACOBI_MAX_SWEEPS) + ",\n"
+    + "    \"jacobi_sweeps_used\": " + to_string(sweeps_used) + ",\n"
+    + "    \"jacobi_tol\": " + fp(JACOBI_TOL) + ",\n"
+    + "    \"sign_convention\": \"each V column sign-flipped so largest |entry| is non-negative\",\n"
+    + "    \"ported_from\": \"tool/p_s_projector_proto.py (retired 2026-04-26 Ω-rules P4 Phase 6)\"\n"
+    + "  },\n"
+    + "  \"input_shape\": {\n"
+    + "    \"H_stack\": [" + to_string(M) + ", " + to_string(N) + "],\n"
+    + "    \"n_paths\": 4,\n"
+    + "    \"hidden_dim\": " + to_string(N) + ",\n"
+    + "    \"note\": \"256-d is byte_weighted_mean reduction from 4096-d Qwen3-8B\"\n"
+    + "  },\n"
+    + "  \"h_last_provenance\": [\n"
+    + prov_block + "\n"
+    + "  ],\n"
+    + "  \"cell_basis_provenance\": " + cell_prov + ",\n"
+    + "  \"projector\": {\n"
+    + "    \"factorization\": \"P_S = V_PCA_top16 @ E_cell.T\",\n"
+    + "    \"shape\": [" + to_string(N) + ", 16],\n"
+    + "    \"v16_orthogonality_max_off_diag\": " + fp(V_orth_max) + "\n"
+    + "  },\n"
+    + "  \"pca_singular_values_top16\": [\n"
+    + sv_block + "\n"
+    + "  ],\n"
+    + "  \"predicate\": {\n"
+    + "    \"name\": \"top16_energy_ratio_>=_0.95\",\n"
+    + "    \"threshold\": " + fp(ENERGY_THRESHOLD) + ",\n"
+    + "    \"value\": " + fp(energy_ratio) + ",\n"
+    + "    \"verdict\": \"" + verdict + "\"\n"
+    + "  },\n"
+    + "  \"per_path_evidence\": [\n"
+    + pp_block + "\n"
+    + "  ],\n"
+    + "  \"round_trip\": {\n"
+    + "    \"100_step_drift_max_rel\": " + fp(drift_max) + ",\n"
+    + "    \"100_step_drift_final_rel\": " + fp(drift_final) + ",\n"
+    + "    \"note\": \"non-zero drift expected: P_S^T is left-inverse only on V16 row-span\"\n"
+    + "  },\n"
+    + "  \"reconstruction_relative_error_full_stack\": " + fp(recon_rel_err) + ",\n"
+    + "  \"cert_sha256\": \"" + cert_sha + "\"\n"
+    + "}\n"
+
+let cmd_write_cert = "cat > " + shell_escape(OUT_PATH) + " <<'HEXA_CERT_EOF'\n" + cert_body + "HEXA_CERT_EOF"
+let _ = exec(cmd_write_cert)
+
+// Cleanup tmp.
+let _ = exec("rm -f " + TMP_GRAM + " " + TMP_AWK + " " + TMP_OUT + " " + TMP_BATCH_IN + " " + TMP_BATCH_OUT)
+
+let exit_code = if verdict == "PASS" { 0 } else { 1 }
+
+println("P_S projector r" + ROUND_ID + ": predicate=" + verdict + " (energy=" + fp(energy_ratio) + "/0.95)")
+println("  cert: " + OUT_PATH)
+println("  sha256: " + cert_sha)
+println("  jacobi_sweeps_used: " + to_string(sweeps_used))
+println("  v16_orthogonality_max_off_diag: " + fp(V_orth_max))
+exit(exit_code)

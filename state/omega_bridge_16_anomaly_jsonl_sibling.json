@@ -1,0 +1,64 @@
+{
+  "cycle": "omega_bridge_16",
+  "axis": "bridge / hexa-sim time-series integration",
+  "timestamp": "2026-04-26T19:55:00Z",
+  "user_email": "mk225599@proton.me",
+  "title": "bridge_anomaly sentinel → atlas_health_timeline JSONL sibling row",
+  "summary": "Promote __BRIDGE_ANOMALY__ from a stdout-only sentinel into a structured time-series record. Modify the ω-bridge-15 invocation block in tool/bridge_health.sh: capture analyzer stdout (instead of suppressing it), re-emit the sentinel verbatim (preserves operator-visible behaviour), then parse the positional sentinel fields (verdict / bridges / samples / flagged / window / mult) via single awk substitution and append a sibling JSONL line scoped 'bridge_anomaly' to $TIMELINE. Gated under JSON=0 so the existing --json mode still suppresses timeline writes (consistent with the bridge_registry line at L341-343).",
+  "context": {
+    "predecessors": {
+      "omega_bridge_15": "established the CLI-only anomaly invocation; this cycle adds structured time-series persistence for the result",
+      "atlas_health_timeline_jsonl_pattern": "single-line-per-event JSONL with scope= discriminator — re-used here without changing the existing scope='bridge_registry' line shape"
+    },
+    "problem": "Anomaly verdicts were printed to stdout but never written to disk. Time-series tooling (anomaly rate over rolling window, MTBF per bridge, alert thresholds) had no structured record to query — operators would need to re-grep the analyzer's sentinel from terminal logs after each sweep.",
+    "design_goal": "Zero new files. Reuse $TIMELINE. Reuse the 'one JSONL line per scope per event' pattern. No new schema-discovery cost for downstream consumers — they pivot on the scope field."
+  },
+  "files_edited": [
+    {
+      "path": "/Users/ghost/core/nexus/tool/bridge_health.sh",
+      "delta_loc": "+28 / -2",
+      "modification_site": "L372-405 (the ω-bridge-15 anomaly invocation block)",
+      "changes": [
+        "stdout capture: ANOMALY_OUT=$(... 2>/dev/null) || ANOMALY_OUT=''",
+        "verbatim re-emit: printf '%s\\n' \"$ANOMALY_OUT\" preserves prior operator-visible behaviour",
+        "positional awk parser: extracts verdict + 5 numeric fields by stripping `key=` prefix from $3..$7",
+        "JSONL append: gated on JSON=0 (parity with bridge_registry line); writes to $TIMELINE",
+        "robustness: empty ANOMALY_OUT short-circuits; missing __BRIDGE_ANOMALY__ line short-circuits; tolerates trailing reason=/path= fields in INSUFFICIENT_DATA verdict (positional parse stops at $7)"
+      ]
+    }
+  ],
+  "files_created": [],
+  "jsonl_schema_added": {
+    "scope": "bridge_anomaly",
+    "fields": ["ts", "scope", "verdict", "bridges", "samples", "flagged", "window", "multiplier", "checker"],
+    "verdict_domain": ["PASS", "WARN", "INSUFFICIENT_DATA", "UNKNOWN (parser fallback)"],
+    "example_warn": {"ts":"2026-04-26T10:47:19Z","scope":"bridge_anomaly","verdict":"WARN","bridges":2,"samples":9,"flagged":2,"window":7,"multiplier":3.0,"checker":"bridge_anomaly.hexa"},
+    "example_insufficient": {"ts":"2026-04-26T10:47:19Z","scope":"bridge_anomaly","verdict":"INSUFFICIENT_DATA","bridges":0,"samples":0,"flagged":0,"window":7,"multiplier":3.0,"checker":"bridge_anomaly.hexa"}
+  },
+  "validation": [
+    {"step": "bash -n tool/bridge_health.sh", "result": "syntax OK"},
+    {"step": "isolated parser, WARN case", "input": "__BRIDGE_ANOMALY__ WARN bridges=2 samples=9 flagged=2 window=7 mult=3.0", "output": "valid JSON, all fields populated correctly"},
+    {"step": "isolated parser, INSUFFICIENT_DATA with trailing fields", "input": "__BRIDGE_ANOMALY__ INSUFFICIENT_DATA bridges=0 samples=0 flagged=0 window=7 mult=3.0 reason=history_missing path=/x/y/z.tsv", "output": "valid JSON, trailing reason/path correctly ignored by positional parse"}
+  ],
+  "scope_constraints_honoured": [
+    "minimal blast — single block edit in one tracked .sh",
+    "raw 77 append-only — sibling JSONL row per sweep, never rewrites prior rows",
+    "raw 80 sentinel preserved — analyzer's __BRIDGE_ANOMALY__ still emitted to stdout verbatim",
+    "raw 71 report-only — analyzer failure stays non-fatal; main exit code untouched",
+    "CLI-only invocation preserved — no library/path coupling change vs bridge-15",
+    "no parallel-session collision — only tracked tool/bridge_health.sh edited; cli/run.hexa, n6/*, kick_*, atlas_health_timeline.jsonl all untouched (the JSONL is APPENDED to at runtime, not edited at source)",
+    "no commit in anima — closure JSON written as untracked"
+  ],
+  "non_changes": {
+    "atlas_health_timeline.jsonl": "currently dirty (parallel-session) — NOT touched by this cycle (the script appends at runtime; my edit only modifies the .sh that does the appending)",
+    "tool/bridge_anomaly.hexa": "untouched — analyzer remains the source of truth, this cycle only reshapes the consumer side"
+  },
+  "next_followups": [
+    "downstream alert rule: tail -F atlas_health_timeline.jsonl | jq 'select(.scope==\"bridge_anomaly\" and .verdict==\"WARN\")' for live alerting",
+    "consider exposing per-bridge flag breakdown (currently aggregated as flagged=N) — would need analyzer to also emit per-flag JSONL or extend the sentinel"
+  ],
+  "head_pinned": {
+    "nexus_at_audit_start": "dbca08f3fb5b03fc0a102c708fe476967294d9c0 (post-runner-13a)",
+    "hexa_lang_at_audit_start": "ba52016df2696b4393f9354a165e06ad05523388 (post-stdlib-14)"
+  }
+}

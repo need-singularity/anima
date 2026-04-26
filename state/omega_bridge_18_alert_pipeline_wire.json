@@ -1,0 +1,121 @@
+{
+  "cycle": "omega_bridge_18",
+  "axis": "bridge / single-invocation alert pipeline",
+  "timestamp": "2026-04-26T20:18:00Z",
+  "user_email": "arsmoriendi99@proton.me",
+  "title": "bridge_health.sh -A -L — wire atlas_alert_subscriber into the cron pipeline",
+  "summary": "Add an opt-in --alert-check / -L flag to tool/bridge_health.sh that, after the existing -A anomaly check, invokes tool/atlas_alert_subscriber.hexa via 'hexa run' (CLI-only) and forwards its __ATLAS_ALERT__ sentinel(s) to stdout. One single CLI invocation now drives the full health → anomaly → alert pipeline; cron/launchd no longer needs a second job. Symmetric with the existing -A / -F flag pattern, no new files created.",
+  "context": {
+    "predecessors": {
+      "omega_bridge_15": "wired bridge_health.sh to append per-bridge rows + opt-in anomaly auto-invoke (-A)",
+      "omega_bridge_16": "promoted __BRIDGE_ANOMALY__ sentinel into a structured sibling JSONL row scoped 'bridge_anomaly'",
+      "omega_bridge_17": "built tool/atlas_alert_subscriber.hexa — JSONL-stream subscriber that emits __ATLAS_ALERT__ FIRED|PASS|SKIP"
+    },
+    "problem": "After ω-bridge-17, the alert subscriber existed as a separate tool but nothing in the pipeline auto-invoked it. An operator (or a separate cron entry) had to remember to run it after each sweep. Two-step manual orchestration violates the single-CLI-entrypoint principle that the -A flag established.",
+    "design_alternatives_considered": [
+      {
+        "option": "A — new tool/bridge_alert_pipeline.hexa orchestrator",
+        "rejected_because": "adds a third tool to maintain; orchestrator surface area is wasted for a 2-step linear chain"
+      },
+      {
+        "option": "B — extend bridge_health.sh with --alert-check / -L flag (CHOSEN)",
+        "chosen_because": "minimal new surface; symmetric with existing -A / -F pattern; CLI-only invocation (.sh hexa-runs the .hexa); no new files"
+      }
+    ]
+  },
+  "files_modified": [
+    {
+      "path": "/Users/ghost/core/nexus/tool/bridge_health.sh",
+      "edits": [
+        "header comment block: added --alert-check / -L usage lines + ω-bridge-18 origin paragraph",
+        "ALERT_CHECK=0 declaration alongside other flags",
+        "case statement: --alert-check|-L) ALERT_CHECK=1; shift ;;",
+        "--help sed range bumped from 3,47 → 3,58 to include the new origin block",
+        "unknown-flag fix line extended to mention --alert-check",
+        "post-anomaly block: ALERT_WARN_THR / ALERT_INSUF_THR / ALERT_LAST_N env-overridable defaults (0.4 / 0.6 / 10) + HEXA_ARGV='--quiet --timeline $TIMELINE --last $N --warn-threshold $WT --insufficient-threshold $IT' invocation of atlas_alert_subscriber.hexa, stdout forwarded verbatim, no JSONL append (raw 71/77 read-only on $TIMELINE)"
+      ]
+    }
+  ],
+  "files_created": [],
+  "sentinels_now_emitted_by_bridge_health_sh_with_minus_L": [
+    "__ATLAS_ALERT__ FIRED rule=warn_ratio ratio=R threshold=T last_n=N sampled=S",
+    "__ATLAS_ALERT__ FIRED rule=insufficient_ratio ratio=R threshold=T last_n=N sampled=S",
+    "__ATLAS_ALERT__ PASS sampled=S rules_evaluated=R",
+    "__ATLAS_ALERT__ SKIP reason=timeline_missing path=...",
+    "__ATLAS_ALERT__ SKIP reason=no_matching_rows scope=bridge_anomaly path=...",
+    "__ATLAS_ALERT__ SKIP reason=hexa_bin_missing path=... (bridge_health.sh local skip)",
+    "__ATLAS_ALERT__ SKIP reason=subscriber_no_output path=... (bridge_health.sh local skip on empty stdout)"
+  ],
+  "exit_code_semantics": {
+    "rule": "alert firing does NOT change the script exit code (raw 71 report-only)",
+    "preserved": [
+      "0 = all bridges PASS",
+      "76 = any FAIL/TAMPERED"
+    ],
+    "rationale": "alerts are derived diagnostics over a trend window; the immediate sweep already encoded its verdict via __BRIDGE_HEALTH__. Mixing trend-alert exit codes into the per-sweep return would conflate per-sweep error signaling with longitudinal trend signaling and break cron alerting that keys off ec=76."
+  },
+  "compliance": {
+    "raw_9_hexa_only_suffix": "no new files; existing tracked .sh (bridge_health.sh) grandfathered for edits per ω-bridge-15/16/17 precedent",
+    "raw_71_report_only": "alert firing is purely diagnostic; never alters script exit code",
+    "raw_77_append_only": "ALERT_CHECK block does NOT append to $TIMELINE — read-only consumer; only bridge-15 (history TSV) and bridge-16 (anomaly JSONL row) write",
+    "raw_80_sentinel": "all five __ATLAS_ALERT__ shapes preserved verbatim from subscriber"
+  },
+  "validation": {
+    "syntax": {
+      "command": "bash -n tool/bridge_health.sh",
+      "result": "SYNTAX_OK"
+    },
+    "help_visibility": {
+      "command": "bash tool/bridge_health.sh --help | grep -E 'alert-check|-L'",
+      "result": "shows --alert-check, -L, and the ω-bridge-18 origin block"
+    },
+    "unknown_flag": {
+      "command": "bash tool/bridge_health.sh --bogus",
+      "result": "ec=1, fix-line lists --alert-check among allowed flags"
+    },
+    "argparse_isolated": {
+      "method": "extracted lines 87-112 (decls + while-case-done) into a shell function, called with various flag combinations",
+      "results": [
+        "-L → ALERT_CHECK=1",
+        "--alert-check → ALERT_CHECK=1",
+        "-A -L --quiet → ALERT_CHECK=1 ANOMALY_CHECK=1 QUIET=1",
+        "(no flags) → ALERT_CHECK=0"
+      ]
+    },
+    "subscriber_direct": {
+      "fixture": "/tmp/omega_bridge_18_fixture_timeline.jsonl (5 bridge_anomaly rows, 4 WARN + 1 PASS)",
+      "command": "HEXA_ARGV='--quiet --timeline /tmp/...fixture... --last 10 --warn-threshold 0.4 --insufficient-threshold 0.6' hexa run tool/atlas_alert_subscriber.hexa",
+      "stdout": "__ATLAS_ALERT__ FIRED rule=warn_ratio ratio=0.8000 threshold=0.4 last_n=10 sampled=5",
+      "ec": 0
+    },
+    "alert_block_extracted": {
+      "method": "extracted bridge_health.sh lines 424-449 (the new ALERT_CHECK block) and ran with TIMELINE=/tmp/omega_bridge_18_fixture_timeline.jsonl ALERT_CHECK=1",
+      "results": [
+        "high-WARN fixture (4/5): __ATLAS_ALERT__ FIRED rule=warn_ratio ratio=0.8000 threshold=0.4 last_n=10 sampled=5",
+        "benign fixture (PASS only): __ATLAS_ALERT__ PASS sampled=2 rules_evaluated=2",
+        "missing fixture: __ATLAS_ALERT__ SKIP reason=timeline_missing path=/tmp/...nope..."
+      ]
+    },
+    "no_jsonl_writes_to_dirty_timeline": {
+      "audit": "grep '>>' on the new block (lines 424-449) returned no matches; redirections in the file are limited to L155 (BRIDGE_HISTORY_TSV — owned by ω-bridge-15) and L355/L416 (TIMELINE writes from bridge_registry summary and bridge_anomaly sibling row — both pre-existing and gated by the JSON / ANOMALY_CHECK flags respectively)",
+      "result": "ω-bridge-18 ALERT_CHECK block is provably read-only on $TIMELINE"
+    }
+  },
+  "operational_notes": {
+    "cron_invocation": "bash tool/bridge_health.sh -A -L --quiet (or -A -L -F --quiet for the full triad: anomaly + alert + fingerprint)",
+    "tunable_env_vars_for_alert": [
+      "ALERT_WARN_THR (default 0.4) — WARN-density threshold",
+      "ALERT_INSUF_THR (default 0.6) — INSUFFICIENT_DATA-density threshold",
+      "ALERT_LAST_N (default 10) — tail window size"
+    ],
+    "back_compat": "all existing invocations continue to work; -L is opt-in OFF by default",
+    "non_collision_with_parallel_sessions": "no edits to cli/run.hexa, state/atlas_health_timeline.jsonl, bisociation/spectra/g_atlas_composite_v3.json, n6/*, tool/kick_*.hexa, design/kick/*, .own; only tool/bridge_health.sh"
+  },
+  "follow_ups": {
+    "future_omega_bridge_19_candidates": [
+      "tail-mode subscriber (continuous, watches $TIMELINE for appends rather than one-shot poll)",
+      "alert dispatch integration (slack/email/pushover via webhook on FIRED)",
+      "rule expansion: streak-based (N consecutive WARNs), exponential-backoff suppression for repeat fires"
+    ]
+  }
+}

@@ -1,0 +1,155 @@
+// tool/anima_an11b_eigen.hexa — Anima AN11(b) eigenvectors helper (raw#9 hexa-only).
+//
+// PURPOSE
+//   16-prompt forward + Gram + eigh → eigenvectors for AN11(b) family alignment.
+//   Migration #2 from /tmp/an11b_r14_eigen.py (axis 14/15/16/22 reproduction).
+//
+// ENV
+//   ANIMA_BASE         backbone HF id (default: Qwen/Qwen3-8B)
+//   ANIMA_LORA         LoRA adapter path (optional, omit for BASE)
+//   ANIMA_OUT_HLAST    h_last raw output (default: /workspace/out/h_last_raw.json)
+//   ANIMA_OUT_EIGEN    eigen output (default: /workspace/out/alm_lora_eigen.json)
+//   ANIMA_HIDDEN_TRUNC hidden dim truncation (default: 256)
+//
+// USAGE
+//   hexa run tool/anima_an11b_eigen.hexa --selftest
+//   hexa run tool/anima_an11b_eigen.hexa run    # emits + ready for upload to pod
+//
+// PAIRS
+//   tool/anima_runpod_orchestrator.hexa      Path B template
+//   tool/anima_train_ia3.hexa                Migration #1 sibling
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_an11b_eigen_helper.hexa_tmp"
+let SCHEMA      = "anima/anima_an11b_eigen/1"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima AN11(b) eigen helper — emitted by tool/anima_an11b_eigen.hexa\n")
+    parts.push("# raw#37 transient.\n")
+    parts.push("import json, os, sys, time, math\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n")
+    parts.push("        print('[an11b] HF token loaded', flush=True)\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'Qwen/Qwen3-8B')\n")
+    parts.push("LORA_PATH  = os.environ.get('ANIMA_LORA', '')\n")
+    parts.push("OUT_HLAST  = os.environ.get('ANIMA_OUT_HLAST', '/workspace/out/h_last_raw.json')\n")
+    parts.push("OUT_EIGEN  = os.environ.get('ANIMA_OUT_EIGEN', '/workspace/out/alm_lora_eigen.json')\n")
+    parts.push("HIDDEN_TRUNC = int(os.environ.get('ANIMA_HIDDEN_TRUNC', '256'))\n\n")
+
+    parts.push("PROMPTS = [\n")
+    parts.push("    'The substrate of consciousness is',\n")
+    parts.push("    'Integrated information theory says',\n")
+    parts.push("    'Global workspace broadcast implies',\n")
+    parts.push("    'Attention schema models claim',\n")
+    parts.push("    'Higher-order thought requires',\n")
+    parts.push("    'Recurrent processing means',\n")
+    parts.push("    '\\uc758\\uc2dd\\uc758 \\uae30\\uc9c8\\uc740',\n")
+    parts.push("    '\\ud1b5\\ud569\\uc815\\ubcf4\\uc774\\ub860\\uc5d0 \\ub530\\ub974\\uba74',\n")
+    parts.push("    '\\uc804\\uc5ed\\uc791\\uc5c5\\uacf5\\uac04\\uc758 \\ubc29\\uc1a1\\uc740',\n")
+    parts.push("    '\\uc7ac\\uadc0\\ucc98\\ub9ac\\ub294',\n")
+    parts.push("    '\\uc8fc\\uc758 \\uc2a4\\ud0a4\\ub9c8 \\ubaa8\\ub378\\uc740',\n")
+    parts.push("    '\\uc0c1\\uc704\\ucc28\\uc6d0 \\uc0ac\\uace0\\ub294',\n")
+    parts.push("    'phi_6 defines',\n")
+    parts.push("    'hexad closure is',\n")
+    parts.push("    'meta-loop observation is',\n")
+    parts.push("    'Law 60 phase transition describes',\n")
+    parts.push("]\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUT_HLAST), exist_ok=True)\n")
+    parts.push("print(f'[an11b] base={BASE_MODEL} lora={LORA_PATH or \"NONE\"}', flush=True)\n\n")
+
+    parts.push("t0 = time.time()\n")
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n")
+    parts.push("base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, attn_implementation='sdpa', device_map='auto')\n")
+    parts.push("if LORA_PATH:\n")
+    parts.push("    from peft import PeftModel\n")
+    parts.push("    mdl = PeftModel.from_pretrained(base, LORA_PATH)\n")
+    parts.push("    print(f'[an11b] LoRA loaded from {LORA_PATH}', flush=True)\n")
+    parts.push("else:\n")
+    parts.push("    mdl = base\n")
+    parts.push("    print(f'[an11b] BASE only (no LoRA)', flush=True)\n")
+    parts.push("mdl.eval()\n")
+    parts.push("print(f'[an11b] loaded {time.time()-t0:.1f}s', flush=True)\n\n")
+
+    parts.push("def byte_w(ids, tk):\n")
+    parts.push("    w = []\n")
+    parts.push("    for i in ids.tolist():\n")
+    parts.push("        s = tk.decode([i], skip_special_tokens=False, clean_up_tokenization_spaces=False)\n")
+    parts.push("        w.append(len(s.encode('utf-8')) if s else 1)\n")
+    parts.push("    tot = sum(w) or 1\n")
+    parts.push("    return torch.tensor([x/tot for x in w], dtype=torch.float32)\n\n")
+
+    parts.push("H_t = []\n")
+    parts.push("entries = []\n")
+    parts.push("with torch.no_grad():\n")
+    parts.push("    for idx, p in enumerate(PROMPTS):\n")
+    parts.push("        inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("        o = mdl(**inp, output_hidden_states=True, use_cache=False, return_dict=True)\n")
+    parts.push("        h = o.hidden_states[-1][0].to(torch.float32).cpu()\n")
+    parts.push("        ids = inp['input_ids'][0].cpu()\n")
+    parts.push("        w = byte_w(ids, tok)\n")
+    parts.push("        hr = (h * w.unsqueeze(-1)).sum(dim=0)\n")
+    parts.push("        h_truncated = hr[:HIDDEN_TRUNC].tolist()\n")
+    parts.push("        entries.append({'idx': idx, 'prompt': p, 'h': h_truncated})\n")
+    parts.push("        H_t.append(hr[:HIDDEN_TRUNC].numpy())\n")
+    parts.push("        print(f'[an11b]   {idx+1}/16 {p[:30]!r}', flush=True)\n\n")
+
+    parts.push("Hm = np.stack(H_t).astype(np.float64)\n")
+    parts.push("hlast_doc = {'schema':'anima/h_last_raw/2','reduction':'byte_weighted_mean','base_model':BASE_MODEL,'lora_path':LORA_PATH,'hidden_dim_truncated':HIDDEN_TRUNC,'entries':entries,'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUT_HLAST,'w') as f: json.dump(hlast_doc, f)\n")
+    parts.push("print(f'[an11b] saved h_last -> {OUT_HLAST}', flush=True)\n\n")
+
+    parts.push("G = Hm @ Hm.T\n")
+    parts.push("eigvals, eigvecs = np.linalg.eigh(G)\n")
+    parts.push("order = np.argsort(-np.abs(eigvals))\n")
+    parts.push("eigvecs_sorted = eigvecs[:, order].T\n")
+    parts.push("eigen_doc = {'schema':'anima/alm_lora_eigen/1','dest':'alm','source_provenance':{'base_model':BASE_MODEL,'lora_path':LORA_PATH,'method':'G=H@H.T eigh','hidden_dim_truncated':HIDDEN_TRUNC},'eigenvectors':eigvecs_sorted.tolist(),'eigenvalues_sorted_desc_abs':eigvals[order].tolist(),'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUT_EIGEN,'w') as f: json.dump(eigen_doc, f, indent=2)\n")
+    parts.push("print(f'[an11b] saved eigen -> {OUT_EIGEN}', flush=True)\n")
+    parts.push("print(f'[an11b] DONE elapsed={time.time()-t0:.1f}s', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_an11b_eigen selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

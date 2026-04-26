@@ -1,0 +1,162 @@
+// tool/anima_train_r14_lora.hexa — Anima LoRA training (raw#9 hexa-only).
+//
+// PURPOSE
+//   r14 corpus LoRA training (scratch + continuation modes). Mk.XI v10 primary path.
+//   Migration #4 from /tmp/train_r14_shard1.py + /tmp/train_r14_mistral.py.
+//
+// ENV
+//   ANIMA_BASE         backbone HF id (default: Qwen/Qwen3-8B)
+//   ANIMA_LORA_INIT    baseline LoRA path (optional, for continuation)
+//                      omit → from scratch
+//   ANIMA_CORPUS       /workspace/corpus_alm_r14_v1.jsonl (default)
+//   ANIMA_OUTPUT_DIR   output dir (default: /workspace/out/lora_r14)
+//   ANIMA_LR           learning rate (default: 5e-5)
+//   ANIMA_EPOCHS       (default: 3)
+//   ANIMA_LORA_R       (default: 64)
+//   ANIMA_LORA_ALPHA   (default: 128)
+//   ANIMA_SHARD_IDX    corpus shard index (default: 0, full corpus = SHARD_TOTAL=1)
+//   ANIMA_SHARD_TOTAL  total shards (default: 1)
+//
+// USAGE
+//   hexa run tool/anima_train_r14_lora.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_train_r14_lora_helper.hexa_tmp"
+let SCHEMA      = "anima/anima_train_r14_lora/1"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima LoRA r14 trainer helper — emitted by tool/anima_train_r14_lora.hexa\n")
+    parts.push("# raw#37 transient.\n")
+    parts.push("import json, os, sys, time, math\n")
+    parts.push("from pathlib import Path\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import (AutoModelForCausalLM, AutoTokenizer, TrainingArguments,\n")
+    parts.push("                          Trainer, DataCollatorForLanguageModeling)\n")
+    parts.push("from peft import PeftModel, LoraConfig, get_peft_model, TaskType\n")
+    parts.push("from datasets import Dataset\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n")
+    parts.push("        print('[lora] HF token loaded', flush=True)\n\n")
+
+    parts.push("BASE_MODEL  = os.environ.get('ANIMA_BASE', 'Qwen/Qwen3-8B')\n")
+    parts.push("LORA_INIT   = os.environ.get('ANIMA_LORA_INIT', '')\n")
+    parts.push("CORPUS      = os.environ.get('ANIMA_CORPUS', '/workspace/corpus_alm_r14_v1.jsonl')\n")
+    parts.push("OUTPUT_DIR  = os.environ.get('ANIMA_OUTPUT_DIR', '/workspace/out/lora_r14')\n")
+    parts.push("MAX_SEQ     = int(os.environ.get('ANIMA_MAX_SEQ', '2048'))\n")
+    parts.push("EPOCHS      = int(os.environ.get('ANIMA_EPOCHS', '3'))\n")
+    parts.push("LR          = float(os.environ.get('ANIMA_LR', '5e-5'))\n")
+    parts.push("GRAD_ACC    = int(os.environ.get('ANIMA_GRAD_ACC', '16'))\n")
+    parts.push("LORA_R      = int(os.environ.get('ANIMA_LORA_R', '64'))\n")
+    parts.push("LORA_ALPHA  = int(os.environ.get('ANIMA_LORA_ALPHA', '128'))\n")
+    parts.push("SHARD_IDX   = int(os.environ.get('ANIMA_SHARD_IDX', '0'))\n")
+    parts.push("SHARD_TOTAL = int(os.environ.get('ANIMA_SHARD_TOTAL', '1'))\n\n")
+
+    parts.push("os.makedirs(OUTPUT_DIR, exist_ok=True)\n")
+    parts.push("MODE = 'continuation' if LORA_INIT else 'from_scratch'\n")
+    parts.push("print(f'[lora] mode={MODE} base={BASE_MODEL} init={LORA_INIT or \"NONE\"} output={OUTPUT_DIR}', flush=True)\n\n")
+
+    parts.push("docs_all = []\n")
+    parts.push("with open(CORPUS) as f:\n")
+    parts.push("    for ln in f:\n")
+    parts.push("        ln = ln.strip()\n")
+    parts.push("        if ln: docs_all.append(json.loads(ln))\n")
+    parts.push("N = len(docs_all)\n")
+    parts.push("shard_size = math.ceil(N / SHARD_TOTAL)\n")
+    parts.push("start = SHARD_IDX * shard_size\n")
+    parts.push("end = min(N, start + shard_size)\n")
+    parts.push("docs = docs_all[start:end]\n")
+    parts.push("print(f'[lora] corpus_total={N} shard=[{start}:{end}] docs={len(docs)}', flush=True)\n\n")
+
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n\n")
+
+    parts.push("def fmt(d): return f\"{d.get('prompt','')}\\n{d.get('response','')}\"\n")
+    parts.push("texts = [fmt(d) for d in docs]\n")
+    parts.push("enc = tok(texts, truncation=True, max_length=MAX_SEQ, padding=False)\n")
+    parts.push("ds = Dataset.from_dict({'input_ids': enc['input_ids'], 'attention_mask': enc['attention_mask']})\n\n")
+
+    parts.push("print(f'[lora] loading base model...', flush=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=torch.bfloat16, device_map='auto', trust_remote_code=True)\n")
+    parts.push("base.config.use_cache = False\n")
+    parts.push("print(f'[lora] base loaded {time.time()-t0:.1f}s', flush=True)\n\n")
+
+    parts.push("if LORA_INIT:\n")
+    parts.push("    print(f'[lora] continuation from {LORA_INIT}', flush=True)\n")
+    parts.push("    mdl = PeftModel.from_pretrained(base, LORA_INIT, is_trainable=True)\n")
+    parts.push("else:\n")
+    parts.push("    print(f'[lora] from scratch r={LORA_R} alpha={LORA_ALPHA} all-linear', flush=True)\n")
+    parts.push("    cfg = LoraConfig(r=LORA_R, lora_alpha=LORA_ALPHA, target_modules='all-linear', lora_dropout=0.0, bias='none', task_type=TaskType.CAUSAL_LM)\n")
+    parts.push("    mdl = get_peft_model(base, cfg)\n")
+    parts.push("mdl.print_trainable_parameters()\n\n")
+
+    parts.push("args = TrainingArguments(output_dir=OUTPUT_DIR + '/checkpoints', num_train_epochs=EPOCHS,\n")
+    parts.push("    per_device_train_batch_size=1, gradient_accumulation_steps=GRAD_ACC, learning_rate=LR,\n")
+    parts.push("    lr_scheduler_type='cosine', warmup_ratio=0.03, bf16=True, logging_steps=5,\n")
+    parts.push("    save_strategy='no', report_to='none', remove_unused_columns=False)\n\n")
+
+    parts.push("collator = DataCollatorForLanguageModeling(tokenizer=tok, mlm=False)\n")
+    parts.push("trainer = Trainer(model=mdl, args=args, train_dataset=ds, data_collator=collator)\n\n")
+
+    parts.push("print(f'[lora] training: {len(docs)} docs x {EPOCHS} epochs LR={LR}', flush=True)\n")
+    parts.push("t1 = time.time()\n")
+    parts.push("trainer.train()\n")
+    parts.push("print(f'[lora] training elapsed={time.time()-t1:.1f}s', flush=True)\n\n")
+
+    parts.push("final = OUTPUT_DIR + '/final'\n")
+    parts.push("mdl.save_pretrained(final)\n")
+    parts.push("tok.save_pretrained(final)\n")
+    parts.push("print(f'[lora] adapter saved to {final}', flush=True)\n\n")
+
+    parts.push("witness = {'schema':'anima/anima_train_r14_lora/1','base_model':BASE_MODEL,\n")
+    parts.push("    'lora_init': LORA_INIT or 'from_scratch','lora_rank':LORA_R,'lora_alpha':LORA_ALPHA,\n")
+    parts.push("    'lora_target_modules':'all-linear','corpus_docs':len(docs),'corpus_total':N,\n")
+    parts.push("    'shard':f'{SHARD_IDX+1}/{SHARD_TOTAL}','epochs':EPOCHS,'learning_rate':LR,\n")
+    parts.push("    'grad_accumulation':GRAD_ACC,'max_seq_length':MAX_SEQ,\n")
+    parts.push("    'training_elapsed_sec':round(time.time()-t1,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'output_dir':final,\n")
+    parts.push("    'mode':'continuation' if LORA_INIT else 'from_scratch'}\n")
+    parts.push("with open(OUTPUT_DIR + '/witness.json','w') as f: json.dump(witness, f, indent=2)\n")
+    parts.push("print(f'[lora] DONE -> {OUTPUT_DIR}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_train_r14_lora selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("modes=from_scratch (no ANIMA_LORA_INIT) | continuation (ANIMA_LORA_INIT=path)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

@@ -1,0 +1,181 @@
+{
+  "schema": "anima/convergence/h100_stage2_r5/1",
+  "session_id": "h100_stage2_r5_20260424",
+  "started_at": "2026-04-24T13:29:59Z",
+  "closed_at": "2026-04-24T16:21:39Z",
+  "status": "CLOSED — Φ gate r5 = FAIL (3/6 L2, 4/6 KL); p3_p4 L2 0.1753 > 0.1471 p95 (worse than r4 0.1427); p2_p4 also newly failing (L2 0.2230, KL 0.1520)",
+  "roadmap_entries": ["#10", "#77", "#86", "#91"],
+  "cascade_parent": "state/convergence/h100_stage2_r4_20260424.json (r4 edge-FAIL @ p3_p4 L2=0.1427 → r14 full-corpus retrain)",
+  "purpose": "Stage-2 r5 on full r14 corpus (1200 bilingual pairs, sha256 21fcfa51b92f129b119d7fa42303adf7916547ef71c80c16f08e53839bf52b0b) — test whether fuller Korean-balanced corpus closes the p3_p4 L2 edge (r4: 0.1427 > p95 0.131). PASS target: L2 6/6 + KL 6/6 + p3_p4 < 0.10.",
+  "policy_ssot": [
+    "config/runpod_auto_charge.json (auto-charge, balance silent)",
+    "config/h100_max_parallelism_policy.json (no GPU cap, budget=gpu-hours)",
+    ".roadmap POLICY R1-R6 (완성도 기준, loss-free edits, weakest-link evidence first)"
+  ],
+  "launch": {
+    "attempts": 3,
+    "attempt_1": {
+      "ts": "2026-04-24T13:29:59Z",
+      "pod_ids": ["huqmcdt5qw48xi", "08j98n0yh8qz3k", "eeirsufpwqjoh0", "q117owfl7wea1m"],
+      "chain_log": "/tmp/h100_stage2_chain_20260424T133000Z.log",
+      "result": "ABORT — auto-kickoff chain died at step 1/4 ('waiting for SSH') when prior session Bash tool terminated; chain process was a subprocess of Bash call, not detached",
+      "post_mortem": "16 H100 idle for ~68 min, $63 burned with 0% training",
+      "pods_cleaned": true
+    },
+    "attempt_2": {
+      "ts": "2026-04-24T14:38:18Z",
+      "pod_ids": ["9gzikghyja9p6l", "ek9g9obk99366g", "6q5bj9gwnl6e5t", "pmktmfvmu7iem2"],
+      "chain_log": "/tmp/h100_stage2_chain_20260424T143818Z.log",
+      "result": "ABORT — bootstrap rc=99 on all 4 pods. Two latent bugs surfaced:",
+      "root_cause_1": "bash 3.2 cannot parse `declare -A PID_WAIT` (added post-r4 in commit 773dc2fa); macOS /bin/bash is 3.2 and post_launch_chain.bash shebang is /bin/bash. Chain syntax-errored before step 1.",
+      "root_cause_2": "bootstrap BOOTSTRAP_URL extraction via `sed 's/.*=//'` was greedy — RunPod presigned URL has 5+ `=` (X-Amz-Credential/Date/Signature query params) so only the final signature-hash trailer remained → curl tried to resolve a 64-char hex as hostname → DNS fail → bootstrap 99",
+      "cost_burned_usd": 5,
+      "pods_cleaned": true
+    },
+    "attempt_3": {
+      "ts": "2026-04-24T15:01:14Z",
+      "pod_ids": ["z3ur45qbd0b71e", "w1tdyj2x3221u6", "hi0xv4o75ifqqy", "cmpielv4nthghc"],
+      "chain_log": "/tmp/h100_stage2_chain_20260424T150157Z.log",
+      "after_fixes": [
+        "declare -A removed + replaced with plain `state_pN` per-pod vars (loss-free)",
+        "sed non-greedy: `sed 's/^[^=]*=//' | tr -d '\\\\'` (extracts only first `=` value, strips any literal backslashes from heredoc escapes)"
+      ],
+      "result": "CHAIN COMPLETE at 15:04:29Z — SSH OK (12s), bootstrap DONE 4/4 (2m3s), driver shipped 4/4 (12s), 4 trainings kicked off nohup bg",
+      "cost_burned_usd": 0,
+      "comment": "third time's the charm — root causes isolated + fixed, execution deterministic"
+    }
+  },
+  "incidents": [
+    {
+      "seq": 1,
+      "when": "2026-04-24T13:30Z",
+      "symptom": "chain script died silently at SSH-wait step after prior Bash session ended",
+      "root_cause": "nohup ignores SIGHUP but not SIGTERM; the Bash tool's subprocess was killed when its shell terminated, taking the auto-kickoff chain with it",
+      "fix": "relaunch via `(cmd >log 2>&1 & disown) &` detach pattern; later also tried `screen -dmS` when declare -A bug first surfaced",
+      "cost": "$63 (68min × 16 H100 × $0.058/GPU-hr)",
+      "prevention": "future chain launches should use `setsid` (Linux) or homebrew bash4 `screen -dmS` (macOS) for true session detachment — not just `nohup &` under parent shell"
+    },
+    {
+      "seq": 2,
+      "when": "2026-04-24T14:41Z",
+      "symptom": "bootstrap rc=99 all 4 pods; ssh error = stderr `DNS resolve failed for c2d79eb20cfd...`",
+      "root_cause": "post_launch_chain.bash line 78 uses `sed 's/.*=//'` to extract value from `echo URL=...` and `echo SHA=...` lines. RunPod fetch_hexa returns presigned S3 URLs with 5+ query-param `=` signs; greedy match kept only the last X-Amz-Signature trailer",
+      "fix": "change to `sed 's/^[^=]*=//' | tr -d '\\\\'` in both URL_LINE and SHA_LINE extractors",
+      "verification_pre_relaunch": "dry-run extraction printed https://.../hexa-...tar.gz?X-Amz-Algorithm=... + 64-char hex SHA correctly",
+      "cost": "$5 (~6min × 16 H100 attempt-2)",
+      "prevention": "any extraction of structured values (URLs, JSON, key=value) under `set -e` must use non-greedy or anchored patterns; never trust greedy regex on user-provided opaque strings"
+    },
+    {
+      "seq": 3,
+      "when": "2026-04-24T14:38Z",
+      "symptom": "chain died before step 1 with no stderr captured; process table showed no chain PID running",
+      "root_cause": "tool/h100_stage2_post_launch_chain.bash L165 used `declare -A PID_WAIT` (bash 4.0+ associative array) — macOS /bin/bash is 3.2 and shebang was `#!/bin/bash`, so parser errored silently under `exec ... &>log`",
+      "fix": "rewrite PID_WAIT as parallel scalars `local wait_p1 wait_p2 wait_p3 wait_p4` (loss-free since only 4 fixed path IDs)",
+      "commit_pending": "will land with incident #2 sed fix in one commit",
+      "prevention": "any new bash idiom beyond 3.2 (declare -A, mapfile, readarray, ${var,,}) MUST either change shebang to `#!/usr/bin/env bash` + document bash4 dep, OR use portable POSIX equivalents; this script runs from macOS operator shell"
+    },
+    {
+      "seq": 4,
+      "when": "2026-04-24T15:37Z",
+      "symptom": "adapter_pull pulled 4/4 /final/ dirs successfully but did NOT pull /workspace/trained_pN/h_last_raw.json; pods were killed immediately post-pull → h_last_raw data lost",
+      "root_cause": "tool/h100_stage2_adapter_pull.bash step 2 only scp'd `/workspace/trained_pN/final/` (the LoRA adapter). h_last_raw.json lives at `/workspace/trained_pN/h_last_raw.json` (one level up, outside `final/`). The file was used as training-complete signal (step 1 waits for it) but never pulled. Pod kill at step 4 destroyed the file.",
+      "downstream_impact": "Stage 4 forward-pass artifact missing → Stage 6 Φ gate cannot run → blocks CP1 closure path via r5",
+      "fix": "patched adapter_pull.bash step 2 to ALSO scp h_last_raw.json → state/h_last_raw_pN_TRAINED_pending.json (non-fatal warn if missing). Will land with incident #2/#3 fix.",
+      "recovery_options": [
+        "A. Launch forward-pass-only mini pod (1 H100, sequential across 4 bases, ~40min, ~$3-5) — regenerate 4 h_last_raw files from the pulled adapters",
+        "B. Local Mac CPU/MPS forward-pass (free, ~2-4h wall, ~OOM risk for 12B Gemma)",
+        "C. Accept r5 as training-only; skip Φ gate; use r4 edge-FAIL as provisional result — breaks full CP1 decision"
+      ],
+      "prevention": "adapter_pull step 2 now pulls both; convergence mistake #5 (2026-04-24 r3) was inverse error (pulled only h_last_raw, lost adapter) — now pull BOTH, keep BOTH as independent artifacts"
+    }
+  ],
+  "code_fixes_committed": [
+    {"file": "tool/h100_stage2_post_launch_chain.bash", "change": "declare -A PID_WAIT → plain wait_p1..p4 scalars (bash 3.2 compat)", "status": "staged (not committed — claude9 .git/index.lock held)"},
+    {"file": "tool/h100_stage2_post_launch_chain.bash", "change": "sed 's/.*=//' → sed 's/^[^=]*=//' | tr -d '\\\\' (non-greedy, strip escape backslashes)", "status": "staged"},
+    {"file": "tool/h100_stage2_adapter_pull.bash", "change": "step 2 also pulls h_last_raw.json → state/h_last_raw_pN_TRAINED_pending.json", "status": "staged (this session)"}
+  ],
+  "artifacts_landed": [
+    {"path": "state/trained_adapters/p1/final/", "size": "684M", "base_model": "Qwen/Qwen3-8B", "rank": 64},
+    {"path": "state/trained_adapters/p2/final/", "size": "657M", "base_model": "unsloth/Meta-Llama-3.1-8B", "rank": 64},
+    {"path": "state/trained_adapters/p3/final/", "size": "1.3G", "base_model": "mistralai/Mistral-Nemo-Base-2407", "rank": 96},
+    {"path": "state/trained_adapters/p4/final/", "size": "2.1G", "base_model": "google/gemma-3-12b-pt", "rank": 128},
+    {"path": "state/h100_stage2_adapter_pull_state.json", "desc": "4/4 pulled, pods_killed_after_pull=true"},
+    {"path": "state/h100_stage2_launch_state.json", "desc": "attempt-3 launch metadata"}
+  ],
+  "artifacts_missing_or_pending": [
+    "state/atlas_convergence_witness.jsonl r5 entry — Stage 7, pending operator decision on next round"
+  ],
+  "artifacts_landed_recovery_A": [
+    {"path": "state/h_last_raw_p1_TRAINED_r5.json", "size": "84KB", "entries": 16, "h_dim": 256},
+    {"path": "state/h_last_raw_p2_TRAINED_r5.json", "size": "80KB", "entries": 16, "h_dim": 256},
+    {"path": "state/h_last_raw_p3_TRAINED_r5.json", "size": "77KB", "entries": 16, "h_dim": 256},
+    {"path": "state/h_last_raw_p4_TRAINED_r5.json", "size": "82KB", "entries": 16, "h_dim": 256},
+    {"path": "state/phi_4path_cross_result_v3_TRAINED_r5.json", "desc": "full cross-substrate result (spectra + null bootstrap + pair table)"},
+    {"path": "state/phi_4path_gate_last_verdict.json", "verdict": "FAIL (3/6 L2, 4/6 KL)", "p3_p4_L2": 0.1753279191},
+    {"path": "state/h_last_raw_regen_r5_result.json", "desc": "Recovery-A pod + Φ gate summary"}
+  ],
+  "recovery_A_forward_pass": {
+    "tool": "tool/h_last_raw_regen_r5.bash",
+    "pod_id": "aov4vbzsqkmcxp",
+    "pod_name": "anima-fwd-r5-20260424T155441Z",
+    "launched_at": "2026-04-24T15:54:42Z",
+    "killed_at": "2026-04-24T16:21:20Z",
+    "wall_minutes": 26.6,
+    "gpu_hours": 0.44,
+    "bid_usd_per_hr": 3.50,
+    "estimated_cost_usd": 1.55,
+    "per_path_timings": {
+      "p1_Qwen3-8B_rank64": "scp 2m + fwd 1m30 = 3m30 (16:55:23 → 16:58:55)",
+      "p2_Llama3.1-8B_rank64": "scp 6m + fwd 1m30 = 7m30 (16:58:58 → 17:06:37) — network burst variance",
+      "p3_Mistral-Nemo-12B_rank96": "scp 3m49 + fwd 2m = 5m53 (17:06:40 → 17:12:33)",
+      "p4_Gemma3-12B_rank128": "scp 6m28 + fwd 2m10 = 8m41 (17:12:36 → 17:21:17)"
+    },
+    "phi_gate_r5_verdict": "FAIL (3/6 L2, 4/6 KL)",
+    "p3_p4_L2_r4_vs_r5": {"r4": 0.1427, "r5": 0.1753, "delta": "+0.0326 (worse)"},
+    "new_failure_pair_in_r5": "p2_p4 (L2 0.2230, KL 0.1520) — didn't fail in r4",
+    "method_parity_verified": "Same EVAL 16 prompts + hidden_dim_truncated=256 + schema anima/h_last_raw/1 as r2/r3/r4 (bit-exact driver logic copied from tool/h100_stage2_post_launch_chain.bash lines 262-270)"
+  },
+  "next_round_hypothesis": [
+    "r14 corpus expansion (1200 vs r13 subset) did NOT close the p3_p4 edge — actually widened it (+0.033 L2). Hypothesis: Korean-heavy content pushes Gemma-3-12B (p4) and Mistral-Nemo-12B (p3) further apart in spectrum space because their tokenizer vocabularies differ most there (262K vs 32K).",
+    "Newly-failing p2_p4 (Llama-Gemma) mirrors the same tokenizer-divergence pattern for larger-param Gemma path.",
+    "Next round options: (a) increase max_steps 300→600 to push towards spectrum convergence (costs ~2x GPU-hr per pod), (b) reduce substrate diversity by swapping p4 back to gemma-3-12b fine-tune of same corpus on an Apache substrate, (c) accept FAIL as evidence that the 4-path hypothesis requires tighter tokenizer normalization (pre-registered #17 exit criterion — this IS the finding)."
+  ],
+  "training_timeline": {
+    "chain_kickoff": "2026-04-24T15:04:29Z",
+    "adapter_pull_start": "2026-04-24T15:04:29Z (background daemon)",
+    "all_h_last_raw_present_on_pods": "2026-04-24T15:20:11Z (~16 min training wall, much faster than r4 27min due to fully pre-cached bases + warmer disk)",
+    "scp_complete": "2026-04-24T15:37:33Z (17 min scp, p4 2.1G slowest)",
+    "pods_killed": "2026-04-24T15:37:36Z",
+    "total_gpu_hours_r5": "16 GPU × (15:37 − 13:30) / 60 ≈ 33.8 GPU-hr (incl. 2 aborted attempts)",
+    "useful_gpu_hours_r5": "16 GPU × (15:37 − 15:01) / 60 ≈ 9.6 GPU-hr (attempt 3 only)"
+  },
+  "final_state": {},
+  "next_step_options": [
+    "Recovery A (recommended): 1-H100 forward-pass pod sequentially loads each base + LoRA, writes h_last_raw_pN.json, pulls, kills. Cost ~$3-5, wall ~40min. Produces Stage 4 artifacts.",
+    "Then Stage 5 CP1 gen (10 prompts) via cp1_serve_launch.bash on p1 adapter + evaluate",
+    "Then Stage 6 Φ gate: hexa run tool/phi_4path_gate.hexa --tag r5",
+    "Stage 7: append state/atlas_convergence_witness.jsonl with r5 verdict + failures",
+    "Stage 8: h_last_raw_rotate + adapter R2 archive + trained_adapters → trained_adapters_r5 backup"
+  ],
+  "invariants_honored": [
+    "HEXA-FIRST: no .py files authored in repo (pod-side training drivers only, .gitignore enforces)",
+    "auto-charge: no balance/budget halting during H100 chains",
+    "convergence_store: this file lives under state/convergence/ not flat state/",
+    "max-parallelism: no GPU count cap; budget metric = gpu_hours",
+    "no_idle_pods: never pause for A/B/C/D menus while pods are live",
+    "diagnostic_before_retry_x3: H-DIAG3 rule — 2 consecutive same-strategy fails require new diagnostic evidence before attempt 3 (honored: incident #2 dry-run verified URL extraction before attempt 3 relaunch)",
+    "loss-free: all bug fixes this session are root-cause fixes, not workarounds (bash3.2 compat, sed non-greedy, adapter_pull step-2 augment)"
+  ],
+  "prevention_index_additions": [
+    "bash_version_compat: macOS /bin/bash is 3.2; any declare -A / mapfile / ${var,,} in tool/*.bash requires `#!/usr/bin/env bash` shebang + documented bash4 dep OR POSIX rewrite",
+    "greedy_regex_on_opaque_strings: extraction of values from vendor-provided URLs/JSON must use anchored or non-greedy patterns (`s/^[^=]*=//`, not `s/.*=//`)",
+    "session_detachment: chain launches from Bash tool must survive parent shell termination — use setsid/screen/systemd-run, never rely on nohup alone under interactive parent",
+    "both_artifacts_pulled: adapter_pull must scp BOTH `final/` (LoRA) AND `h_last_raw.json` (forward-pass data) before pod kill; losing either costs a forward-pass rerun"
+  ],
+  "meta_lessons": [
+    "Training itself was fast (16 min) — the r2/r3/r4 '27min/path' estimate was stale (more corpus, but better cache). Re-baseline GPU-hour budgets downward for r6+.",
+    "Launch overhead (bootstrap + SSH + driver ship) is ~5 min per attempt on stable chain. Failed attempts cost $3-5 each — H-DIAG3 dry-run-before-retry is high ROI (attempt-3 succeeded because incident #2 fix was verified locally before relaunch).",
+    "Post-training scp is 17 min, dominated by p4 Gemma-3-12b 2.1G adapter (LoRA rank 128 bf16). If tighter CP1 iteration needed, smaller adapter ranks would significantly speed scp.",
+    "Convergence mistake #5 (2026-04-24 r3, lost adapter) and incident #4 this session (lost h_last_raw) are DUAL failures of the same root: adapter_pull was iteratively patched to pull one artifact then the other, never both. Now fixed to pull both with independent failure paths."
+  ]
+}

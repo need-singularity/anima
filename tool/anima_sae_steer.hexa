@@ -1,0 +1,122 @@
+// tool/anima_sae_steer.hexa — Anima SAE-STEER paradigm pilot (raw#9 hexa-only).
+//
+// PURPOSE
+//   SAE feature × 4-family signature alignment (paradigm v11 SAE-STEER).
+//   Migration #10 from /tmp/sae_steer_pilot.py (axis 19 — infrastructure-blocked).
+//   Random projection 3584→16 (JL-style) for SAE features × family signature cosine.
+//
+// raw#10 honest caveat: random projection lossy — actual steering 위해서는 activation-based
+// feature labeling 필요. 본 helper는 SAE feature space가 family signature axis와
+// any aligned인지 lower bound check만 가능.
+//
+// ENV
+//   ANIMA_SAE_RELEASE  SAELens release (default: gemma-scope-9b-pt-res)
+//   ANIMA_SAE_ID       SAE id (default: layer_20/width_16k/average_l0_71)
+//   ANIMA_OUTPUT       output JSON
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_sae_steer_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima SAE-STEER pilot helper — emitted by tool/anima_sae_steer.hexa\n")
+    parts.push("# raw#37 transient. NOTE: requires sae_lens with compatible transformer_lens version.\n")
+    parts.push("import json, os, sys, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("SAE_RELEASE = os.environ.get('ANIMA_SAE_RELEASE', 'gemma-scope-9b-pt-res')\n")
+    parts.push("SAE_ID = os.environ.get('ANIMA_SAE_ID', 'layer_20/width_16k/average_l0_71')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/sae_steer.json')\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("print(f'[sae-steer] loading SAELens + {SAE_RELEASE} {SAE_ID}', flush=True)\n")
+    parts.push("from sae_lens import SAE\n")
+    parts.push("sae, cfg, sparsity = SAE.from_pretrained(release=SAE_RELEASE, sae_id=SAE_ID, device='cuda')\n")
+    parts.push("print(f'[sae-steer] SAE loaded {time.time()-t0:.1f}s, n_features={sae.cfg.d_sae}, d_in={sae.cfg.d_in}', flush=True)\n\n")
+
+    parts.push("W_dec = sae.W_dec.detach().cpu().numpy()\n")
+    parts.push("print(f'[sae-steer] W_dec shape={W_dec.shape}', flush=True)\n\n")
+
+    parts.push("templates = []\n")
+    parts.push("with open('/workspace/an11_b_templates.jsonl') as f:\n")
+    parts.push("    for ln in f:\n")
+    parts.push("        ln = ln.strip()\n")
+    parts.push("        if ln: templates.append(json.loads(ln))\n\n")
+
+    parts.push("def normv(v):\n")
+    parts.push("    n = np.linalg.norm(v); return v/n if n > 0 else v\n\n")
+
+    parts.push("family_means = {}\n")
+    parts.push("for fam in ['Hexad','Law','Phi','SelfRef']:\n")
+    parts.push("    sigs = [np.array(t['signature']) for t in templates if t['family']==fam]\n")
+    parts.push("    family_means[fam] = np.mean(sigs, axis=0)\n")
+    parts.push("    print(f'[sae-steer] family {fam}: {len(sigs)} templates', flush=True)\n\n")
+
+    parts.push("# JL random projection 3584 → 16 (template signature dim)\n")
+    parts.push("np.random.seed(42)\n")
+    parts.push("proj = np.random.randn(W_dec.shape[1], 16) / np.sqrt(W_dec.shape[1])\n")
+    parts.push("W_dec_proj = W_dec @ proj\n")
+    parts.push("W_dec_proj_n = np.array([normv(W_dec_proj[i]) for i in range(W_dec_proj.shape[0])])\n\n")
+
+    parts.push("results = {}\n")
+    parts.push("for fam, sig in family_means.items():\n")
+    parts.push("    sig_n = normv(sig)\n")
+    parts.push("    cos = np.abs(W_dec_proj_n @ sig_n)\n")
+    parts.push("    top10_idx = np.argsort(-cos)[:10]\n")
+    parts.push("    results[fam] = {'max_cosine_proj':float(np.max(cos)),\n")
+    parts.push("        'mean_top10_cosine_proj':float(np.mean(cos[top10_idx])),\n")
+    parts.push("        'top10_feature_indices':top10_idx.tolist(),\n")
+    parts.push("        'top10_cosines':[float(c) for c in cos[top10_idx]],\n")
+    parts.push("        'n_features_above_0_5':int(np.sum(cos > 0.5)),\n")
+    parts.push("        'n_features_above_0_3':int(np.sum(cos > 0.3))}\n")
+    parts.push("    print(f'[sae-steer] {fam}: max_cos={float(np.max(cos)):.4f} top10_mean={float(np.mean(cos[top10_idx])):.4f}', flush=True)\n\n")
+
+    parts.push("summary = {'schema':'anima/sae_steer_pilot/1','sae_release':SAE_RELEASE,'sae_id':SAE_ID,\n")
+    parts.push("    'sae_n_features':int(W_dec.shape[0]),'sae_d_in':int(W_dec.shape[1]),\n")
+    parts.push("    'method':'random projection 3584→16 (JL) for SAE features × family signature cosine',\n")
+    parts.push("    'raw10_caveat':'random projection lossy — actual steering needs activation-based labeling',\n")
+    parts.push("    'results_per_family':results,\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[sae-steer] DONE -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_sae_steer selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("CAVEAT: requires sae_lens compat (axis 19 transformer_lens × transformers >=4.45 BertForPreTraining incompat blocker)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

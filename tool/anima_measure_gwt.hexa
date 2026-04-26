@@ -1,0 +1,156 @@
+// tool/anima_measure_gwt.hexa — Anima V_phen_GWT measurement (raw#9 hexa-only).
+//
+// PURPOSE
+//   V_phen_GWT_proper attention 4D Shannon entropy measurement.
+//   Migration #3 from /tmp/measure_gwt_phi3_mini.py + measure_gwt_lora.py + measure_gwt_corpus_direct.py.
+//   Single helper supports 4 modes via env: BASE / LoRA / corpus_direct / corpus_lora.
+//
+// ENV
+//   ANIMA_MODE         BASE | LoRA | CORPUS_BASE | CORPUS_LORA (default: BASE)
+//   ANIMA_BASE         backbone HF id (default: Qwen/Qwen3-8B)
+//   ANIMA_LORA         LoRA path (required for LoRA / CORPUS_LORA)
+//   ANIMA_CORPUS       jsonl corpus (required for CORPUS_*)
+//   ANIMA_OUTPUT       output JSON path (default: /workspace/out/gwt.json)
+//   ANIMA_TAG          measurement tag (default: GWT_measurement)
+//   ANIMA_N_DOCS       corpus mode N first docs (default: 10)
+//   ANIMA_PROMPT       BASE/LoRA mode default prompt
+//   ANIMA_TRUST_REMOTE trust_remote_code (default: true; set false for Phi3 modeling_phi3.py KeyError 우회)
+//
+// USAGE
+//   hexa run tool/anima_measure_gwt.hexa --selftest
+//   hexa run tool/anima_measure_gwt.hexa run    # emits /tmp/anima_measure_gwt_helper.hexa_tmp
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_measure_gwt_helper.hexa_tmp"
+let SCHEMA      = "anima/anima_measure_gwt/1"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima V_phen_GWT measurement helper — emitted by tool/anima_measure_gwt.hexa\n")
+    parts.push("# raw#37 transient.\n")
+    parts.push("import json, os, sys, math, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n")
+    parts.push("        print('[gwt] HF token loaded', flush=True)\n\n")
+
+    parts.push("MODE = os.environ.get('ANIMA_MODE', 'BASE').upper()\n")
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'Qwen/Qwen3-8B')\n")
+    parts.push("LORA_PATH  = os.environ.get('ANIMA_LORA', '')\n")
+    parts.push("CORPUS     = os.environ.get('ANIMA_CORPUS', '')\n")
+    parts.push("OUTPUT     = os.environ.get('ANIMA_OUTPUT', '/workspace/out/gwt.json')\n")
+    parts.push("TAG        = os.environ.get('ANIMA_TAG', 'GWT_measurement')\n")
+    parts.push("N_DOCS     = int(os.environ.get('ANIMA_N_DOCS', '10'))\n")
+    parts.push("DEFAULT_PROMPT = os.environ.get('ANIMA_PROMPT', 'The quick brown fox jumps over the lazy dog. The capital of France is Paris. Quantum mechanics describes the behavior of matter at atomic scales. Entropy measures the disorder of a thermodynamic system.')\n")
+    parts.push("_TRC = os.environ.get('ANIMA_TRUST_REMOTE', 'true').lower() in ('1','true','yes')\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[gwt] mode={MODE} base={BASE_MODEL} lora={LORA_PATH or \"NONE\"} corpus={CORPUS or \"NONE\"}', flush=True)\n\n")
+
+    parts.push("t0 = time.time()\n")
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=_TRC)\n")
+    parts.push("base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=_TRC, torch_dtype=torch.bfloat16, attn_implementation='eager', device_map='auto')\n")
+    parts.push("if MODE in ('LORA', 'CORPUS_LORA'):\n")
+    parts.push("    if not LORA_PATH:\n")
+    parts.push("        print('ERROR: LoRA mode requires ANIMA_LORA env'); sys.exit(2)\n")
+    parts.push("    from peft import PeftModel\n")
+    parts.push("    mdl = PeftModel.from_pretrained(base, LORA_PATH)\n")
+    parts.push("    print(f'[gwt] LoRA loaded from {LORA_PATH}', flush=True)\n")
+    parts.push("else:\n")
+    parts.push("    mdl = base\n")
+    parts.push("mdl.eval()\n")
+    parts.push("print(f'[gwt] loaded in {time.time()-t0:.1f}s', flush=True)\n\n")
+
+    parts.push("def measure_gwt(prompt):\n")
+    parts.push("    inp = tok(prompt, return_tensors='pt', max_length=512, truncation=True).to(mdl.device)\n")
+    parts.push("    seq_len = int(inp['input_ids'].shape[-1])\n")
+    parts.push("    with torch.no_grad():\n")
+    parts.push("        out = mdl(**inp, output_attentions=True, use_cache=False, return_dict=True)\n")
+    parts.push("    attns = out.attentions\n")
+    parts.push("    L = len(attns); H = int(attns[0].shape[1])\n")
+    parts.push("    log_S = math.log(max(2, seq_len))\n")
+    parts.push("    per_head = np.zeros((L, H), dtype=np.float64)\n")
+    parts.push("    eps = 1e-12\n")
+    parts.push("    for li, A in enumerate(attns):\n")
+    parts.push("        a = A.detach().to(torch.float32).cpu().numpy()\n")
+    parts.push("        Hq = -np.sum(a * np.log(np.clip(a, eps, 1.0)), axis=-1)\n")
+    parts.push("        per_head[li] = np.mean(Hq, axis=-1)[0] / log_S\n")
+    parts.push("    mean_norm = float(np.mean(per_head))\n")
+    parts.push("    bcast = int(np.sum(np.mean(per_head, axis=1) >= 0.55))\n")
+    parts.push("    return {'seq_len': seq_len, 'L': L, 'H': H, 'V_phen_GWT': mean_norm, 'broadcast_layer_count': bcast}\n\n")
+
+    parts.push("results = {}\n")
+    parts.push("if MODE in ('CORPUS_BASE', 'CORPUS_LORA'):\n")
+    parts.push("    if not CORPUS:\n")
+    parts.push("        print('ERROR: CORPUS mode requires ANIMA_CORPUS env'); sys.exit(2)\n")
+    parts.push("    docs = []\n")
+    parts.push("    with open(CORPUS) as f:\n")
+    parts.push("        for ln in f:\n")
+    parts.push("            ln = ln.strip()\n")
+    parts.push("            if ln: docs.append(json.loads(ln))\n")
+    parts.push("    docs = docs[:N_DOCS]\n")
+    parts.push("    print(f'[gwt] measuring {len(docs)} corpus docs', flush=True)\n")
+    parts.push("    per_doc = []\n")
+    parts.push("    all_means = []\n")
+    parts.push("    for di, d in enumerate(docs):\n")
+    parts.push("        text = f\"{d.get('prompt','')}\\n{d.get('response','')}\"\n")
+    parts.push("        r = measure_gwt(text)\n")
+    parts.push("        all_means.append(r['V_phen_GWT'])\n")
+    parts.push("        per_doc.append({'idx': di, 'doc_id': d.get('id',''), **r})\n")
+    parts.push("        print(f'[gwt]   {di+1}/{len(docs)} {d.get(\"id\",\"\")[:40]} GWT={r[\"V_phen_GWT\"]:.4f}', flush=True)\n")
+    parts.push("    results = {'aggregate_mean_V_phen_GWT': float(np.mean(all_means)),\n")
+    parts.push("               'aggregate_std_V_phen_GWT': float(np.std(all_means)),\n")
+    parts.push("               'n_docs_measured': len(docs), 'per_doc': per_doc}\n")
+    parts.push("else:\n")
+    parts.push("    r = measure_gwt(DEFAULT_PROMPT)\n")
+    parts.push("    results = {'prompt_first50': DEFAULT_PROMPT[:50], **r}\n\n")
+
+    parts.push("summary = {'schema':'anima/v_phen_gwt_measure/1','purpose':'V_phen_GWT measurement via tool/anima_measure_gwt.hexa',\n")
+    parts.push("    'mode':MODE,'backbone':BASE_MODEL,'lora':LORA_PATH,'corpus':CORPUS,'tag':TAG,\n")
+    parts.push("    'results':results,'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[gwt] DONE -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_measure_gwt selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("modes=BASE|LORA|CORPUS_BASE|CORPUS_LORA")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

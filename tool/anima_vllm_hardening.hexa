@@ -1,0 +1,161 @@
+// tool/anima_vllm_hardening.hexa — Anima vllm + LoRA AN11(c) hardening (raw#9 hexa-only).
+//
+// PURPOSE
+//   vllm OpenAI-API server + LoRA adapter serving + AN11(c) live JSD measurement.
+//   Migration #7 from /tmp/vllm_hardening_an11c.py (axis 2 cycle).
+//
+// ENV
+//   ANIMA_BASE         backbone HF id (default: Qwen/Qwen3-8B)
+//   ANIMA_LORA         LoRA adapter path (default: /workspace/lora_r6_p1_final)
+//   ANIMA_PORT         vllm port (default: 8080)
+//   ANIMA_OUTPUT       output JSON (default: /workspace/out/vllm_an11c.json)
+//   ANIMA_N_PROMPTS    20 prompts AN11(c) (default: 20)
+//   ANIMA_N_GENS       20 gens per prompt (default: 20)
+//   ANIMA_MAX_TOKENS   max_tokens per gen (default: 32)
+//   ANIMA_LORA_NAME    vllm lora-modules registration name (default: r6p1)
+//   ANIMA_MAX_LORA_RANK (default: 64)
+//
+// USAGE
+//   hexa run tool/anima_vllm_hardening.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_vllm_hardening_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima vllm hardening helper — emitted by tool/anima_vllm_hardening.hexa\n")
+    parts.push("# raw#37 transient.\n")
+    parts.push("import json, os, sys, time, subprocess, signal, math\n")
+    parts.push("from collections import Counter\n")
+    parts.push("import urllib.request, urllib.error\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n")
+    parts.push("        print('[vllm] HF token loaded', flush=True)\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'Qwen/Qwen3-8B')\n")
+    parts.push("LORA_PATH  = os.environ.get('ANIMA_LORA', '/workspace/lora_r6_p1_final')\n")
+    parts.push("PORT       = int(os.environ.get('ANIMA_PORT', '8080'))\n")
+    parts.push("OUTPUT     = os.environ.get('ANIMA_OUTPUT', '/workspace/out/vllm_an11c.json')\n")
+    parts.push("N_PROMPTS  = int(os.environ.get('ANIMA_N_PROMPTS', '20'))\n")
+    parts.push("N_GENS     = int(os.environ.get('ANIMA_N_GENS', '20'))\n")
+    parts.push("MAX_TOKENS = int(os.environ.get('ANIMA_MAX_TOKENS', '32'))\n")
+    parts.push("LORA_NAME  = os.environ.get('ANIMA_LORA_NAME', 'r6p1')\n")
+    parts.push("MAX_LORA_RANK = int(os.environ.get('ANIMA_MAX_LORA_RANK', '64'))\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[vllm] base={BASE_MODEL} lora={LORA_PATH} port={PORT} lora_name={LORA_NAME}', flush=True)\n\n")
+
+    parts.push("cmd = ['python3', '-m', 'vllm.entrypoints.openai.api_server',\n")
+    parts.push("    '--model', BASE_MODEL, '--enable-lora',\n")
+    parts.push("    '--lora-modules', f'{LORA_NAME}={LORA_PATH}',\n")
+    parts.push("    '--port', str(PORT), '--host', '0.0.0.0',\n")
+    parts.push("    '--max-model-len', '2048', '--gpu-memory-utilization', '0.85',\n")
+    parts.push("    '--dtype', 'bfloat16', '--trust-remote-code',\n")
+    parts.push("    '--max-loras', '1', '--max-lora-rank', str(MAX_LORA_RANK)]\n")
+    parts.push("print(f'[vllm] launching: {\" \".join(cmd)}', flush=True)\n")
+    parts.push("proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n\n")
+
+    parts.push("health_url = f'http://127.0.0.1:{PORT}/health'\n")
+    parts.push("t0 = time.time(); ready = False\n")
+    parts.push("while time.time()-t0 < 600:\n")
+    parts.push("    try:\n")
+    parts.push("        with urllib.request.urlopen(health_url, timeout=3) as r:\n")
+    parts.push("            if r.status == 200: ready = True; break\n")
+    parts.push("    except (urllib.error.URLError, ConnectionRefusedError, OSError): pass\n")
+    parts.push("    if proc.poll() is not None:\n")
+    parts.push("        out, _ = proc.communicate(timeout=5)\n")
+    parts.push("        print(f'[vllm] CRASHED:\\n{(out or b\"\").decode(errors=\"replace\")[-3000:]}', flush=True)\n")
+    parts.push("        sys.exit(1)\n")
+    parts.push("    time.sleep(3)\n")
+    parts.push("if not ready:\n")
+    parts.push("    print(f'[vllm] /health NOT ready in {time.time()-t0:.1f}s — abort', flush=True)\n")
+    parts.push("    proc.send_signal(signal.SIGTERM); sys.exit(1)\n")
+    parts.push("print(f'[vllm] /health 200 in {time.time()-t0:.1f}s', flush=True)\n\n")
+
+    parts.push("PROMPTS = ['The capital of France is','Quantum mechanics describes','Consciousness emerges from','Machine learning models can','The theory of relativity states','Evolution by natural selection means','A neural network learns by','Entropy in thermodynamics measures','The speed of light is','Photosynthesis converts','DNA replication occurs during','Black holes are regions where','Climate change is driven by','The immune system protects','Memory in the brain involves','Mathematical proofs require','Language acquisition in children','Renewable energy sources include','Quantum entanglement allows','The standard model of physics']\n")
+    parts.push("PROMPTS = PROMPTS[:N_PROMPTS]\n\n")
+
+    parts.push("def gen_one(prompt):\n")
+    parts.push("    body = json.dumps({'model':LORA_NAME,'prompt':prompt,'max_tokens':MAX_TOKENS,'temperature':1.0,'top_p':1.0}).encode()\n")
+    parts.push("    req = urllib.request.Request(f'http://127.0.0.1:{PORT}/v1/completions', data=body, headers={'Content-Type':'application/json'})\n")
+    parts.push("    with urllib.request.urlopen(req, timeout=60) as r:\n")
+    parts.push("        return json.loads(r.read())['choices'][0]['text']\n\n")
+
+    parts.push("print(f'[vllm] AN11(c): {N_PROMPTS} prompts x {N_GENS} gens', flush=True)\n")
+    parts.push("t1 = time.time(); all_completions = []; per_prompt_uniq = []\n")
+    parts.push("for pi, p in enumerate(PROMPTS):\n")
+    parts.push("    completions = []\n")
+    parts.push("    for gi in range(N_GENS):\n")
+    parts.push("        try: completions.append(gen_one(p))\n")
+    parts.push("        except Exception as e: print(f'[vllm] gen fail {pi}.{gi}: {e}', flush=True); completions.append('')\n")
+    parts.push("    per_prompt_uniq.append(len(set(completions)))\n")
+    parts.push("    all_completions.extend(completions)\n")
+    parts.push("    if (pi+1)%5==0: print(f'[vllm] {pi+1}/{N_PROMPTS} elapsed={time.time()-t1:.1f}s', flush=True)\n\n")
+
+    parts.push("elapsed = time.time()-t1\n")
+    parts.push("all_tokens = ' '.join(all_completions).split()\n")
+    parts.push("counter = Counter(all_tokens)\n")
+    parts.push("total = sum(counter.values())\n")
+    parts.push("K = max(1, len(counter))\n")
+    parts.push("if total == 0:\n")
+    parts.push("    H_norm = 0.0; top_mass = 1.0; H_raw = 0.0\n")
+    parts.push("else:\n")
+    parts.push("    H_raw = -sum((c/total)*math.log(c/total) for c in counter.values())\n")
+    parts.push("    H_norm = H_raw / math.log(max(2, K))\n")
+    parts.push("    top_mass = counter.most_common(1)[0][1] / total\n\n")
+
+    parts.push("uniq_global = len(set(all_completions))\n")
+    parts.push("result = {'schema':'anima/an11c_vllm_live/1','model':BASE_MODEL,'lora':LORA_PATH,\n")
+    parts.push("    'n_prompts':N_PROMPTS,'n_gens_per_prompt':N_GENS,'n_total_calls':N_PROMPTS*N_GENS,\n")
+    parts.push("    'elapsed_sec':round(elapsed,1),'unique_completions_global':uniq_global,\n")
+    parts.push("    'unique_completions_global_ratio':uniq_global/float(N_PROMPTS*N_GENS),\n")
+    parts.push("    'per_prompt_unique_mean':float(sum(per_prompt_uniq))/max(1,len(per_prompt_uniq)),\n")
+    parts.push("    'token_entropy_raw_nats':round(H_raw,6),'token_entropy_normalized':round(H_norm,6),\n")
+    parts.push("    'top_token_global_mass':round(top_mass,6),\n")
+    parts.push("    'an11c_jsd_proxy':round(H_raw,6),\n")
+    parts.push("    'reference_an11c_jsd_transformers_direct':0.6931,\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(result, f, indent=2)\n")
+    parts.push("print(json.dumps(result, indent=2), flush=True)\n")
+    parts.push("print(f'[vllm] DONE -> {OUTPUT}', flush=True)\n\n")
+
+    parts.push("proc.send_signal(signal.SIGTERM)\n")
+    parts.push("try: proc.wait(timeout=30)\n")
+    parts.push("except subprocess.TimeoutExpired: proc.kill()\n")
+    parts.push("print('[vllm] vllm terminated', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_vllm_hardening selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("AN11(c) live measurement: 20 prompts x 20 gens = 400 calls")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

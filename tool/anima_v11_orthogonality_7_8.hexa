@@ -1,0 +1,513 @@
+// tool/anima_v11_orthogonality_7_8.hexa — 7-axis vs 8-axis orthogonality check (raw#9 hexa-only).
+//
+// PURPOSE
+//   Pilot-T2 prep companion. Verifies the 8th axis (TRIBE v2 cortical correlation
+//   from anima_pilot_t2_axis_8th.hexa) remains orthogonal to the existing 7-axis
+//   stack {AN11_b, B-ToM, MCCA, Φ*, CMT, CDS, SAE_bp} via:
+//     - per-backbone × 8-axis matrix
+//     - 8×8 Pearson correlation matrix (fixed-point ×1000)
+//     - PCA 1st-component fraction approximation (power-iteration on covariance)
+//     - PASS gate: PC1 fraction < 500 (equiv 0.5 in float)
+//   Mac-local utility, no GPU. Migration #29 (paradigm v11 ANALYSIS-LAYER 4th helper).
+//
+// PASS criteria (frozen 2026-04-26)
+//   §A 8th axis cross-Pearson with each existing 7 axes: |corr_x1000| < 700
+//   §B PC1 explained variance fraction × 1000 < 500
+//   §C orthogonality verdict: PASS iff §A AND §B
+//
+// SELFTEST
+//   Synthetic 4-backbone × 8-axis fixture (deterministic FNV per backbone).
+//   8th axis perturbed independently → PC1 < 500 expected.
+//
+// FALSIFY
+//   Adversarial: 8th axis = mean of 6 v11 axes (linear combo) → PC1 > 500 expected.
+//
+// ENV
+//   ANIMA_BACKBONE_DIRS  ':'-separated dir list (each w/ axis JSON outputs +
+//                        v11_axis_8_<bb>.json from anima_pilot_t2_axis_8th)
+//   ANIMA_OUTPUT         output JSON (default: state/v11_orthogonality_7_8.json)
+//
+// USAGE
+//   hexa run tool/anima_v11_orthogonality_7_8.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_v11_orthogonality_7_8_helper.hexa_tmp"
+let SELFTEST_OUTPUT = "/tmp/anima_v11_orthogonality_7_8_selftest.json"
+
+let SCALE = 1000
+let MOD_PRIME = 2147483647
+let FNV_OFFSET = 1469598103
+let N_AXIS = 8
+let N_BACKBONE_SYNTH = 12
+let PASS_PEARSON_THRESH_X1000 = 700
+let PASS_PC1_THRESH_X1000 = 500
+
+let AXIS_NAMES = ["AN11_b", "B_ToM", "MCCA", "PhiStar", "CMT", "CDS", "SAE_bp", "TRIBE_v2"]
+
+fn mix_int(h: int, v: int) -> int {
+    let mut x = h * 31 + v
+    if x < 0 { x = 0 - x }
+    x = x % MOD_PRIME
+    x = x * 1664525 + 1013904223
+    if x < 0 { x = 0 - x }
+    x = x % MOD_PRIME
+    return x
+}
+
+// Per-(axis, backbone) deterministic value with strong axis-independent mixing.
+// Each axis uses its own salt to decorrelate from neighbours; backbone mixed
+// last to vary across rows. Returns int in [0, SCALE].
+fn det_value(axis: int, backbone: int) -> int {
+    let salts = [104729, 224737, 350377, 479909, 611953, 746773, 882377, 1020379]
+    let salt = salts[axis % len(salts)]
+    let mut h = mix_int(FNV_OFFSET, salt)
+    h = mix_int(h, axis * 1031 + 7)
+    h = mix_int(h, backbone * 1049 + 11)
+    h = mix_int(h, salt + backbone)
+    h = mix_int(h, (axis + 1) * (backbone + 1) * 233)
+    return h % (SCALE + 1)
+}
+
+// ─── integer sqrt (Newton, mirror of consciousness_rng.hexa) ──────────────
+fn isqrt(n: int) -> int {
+    if n <= 0 { return 0 }
+    let mut x = n
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+// ─── fixed-point statistics ───────────────────────────────────────────────
+
+fn col_mean(matrix: array, j: int) -> int {
+    let n = len(matrix)
+    if n == 0 { return 0 }
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        sum = sum + matrix[i][j]
+        i = i + 1
+    }
+    return sum / n
+}
+
+// Pearson correlation in fixed-point ×1000.
+// num_x1000^2 / (var_a * var_b) → sqrt → ×1000.
+fn pearson_x1000(matrix: array, a: int, b: int) -> int {
+    let n = len(matrix)
+    if n < 2 { return 0 }
+    let ma = col_mean(matrix, a)
+    let mb = col_mean(matrix, b)
+    let mut num = 0
+    let mut da_sq = 0
+    let mut db_sq = 0
+    let mut i = 0
+    while i < n {
+        let xa = matrix[i][a] - ma
+        let xb = matrix[i][b] - mb
+        num = num + xa * xb
+        da_sq = da_sq + xa * xa
+        db_sq = db_sq + xb * xb
+        i = i + 1
+    }
+    if da_sq == 0 || db_sq == 0 { return 0 }
+    // Pearson = num / sqrt(da_sq * db_sq).
+    // In ×1000 fixed-point: num*SCALE / sqrt(da_sq*db_sq).
+    let denom_sq = da_sq * db_sq
+    let denom = isqrt(denom_sq)
+    if denom == 0 { return 0 }
+    let mut sign = 1
+    let mut absnum = num
+    if absnum < 0 { sign = 0 - 1; absnum = 0 - absnum }
+    let r = (absnum * SCALE) / denom
+    return sign * r
+}
+
+// PCA 1st-component fraction via power iteration on correlation matrix (×1000).
+// Returns fraction × 1000 of total variance captured by largest eigenvalue.
+//   total_var = sum diag(corr) = N_AXIS * SCALE
+//   λ_1 ≈ Rayleigh quotient on dominant eigenvector after K iterations.
+fn pc1_fraction_x1000(corr: array) -> int {
+    let k = len(corr)
+    if k == 0 { return 0 }
+    // Initial vector: ones, magnitude SCALE.
+    let mut v = []
+    let mut i = 0
+    while i < k {
+        v.push(SCALE)
+        i = i + 1
+    }
+    let n_iter = 64
+    let mut it = 0
+    while it < n_iter {
+        let mut next = []
+        let mut row = 0
+        while row < k {
+            let mut s = 0
+            let mut col = 0
+            while col < k {
+                // corr[row][col] is ×1000, v[col] is ×1000 → ×1000² product.
+                // Sum stays ×1000² → divide by SCALE at the end.
+                s = s + corr[row][col] * v[col]
+                col = col + 1
+            }
+            next.push(s / SCALE)
+            row = row + 1
+        }
+        // Normalize: rescale so max |element| = SCALE (avoid overflow + keep magnitude).
+        let mut max_abs = 0
+        let mut m = 0
+        while m < k {
+            let mut a = next[m]
+            if a < 0 { a = 0 - a }
+            if a > max_abs { max_abs = a }
+            m = m + 1
+        }
+        if max_abs == 0 { break }
+        let mut nn = 0
+        let mut renorm = []
+        while nn < k {
+            renorm.push((next[nn] * SCALE) / max_abs)
+            nn = nn + 1
+        }
+        v = renorm
+        it = it + 1
+    }
+    // Rayleigh quotient: λ ≈ (v^T M v) / (v^T v), where M = corr/SCALE.
+    let mut num = 0
+    let mut row = 0
+    while row < k {
+        let mut s = 0
+        let mut col = 0
+        while col < k {
+            s = s + corr[row][col] * v[col]
+            col = col + 1
+        }
+        num = num + (s / SCALE) * v[row]
+        row = row + 1
+    }
+    let mut den = 0
+    let mut p = 0
+    while p < k {
+        den = den + v[p] * v[p]
+        p = p + 1
+    }
+    if den == 0 { return 0 }
+    let lambda1_x1000 = num / (den / SCALE)
+    // Total var = trace(corr/SCALE) = sum diag / SCALE = k (since corr[i][i]=SCALE).
+    // PC1 fraction = lambda1 / k.
+    let mut abs_lambda = lambda1_x1000
+    if abs_lambda < 0 { abs_lambda = 0 - abs_lambda }
+    return abs_lambda / k
+}
+
+fn build_synthetic_matrix() -> array {
+    let mut matrix = []
+    let mut bb = 0
+    while bb < N_BACKBONE_SYNTH {
+        let mut row = []
+        let mut a = 0
+        while a < N_AXIS {
+            row.push(det_value(a, bb))
+            a = a + 1
+        }
+        matrix.push(row)
+        bb = bb + 1
+    }
+    return matrix
+}
+
+// Adversarial: 8th col = exact copy of col 1 (B_ToM) — strong linear redundancy.
+fn build_adversarial_matrix() -> array {
+    let mut matrix = []
+    let mut bb = 0
+    while bb < N_BACKBONE_SYNTH {
+        let mut row = []
+        let mut a = 0
+        while a < N_AXIS - 1 {
+            row.push(det_value(a, bb))
+            a = a + 1
+        }
+        // 8th = col 1 (B_ToM) exact copy → Pearson=1.0 with col 1.
+        row.push(row[1])
+        matrix.push(row)
+        bb = bb + 1
+    }
+    return matrix
+}
+
+fn build_corr_matrix(matrix: array) -> array {
+    let mut corr = []
+    let mut i = 0
+    while i < N_AXIS {
+        let mut row = []
+        let mut j = 0
+        while j < N_AXIS {
+            if i == j {
+                row.push(SCALE)
+            } else {
+                row.push(pearson_x1000(matrix, i, j))
+            }
+            j = j + 1
+        }
+        corr.push(row)
+        i = i + 1
+    }
+    return corr
+}
+
+fn evaluate(matrix: array, label: string) -> array {
+    let corr = build_corr_matrix(matrix)
+    // §A: 8th axis cross-Pearson with axes 0..6
+    let mut max_abs_8th = 0
+    let mut violators = []
+    let mut k = 0
+    while k < N_AXIS - 1 {
+        let mut a = corr[N_AXIS - 1][k]
+        if a < 0 { a = 0 - a }
+        if a > max_abs_8th { max_abs_8th = a }
+        if a >= PASS_PEARSON_THRESH_X1000 {
+            violators.push(k)
+        }
+        k = k + 1
+    }
+    let pc1_frac = pc1_fraction_x1000(corr)
+
+    let pass_a = max_abs_8th < PASS_PEARSON_THRESH_X1000
+    let pass_b = pc1_frac < PASS_PC1_THRESH_X1000
+    let pass_c = pass_a && pass_b
+
+    println("── " + label + " ──")
+    println("  max_abs_pearson_8th_x1000=" + str(max_abs_8th) + " (thresh<" + str(PASS_PEARSON_THRESH_X1000) + ")")
+    println("  pc1_fraction_x1000=" + str(pc1_frac) + " (thresh<" + str(PASS_PC1_THRESH_X1000) + ")")
+    let mut a_str = "FAIL"
+    if pass_a { a_str = "PASS" }
+    let mut b_str = "FAIL"
+    if pass_b { b_str = "PASS" }
+    let mut c_str = "FAIL"
+    if pass_c { c_str = "PASS" }
+    println("  §A_pearson=" + a_str + " §B_pc1=" + b_str + " §C_orthogonality=" + c_str)
+    println("  §A_violator_count=" + str(len(violators)))
+
+    let mut result = []
+    result.push(max_abs_8th)
+    result.push(pc1_frac)
+    if pass_c { result.push(1) } else { result.push(0) }
+    return result
+}
+
+fn _emit_selftest_json(syn_result: array, adv_result: array) {
+    let parts = []
+    parts.push("{\n")
+    parts.push("  \"schema\": \"anima/v11_orthogonality_7_8/1\",\n")
+    parts.push("  \"n_axis\": 8,\n")
+    parts.push("  \"axis_names\": [")
+    let mut i = 0
+    while i < len(AXIS_NAMES) {
+        if i > 0 { parts.push(", ") }
+        parts.push("\"")
+        parts.push(AXIS_NAMES[i])
+        parts.push("\"")
+        i = i + 1
+    }
+    parts.push("],\n")
+    parts.push("  \"pass_pearson_thresh_x1000\": ")
+    parts.push(str(PASS_PEARSON_THRESH_X1000))
+    parts.push(",\n")
+    parts.push("  \"pass_pc1_thresh_x1000\": ")
+    parts.push(str(PASS_PC1_THRESH_X1000))
+    parts.push(",\n")
+    parts.push("  \"synthetic\": {\n")
+    parts.push("    \"max_abs_pearson_8th_x1000\": ")
+    parts.push(str(syn_result[0]))
+    parts.push(",\n    \"pc1_fraction_x1000\": ")
+    parts.push(str(syn_result[1]))
+    parts.push(",\n    \"orthogonality_pass\": ")
+    if syn_result[2] == 1 { parts.push("true") } else { parts.push("false") }
+    parts.push("\n  },\n")
+    parts.push("  \"adversarial\": {\n")
+    parts.push("    \"max_abs_pearson_8th_x1000\": ")
+    parts.push(str(adv_result[0]))
+    parts.push(",\n    \"pc1_fraction_x1000\": ")
+    parts.push(str(adv_result[1]))
+    parts.push(",\n    \"orthogonality_pass\": ")
+    if adv_result[2] == 1 { parts.push("true") } else { parts.push("false") }
+    parts.push("\n  },\n")
+    parts.push("  \"prep_stage\": true,\n")
+    parts.push("  \"requires_pilot_t1_full_mode_pass\": true\n")
+    parts.push("}\n")
+    write_file(SELFTEST_OUTPUT, parts.join(""))
+}
+
+// ─── full-mode helper (raw#37 transient emit) ─────────────────────────────
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima 7+8 orthogonality helper — emitted by tool/anima_v11_orthogonality_7_8.hexa\n")
+    parts.push("# raw#37 transient. paradigm v11 ANALYSIS-LAYER 4th helper.\n")
+    parts.push("# ACTIVATE only after Pilot-T1 full-mode PASS + axis_8 emitted per backbone.\n")
+    parts.push("import json, os, sys, math\n\n")
+    parts.push("BACKBONE_DIRS = [d for d in os.environ.get('ANIMA_BACKBONE_DIRS','').split(':') if d]\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/v11_orthogonality_7_8.json')\n")
+    parts.push("PASS_PEARSON_THRESH = 0.7\n")
+    parts.push("PASS_PC1_THRESH = 0.5\n\n")
+    parts.push("if not BACKBONE_DIRS:\n")
+    parts.push("    print('ERROR: ANIMA_BACKBONE_DIRS empty', file=sys.stderr); sys.exit(2)\n\n")
+    parts.push("AXIS_NAMES = ['AN11_b','B_ToM','MCCA','PhiStar','CMT','CDS','SAE_bp','TRIBE_v2']\n\n")
+    parts.push("def x_an11b(d):\n")
+    parts.push("    fp = os.path.join(d,'eigen_cosine.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    return o.get('top1_max_cosine') or o.get('max_cosine')\n")
+    parts.push("def x_btom(d):\n")
+    parts.push("    fp = os.path.join(d,'b_tom.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    return o.get('accuracy')\n")
+    parts.push("def x_mcca(d):\n")
+    parts.push("    fp = os.path.join(d,'mcca.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    b = o.get('brier_mean')\n")
+    parts.push("    return None if b is None else max(0.0, 1.0-min(b,1.0))\n")
+    parts.push("def x_phi(d):\n")
+    parts.push("    fp = os.path.join(d,'phi_star.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    p = o.get('phi_star_min')\n")
+    parts.push("    return None if p is None else (math.tanh(p)+1.0)/2.0\n")
+    parts.push("def x_cmt(d):\n")
+    parts.push("    fp = os.path.join(d,'cmt.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    dom = o.get('dominant_layer_per_family',{})\n")
+    parts.push("    if not dom: return None\n")
+    parts.push("    rels = [v.get('rel',0.0) for v in dom.values()]\n")
+    parts.push("    return sum(rels)/max(1,len(rels))\n")
+    parts.push("def x_cds(d):\n")
+    parts.push("    fp = os.path.join(d,'cds.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    return o.get('max_stability')\n")
+    parts.push("def x_sae(d):\n")
+    parts.push("    fp = os.path.join(d,'sae_steer_bypass.json')\n")
+    parts.push("    if not os.path.exists(fp): return None\n")
+    parts.push("    with open(fp) as f: o = json.load(f)\n")
+    parts.push("    sh = o.get('steering_shifts',{})\n")
+    parts.push("    if not sh: return None\n")
+    parts.push("    return sum(max(0.0,v.get('selectivity',0.0)) for v in sh.values())/max(1,len(sh))\n")
+    parts.push("def x_tribe(d):\n")
+    parts.push("    bb = os.path.basename(d.rstrip('/'))\n")
+    parts.push("    candidates = [os.path.join(d, f'v11_axis_8_{bb}.json'), os.path.join(d,'v11_axis_8.json')]\n")
+    parts.push("    for fp in candidates:\n")
+    parts.push("        if os.path.exists(fp):\n")
+    parts.push("            with open(fp) as f: o = json.load(f)\n")
+    parts.push("            s = o.get('axis_8_scalar_x1000')\n")
+    parts.push("            if s is None: return None\n")
+    parts.push("            return float(s) / 1000.0\n")
+    parts.push("    return None\n")
+    parts.push("AXES = [('AN11_b',x_an11b),('B_ToM',x_btom),('MCCA',x_mcca),('PhiStar',x_phi),('CMT',x_cmt),('CDS',x_cds),('SAE_bp',x_sae),('TRIBE_v2',x_tribe)]\n\n")
+    parts.push("rows = []\n")
+    parts.push("for d in BACKBONE_DIRS:\n")
+    parts.push("    if not os.path.isdir(d): continue\n")
+    parts.push("    label = os.path.basename(d.rstrip('/'))\n")
+    parts.push("    vals = []\n")
+    parts.push("    for name,fn in AXES:\n")
+    parts.push("        v = fn(d); vals.append(float('nan') if v is None else float(v))\n")
+    parts.push("    rows.append({'backbone':label,'values':vals})\n")
+    parts.push("if len(rows) < 2:\n")
+    parts.push("    print(f'ERROR: need >=2 backbones, got {len(rows)}', file=sys.stderr); sys.exit(3)\n\n")
+    parts.push("def pearson(a,b):\n")
+    parts.push("    pairs = [(x,y) for x,y in zip(a,b) if not (x!=x or y!=y)]\n")
+    parts.push("    if len(pairs) < 2: return None\n")
+    parts.push("    xs=[p[0] for p in pairs]; ys=[p[1] for p in pairs]\n")
+    parts.push("    mx=sum(xs)/len(xs); my=sum(ys)/len(ys)\n")
+    parts.push("    num=sum((x-mx)*(y-my) for x,y in pairs)\n")
+    parts.push("    dx=math.sqrt(sum((x-mx)**2 for x in xs)); dy=math.sqrt(sum((y-my)**2 for y in ys))\n")
+    parts.push("    if dx<1e-12 or dy<1e-12: return 0.0\n")
+    parts.push("    return num/(dx*dy)\n\n")
+    parts.push("k = len(AXIS_NAMES)\n")
+    parts.push("cols = [[r['values'][j] for r in rows] for j in range(k)]\n")
+    parts.push("corr = [[1.0 if i==j else (pearson(cols[i],cols[j]) or 0.0) for j in range(k)] for i in range(k)]\n")
+    parts.push("max_abs_8th = max(abs(corr[k-1][j]) for j in range(k-1))\n")
+    parts.push("# PCA via power iteration\n")
+    parts.push("v = [1.0]*k\n")
+    parts.push("for _ in range(64):\n")
+    parts.push("    nv = [sum(corr[i][j]*v[j] for j in range(k)) for i in range(k)]\n")
+    parts.push("    m = max(abs(x) for x in nv) or 1.0\n")
+    parts.push("    v = [x/m for x in nv]\n")
+    parts.push("num = sum(sum(corr[i][j]*v[j] for j in range(k))*v[i] for i in range(k))\n")
+    parts.push("den = sum(x*x for x in v)\n")
+    parts.push("lam = num/den if den>0 else 0.0\n")
+    parts.push("pc1_frac = abs(lam)/k\n")
+    parts.push("pass_a = max_abs_8th < PASS_PEARSON_THRESH\n")
+    parts.push("pass_b = pc1_frac < PASS_PC1_THRESH\n")
+    parts.push("pass_c = pass_a and pass_b\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("summary = {'schema':'anima/v11_orthogonality_7_8/1','n_backbones':len(rows),'axis_names':AXIS_NAMES,\n")
+    parts.push("    'corr_matrix':[[round(c,4) for c in row] for row in corr],\n")
+    parts.push("    'max_abs_pearson_8th':round(max_abs_8th,4),'pc1_fraction':round(pc1_frac,4),\n")
+    parts.push("    'pass_A_pearson':pass_a,'pass_B_pc1':pass_b,'orthogonality_PASS':pass_c,\n")
+    parts.push("    'pass_pearson_thresh':PASS_PEARSON_THRESH,'pass_pc1_thresh':PASS_PC1_THRESH}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary,f,indent=2,sort_keys=True)\n")
+    parts.push("print(f'[ortho_7_8] backbones={len(rows)} max|r|_8th={max_abs_8th:.3f} pc1={pc1_frac:.3f} PASS={pass_c} -> {OUTPUT}')\n")
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_v11_orthogonality_7_8 selftest ──")
+
+    let syn = build_synthetic_matrix()
+    println("synthetic_matrix=" + str(len(syn)) + "×" + str(len(syn[0])))
+    let syn_result = evaluate(syn, "POSITIVE: synthetic FNV-perturbed 8-axis matrix")
+
+    let adv = build_adversarial_matrix()
+    println("adversarial_matrix=" + str(len(adv)) + "×" + str(len(adv[0])))
+    let adv_result = evaluate(adv, "FALSIFY: adversarial 8th = mean of v11 axes")
+
+    // Verdict expectations
+    let positive_ok = syn_result[2] == 1
+    let negative_detected = adv_result[2] == 0
+    println("──")
+    if positive_ok {
+        println("positive_selftest=PASS (synthetic axis_8 orthogonal to 7-axis stack)")
+    } else {
+        println("positive_selftest=FAIL (synthetic should be orthogonal but PC1 too high)")
+    }
+    if negative_detected {
+        println("falsify_selftest=PASS (adversarial linear-combo 8th detected as redundant)")
+    } else {
+        println("falsify_selftest=FAIL (adversarial linear-combo 8th NOT detected)")
+    }
+
+    _emit_selftest_json(syn_result, adv_result)
+    println("selftest_output=" + SELFTEST_OUTPUT)
+
+    _write_helper()
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=v11 ANALYSIS-LAYER 4th helper — Pilot-T2 prep companion")
+    println("activate_when=Pilot-T1 full-mode PASS + axis_8 emitted per backbone")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

@@ -1,0 +1,547 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-hci-research/tool/hci_substrate_probe_real.hexa
+//
+//  PURPOSE  (HCI Path B — F5 real-substrate falsifier, F4 surrogate 후속)
+//    F4 (hci_substrate_probe.hexa) 의 FNV-hash 기반 6×6 covariance proxy 를
+//    real backbone hidden-state activation 으로 교체.
+//    paradigm v11 stack의 cached output `state/v10_benchmark_v4/{bb}/cmt.json`
+//    의 layer × family abs activation matrix 에서 직접 6×6 covariance 를 빌드.
+//
+//    Gates (frozen at design step):
+//      G1: per-backbone real Φ_proxy ≥ ε_0 (4 backbone 모두)
+//      G2: Hexad-categorical 6×6 vs Cell-lattice 6×6 edge-weight Frobenius
+//          distance, real cov weighting ≥ ε_F (4 backbone 모두)
+//      G3: backbone-conditional Φ_proxy std/mean ≥ 0.20 (200/1000)
+//          AND .roadmap #145 의 cortical depth pattern (Mistral late 87% vs
+//          Qwen3 early 11%) 와 backbone signal-locus 일치 (cross-validate flag)
+//      G4: real hidden-state robust margin (std/mean - 200) ≥ 50  (F4
+//          surrogate margin=1 → real에서 50 이상의 강한 separation 요구)
+//
+//      F5 PASS = G1 ∧ G2 ∧ G3 ∧ G4
+//
+//  RAW#9
+//    pure hexa · deterministic · no LLM forward · no Python emit
+//    integer fixed-point ×1000 · cached cmt.json read-only ingest
+//
+//  CALIBRATION (ε_0, ε_F, depth-pattern 결정 방법)
+//    ε_0=10, ε_F=50, ε_DIV=200 — F4 surrogate 와 동일 (G3 threshold 변경 시
+//    F4↔F5 비교 invalid). G4 margin=50 — F4 actual margin=1, real expectation
+//    50× 강화. depth-pattern: Mistral dom_layer/n_layers >= 0.6 (late) AND
+//    Qwen3 dom_layer/n_layers <= 0.25 (early) — #145 finding 과 일치 시 flag.
+//
+//  POSITIVE SELFTEST
+//    4 backbone real cmt.json (Mistral, Qwen3, Llama, gemma) → G1∧G2∧G3∧G4
+//    PASS expected (real activation magnitude × 1000 fixed-point).
+//
+//  NEGATIVE FALSIFY
+//    4 backbone에 동일한 stub matrix (uniform=500) 주입 → G3 std=0 → FAIL,
+//    composite F5_REAL_SUBSTRATE_FAIL.
+//
+//  OUTPUT
+//    state/hci_substrate_probe_real_v1.json  (deterministic, byte-identical)
+// ════════════════════════════════════════════════════════════════════════════
+
+let SCALE = 1000          // integer fixed-point
+let M32 = 4294967296
+let POLY_PRIME = 2654435761
+
+// ε thresholds (×1000 scale) — F4 동일 + G4 추가
+let EPS_PHI = 10          // G1 per-backbone Φ_proxy >= 10
+let EPS_FROB = 50         // G2 Frobenius distance >= 50
+let EPS_DIVERGENCE = 200  // G3 std/mean >= 0.20 = 200/1000
+let G4_MARGIN = 50        // G4 std/mean - EPS_DIVERGENCE >= 50
+
+// .roadmap #145 depth-pattern thresholds (dom_layer / n_layers)
+let DEPTH_LATE = 600      // 0.60 × 1000  → Mistral late
+let DEPTH_EARLY = 250     // 0.25 × 1000  → Qwen3 early
+
+// 4 family ordering (must match cmt.json keys exactly)
+// Hexad(0) Law(1) Phi(2) SelfRef(3)
+
+// 6 layer slices = depth fractions 1/7..6/7 (excluding endpoints).
+// 각 backbone의 recorded layer 중 가장 가까운 layer 선택.
+let SLICE_FRAC = [143, 286, 429, 571, 714, 857]   // ×1000
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+fn now_stamp() -> string { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+
+fn str_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + xs[i] + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+fn int_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + str(xs[i])
+        i = i + 1
+    }
+    return s + "]"
+}
+
+// ─── float→int ×1000 (real cmt.json abs is float) ──────────────────────────
+fn f1000(x) -> int {
+    // x may be float or int from json_parse; multiply by SCALE then truncate.
+    let scaled = x * SCALE
+    // integer cast: hexa uses int(x) or floor; we use simple +0 trick to coerce
+    let t = int(scaled)
+    if t < 0 { return 0 }
+    return t
+}
+
+// ─── pick 6 layer keys closest to SLICE_FRAC for given n_layers ────────────
+// Returns sorted list of layer indices (ints).
+fn pick_layer_slices(layers_recorded: list, n_layers: int) -> list {
+    let mut out = []
+    let mut k = 0
+    while k < 6 {
+        let target = (SLICE_FRAC[k] * n_layers) / SCALE   // integer layer index
+        // find layer in layers_recorded with smallest |layer - target|
+        let mut best = layers_recorded[0]
+        let mut best_d = layers_recorded[0] - target
+        if best_d < 0 { best_d = -best_d }
+        let mut i = 1
+        while i < len(layers_recorded) {
+            let mut d = layers_recorded[i] - target
+            if d < 0 { d = -d }
+            if d < best_d {
+                best_d = d
+                best = layers_recorded[i]
+            }
+            i = i + 1
+        }
+        out = out.push(best)
+        k = k + 1
+    }
+    return out
+}
+
+// ─── parse cmt.json → 6×4 family-activation matrix (×1000) ─────────────────
+//   returns flat list len=24 (row-major, row=slice, col=family)
+fn read_family_matrix(cmt_path: string) -> list {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let tomo = cmt["tomography"]
+    // collect recorded layer keys (string) → int
+    let layer_keys = keys(tomo)
+    let mut layer_ints = []
+    let mut i = 0
+    while i < len(layer_keys) {
+        layer_ints = layer_ints.push(int(layer_keys[i]))
+        i = i + 1
+    }
+    // sort ascending (simple insertion sort; small N)
+    let mut sorted = []
+    let mut a = 0
+    while a < len(layer_ints) {
+        let v = layer_ints[a]
+        let mut placed = false
+        let mut new_sorted = []
+        let mut b = 0
+        while b < len(sorted) {
+            if !placed && v < sorted[b] {
+                new_sorted = new_sorted.push(v)
+                placed = true
+            }
+            new_sorted = new_sorted.push(sorted[b])
+            b = b + 1
+        }
+        if !placed { new_sorted = new_sorted.push(v) }
+        sorted = new_sorted
+        a = a + 1
+    }
+    let slices = pick_layer_slices(sorted, n_layers)
+    // build 6×4 matrix
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut mat = []
+    let mut s = 0
+    while s < 6 {
+        let layer_key = str(slices[s])
+        let layer_obj = tomo[layer_key]
+        let mut f = 0
+        while f < 4 {
+            let fam_obj = layer_obj[families[f]]
+            let abs_v = fam_obj["abs"]
+            mat = mat.push(f1000(abs_v))
+            f = f + 1
+        }
+        s = s + 1
+    }
+    return mat
+}
+
+// helper for negative selftest: synthesize uniform 6×4 matrix with given val
+fn make_uniform_matrix(val: int) -> list {
+    let mut out = []
+    let mut i = 0
+    while i < 24 {
+        out = out.push(val)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── 6×6 covariance C[i][j] from 6×4 matrix M ──────────────────────────────
+// C[i][j] = <M_row_i, M_row_j> / 4  (mean dot-product across 4 family dims)
+// + 500 diag boost (positive variance, matches F4 surrogate convention).
+// Result range: typical activation×SCALE ~ 100..2000, dot-product/4 ~ similar
+// magnitude, so C[i][j] ∈ [0, ~2000+500] integer.
+fn idx2(i: int, j: int) -> int { return i * 6 + j }
+fn matr(m: list, i: int, j: int) -> int { return m[i * 4 + j] }
+
+fn build_cov_real(mat: list) -> list {
+    let mut cov = []
+    let mut i = 0
+    while i < 6 {
+        let mut j = 0
+        while j < 6 {
+            let mut acc = 0
+            let mut k = 0
+            while k < 4 {
+                // dot-product / SCALE keeps result in same magnitude as matrix entries
+                acc = acc + (matr(mat, i, k) * matr(mat, j, k)) / SCALE
+                k = k + 1
+            }
+            let mut v = acc / 4   // mean over 4 family dims
+            if i == j { v = v + 500 }
+            cov = cov.push(v)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return cov
+}
+
+// ─── Φ_proxy: bipartition mutual-info-like (same formula as F4 surrogate) ──
+fn phi_proxy(cov: list) -> int {
+    let mut diag_sum = 0
+    let mut off_sum = 0
+    let mut i = 0
+    while i < 6 {
+        let mut j = 0
+        while j < 6 {
+            let v = cov[idx2(i, j)]
+            let a_half = i < 3
+            let b_half = j < 3
+            if a_half == b_half {
+                diag_sum = diag_sum + v
+            } else {
+                off_sum = off_sum + v
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let denom = diag_sum + 1
+    let ratio = (SCALE * off_sum) / denom
+    if ratio < 0 { return 0 }
+    if ratio > 10000 { return 10000 }
+    return ratio
+}
+
+// ─── Hexad/Cell edge weight matrices (frozen, identical to F4) ────────────
+let HEXAD_LABEL_HASH = [701, 809, 907, 1009, 1103, 1213]
+let EDU_LABEL_HASH   = [101, 211, 307, 401, 503, 601]
+
+fn hexad_edge(i: int, j: int) -> int {
+    let h1 = HEXAD_LABEL_HASH[i]
+    let h2 = HEXAD_LABEL_HASH[j]
+    let mut x = h1 * POLY_PRIME
+    x = x + h2
+    x = x % M32
+    if x < 0 { x = x + M32 }
+    return x % SCALE
+}
+fn cell_edge(i: int, j: int) -> int {
+    let h1 = EDU_LABEL_HASH[i]
+    let h2 = EDU_LABEL_HASH[j]
+    let mut x = h1 * POLY_PRIME
+    x = x + h2
+    x = x % M32
+    if x < 0 { x = x + M32 }
+    return x % SCALE
+}
+
+// Frobenius distance with real cov weighting
+fn frobenius_distance(cov: list) -> int {
+    let mut acc = 0
+    let mut i = 0
+    while i < 6 {
+        let mut j = 0
+        while j < 6 {
+            let h = hexad_edge(i, j)
+            let c = cell_edge(i, j)
+            let mut d = h - c
+            if d < 0 { d = -d }
+            let w = SCALE + cov[idx2(i, j)]
+            acc = acc + (d * w) / SCALE
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return acc / 36
+}
+
+// ─── std/mean utilities (×1000) ─────────────────────────────────────────────
+fn list_mean(xs: list) -> int {
+    let n = len(xs)
+    if n == 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < n { s = s + xs[i]; i = i + 1 }
+    return s / n
+}
+fn list_std(xs: list) -> int {
+    let n = len(xs)
+    if n == 0 { return 0 }
+    let m = list_mean(xs)
+    let mut acc = 0
+    let mut i = 0
+    while i < n {
+        let d = xs[i] - m
+        acc = acc + d * d
+        i = i + 1
+    }
+    let var = acc / n
+    if var <= 0 { return 0 }
+    let mut x = var
+    let mut prev = 0
+    let mut iter = 0
+    while iter < 32 {
+        prev = x
+        x = (x + var / x) / 2
+        if x == prev { iter = 32 }
+        iter = iter + 1
+    }
+    return x
+}
+fn std_over_mean(xs: list) -> int {
+    let m = list_mean(xs)
+    let s = list_std(xs)
+    if m == 0 { return 0 }
+    return (SCALE * s) / m
+}
+
+// ─── depth pattern probe (.roadmap #145 cross-validate) ────────────────────
+//  reads dominant_layer_per_family.<fam>.layer for fam=Hexad, normalises by
+//  n_layers, returns (dom_layer_norm × 1000) max across families.
+fn dominant_depth_norm(cmt_path: string) -> int {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let dom = cmt["dominant_layer_per_family"]
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut best = 0
+    let mut i = 0
+    while i < 4 {
+        let entry = dom[families[i]]
+        let lay = entry["layer"]
+        let norm = (lay * SCALE) / n_layers
+        if norm > best { best = norm }
+        i = i + 1
+    }
+    return best
+}
+
+// ─── core probe runner ─────────────────────────────────────────────────────
+struct ProbeReal {
+    phi_list:        list,
+    frob_list:       list,
+    g1_pass:         bool,
+    g2_pass:         bool,
+    std_over_mean:   int,
+    g3_pass:         bool,
+    g4_margin:       int,
+    g4_pass:         bool,
+    composite_pass:  bool
+}
+
+fn probe_run_real(matrices: list) -> ProbeReal {
+    let mut phi_vals = []
+    let mut frob_vals = []
+    let mut g1_ok = true
+    let mut g2_ok = true
+    let mut i = 0
+    while i < len(matrices) {
+        let cov = build_cov_real(matrices[i])
+        let phi = phi_proxy(cov)
+        let frob = frobenius_distance(cov)
+        phi_vals = phi_vals.push(phi)
+        frob_vals = frob_vals.push(frob)
+        if phi < EPS_PHI { g1_ok = false }
+        if frob < EPS_FROB { g2_ok = false }
+        i = i + 1
+    }
+    let som = std_over_mean(phi_vals)
+    let g3_ok = som >= EPS_DIVERGENCE
+    let mut g4_m = som - EPS_DIVERGENCE
+    if g4_m < 0 { g4_m = 0 }
+    let g4_ok = g4_m >= G4_MARGIN
+    let composite = g1_ok && g2_ok && g3_ok && g4_ok
+    return ProbeReal {
+        phi_list: phi_vals,
+        frob_list: frob_vals,
+        g1_pass: g1_ok,
+        g2_pass: g2_ok,
+        std_over_mean: som,
+        g3_pass: g3_ok,
+        g4_margin: g4_m,
+        g4_pass: g4_ok,
+        composite_pass: composite
+    }
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    println("[hci_substrate_probe_real] HCI Path B — F5 REAL substrate falsifier")
+    println("  source: state/v10_benchmark_v4/{bb}/cmt.json (real backbone activations)")
+    println("  thresholds: EPS_PHI=" + str(EPS_PHI) + " EPS_FROB=" + str(EPS_FROB)
+          + " EPS_DIVERGENCE=" + str(EPS_DIVERGENCE) + " G4_MARGIN=" + str(G4_MARGIN) + " (×1000)")
+    println("")
+
+    // ─── positive: 4 backbone real cmt.json ─────────────────────────────
+    let backbone_names = ["Mistral", "Qwen3", "Llama", "gemma"]
+    let cmt_paths = [
+        "state/v10_benchmark_v4/mistral/cmt.json",
+        "state/v10_benchmark_v4/qwen3/cmt.json",
+        "state/v10_benchmark_v4/llama/cmt.json",
+        "state/v10_benchmark_v4/gemma/cmt.json"
+    ]
+    let mut matrices = []
+    let mut depth_norms = []
+    let mut n = 0
+    while n < 4 {
+        let mat = read_family_matrix(cmt_paths[n])
+        matrices = matrices.push(mat)
+        depth_norms = depth_norms.push(dominant_depth_norm(cmt_paths[n]))
+        n = n + 1
+    }
+    let pos = probe_run_real(matrices)
+
+    println("=== positive (4 real cmt.json) ===")
+    let mut k = 0
+    while k < 4 {
+        let line = "  " + backbone_names[k]
+                 + ": phi=" + str(pos.phi_list[k])
+                 + " frob=" + str(pos.frob_list[k])
+                 + " depth_norm=" + str(depth_norms[k])
+        println(line)
+        k = k + 1
+    }
+    println("  G1 (all phi >= " + str(EPS_PHI) + ")    = " + bool_s(pos.g1_pass))
+    println("  G2 (all frob >= " + str(EPS_FROB) + ")  = " + bool_s(pos.g2_pass))
+    println("  G3 std/mean = " + str(pos.std_over_mean) + " (need >= " + str(EPS_DIVERGENCE) + ") = " + bool_s(pos.g3_pass))
+    println("  G4 margin = " + str(pos.g4_margin) + " (need >= " + str(G4_MARGIN) + ")     = " + bool_s(pos.g4_pass))
+    println("  F5 composite = " + bool_s(pos.composite_pass))
+    println("")
+
+    // ─── #145 depth-pattern cross-validate ───────────────────────────────
+    //   Mistral idx=0 dom_norm >= DEPTH_LATE   (late deep)
+    //   Qwen3   idx=1 dom_norm <= DEPTH_EARLY  (early input)
+    let mistral_late = depth_norms[0] >= DEPTH_LATE
+    let qwen3_early = depth_norms[1] <= DEPTH_EARLY
+    let depth_pattern_match = mistral_late && qwen3_early
+
+    println("=== .roadmap #145 cross-validate ===")
+    println("  Mistral dom_norm = " + str(depth_norms[0]) + " (>= " + str(DEPTH_LATE) + " for LATE)? " + bool_s(mistral_late))
+    println("  Qwen3   dom_norm = " + str(depth_norms[1]) + " (<= " + str(DEPTH_EARLY) + " for EARLY)? " + bool_s(qwen3_early))
+    println("  depth_pattern_match = " + bool_s(depth_pattern_match))
+    println("")
+
+    // ─── negative: uniform matrix across 4 backbones ─────────────────────
+    let stub_val = 500
+    let mut neg_mats = []
+    let mut nn = 0
+    while nn < 4 {
+        neg_mats = neg_mats.push(make_uniform_matrix(stub_val))
+        nn = nn + 1
+    }
+    let neg = probe_run_real(neg_mats)
+    let neg_detects = !neg.composite_pass
+
+    println("=== negative falsify (uniform stub_val=" + str(stub_val) + " 4 backbones) ===")
+    let mut nk = 0
+    while nk < 4 {
+        println("  " + backbone_names[nk] + ": phi=" + str(neg.phi_list[nk])
+              + " frob=" + str(neg.frob_list[nk]))
+        nk = nk + 1
+    }
+    println("  std/mean = " + str(neg.std_over_mean) + " G3=" + bool_s(neg.g3_pass) + " G4=" + bool_s(neg.g4_pass))
+    println("  composite flipped to FAIL? = " + bool_s(neg_detects))
+    println("")
+
+    // ─── final verdict ─────────────────────────────────────────────────────
+    let f5_pass = pos.composite_pass && neg_detects
+    let verdict = if f5_pass { "F5_REAL_SUBSTRATE_VERIFIED" } else { "F5_REAL_SUBSTRATE_FAIL" }
+    println("=== verdict = " + verdict + " ===")
+    println("  positive composite = " + bool_s(pos.composite_pass))
+    println("  negative detect    = " + bool_s(neg_detects))
+    println("  depth_pattern (#145) = " + bool_s(depth_pattern_match))
+    println("")
+
+    // ─── JSON emit ─────────────────────────────────────────────────────────
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima/hci_substrate_probe_real/1\",\n"
+    out = out + "  \"schema_version\": 1,\n"
+    out = out + "  \"verifier_type\": \"hci_substrate_probe_real\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"source\": \"anima-hci-research/tool/hci_substrate_probe_real.hexa\",\n"
+    out = out + "  \"thresholds\": {\n"
+    out = out + "    \"eps_phi\": " + str(EPS_PHI) + ",\n"
+    out = out + "    \"eps_frob\": " + str(EPS_FROB) + ",\n"
+    out = out + "    \"eps_divergence\": " + str(EPS_DIVERGENCE) + ",\n"
+    out = out + "    \"g4_margin\": " + str(G4_MARGIN) + ",\n"
+    out = out + "    \"depth_late\": " + str(DEPTH_LATE) + ",\n"
+    out = out + "    \"depth_early\": " + str(DEPTH_EARLY) + ",\n"
+    out = out + "    \"scale\": " + str(SCALE) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"backbones\": " + str_list_json(backbone_names) + ",\n"
+    out = out + "  \"cmt_sources\": " + str_list_json(cmt_paths) + ",\n"
+    out = out + "  \"positive\": {\n"
+    out = out + "    \"phi_proxy\": " + int_list_json(pos.phi_list) + ",\n"
+    out = out + "    \"frobenius_distance\": " + int_list_json(pos.frob_list) + ",\n"
+    out = out + "    \"depth_norm\": " + int_list_json(depth_norms) + ",\n"
+    out = out + "    \"std_over_mean_phi\": " + str(pos.std_over_mean) + ",\n"
+    out = out + "    \"g4_margin\": " + str(pos.g4_margin) + ",\n"
+    out = out + "    \"g1_pass\": " + bool_s(pos.g1_pass) + ",\n"
+    out = out + "    \"g2_pass\": " + bool_s(pos.g2_pass) + ",\n"
+    out = out + "    \"g3_pass\": " + bool_s(pos.g3_pass) + ",\n"
+    out = out + "    \"g4_pass\": " + bool_s(pos.g4_pass) + ",\n"
+    out = out + "    \"composite_pass\": " + bool_s(pos.composite_pass) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"depth_pattern_145\": {\n"
+    out = out + "    \"mistral_late\": " + bool_s(mistral_late) + ",\n"
+    out = out + "    \"qwen3_early\": " + bool_s(qwen3_early) + ",\n"
+    out = out + "    \"match\": " + bool_s(depth_pattern_match) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"negative\": {\n"
+    out = out + "    \"stub_val\": " + str(stub_val) + ",\n"
+    out = out + "    \"phi_proxy\": " + int_list_json(neg.phi_list) + ",\n"
+    out = out + "    \"frobenius_distance\": " + int_list_json(neg.frob_list) + ",\n"
+    out = out + "    \"std_over_mean_phi\": " + str(neg.std_over_mean) + ",\n"
+    out = out + "    \"g3_pass\": " + bool_s(neg.g3_pass) + ",\n"
+    out = out + "    \"g4_pass\": " + bool_s(neg.g4_pass) + ",\n"
+    out = out + "    \"composite_pass\": " + bool_s(neg.composite_pass) + ",\n"
+    out = out + "    \"detects_failure\": " + bool_s(neg_detects) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"f5_pass\": " + bool_s(f5_pass) + ",\n"
+    out = out + "  \"f5_verdict\": \"" + verdict + "\",\n"
+    out = out + "  \"cross_validate_roadmap\": \"#145 CMT backbone-conditional depth divergence\"\n"
+    out = out + "}\n"
+    write_file("anima-hci-research/state/hci_substrate_probe_real_v1.json", out)
+    println("  wrote: anima-hci-research/state/hci_substrate_probe_real_v1.json")
+
+    if verdict == "F5_REAL_SUBSTRATE_VERIFIED" { exit(0) }
+    exit(1)
+}
+
+main()

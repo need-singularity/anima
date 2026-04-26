@@ -1,0 +1,221 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-hci-research/tool/hci_substrate_smoke_real.hexa
+//
+//  PURPOSE  (HCI Path B — 5-falsifier composite chain, F4 + F5 모두 포함)
+//    F1+F2 (functor) + F3 (adversarial) + F4 (substrate surrogate)
+//                                       + F5 (substrate REAL)
+//    의 verdict 를 read, composite verdict 산출:
+//      HCI_REAL_SUBSTRATE_VERIFIED  iff  F1 ∧ F2 ∧ F3 ∧ F4 ∧ F5
+//
+//  PRECONDITIONS
+//    state/hci_functor_falsifier_v1.json
+//    state/hci_adversarial_flip_v1.json
+//    state/hci_substrate_probe_v1.json           (F4 surrogate)
+//    state/hci_substrate_probe_real_v1.json      (F5 real)
+//
+//  RAW#9
+//    pure hexa · jq 미사용 · self-contained substring scan
+//    (기존 hci_substrate_smoke 와 별개, 5-falsifier chain).
+//
+//  OUTPUT
+//    state/hci_substrate_smoke_real_v1.json
+// ════════════════════════════════════════════════════════════════════════════
+
+let FUNCTOR_PATH        = "anima-hci-research/state/hci_functor_falsifier_v1.json"
+let ADVERS_PATH         = "anima-hci-research/state/hci_adversarial_flip_v1.json"
+let SUBSTRATE_PATH      = "anima-hci-research/state/hci_substrate_probe_v1.json"
+let SUBSTRATE_REAL_PATH = "anima-hci-research/state/hci_substrate_probe_real_v1.json"
+let OUT_PATH            = "anima-hci-research/state/hci_substrate_smoke_real_v1.json"
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+fn now_stamp() -> string { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+
+fn find_bool(content: string, key: string) -> bool {
+    let needle_t = "\"" + key + "\": true"
+    let needle_f = "\"" + key + "\": false"
+    if content.contains(needle_t) { return true }
+    if content.contains(needle_f) { return false }
+    return false
+}
+
+fn find_string(content: string, key: string) -> string {
+    let probe = "\"" + key + "\": \""
+    let idx = content.index_of(probe)
+    if idx < 0 { return "" }
+    let start = idx + len(probe)
+    let rest = content.substring(start, len(content))
+    let end = rest.index_of("\"")
+    if end < 0 { return "" }
+    return rest.substring(0, end)
+}
+
+fn main() {
+    println("[hci_substrate_smoke_real] HCI Path B 5-falsifier composite chain (F1∧F2∧F3∧F4∧F5)")
+    println("  read: " + FUNCTOR_PATH)
+    println("  read: " + ADVERS_PATH)
+    println("  read: " + SUBSTRATE_PATH)
+    println("  read: " + SUBSTRATE_REAL_PATH)
+    println("")
+
+    if !file_exists(FUNCTOR_PATH) {
+        println("[hci_substrate_smoke_real] FATAL: missing F1+F2 (functor) state — run hci_functor_falsifier.hexa")
+        exit(2)
+    }
+    if !file_exists(ADVERS_PATH) {
+        println("[hci_substrate_smoke_real] FATAL: missing F3 (adversarial) state — run hci_adversarial_flip.hexa")
+        exit(2)
+    }
+    if !file_exists(SUBSTRATE_PATH) {
+        println("[hci_substrate_smoke_real] FATAL: missing F4 (substrate surrogate) state — run hci_substrate_probe.hexa")
+        exit(2)
+    }
+    if !file_exists(SUBSTRATE_REAL_PATH) {
+        println("[hci_substrate_smoke_real] FATAL: missing F5 (substrate REAL) state — run hci_substrate_probe_real.hexa")
+        exit(2)
+    }
+
+    let func_json = read_file(FUNCTOR_PATH)
+    let adv_json  = read_file(ADVERS_PATH)
+    let sub_json  = read_file(SUBSTRATE_PATH)
+    let real_json = read_file(SUBSTRATE_REAL_PATH)
+
+    // ─── F1+F2 ────────────────────────────────────────────────────────────
+    let f1_pass = find_bool(func_json, "f1_pass")
+    let f2_pass = find_bool(func_json, "f2_pass")
+    let f1_neg  = find_bool(func_json, "f1_neg_detects")
+    let f2_neg  = find_bool(func_json, "f2_neg_detects")
+    let func_verdict = find_string(func_json, "composite_verdict")
+
+    // ─── F3 ───────────────────────────────────────────────────────────────
+    let baseline_ok = find_bool(adv_json, "baseline_both_closed")
+    let revert_ok   = find_bool(adv_json, "revert_ok")
+    let f3_verdict  = find_string(adv_json, "f3_verdict")
+    let s1_marker   = "\"s1_jam\""
+    let s2_marker   = "\"s2_leaky\""
+    let s1_idx      = adv_json.index_of(s1_marker)
+    let s2_idx      = adv_json.index_of(s2_marker)
+    let s1_bidir    = if s1_idx >= 0 {
+        let upper = if s2_idx > s1_idx { s2_idx } else { len(adv_json) }
+        find_bool(adv_json.substring(s1_idx, upper), "bidirectional")
+    } else { find_bool(adv_json, "bidirectional") }
+    let s2_bidir    = if s2_idx >= 0 {
+        find_bool(adv_json.substring(s2_idx, len(adv_json)), "bidirectional")
+    } else { false }
+
+    // ─── F4 surrogate ─────────────────────────────────────────────────────
+    let f4_pass     = find_bool(sub_json, "f4_pass")
+    let f4_verdict  = find_string(sub_json, "f4_verdict")
+    let pos_marker  = "\"positive\""
+    let neg_marker  = "\"negative\""
+    let pos_idx     = sub_json.index_of(pos_marker)
+    let neg_idx     = sub_json.index_of(neg_marker)
+    let pos_composite = if pos_idx >= 0 && neg_idx > pos_idx {
+        find_bool(sub_json.substring(pos_idx, neg_idx), "composite_pass")
+    } else { false }
+    let neg_detects = if neg_idx >= 0 {
+        find_bool(sub_json.substring(neg_idx, len(sub_json)), "detects_failure")
+    } else { false }
+
+    // ─── F5 real ──────────────────────────────────────────────────────────
+    let f5_pass     = find_bool(real_json, "f5_pass")
+    let f5_verdict  = find_string(real_json, "f5_verdict")
+    let r_pos_idx   = real_json.index_of(pos_marker)
+    let r_neg_idx   = real_json.index_of(neg_marker)
+    let r_dp_idx    = real_json.index_of("\"depth_pattern_145\"")
+    let f5_pos_composite = if r_pos_idx >= 0 {
+        let upper = if r_dp_idx > r_pos_idx { r_dp_idx } else { len(real_json) }
+        find_bool(real_json.substring(r_pos_idx, upper), "composite_pass")
+    } else { false }
+    let f5_neg_detects = if r_neg_idx >= 0 {
+        find_bool(real_json.substring(r_neg_idx, len(real_json)), "detects_failure")
+    } else { false }
+    let depth_match = if r_dp_idx >= 0 {
+        let upper = if r_neg_idx > r_dp_idx { r_neg_idx } else { len(real_json) }
+        find_bool(real_json.substring(r_dp_idx, upper), "match")
+    } else { false }
+
+    println("=== F1+F2 (functor) ===")
+    println("  f1_pass=" + bool_s(f1_pass) + " f2_pass=" + bool_s(f2_pass))
+    println("  f1_neg=" + bool_s(f1_neg) + " f2_neg=" + bool_s(f2_neg))
+    println("  func_verdict=" + func_verdict)
+    println("")
+    println("=== F3 (adversarial) ===")
+    println("  baseline_ok=" + bool_s(baseline_ok) + " s1_bidir=" + bool_s(s1_bidir)
+          + " s2_bidir=" + bool_s(s2_bidir) + " revert_ok=" + bool_s(revert_ok))
+    println("  f3_verdict=" + f3_verdict)
+    println("")
+    println("=== F4 (substrate surrogate) ===")
+    println("  pos_composite=" + bool_s(pos_composite) + " neg_detects=" + bool_s(neg_detects))
+    println("  f4_verdict=" + f4_verdict)
+    println("")
+    println("=== F5 (substrate REAL) ===")
+    println("  pos_composite=" + bool_s(f5_pos_composite) + " neg_detects=" + bool_s(f5_neg_detects))
+    println("  depth_pattern_145=" + bool_s(depth_match))
+    println("  f5_verdict=" + f5_verdict)
+    println("")
+
+    // ─── composite ────────────────────────────────────────────────────────
+    let f1_ok = f1_pass && f1_neg
+    let f2_ok = f2_pass && f2_neg
+    let f3_ok = baseline_ok && s1_bidir && s2_bidir && revert_ok
+    let f4_ok = f4_pass && pos_composite && neg_detects
+    let f5_ok = f5_pass && f5_pos_composite && f5_neg_detects
+    let composite = f1_ok && f2_ok && f3_ok && f4_ok && f5_ok
+    let verdict = if composite { "HCI_REAL_SUBSTRATE_VERIFIED" } else { "HCI_REAL_SUBSTRATE_FAIL" }
+
+    println("=== 5-falsifier composite (F1∧F2∧F3∧F4∧F5) ===")
+    println("  F1 ok = " + bool_s(f1_ok))
+    println("  F2 ok = " + bool_s(f2_ok))
+    println("  F3 ok = " + bool_s(f3_ok))
+    println("  F4 ok = " + bool_s(f4_ok))
+    println("  F5 ok = " + bool_s(f5_ok))
+    println("  HCI real-substrate verdict = " + verdict)
+    println("")
+
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima/hci_substrate_smoke_real/1\",\n"
+    out = out + "  \"schema_version\": 1,\n"
+    out = out + "  \"verifier_type\": \"hci_substrate_smoke_real\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"source\": \"anima-hci-research/tool/hci_substrate_smoke_real.hexa\",\n"
+    out = out + "  \"inputs\": [\n"
+    out = out + "    \"" + FUNCTOR_PATH + "\",\n"
+    out = out + "    \"" + ADVERS_PATH + "\",\n"
+    out = out + "    \"" + SUBSTRATE_PATH + "\",\n"
+    out = out + "    \"" + SUBSTRATE_REAL_PATH + "\"\n"
+    out = out + "  ],\n"
+    out = out + "  \"f1_ok\": " + bool_s(f1_ok) + ",\n"
+    out = out + "  \"f2_ok\": " + bool_s(f2_ok) + ",\n"
+    out = out + "  \"f3_ok\": " + bool_s(f3_ok) + ",\n"
+    out = out + "  \"f4_ok\": " + bool_s(f4_ok) + ",\n"
+    out = out + "  \"f5_ok\": " + bool_s(f5_ok) + ",\n"
+    out = out + "  \"f1_pass\": " + bool_s(f1_pass) + ",\n"
+    out = out + "  \"f2_pass\": " + bool_s(f2_pass) + ",\n"
+    out = out + "  \"f1_neg_detects\": " + bool_s(f1_neg) + ",\n"
+    out = out + "  \"f2_neg_detects\": " + bool_s(f2_neg) + ",\n"
+    out = out + "  \"baseline_both_closed\": " + bool_s(baseline_ok) + ",\n"
+    out = out + "  \"s1_bidirectional\": " + bool_s(s1_bidir) + ",\n"
+    out = out + "  \"s2_bidirectional\": " + bool_s(s2_bidir) + ",\n"
+    out = out + "  \"revert_ok\": " + bool_s(revert_ok) + ",\n"
+    out = out + "  \"f4_pass\": " + bool_s(f4_pass) + ",\n"
+    out = out + "  \"f4_pos_composite\": " + bool_s(pos_composite) + ",\n"
+    out = out + "  \"f4_neg_detects\": " + bool_s(neg_detects) + ",\n"
+    out = out + "  \"f5_pass\": " + bool_s(f5_pass) + ",\n"
+    out = out + "  \"f5_pos_composite\": " + bool_s(f5_pos_composite) + ",\n"
+    out = out + "  \"f5_neg_detects\": " + bool_s(f5_neg_detects) + ",\n"
+    out = out + "  \"depth_pattern_145_match\": " + bool_s(depth_match) + ",\n"
+    out = out + "  \"functor_verdict\": \"" + func_verdict + "\",\n"
+    out = out + "  \"f3_verdict\": \"" + f3_verdict + "\",\n"
+    out = out + "  \"f4_verdict\": \"" + f4_verdict + "\",\n"
+    out = out + "  \"f5_verdict\": \"" + f5_verdict + "\",\n"
+    out = out + "  \"hci_real_substrate_verdict\": \"" + verdict + "\"\n"
+    out = out + "}\n"
+    write_file(OUT_PATH, out)
+    println("  wrote: " + OUT_PATH)
+
+    if verdict == "HCI_REAL_SUBSTRATE_VERIFIED" { exit(0) }
+    exit(1)
+}
+
+main()

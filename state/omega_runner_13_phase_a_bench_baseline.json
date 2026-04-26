@@ -1,0 +1,92 @@
+{
+  "cycle": "omega_runner_13_phase_a",
+  "axis": "runner / docker exec transport latency",
+  "timestamp": "2026-04-26T19:50:00Z",
+  "user_email": "mk225599@proton.me",
+  "title": "docker-exec floor empirical baseline — Phase A of persistent-exec-socket cycle",
+  "summary": "Phase the runner-13 cycle. Phase A (this commit) builds a sweeper-safe .hexa benchmark harness (tool/runner_exec_bench.hexa) that produces an empirical p50/min/max/mean distribution per docker-exec pattern (bare / bash -c / bash -lc), with overhead-corrected timing via gdate +%s%3N pre-measured pair median. Result on hexa-exec container, 30 runs: bash_lc p50=57ms (min=33, max=103, mean=58.5). Brief carried a 103ms floor figure — that turned out to be the **max** for bash_lc, not the floor; the operational p50 is ~50-60ms. Phase B (runner-13b, deferred) will introduce persistent-mode (long-lived `docker exec -i $C bash` + line-protocol framing) to hexa_remote.sh and re-run this same harness with --persistent flag to quantify savings against this baseline.",
+  "context": {
+    "predecessors": {
+      "wave_21_2026_04_25": "hexa_remote.sh docker exec isolation mode (HEXA_REMOTE_DOCKER=1) — single docker exec per call, no reuse",
+      "omega_runner_12": "runner status integration (predecessor in runner namespace)"
+    },
+    "problem": "Brief asserted a 103ms docker-exec floor and proposed long-lived shell + line-protocol to bypass. Pre-implementation audit required: (1) verify the floor is real and reproducible, (2) characterize distribution shape (long tail? bimodal?), (3) identify which exec pattern hexa_remote actually uses.",
+    "scope_decision": "Phase A only. Implementing a persistent-exec transport before measuring the actual savings ceiling is premature. Build the bench harness first; let the data drive Phase B sizing."
+  },
+  "files_created": [
+    {
+      "path": "/Users/ghost/core/nexus/tool/runner_exec_bench.hexa",
+      "loc": 124,
+      "lang": "hexa stage1",
+      "role": "empirical docker-exec floor benchmark",
+      "patterns_measured": ["bare /bin/true", "bash -c /bin/true", "bash -lc /bin/true (hexa_remote path)"],
+      "overhead_correction": "gdate +%s%3N pair median pre-measured (30 samples) and subtracted from each docker sample",
+      "sentinel": "__RUNNER_BENCH__ pattern=NAME runs=N p50_ms=X min_ms=Y max_ms=Z mean_ms=M overhead_corrected=true",
+      "no_side_effects": "/bin/true; container untouched; nothing written to disk"
+    }
+  ],
+  "files_edited": [],
+  "baseline_measurements": {
+    "container": "hexa-exec (image=hexa-runner:latest)",
+    "host": "Mac (Darwin 24.6.0)",
+    "runs_per_pattern": 30,
+    "timing_overhead_ms_median": 3,
+    "results": {
+      "bare": {"p50_ms": 51, "min_ms": 45, "max_ms": 69, "mean_ms": 52.8},
+      "bash_c": {"p50_ms": 52, "min_ms": 31, "max_ms": 913, "mean_ms": 80.5, "note": "single outlier at 913ms inflated mean — likely host scheduling / docker daemon GC blip"},
+      "bash_lc": {"p50_ms": 57, "min_ms": 33, "max_ms": 103, "mean_ms": 58.5, "note": "this is the path hexa_remote.sh L1237 uses; the 103ms in the brief matches THIS max, not p50"}
+    },
+    "interpretation": [
+      "operational floor (p50) is ~50-60ms across all three patterns — surprisingly, login-shell variant is not measurably slower",
+      "long tail exists: bash_c saw a 913ms outlier in 30 runs (3% tail rate)",
+      "brief's '103ms floor' corresponds to bash_lc max (worst-case), not the typical floor",
+      "Phase B savings ceiling: ~50-60ms per call (typical) + tail-elimination (variable)"
+    ]
+  },
+  "phase_b_design": {
+    "deferred_to": "ω-runner-13b",
+    "target": "amortize the per-call docker-exec startup by reusing one long-lived shell per session",
+    "transport": "bash coproc inside hexa_remote.sh (existing grandfathered .sh, raw 9 exception). Spawn once, send requests via stdin, read responses via stdout.",
+    "protocol_spec": {
+      "request": "newline-terminated shell command, optionally followed by sentinel close marker",
+      "response_framing": "command output + trailing line `__HX_DONE__ rc=<int>` to delimit",
+      "lifecycle": "spawn on first PERSISTENT call; reuse for subsequent calls in same hexa_remote process; teardown on EXIT trap",
+      "fallback": "if persistent shell exits unexpectedly, fall back to fresh docker exec (current path)",
+      "error_capture": "merge stderr into stdout via 2>&1 inside the coproc, separate later via marker line if needed",
+      "isolation": "each request runs in a subshell `(cd /tmp; <cmd>)` to keep cwd/env reset between requests; explicit opt-out via REUSE_SHELL_STATE=1"
+    },
+    "integration_point_in_hexa_remote": "L1237 (`REMOTE_CMD=\"$REMOTE_TRAP; docker exec -i $_DOCKER_CONTAINER bash -lc $(printf %q \"$_INNER_CMD\")\"`). New env var HEXA_REMOTE_PERSISTENT=1 routes through the coproc path; default OFF preserves current behaviour exactly.",
+    "phase_b_validation": [
+      "re-run tool/runner_exec_bench.hexa with --persistent flag (requires Phase B implementation)",
+      "compare p50/p95 against this baseline; target: >= 3× speedup on p50 (≤20ms) for sequential calls",
+      "concurrent-call safety: serialize via a per-session lock; persistent shell is single-client by design"
+    ]
+  },
+  "validation": [
+    {"step": "syntax + smoke", "command": "HEXA_ARGV='--runs 10' hexa run tool/runner_exec_bench.hexa", "result": "ran cleanly, all 3 patterns produced sentinel + human-readable rows"},
+    {"step": "30-run baseline", "command": "HEXA_ARGV='--quiet' hexa run tool/runner_exec_bench.hexa", "result": "3 sentinel lines emitted; numbers above"},
+    {"step": "graceful skip on missing container", "expected": "__RUNNER_BENCH__ SKIP reason=container_not_running", "verified_by_inspection": true}
+  ],
+  "scope_constraints_honoured": [
+    "hexa-only-suffix (raw 9): new file is .hexa, no .sh edits this cycle",
+    "raw 71 report-only: bench is read-only on container, no state writes",
+    "raw 80 sentinel: __RUNNER_BENCH__ per pattern",
+    "CLI-only inter-call: tool is invoked via `hexa run`, no library coupling; reads HEXA_ARGV env",
+    "no parallel-session collision: tool/runner_exec_bench.hexa is a NEW path; nexus parallel session touches state/, n6/, cli/run.hexa, tool/kick_*.hexa — all distinct",
+    "no commit in anima — closure JSON written as untracked",
+    "minimal blast: 1 new file in nexus, no edit to hexa_remote.sh or any other tool"
+  ],
+  "non_changes": {
+    "scripts/bin/hexa_remote": "untouched in Phase A — Phase B will add HEXA_REMOTE_PERSISTENT path here",
+    "all parallel-session-modified files": "untouched (cli/run.hexa, state/atlas_health_timeline.jsonl, bisociation/spectra/*, n6/*, tool/kick_*)"
+  },
+  "next_followups": [
+    "ω-runner-13b: implement HEXA_REMOTE_PERSISTENT mode (bash coproc + line-protocol)",
+    "ω-runner-13c: integrate persistent mode into bridge_health.sh sweep — 16 bridges × 50ms saved = 800ms per sweep",
+    "consider: hexa-runner image cold-start vs warm-start (separate axis if relevant)"
+  ],
+  "head_pinned": {
+    "nexus_at_audit_start": "7c5a7264285d912b97ab44a3fae46a9cdc0da628 (post-bridge-15)",
+    "hexa_lang_at_audit_start": "ba52016df2696b4393f9354a165e06ad05523388 (post-stdlib-14)"
+  }
+}

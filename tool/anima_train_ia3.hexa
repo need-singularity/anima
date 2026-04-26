@@ -1,0 +1,145 @@
+// tool/anima_train_ia3.hexa — Anima IA3-RESCALE training (raw#9 hexa-only, raw#37 emit pattern).
+//
+// PURPOSE
+//   Mk.XI v12 4-backbone × IA3 r14 ensemble verification helper.
+//   Mistral IA3 r14 success (Axis 22-23, max 0.688 Law) → 4-backbone scale verify.
+//
+// ENV
+//   ANIMA_BASE         backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_CORPUS       /workspace path (default: /workspace/corpus_alm_r14_v1.jsonl)
+//   ANIMA_OUTPUT_DIR   output dir (default: /workspace/out/ia3_train)
+//   ANIMA_LR           learning rate (default: 1e-3 IA3 typical)
+//   ANIMA_EPOCHS       epochs (default: 3)
+//
+// USAGE
+//   hexa run tool/anima_train_ia3.hexa --selftest
+//   hexa run tool/anima_train_ia3.hexa run    # emits /tmp/anima_train_ia3_helper.py + executes
+//
+// PAIRS
+//   tool/anima_runpod_orchestrator.hexa    Path B template
+//   /tmp/train_ia3_mistral.py              prior raw#37 transient (env-override missing, this fix)
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_train_ia3_helper.hexa_tmp"
+let SCHEMA      = "anima/anima_train_ia3/1"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima IA3 trainer helper — emitted by tool/anima_train_ia3.hexa\n")
+    parts.push("# raw#37 transient.\n")
+    parts.push("import json, os, sys, time, math\n")
+    parts.push("from pathlib import Path\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import (AutoModelForCausalLM, AutoTokenizer, TrainingArguments,\n")
+    parts.push("                          Trainer, DataCollatorForLanguageModeling)\n")
+    parts.push("from peft import IA3Config, get_peft_model, TaskType\n")
+    parts.push("from datasets import Dataset\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n")
+    parts.push("        print('[ia3] HF token loaded', flush=True)\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("CORPUS = os.environ.get('ANIMA_CORPUS', '/workspace/corpus_alm_r14_v1.jsonl')\n")
+    parts.push("OUTPUT_DIR = os.environ.get('ANIMA_OUTPUT_DIR', '/workspace/out/ia3_train')\n")
+    parts.push("MAX_SEQ = int(os.environ.get('ANIMA_MAX_SEQ', '2048'))\n")
+    parts.push("EPOCHS = int(os.environ.get('ANIMA_EPOCHS', '3'))\n")
+    parts.push("LR = float(os.environ.get('ANIMA_LR', '1e-3'))\n")
+    parts.push("GRAD_ACC = int(os.environ.get('ANIMA_GRAD_ACC', '16'))\n\n")
+
+    parts.push("os.makedirs(OUTPUT_DIR, exist_ok=True)\n")
+    parts.push("print(f'[ia3] base={BASE_MODEL} output={OUTPUT_DIR}', flush=True)\n\n")
+
+    parts.push("docs = []\n")
+    parts.push("with open(CORPUS) as f:\n")
+    parts.push("    for ln in f:\n")
+    parts.push("        ln = ln.strip()\n")
+    parts.push("        if ln: docs.append(json.loads(ln))\n")
+    parts.push("print(f'[ia3] corpus_docs={len(docs)}', flush=True)\n\n")
+
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n\n")
+
+    parts.push("def fmt(d): return f\"{d.get('prompt','')}\\n{d.get('response','')}\"\n")
+    parts.push("texts = [fmt(d) for d in docs]\n")
+    parts.push("enc = tok(texts, truncation=True, max_length=MAX_SEQ, padding=False)\n")
+    parts.push("ds = Dataset.from_dict({'input_ids': enc['input_ids'], 'attention_mask': enc['attention_mask']})\n\n")
+
+    parts.push("print(f'[ia3] loading base model...', flush=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=torch.bfloat16, device_map='auto', trust_remote_code=True)\n")
+    parts.push("base.config.use_cache = False\n")
+    parts.push("print(f'[ia3] base loaded {time.time()-t0:.1f}s', flush=True)\n\n")
+
+    parts.push("ia3_cfg = IA3Config(target_modules=['k_proj','v_proj','down_proj'], feedforward_modules=['down_proj'], task_type=TaskType.CAUSAL_LM)\n")
+    parts.push("mdl = get_peft_model(base, ia3_cfg)\n")
+    parts.push("mdl.print_trainable_parameters()\n\n")
+
+    parts.push("args = TrainingArguments(output_dir=OUTPUT_DIR + '/checkpoints', num_train_epochs=EPOCHS,\n")
+    parts.push("    per_device_train_batch_size=1, gradient_accumulation_steps=GRAD_ACC, learning_rate=LR,\n")
+    parts.push("    lr_scheduler_type='cosine', warmup_ratio=0.03, bf16=True, logging_steps=5,\n")
+    parts.push("    save_strategy='no', report_to='none', remove_unused_columns=False)\n\n")
+
+    parts.push("collator = DataCollatorForLanguageModeling(tokenizer=tok, mlm=False)\n")
+    parts.push("trainer = Trainer(model=mdl, args=args, train_dataset=ds, data_collator=collator)\n\n")
+
+    parts.push("print(f'[ia3] training: {len(docs)} docs x {EPOCHS} epochs LR={LR}', flush=True)\n")
+    parts.push("t1 = time.time()\n")
+    parts.push("trainer.train()\n")
+    parts.push("print(f'[ia3] training elapsed={time.time()-t1:.1f}s', flush=True)\n\n")
+
+    parts.push("final = OUTPUT_DIR + '/final'\n")
+    parts.push("mdl.save_pretrained(final)\n")
+    parts.push("tok.save_pretrained(final)\n")
+    parts.push("print(f'[ia3] adapter saved to {final}', flush=True)\n\n")
+
+    parts.push("witness = {'schema': 'anima/anima_train_ia3/1', 'base_model': BASE_MODEL,\n")
+    parts.push("    'adapter_type': 'IA3 (multiplicative rescale)',\n")
+    parts.push("    'target_modules': ['k_proj','v_proj','down_proj'],\n")
+    parts.push("    'feedforward_modules': ['down_proj'], 'corpus_docs': len(docs),\n")
+    parts.push("    'epochs': EPOCHS, 'learning_rate': LR, 'max_seq_length': MAX_SEQ,\n")
+    parts.push("    'training_elapsed_sec': round(time.time()-t1, 1),\n")
+    parts.push("    'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),\n")
+    parts.push("    'output_dir': final,\n")
+    parts.push("    'purpose': 'Mk.XI v12 4-backbone IA3 ensemble fan-out via .hexa source emit (raw#9 strict)'}\n")
+    parts.push("with open(OUTPUT_DIR + '/witness.json', 'w') as f: json.dump(witness, f, indent=2)\n")
+    parts.push("print(f'[ia3] DONE -> {OUTPUT_DIR}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_train_ia3 selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

@@ -1,0 +1,85 @@
+{
+  "cycle": "omega_bridge_15",
+  "axis": "bridge / hexa-sim live-data infrastructure",
+  "timestamp": "2026-04-26T19:30:00Z",
+  "user_email": "mk225599@proton.me",
+  "title": "bridge_health.sh → bridge_health_history.tsv per-bridge wiring + opt-in CLI-only anomaly auto-invocation",
+  "summary": "Close the omega-bridge-14 deferred wiring. Modify tool/bridge_health.sh (grandfathered .sh, raw 9 exception) to APPEND a per-bridge per-sweep row (ts<TAB>bridge<TAB>status<TAB>duration_ms<TAB>ec) to state/bridge_health_history.tsv. Three call sites covered: script_missing (FAIL/0/NA), TAMPERED (TAMPERED/0/NA), and post-selftest (STATUS/DUR_ms/EC). Add opt-in --anomaly-check / -A flag mirroring the existing --fingerprint-check / -F pattern; when set, after sweep the script invokes `hexa run tool/bridge_anomaly.hexa --quiet --history $BRIDGE_HISTORY_TSV` via the canonical hexa CLI binary (no library import, no path coupling). Add --no-history escape hatch for tests. Validation: bash -n syntax pass; analyzer dry-run on 9-row fixture (5 codata samples with 2500ms spike at tail + 4 oeis samples ending FAIL) emits __BRIDGE_ANOMALY__ WARN bridges=2 samples=9 flagged=2.",
+  "context": {
+    "predecessors": {
+      "omega_bridge_14": "analyzer + history TSV schema stub landed (deferred wiring)",
+      "omega_bridge_7": "established opt-in --fingerprint-check flag pattern reused here for --anomaly-check",
+      "omega_network_3": "deferred-recommendation INSUFFICIENT_DATA pattern (when history absent)"
+    },
+    "problem": "Analyzer landed in omega-bridge-14 but read-only — without bridge_health.sh appending per-bridge rows the canonical default path always returned INSUFFICIENT_DATA. No automated detection feedback loop existed.",
+    "design_goal": "Minimal-blast wiring: raw 77 append-only TSV + opt-in CLI auto-invoke. No mandatory analyzer cost on every sweep (preserves cron speed); no library coupling between .sh runner and .hexa analyzer (CLI-only inter-call constraint)."
+  },
+  "files_edited": [
+    {
+      "path": "/Users/ghost/core/nexus/tool/bridge_health.sh",
+      "additions": [
+        "BRIDGE_HISTORY_TSV env var (default $NEXUS_ROOT/state/bridge_health_history.tsv)",
+        "ANOMALY_CHECK + NO_HISTORY flag state vars",
+        "--anomaly-check / -A flag (opt-in CLI-only auto-invoke)",
+        "--no-history flag (testing escape hatch)",
+        "append_history_row() helper — printf-only, no exec fan-out",
+        "3 call sites: script_missing branch, TAMPERED branch, post-selftest end-of-iteration",
+        "post-summary anomaly invocation block — HEXA_ARGV='--quiet --history ...' hexa run bridge_anomaly.hexa, non-fatal on failure (raw 71)"
+      ],
+      "help_block_extension": "sed -n '3,44p' bumped to '3,47p' to absorb 3 new usage lines"
+    }
+  ],
+  "files_created": [],
+  "subcommands_added": {
+    "--anomaly-check (-A)": "opt-in: after sweep, invoke bridge_anomaly.hexa via $HEXA_BIN run (CLI-only, no library import)",
+    "--no-history": "opt-out: skip per-bridge TSV append (testing/dry-run path)"
+  },
+  "data_path": {
+    "writer": "tool/bridge_health.sh (per-iteration printf >> $BRIDGE_HISTORY_TSV)",
+    "reader": "tool/bridge_anomaly.hexa (default --history target)",
+    "schema": "ts<TAB>bridge<TAB>status<TAB>duration_ms<TAB>ec",
+    "raw_compliance": "raw 77 append-only audit",
+    "atomicity": "single printf '%s\\t%s\\t%s\\t%s\\t%s\\n' is shell-builtin → no exec fan-out, line-buffered append is atomic for the row sizes here (< PIPE_BUF / 4096)"
+  },
+  "cli_only_invocation_proof": {
+    "binding": "no .hexa import, no path-based stdlib reuse",
+    "exact_invocation": "HEXA_ARGV='--quiet --history $BRIDGE_HISTORY_TSV' HEXA_RESOLVER_NO_REROUTE=1 \"$HEXA_BIN\" run \"$NEXUS_ROOT/tool/bridge_anomaly.hexa\"",
+    "transport": "argv (HEXA_ARGV env) + stdout (sentinel line) + exit code (non-fatal swallow)"
+  },
+  "duration_unit_compromise": {
+    "issue": "bridge_health.sh uses date +%s for T0/T1 → integer-second granularity. Schema is duration_ms.",
+    "decision": "Multiply DUR * 1000 to satisfy schema. Sub-second timing is lossy but consistent with all existing per-bridge wall measurements in bridge_health.sh.",
+    "future_refinement": "Switch to date +%s%3N (gnu date) or perl -MTime::HiRes when sub-second comparison becomes load-bearing. Deferred — current spike threshold (3× over 200ms floor) tolerates the ±999ms quantisation."
+  },
+  "validation": [
+    {"step": "bash -n tool/bridge_health.sh", "result": "syntax OK"},
+    {"step": "tool/bridge_health.sh --help", "result": "shows --anomaly-check / -A / --no-history rows"},
+    {"step": "analyzer dry-run on 9-row fixture", "command": "HEXA_ARGV='--quiet --history /tmp/anomaly_test_history.tsv' hexa run tool/bridge_anomaly.hexa", "stdout": "__BRIDGE_ANOMALY__ WARN bridges=2 samples=9 flagged=2 window=7 mult=3.0", "interpretation": "codata DURATION_SPIKE (150ms→2500ms = 16×) + oeis FRESH_FAILURE (PASS-dominant prior, FAIL tail) — both rules fired correctly"},
+    {"step": "exact bridge_health.sh invocation simulated via env-var passthrough", "result": "identical sentinel output → wiring path proven"}
+  ],
+  "scope_constraints_honoured": [
+    "CLI-only inter-call (no library/path coupling)",
+    "raw 77 append-only TSV (no in-place rewrite)",
+    "raw 71 report-only (analyzer auto-invoke is non-fatal on failure)",
+    "raw 80 sentinel preserved (__BRIDGE_HEALTH__ + __BRIDGE_ANOMALY__ both emitted)",
+    "no parallel-session collision (kick_* untracked files NOT touched; only tracked bridge_health.sh edited)",
+    "no commit in anima — closure JSON written as untracked"
+  ],
+  "non_changes": {
+    "atlas_health_timeline.jsonl": "currently dirty (parallel-session modification) — NOT touched by this cycle",
+    "cli/run.hexa": "currently dirty (parallel-session) — NOT touched",
+    "g_atlas_composite_v3.json": "currently dirty (parallel-session) — NOT touched",
+    "tool/kick_*.hexa": "parallel-session work — NOT touched",
+    "design/kick/": "parallel-session work — NOT touched"
+  },
+  "next_followups": [
+    "data accumulation: run bridge_health.sh -A in cron for 7+ sweeps to populate the rolling window per bridge",
+    "if duration-spike rule becomes noisy at second-granularity → upgrade to %s%3N timing",
+    "consider exposing __BRIDGE_ANOMALY__ in atlas_health_timeline.jsonl as a sibling JSONL line (separate cycle if pursued)"
+  ],
+  "head_pinned": {
+    "nexus_pre": "5e59259ba6145fd5715f87d4a194c23f3632d551",
+    "hexa_lang_pre": "72eb83674b7dafeaa3599e09ee0b269176c9a766",
+    "anima_pre": "untouched (closure JSON untracked)"
+  }
+}

@@ -1,0 +1,205 @@
+// tool/anima_phi_v3_canonical.hexa — Φ* v3 auto-conditioning canonical metric (raw#9 hexa-only).
+//
+// PURPOSE
+//   Canonical Φ* metric resolving v1 (dim, HID=128) vs v2 (sample, HID=14) divergence.
+//   Robustness sweep finding (.roadmap #161, commit 85ae47fb) showed sign is
+//   HID_TRUNC-dominant: HID=6 ALL NEG / HID=10 mixed / HID=14 ALL POS.
+//
+//   v3 design: AUTO-CONDITIONING — set HID_TRUNC = max(2, N // 2) so that
+//   each half-partition has eff_dof = HALF >= HID, guaranteeing well-conditioned
+//   covariance (no rank-deficient artifact). For N=16, HID=8.
+//
+//   This is the SUBSTRATE-INHERENT canonical regime: both full (N=16) AND
+//   half (N=8) covariances are full-rank in HID dim.
+//
+//   Hypotheses (3-way):
+//     H3A — phi_star_min ALL NEGATIVE → ω-cycle ALM-free path 정당화 회복
+//                                        (#148/#152 universal anti-integration valid)
+//     H3B — cross-backbone divergent (e.g. mistral POS / llama NEG)
+//                                        → architecture-conditional integration
+//     H3C — 4/4 POSITIVE at well-conditioned regime
+//                                        → H1 finding 새 형태로 valid
+//                                          (sign genuinely positive, but only at well-cond)
+//
+// METHOD (sample-partition, identical to v2 except auto HID)
+//   1. Forward 16 prompts × HF transformers, capture last-layer hidden (N=16, h_dim)
+//   2. Truncate to top-variance HID_TRUNC = max(2, N//2) = 8 dims → Xt (N, HID)
+//   3. I_full = log|Cov(Xt)| using all N samples (eff_dof = N - HID = 8)
+//   4. Per K=8 random partitions, split SAMPLES into halves (8|8):
+//      - I_1 = log|Cov(Xt[S1])| with HALF=8 samples (eff_dof = HALF - HID = 0 → ridge-stabilized)
+//      - I_2 = log|Cov(Xt[S2])| similarly
+//      - phi_k = I_full - (I_1 + I_2)
+//   5. Φ* = MIN(phi_k) over K=8 random sample-partitions (canonical strict)
+//
+// ENV
+//   ANIMA_BASE       backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_OUTPUT     output JSON (default: /workspace/out/phi_v3_canonical.json)
+//   ANIMA_N_PROBES   # probes (default: 16)
+//   ANIMA_K_PARTS    # random sample-partitions (default: 8)
+//   ANIMA_RIDGE      ridge for cov stabilization (default: 1e-3)
+//   ANIMA_SEED       RNG seed (default: 42)
+//   (HID_TRUNC NOT user-controllable — auto = max(2, N // 2))
+//
+// USAGE
+//   hexa run tool/anima_phi_v3_canonical.hexa --selftest
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+
+let HELPER_PATH = "/tmp/anima_phi_v3_canonical_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima Phi* v3 canonical (auto-conditioning) helper — emitted by anima_phi_v3_canonical.hexa\n")
+    parts.push("# raw#37 transient. Resolves v1/v2 HID_TRUNC artifact via auto HID = max(2, N//2).\n")
+    parts.push("import json, os, sys, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/phi_v3_canonical.json')\n")
+    parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '16'))\n")
+    parts.push("K_PARTS = int(os.environ.get('ANIMA_K_PARTS', '8'))\n")
+    parts.push("RIDGE = float(os.environ.get('ANIMA_RIDGE', '1e-3'))\n")
+    parts.push("RNG_SEED = int(os.environ.get('ANIMA_SEED', '42'))\n")
+    parts.push("HID_TRUNC = max(2, N_PROBES // 2)  # AUTO: well-conditioned canonical\n\n")
+
+    parts.push("# Same 16-prompt template set as battery v3/v4 + v2 (consistent comparison)\n")
+    parts.push("PROMPTS = [\n")
+    parts.push("    'Define hexad as a six-fold integration:','Six modules form a hexagonal architecture when:',\n")
+    parts.push("    'A balanced six-component system:','Hexad symmetry refers to:',\n")
+    parts.push("    'Logical implication law: if A then:','Sequential rule application proceeds:',\n")
+    parts.push("    'Closure under inference requires:','A formal proof system is closed when:',\n")
+    parts.push("    'Integrated information measures partition independence:','Phi quantifies irreducibility of system:',\n")
+    parts.push("    'Information integration is maximized when:','A whole greater than sum of parts:',\n")
+    parts.push("    'Self-reference emerges when system observes:','Recursive meta-cognition models:',\n")
+    parts.push("    'A self-aware system represents itself by:','Strange loops in cognition arise from:',\n")
+    parts.push("][:N_PROBES]\n")
+    parts.push("N = len(PROMPTS)\n")
+    parts.push("HALF = N // 2  # split into 2 halves of size 8\n")
+    parts.push("EFF_DOF_FULL = N - HID_TRUNC  # canonical well-cond requirement: > 0\n")
+    parts.push("EFF_DOF_HALF = HALF - HID_TRUNC  # half partition: == 0 (ridge-stabilized)\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[phi-v3] base={BASE_MODEL} N={N} HALF={HALF} K={K_PARTS} HID_TRUNC={HID_TRUNC}(auto) eff_dof_full={EFF_DOF_FULL} eff_dof_half={EFF_DOF_HALF} ridge={RIDGE}', flush=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n")
+    parts.push("mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map='auto', output_hidden_states=True)\n")
+    parts.push("mdl.eval()\n")
+    parts.push("h_dim = getattr(mdl.config, 'hidden_size', getattr(mdl.config, 'd_model', 4096))\n")
+    parts.push("print(f'[phi-v3] loaded {time.time()-t0:.1f}s h_dim={h_dim}', flush=True)\n\n")
+
+    parts.push("def byte_weighted_mean(hidden, attn_mask):\n")
+    parts.push("    weights = attn_mask.float()\n")
+    parts.push("    w_sum = weights.sum(dim=1, keepdim=True).clamp(min=1.0)\n")
+    parts.push("    return ((hidden * weights.unsqueeze(-1)).sum(dim=1) / w_sum).float().cpu().numpy()\n\n")
+
+    parts.push("# Forward all prompts -> X (N, h_dim)\n")
+    parts.push("acts = []\n")
+    parts.push("for i, p in enumerate(PROMPTS):\n")
+    parts.push("    inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("    with torch.no_grad():\n")
+    parts.push("        out = mdl(**inp, output_hidden_states=True)\n")
+    parts.push("    h = byte_weighted_mean(out.hidden_states[-1], inp['attention_mask'])\n")
+    parts.push("    acts.append(h[0])\n")
+    parts.push("    if (i+1) % 4 == 0:\n")
+    parts.push("        print(f'[phi-v3] forward {i+1}/{N}', flush=True)\n")
+    parts.push("X = np.stack(acts, axis=0)  # (N, h_dim)\n")
+    parts.push("# Truncate to top-variance HID_TRUNC dims (AUTO well-conditioned for N=16 -> HID=8)\n")
+    parts.push("var = X.var(axis=0); top_idx = np.argsort(-var)[:HID_TRUNC]\n")
+    parts.push("Xt = X[:, top_idx]  # (N, HID_TRUNC)\n")
+    parts.push("print(f'[phi-v3] activations (N,H)={Xt.shape} top_var={[round(float(v),2) for v in np.sort(var)[::-1][:HID_TRUNC]]}', flush=True)\n\n")
+
+    parts.push("def cov_logdet(samples, ridge=RIDGE):\n")
+    parts.push("    \"\"\"Empirical covariance log-determinant for given samples.\"\"\"\n")
+    parts.push("    if samples.shape[0] < 2: return float('nan')\n")
+    parts.push("    Xc = samples - samples.mean(axis=0, keepdims=True)\n")
+    parts.push("    C = (Xc.T @ Xc) / max(1, samples.shape[0] - 1) + ridge * np.eye(samples.shape[1])\n")
+    parts.push("    sign, val = np.linalg.slogdet(C)\n")
+    parts.push("    return float(val) if sign > 0 else float('nan')\n\n")
+
+    parts.push("I_full = cov_logdet(Xt)\n")
+    parts.push("print(f'[phi-v3] I_full = log|C(N={N},H={HID_TRUNC})| = {I_full:.4f}', flush=True)\n\n")
+
+    parts.push("rng = np.random.default_rng(RNG_SEED)\n")
+    parts.push("phi_candidates = []\n")
+    parts.push("part_records = []\n")
+    parts.push("for k in range(K_PARTS):\n")
+    parts.push("    perm = rng.permutation(N)\n")
+    parts.push("    S1_idx = np.sort(perm[:HALF])\n")
+    parts.push("    S2_idx = np.sort(perm[HALF:])\n")
+    parts.push("    I_1 = cov_logdet(Xt[S1_idx])\n")
+    parts.push("    I_2 = cov_logdet(Xt[S2_idx])\n")
+    parts.push("    phi_k = I_full - (I_1 + I_2)\n")
+    parts.push("    phi_candidates.append(phi_k)\n")
+    parts.push("    part_records.append({'k':k,'S1_size':int(len(S1_idx)),'S2_size':int(len(S2_idx)),\n")
+    parts.push("        'I_1':round(I_1,4),'I_2':round(I_2,4),'phi':round(phi_k,4)})\n")
+    parts.push("    print(f'[phi-v3] sample-part {k+1}/{K_PARTS} S1|S2={HALF}|{N-HALF} phi={phi_k:.4f}', flush=True)\n\n")
+
+    parts.push("phi_star = float(min(phi_candidates))\n")
+    parts.push("phi_mean = float(np.mean(phi_candidates))\n")
+    parts.push("phi_max = float(max(phi_candidates))\n\n")
+
+    parts.push("gate_positive = phi_star > 0\n")
+    parts.push("gate_substantial = phi_star >= 1.0\n")
+    parts.push("gate_magnitude = abs(phi_star) >= 0.5\n\n")
+
+    parts.push("summary = {'schema':'anima/phi_v3_canonical/1','backbone':BASE_MODEL,\n")
+    parts.push("    'metric_design':'AUTO-CONDITIONING canonical (HID = max(2, N//2)) — well-conditioned regime',\n")
+    parts.push("    'partition_method':'sample-partition (N=16 -> 8|8 halves)',\n")
+    parts.push("    'n_probes':N,'half_size':HALF,'K_partitions':K_PARTS,\n")
+    parts.push("    'hidden_truncated_auto':HID_TRUNC,'eff_dof_full':EFF_DOF_FULL,'eff_dof_half':EFF_DOF_HALF,\n")
+    parts.push("    'ridge':RIDGE,'seed':RNG_SEED,\n")
+    parts.push("    'I_full':round(I_full,4),\n")
+    parts.push("    'phi_star_min':round(phi_star,4),'phi_mean':round(phi_mean,4),'phi_max':round(phi_max,4),\n")
+    parts.push("    'phi_star_sign':'positive_iit_integrated' if phi_star > 0 else 'negative_anti_integrated',\n")
+    parts.push("    'gate_positive_PASS':gate_positive,'gate_substantial_PASS':gate_substantial,'gate_magnitude_PASS':gate_magnitude,\n")
+    parts.push("    'partitions':part_records,\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[phi-v3] DONE phi_star_min={phi_star:.4f} sign={summary[\"phi_star_sign\"]} positive_gate={gate_positive} -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_phi_v3_canonical selftest ──")
+    _write_helper()
+    // ast.parse via python3
+    let cmd = "python3 -c 'import ast,sys; ast.parse(open(\"" + HELPER_PATH + "\").read()); print(\"ast_parse=ok\")'"
+    let r = exec_with_status(cmd)
+    println(to_string(r[0]).trim())
+    if to_int(r[1]) != 0 { eprintln("ast.parse FAILED"); exit(1) }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("design=auto-conditioning (HID = max(2, N//2)) — well-conditioned canonical")
+    println("hypotheses=H3A_substrate_NEG / H3B_arch_divergent / H3C_universal_POS")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

@@ -1,0 +1,133 @@
+{
+  "cycle": "omega_bridge_17",
+  "axis": "bridge / alert subscription on atlas time-series",
+  "timestamp": "2026-04-26T20:12:00Z",
+  "user_email": "arsmoriendi99@proton.me",
+  "title": "atlas_alert_subscriber — JSONL stream alerter on bridge_anomaly verdicts",
+  "summary": "Build a CLI-only, sweeper-safe .hexa subscriber that polls state/atlas_health_timeline.jsonl (the sibling JSONL produced by ω-bridge-16), filters scope=bridge_anomaly, tails the last N rows, and evaluates two configurable ratio rules: WARN-density and INSUFFICIENT_DATA-density. Each fired rule emits a positional sentinel; absence of fires emits __ATLAS_ALERT__ PASS. Read-only on the timeline file (raw 71/77) and tolerates parallel-session appends because read_file is a snapshot syscall.",
+  "context": {
+    "predecessors": {
+      "omega_bridge_14": "introduced the bridge_anomaly analyzer (.hexa) + history TSV schema",
+      "omega_bridge_15": "wired bridge_health.sh to append per-bridge rows + opt-in anomaly auto-invoke",
+      "omega_bridge_16": "promoted __BRIDGE_ANOMALY__ sentinel into a structured sibling JSONL row scoped 'bridge_anomaly'"
+    },
+    "problem": "Time-series sibling rows existed but no consumer reasoned over verdict trends. A single-sweep WARN is just a snapshot; operators need rate-of-fire signals (e.g. half the last 10 sweeps WARNed) and meta-signals (history isn't accumulating — too many INSUFFICIENT_DATA verdicts in a row).",
+    "design_goal": "One-shot poll (NOT continuous tail -F — kept simple for stage1). Read up to current EOF. Configurable rules via HEXA_ARGV. CLI-only invocation via `hexa run`. No library/path coupling to other tools."
+  },
+  "files_created": [
+    {
+      "path": "/Users/ghost/core/nexus/tool/atlas_alert_subscriber.hexa",
+      "loc": 184,
+      "sentinels": [
+        "__ATLAS_ALERT__ SKIP reason=timeline_missing path=...",
+        "__ATLAS_ALERT__ SKIP reason=no_matching_rows scope=bridge_anomaly path=...",
+        "__ATLAS_ALERT__ FIRED rule=warn_ratio ratio=R threshold=T last_n=N sampled=S",
+        "__ATLAS_ALERT__ FIRED rule=insufficient_ratio ratio=R threshold=T last_n=N sampled=S",
+        "__ATLAS_ALERT__ PASS sampled=S rules_evaluated=R"
+      ],
+      "argv_flags": [
+        "--last N (default 10)",
+        "--warn-threshold R (default 0.4)",
+        "--insufficient-threshold R (default 0.6)",
+        "--timeline PATH (override; for fixtures + future remote consumers)",
+        "--quiet (sentinel-only output)",
+        "--help / -h"
+      ],
+      "algorithm": [
+        "1. Pre-flight: file_exists(timeline_path); else SKIP timeline_missing",
+        "2. Read timeline; filter rows containing scope marker '\"scope\":\"bridge_anomaly\"'",
+        "3. If 0 matched: SKIP no_matching_rows",
+        "4. Tail to last N via shell (avoids hexa int slice arithmetic)",
+        "5. Tally PASS/WARN/INSUFFICIENT_DATA by substring presence on '\"verdict\":\"...\"' marker",
+        "6. Single awk call computes both ratios formatted to 4 decimals (avoids hexa float parse)",
+        "7. Two awk >= comparisons evaluate each rule",
+        "8. Emit human summary (unless --quiet) + sentinel(s)"
+      ]
+    }
+  ],
+  "files_edited": [],
+  "validation": [
+    {
+      "fixture": "A — 5 WARN + 5 PASS",
+      "path": "/tmp/omega_b17_fixture_a.jsonl",
+      "expected": "warn_ratio=0.5 fires (>=0.4)",
+      "observed": "__ATLAS_ALERT__ FIRED rule=warn_ratio ratio=0.5000 threshold=0.4 last_n=10 sampled=10",
+      "status": "PASS"
+    },
+    {
+      "fixture": "B — 8 INSUFFICIENT_DATA + 2 PASS",
+      "path": "/tmp/omega_b17_fixture_b.jsonl",
+      "expected": "insufficient_ratio=0.8 fires (>=0.6)",
+      "observed": "__ATLAS_ALERT__ FIRED rule=insufficient_ratio ratio=0.8000 threshold=0.6 last_n=10 sampled=10",
+      "status": "PASS"
+    },
+    {
+      "fixture": "C — 10 PASS",
+      "path": "/tmp/omega_b17_fixture_c.jsonl",
+      "expected": "no rules fire; emit __ATLAS_ALERT__ PASS",
+      "observed": "__ATLAS_ALERT__ PASS sampled=10 rules_evaluated=2",
+      "status": "PASS"
+    },
+    {
+      "edge_case": "missing timeline file",
+      "argv": "--timeline /tmp/omega_b17_does_not_exist.jsonl",
+      "observed": "__ATLAS_ALERT__ SKIP reason=timeline_missing path=/tmp/omega_b17_does_not_exist.jsonl",
+      "status": "PASS"
+    },
+    {
+      "edge_case": "live nexus timeline (no bridge_anomaly rows yet)",
+      "argv": "(default)",
+      "observed": "__ATLAS_ALERT__ SKIP reason=no_matching_rows scope=bridge_anomaly path=/Users/ghost/core/nexus/state/atlas_health_timeline.jsonl",
+      "status": "PASS"
+    },
+    {
+      "edge_case": "custom threshold raised above observed ratio",
+      "argv": "--timeline fixture_a --warn-threshold 0.6",
+      "observed": "no rules fired; __ATLAS_ALERT__ PASS sampled=10",
+      "status": "PASS"
+    },
+    {
+      "edge_case": "--last 5 windowing",
+      "argv": "--timeline fixture_a --last 5",
+      "observed": "tail of 5 rows = 2 PASS + 3 WARN; warn_ratio=0.6 fires",
+      "status": "PASS"
+    },
+    {
+      "edge_case": "--quiet mode",
+      "argv": "--timeline fixture_a --quiet",
+      "observed": "single-line sentinel output, no human summary",
+      "status": "PASS"
+    },
+    {
+      "edge_case": "--help",
+      "observed": "usage line + flag descriptions printed; tool returns without scanning",
+      "status": "PASS"
+    }
+  ],
+  "scope_constraints_honoured": [
+    "raw 9 hexa-only-suffix — new file is .hexa (sweeper-safe)",
+    "raw 71 read-only — never writes to atlas_health_timeline.jsonl (parallel-session-safe)",
+    "raw 73 admissibility — schema parsed by stable substring markers (single-producer guarantee from ω-bridge-16)",
+    "raw 77 append-only-respect — does not edit the timeline at all",
+    "raw 80 sentinel — every code path emits exactly one __ATLAS_ALERT__ line family",
+    "CLI-only inter-call — invokable via `hexa run tool/atlas_alert_subscriber.hexa`, no library/path coupling",
+    "no parallel-session collision — only created NEW file; did not touch cli/run.hexa, state/atlas_health_timeline.jsonl, bisociation/spectra/g_atlas_composite_v3.json, tool/omega_cycle_atlas_ingest.hexa, n6/*, tool/kick_*.hexa, design/kick/*, .own",
+    "explicit-path commit — `git add tool/atlas_alert_subscriber.hexa` only",
+    "no commit in anima — closure JSON written as untracked"
+  ],
+  "non_changes": {
+    "atlas_health_timeline.jsonl": "currently dirty (parallel-session); subscriber is read-only and tolerates concurrent appends because read_file is a single-syscall snapshot",
+    "bridge_anomaly.hexa": "untouched — analyzer remains source of truth",
+    "bridge_health.sh": "untouched — ω-bridge-16 already wired the sibling JSONL row"
+  },
+  "next_followups": [
+    "tail -F mode (continuous subscription) for live operator dashboards",
+    "additional rule kinds: flag-spike-rate (sum of 'flagged' over last N >= K) and verdict-flap (PASS↔WARN oscillation count)",
+    "alert quench / cooldown so a sustained outage doesn't re-fire on every sweep",
+    "downstream sink: route FIRED sentinels into a separate alerts JSONL (not the canonical timeline) for audit retention"
+  ],
+  "head_pinned": {
+    "nexus_at_audit_start": "db724ac9d30031e5ac6da7b037f36e1d116ae0c5 (post-runner-13b)",
+    "nexus_at_commit": "2ba5a57e87da8ae3d7522169807de263aed7ee05"
+  }
+}

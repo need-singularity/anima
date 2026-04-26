@@ -1,0 +1,164 @@
+{
+  "cycle": "omega_runner_13c",
+  "axis": "runner / persistent docker-exec integration target",
+  "timestamp": "2026-04-26T11:09:08Z",
+  "user_email": "arsmoriendi99@proton.me",
+  "title": "audit-only — persistent FIFO docker-exec pattern has no single-cycle integration target",
+  "verdict": "AUDIT_ONLY_CLOSE",
+  "headline": "13b's 25-50× speedup is real but applies to docker-exec floor, not bridge_health.sh's host-local hexa invocations — there is no in-scope integration; daemonization is required and is out of scope for one cycle.",
+  "summary": "Phase B-2 of runner-13 was conceived as integrating the persistent FIFO docker-exec pattern (proven in 13b at 25-50× speedup) into tool/bridge_health.sh's 16-bridge sweep, with target ≥10× sweep wall speedup. On audit the integration target collapses: bridge_health.sh runs `$HEXA_BIN run $SCRIPT --selftest` LOCALLY on the host (L235 of tool/bridge_health.sh), not via `docker exec`. The HEXA_REMOTE_DOCKER=1 mode at scripts/bin/hexa_remote L1228 is for a different code path (hexa_remote SSH transport with optional container isolation), and hexa_remote is invoked once per `hexa run` call — meaning persistent shell across calls would need a daemon (PID file, lifecycle, lock, recovery, auth), which is non-trivial and exceeds a single PSC cycle's scope. No nexus commit is produced this cycle.",
+  "context": {
+    "predecessors": {
+      "omega_runner_13_phase_a": "established bench harness; bug-corrected in 13b",
+      "omega_runner_13b": "proved persistent FIFO pattern reaches p50=1-3ms vs bare 49-95ms (25-50× speedup)"
+    },
+    "phase_b_2_brief": "Integrate persistent FIFO pattern into bridge_health.sh's 16-bridge sweep; target ≥10× wall speedup.",
+    "audit_finding": "The integration target is misidentified. The 13b speedup applies ONLY to docker-exec invocation floor — that is, when EVERY call goes through `docker exec -i $C sh -lc ...`. bridge_health.sh does not. Substituting persistent-FIFO for the bridge sweep would require either (a) routing each bridge through hexa_remote in HEXA_REMOTE_DOCKER=1 mode, which is not how the sweep is built, or (b) building a host-side hexa-interp daemon, which is a different optimization (amortize ~35ms hexa startup) with no 13b proof point."
+  },
+  "evidence": [
+    {
+      "claim": "bridge_health.sh invokes hexa LOCALLY (not via docker)",
+      "file": "/Users/ghost/core/nexus/tool/bridge_health.sh",
+      "line": 235,
+      "code": "OUT=$(HEXA_RESOLVER_NO_REROUTE=1 \"$TIMEOUT_BIN\" \"$TIMEOUT_SECS\" \"$HEXA_BIN\" run \"$SCRIPT\" --selftest 2>&1); EC=$?",
+      "implication": "$HEXA_BIN is the host hexa binary ($HOME/core/hexa-lang/hexa or /usr/local/bin/hexa). No docker exec involved. Per-call floor is hexa-interp startup (~35ms host-measured), not docker-exec floor."
+    },
+    {
+      "claim": "hexa_remote's docker-exec mode fires `docker exec -i $C bash -lc ...` per invocation, but hexa_remote itself is invoked once per `hexa run X` — no cross-invocation state",
+      "file": "/Users/ghost/core/nexus/scripts/bin/hexa_remote",
+      "line": 1237,
+      "code": "REMOTE_CMD=\"$REMOTE_TRAP; docker exec -i $_DOCKER_CONTAINER bash -lc $(printf %q \"$_INNER_CMD\")\"",
+      "implication": "Within a single hexa_remote call there is exactly one docker exec — persistent mode adds zero value. Cross-call persistence requires a daemon, not a per-call coproc."
+    },
+    {
+      "claim": "host-side hexa startup ~35ms",
+      "method": "3 successive `/Users/ghost/core/hexa-lang/hexa --version` runs measured via python time.time()*1000 around the call",
+      "result_ms": [36, 35, 34],
+      "implication": "16 bridges × 35ms = 560ms host-side hexa startup overhead in a sweep. A host-side hexa daemon could amortize this — but it's a different optimization than 13b proved (which was docker-exec floor, ~80ms)."
+    },
+    {
+      "claim": "`hexa batch` subcommand is documented in --help but not implemented",
+      "test": "/Users/ghost/core/hexa-lang/hexa batch → 'error: unknown subcommand batch'",
+      "help_excerpt": "    batch <f1> <f2> ...     Run N scripts sharing one CLI dispatch\\n                              Each result delimited by ===BATCH_RESULT===",
+      "implication": "If `hexa batch` were implemented, bridge_health.sh could feasibly call `hexa batch <16 selftest scripts>` and amortize startup naturally. This would be a clean integration target — but implementing `hexa batch` is itself a feature project (lives in hexa-lang, not nexus), not a runner-cycle deliverable."
+    }
+  ],
+  "options_considered": {
+    "option_1_audit_only_close": {
+      "chosen": true,
+      "rationale": "Brief's integration target is ill-posed for one cycle. Honest closure now is more valuable than over-stretching to fabricate an integration."
+    },
+    "option_2_alternate_workload": {
+      "chosen": false,
+      "candidates_examined": [
+        {
+          "name": "bridge_health.sh --strict SHA256 batch verify",
+          "reason_rejected": "Pure local file ops (shasum). No docker exec involved. Persistent mode does not apply."
+        },
+        {
+          "name": "hexa-interp persistent session (daemon-style)",
+          "reason_rejected": "Different optimization (amortize hexa startup ~35ms, not docker-exec floor ~80ms). Has NO proof point — 13b did not measure this. Would also require interpreter-side state isolation between bridges, which the current `hexa run` model does not provide. Greenfield design, not integration."
+        },
+        {
+          "name": "hexa_remote with HEXA_REMOTE_DOCKER + cross-invocation daemon",
+          "reason_rejected": "Requires PID-file lifecycle, lock, restart, auth, recovery. Exceeds a single PSC cycle's scope per brief instruction `Don't over-stretch.`"
+        }
+      ]
+    },
+    "option_3_proof_of_concept_daemon_tool": {
+      "chosen": false,
+      "rationale": "A new tool/runner_persistent_daemon.hexa demonstrating the daemon pattern without integration would duplicate 13b's existing FIFO POC at tool/runner_exec_bench.hexa without adding new evidence. 13b already shows the savings; the gap is integration, and integration requires lifecycle/PID/lock work that is one cycle on its own."
+    }
+  },
+  "what_a_real_integration_would_require": {
+    "scope": "ω-runner-13d or later, dedicated cycle",
+    "components": [
+      {
+        "component": "hexa-daemon binary or wrapper",
+        "responsibilities": [
+          "On first request: spawn persistent hexa-interp child with FIFO request/response pipes",
+          "Per request: send `run <script>` line, read until ===HEXA_DONE=== sentinel",
+          "Liveness: PID file at $XDG_RUNTIME_DIR/hexa-daemon.pid, fcntl lock to prevent duplicate spawn",
+          "Recovery: if daemon dies mid-session, fallback to fresh `hexa run`; auto-respawn on next call",
+          "Stale cleanup: detect stale PID via kill(pid, 0); reap and respawn",
+          "Auth: optional shared-secret in env/config for multi-user host (default: file-permission-based on FIFO socket)"
+        ]
+      },
+      {
+        "component": "interpreter-side state isolation",
+        "concern": "Between two `run <script>` invocations on the same daemon, all globals/imports/env from script-1 must not leak into script-2. Current `hexa run` model assumes process-level isolation; daemonization invalidates that assumption.",
+        "options": [
+          "Fork-per-request (eliminates state-leak but loses startup savings — defeats purpose)",
+          "Module-system reset hook in hexa interp (clean re-init of globals/imports each request — requires hexa-lang change)",
+          "Sandbox each request in a fresh AST/eval context within one process (most engineering work, biggest payoff)"
+        ]
+      },
+      {
+        "component": "bridge_health.sh integration",
+        "delta": "Replace L235 fork-per-bridge with a single `hexa-daemon dispatch <16-script-list>` call returning ===HEXA_RESULT=== delimited stdout/stderr/EC tuples; parse and dispatch to existing classify/append-history logic.",
+        "estimated_loc": "+30 / -8 in bridge_health.sh; +200-400 LoC for hexa-daemon"
+      },
+      {
+        "component": "validation",
+        "must_show": [
+          "Sweep wall-time speedup (≥10×)",
+          "No false-positive PASS due to state leak (run --strict twice, confirm consistent SHA verifies)",
+          "No false-negative FAIL due to daemon-side error masking",
+          "Daemon survives container restart / hexa upgrade (lifecycle robustness)"
+        ]
+      }
+    ],
+    "estimate": "1 dedicated cycle for hexa-daemon + isolation; 1 cycle for bridge_health.sh integration + validation. Cannot be a sub-task of runner-13c."
+  },
+  "files_edited": [],
+  "files_created": [
+    {
+      "path": "/Users/ghost/core/anima/state/omega_runner_13c_audit_only_integration_deferred.json",
+      "tracked": false,
+      "reason": "anima closure JSONs are untracked per PSC convention"
+    }
+  ],
+  "validation": [
+    {
+      "step": "confirm bridge_health.sh selftest path is host-local hexa",
+      "command": "grep -n 'docker\\|HEXA_REMOTE' /Users/ghost/core/nexus/tool/bridge_health.sh",
+      "result": "no docker references; HEXA_BIN is host-resolved (L52-69)"
+    },
+    {
+      "step": "confirm hexa_remote docker mode is per-invocation only",
+      "command": "grep -n 'HEXA_REMOTE_DOCKER\\|HEXA_REMOTE_PERSISTENT' /Users/ghost/core/nexus/scripts/bin/hexa_remote",
+      "result": "only HEXA_REMOTE_DOCKER (no persistent-mode hooks); per-call docker exec at L1237"
+    },
+    {
+      "step": "measure host hexa startup floor",
+      "method": "3 × hexa --version with python ms timer",
+      "result": "34, 35, 36 ms — bounds the sweep amortization opportunity at ~16 × 35 = 560ms, distinct from docker-exec floor"
+    },
+    {
+      "step": "verify hexa batch is unimplemented",
+      "command": "/Users/ghost/core/hexa-lang/hexa batch",
+      "result": "error: unknown subcommand 'batch' — confirms no in-tree batching primitive exists"
+    }
+  ],
+  "scope_constraints_honoured": [
+    "no edit to parallel-session-locked files: cli/run.hexa, state/atlas_health_timeline.jsonl, bisociation/spectra/g_atlas_composite_v3.json, tool/omega_cycle_atlas_ingest.hexa, n6/*, tool/kick_*.hexa, design/kick/*, .own, tool/audit_shim_ssot.hexa — none touched",
+    "no commit in anima — closure JSON written as untracked",
+    "no commit in nexus — audit-only finding has no code delta to commit (option 1 chosen)",
+    "CLI-only inter-call respected — no library imports introduced",
+    "hexa-only-suffix N/A this cycle — no new tools created",
+    "no `git add -A` / `git add .` — no nexus staging performed"
+  ],
+  "next_followups": [
+    "ω-runner-13d (deferred): design and implement hexa-daemon (fork-isolated or module-reset model). Validate with isolated-state test before any bridge_health.sh wiring.",
+    "ω-runner-13e (deferred, after 13d): wire bridge_health.sh sweep through hexa-daemon; measure end-to-end wall-time; target ≥10× sweep speedup vs current ~16 × 35ms = ~560ms hexa-startup floor (plus bridge selftest body, which dominates wall and is NOT amortized).",
+    "ω-hexa-batch: if/when `hexa batch` (already in --help) is implemented in hexa-lang, revisit bridge_health.sh — `hexa batch` may be the cleanest path with no daemon overhead.",
+    "investigate whether bridge selftest body times (network latency to remote APIs) dominate the 560ms hexa-startup share — if selftest body wall is e.g. 5-15s/sweep then a 560ms amortization is <10% relief and the brief's ≥10× target is unreachable regardless of daemon design (re-read the brief's target before committing 13d/13e)"
+  ],
+  "honesty_note": "The brief's framing assumed 13b's speedup was a portable optimization that only needed integration. On closer look, 13b's speedup is conditional on `every call going through docker exec`. bridge_health.sh does not. The ≥10× sweep speedup target may not even be physically achievable via persistent FIFO regardless of integration effort, because the sweep's wall is dominated by per-bridge selftest body (network I/O to upstream APIs), NOT by per-call invocation overhead. A future cycle should first profile bridge_health.sh sweep to see what fraction of wall is invocation vs body — if body dominates, no invocation-side optimization can hit ≥10×.",
+  "head_pinned": {
+    "nexus_at_audit": "db724ac9d30031e5ac6da7b037f36e1d116ae0c5",
+    "hexa_lang_at_audit": "c40b419efc53259056d2a7a1362d784adf85917e"
+  },
+  "commit_sha_in_nexus": null,
+  "anima_closure_path": "/Users/ghost/core/anima/state/omega_runner_13c_audit_only_integration_deferred.json"
+}
