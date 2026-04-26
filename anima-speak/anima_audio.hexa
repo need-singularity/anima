@@ -333,6 +333,99 @@ fn _wav_header(sr: int, n_samples: int) {
     return h
 }
 
+// ω-interp-3 bench variant (2026-04-26): alloc + indexed-assign instead of
+// header push + N×2 sample push. Pre-allocates buf of (44 + 2*n) bytes via
+// array_alloc; writes header into slots [0..44), per-sample int16 LE into
+// slots [44 + 2*i, 44 + 2*i + 1]. NO push() inside the per-sample loop.
+fn vocal_hexa_alloc(freq_hz: float, gain: float, ms: int) -> string {
+    let path = _new_path()
+    let mut hz = freq_hz
+    let nyq = (SR + 0.0) / 2.0 - 1.0
+    if hz < 20.0 { hz = 20.0 }
+    if hz > nyq { hz = nyq }
+    let mut g = gain
+    if g < 0.0 { g = 0.0 }
+    if g > 1.0 { g = 1.0 }
+    let mut n = (SR * ms) / 1000
+    if n < 1 { n = 1 }
+    // Build WAV header bytes (44 bytes total) directly into buf[0..44).
+    let data_bytes = n * 2
+    let chunk_size = 36 + data_bytes
+    let total = 44 + data_bytes
+    let mut buf = array_alloc(total)
+    // "RIFF"
+    buf[0] = 0x52; buf[1] = 0x49; buf[2] = 0x46; buf[3] = 0x46
+    buf[4] = chunk_size & 0xFF
+    buf[5] = (chunk_size >> 8) & 0xFF
+    buf[6] = (chunk_size >> 16) & 0xFF
+    buf[7] = (chunk_size >> 24) & 0xFF
+    // "WAVE"
+    buf[8] = 0x57; buf[9] = 0x41; buf[10] = 0x56; buf[11] = 0x45
+    // "fmt "
+    buf[12] = 0x66; buf[13] = 0x6D; buf[14] = 0x74; buf[15] = 0x20
+    // Subchunk1Size = 16
+    buf[16] = 16; buf[17] = 0; buf[18] = 0; buf[19] = 0
+    // AudioFormat = 1 (PCM)
+    buf[20] = 1; buf[21] = 0
+    // NumChannels = 1
+    buf[22] = 1; buf[23] = 0
+    // SampleRate
+    buf[24] = SR & 0xFF
+    buf[25] = (SR >> 8) & 0xFF
+    buf[26] = (SR >> 16) & 0xFF
+    buf[27] = (SR >> 24) & 0xFF
+    // ByteRate = SR * 2
+    let br = SR * 2
+    buf[28] = br & 0xFF
+    buf[29] = (br >> 8) & 0xFF
+    buf[30] = (br >> 16) & 0xFF
+    buf[31] = (br >> 24) & 0xFF
+    // BlockAlign = 2
+    buf[32] = 2; buf[33] = 0
+    // BitsPerSample = 16
+    buf[34] = 16; buf[35] = 0
+    // "data"
+    buf[36] = 0x64; buf[37] = 0x61; buf[38] = 0x74; buf[39] = 0x61
+    buf[40] = data_bytes & 0xFF
+    buf[41] = (data_bytes >> 8) & 0xFF
+    buf[42] = (data_bytes >> 16) & 0xFF
+    buf[43] = (data_bytes >> 24) & 0xFF
+    let two_pi_hz_over_sr = 2.0 * 3.141592653589793 * hz / (SR + 0.0)
+    let mut k = (SR + 0) / 100
+    if k > n / 2 { k = n / 2 }
+    let mut i = 0
+    let mut off = 44
+    while i < n {
+        let t = i + 0.0
+        let mut y = g * sin(two_pi_hz_over_sr * t)
+        if k > 0 {
+            if i < k {
+                let r = 0.5 * (1.0 - cos(3.141592653589793 * (i + 0.0) / (k - 1 + 0.0)))
+                y = y * r
+            }
+            let tail = n - i - 1
+            if tail < k {
+                let r = 0.5 * (1.0 - cos(3.141592653589793 * (tail + 0.0) / (k - 1 + 0.0)))
+                y = y * r
+            }
+        }
+        if y > 1.0 { y = 1.0 }
+        if y < 0.0 - 1.0 { y = 0.0 - 1.0 }
+        let mut s = floor(y * 32767.0 + 0.5)
+        if s > 32767 { s = 32767 }
+        if s < 0 - 32768 { s = 0 - 32768 }
+        let mut u = s
+        if u < 0 { u = u + 65536 }
+        buf[off] = u & 0xFF
+        buf[off + 1] = (u >> 8) & 0xFF
+        off = off + 2
+        i = i + 1
+    }
+    write_bytes(path, buf)
+    if _file_bytes(path) < WAV_MIN_BYTES { return "" }
+    return path
+}
+
 fn vocal_hexa(freq_hz: float, gain: float, ms: int) -> string {
     let path = _new_path()
     // Clamp inputs (mirror vocal() semantics).

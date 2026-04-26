@@ -1,0 +1,98 @@
+{
+  "cycle": "omega-interp-3",
+  "axis": "hexa-runtime / array primitive",
+  "timestamp": "2026-04-26T00:00:00Z",
+  "context": {
+    "predecessor": "omega-interp-2 (94cd2b41) — push dirty-flag + high-water mark, ~10us/op interpreted",
+    "audio_3_baseline": "vocal_hexa chain ~1037ms (hexa-native), warm python worker ~287ms (3.6x faster via numpy SIMD)",
+    "hypothesis": "indexed assign on pre-allocated buffer would skip per-element call_builtin + env_set, dropping dispatch overhead 2-4x on N-bounded fixed-size buffers (e.g., vocal_hexa N=4800 bytes)"
+  },
+  "primitive_added": {
+    "name": "array_alloc",
+    "signature": "fn array_alloc(n: int) -> array<int>",
+    "semantics": "Returns array of n int slots, all zero. n<=0 yields empty array. O(n) once.",
+    "dispatch_arm": {
+      "file": "/Users/ghost/core/hexa-lang/self/hexa_full.hexa",
+      "location": "call_builtin, immediately after `arange` arm (around line 10650)",
+      "impl": "tight while-loop pushing val_int(0) into a host items array, then val_array(items)"
+    },
+    "c_impl": {
+      "file": "/Users/ghost/core/hexa-lang/self/runtime.c",
+      "location": "next to hexa_array_zeros_float (around line 5710)",
+      "function": "HexaVal hexa_array_alloc(HexaVal nv)",
+      "summary": "single malloc(N*sizeof(HexaVal)), fill with hexa_int(0), set len=cap=n (positive=heap). Mirrors hexa_array_zeros_float for ints. Currently AOT-only (interp dispatch arm uses hexa-side pushes; wiring AOT call site is deferred)."
+    }
+  },
+  "selftest_results": {
+    "T1_len_100": {"expected": 100, "actual": 100, "status": "PASS"},
+    "T2_empty": {"expected": 0, "actual": 0, "status": "PASS"},
+    "T3_indexed_assign": {
+      "expected": "len=4800, a[0]=42, a[4799]=99, a[2400]=0",
+      "actual":   "len=4800, a[0]=42, a[4799]=99, a[2400]=0",
+      "status": "PASS"
+    },
+    "T4_4800_storage_micro": {
+      "config": "N=4800, R=100 reps, store constant 0",
+      "push_total_ms": 1643,
+      "alloc_total_ms": 1736,
+      "speedup_x100": 94,
+      "interpretation": "alloc variant 6% SLOWER on pure-storage micro. Dispatch arm uses hexa-side pushes to build the zero-filled items array — pays N pushes upfront then N indexed assigns = 2N work vs N pushes. Indexed-assign per element ~= push per element after omega-interp-2 dirty-flag landed.",
+      "status": "FUNCTIONAL (correctness PASS) / NO-PERF-WIN"
+    },
+    "T4_storage_paired": {
+      "config": "N=4844 outer, 2 stores per i (mimics vocal_hexa low+high byte), R=50",
+      "push_ms": 1040,
+      "alloc_ms": 1199,
+      "speedup_x100": 86,
+      "note": "alloc 14% SLOWER — same root cause as T4 micro"
+    }
+  },
+  "vocal_hexa_bench": {
+    "config": "440Hz, gain=0.5, 100ms (n=2400 samples, 4844 byte buffer), R=5 warm runs each",
+    "vocal_hexa_push_mean_ms": 82,
+    "vocal_hexa_alloc_mean_ms": 83,
+    "speedup_x100": 98,
+    "delta_ms_per_call": 1,
+    "interpretation": "Effectively tied. Storage was never the bottleneck for vocal_hexa — sin/cos/floor + arithmetic per sample dominates. Optimizing the storage path alone leaves the chain ~unchanged.",
+    "bench_script": "/Users/ghost/core/anima/anima-speak/_omega_interp_3_bench.hexa",
+    "alloc_variant_added": "vocal_hexa_alloc in /Users/ghost/core/anima/anima-speak/anima_audio.hexa (preserves vocal_hexa unchanged for A/B)"
+  },
+  "estimated_chain_speedup": {
+    "predicted": "vocal_hexa 144ms -> 50ms, chain 1037ms -> ~360ms (per cycle prompt hypothesis)",
+    "actual": "vocal_hexa 82ms -> 83ms, chain delta ~0ms",
+    "verdict": "HYPOTHESIS NOT BORNE OUT — array_alloc + indexed assign does not beat push-with-dirty-flag for vocal_hexa workload"
+  },
+  "root_cause_of_no_win": {
+    "1_dispatch_overhead": "host-interp dispatch arm for array_alloc uses N hexa-source `result.push(zero)` calls — these compile to N hexa_array_push C calls in the host interp binary. Equivalent to N pushes already, before user even starts indexed assigns.",
+    "2_indexed_assign_parity": "after omega-interp-2 dirty-flag landed (94cd2b41), per-element push ~= per-element indexed assign at the C-runtime level. Both are O(1) writes to the items buffer with one defensive array_store rebind.",
+    "3_compute_dominates": "vocal_hexa per-sample work is dominated by sin/cos/floor + arithmetic (10+ ops), not the 2 byte stores. Optimizing 2 stores out of 12 ops yields negligible delta.",
+    "fix_path_for_real_win": "wire host-interp call_builtin('array_alloc') to invoke the C primitive directly via a host_native bridge (similar to how `time_ms` calls C `time_ms()`). Single C call replaces N hexa-source pushes — would give true O(n) calloc-speed allocation. Requires extending the hexa_full.hexa builtin-table to include a host-native indirection for this name."
+  },
+  "build_artifacts": {
+    "interp_built": "/Users/ghost/core/hexa-lang/build/hexa_interp.real (2797024 bytes, smoke OK)",
+    "shim_intact": true,
+    "hexa_full_changed_lines": "+15 (call_builtin array_alloc arm)",
+    "runtime_c_changed_lines": "+22 (hexa_array_alloc C function — AOT path; not yet wired)",
+    "anima_audio_changed_lines": "+82 (vocal_hexa_alloc variant for A/B bench, vocal_hexa untouched)"
+  },
+  "recommendation_for_audio_4": {
+    "extend_to_other_organs": "DEFERRED. Without a C-bridged dispatch for array_alloc, extending breath_hexa/pipe_hexa/vocal_lf_hexa to use the same pattern would yield 0-2% deltas (parity with push). NOT worth the surface-area churn.",
+    "alternative_path_1": "First land a host-native bridge for array_alloc (call_builtin -> direct hexa_array_alloc C call). Re-bench vocal_hexa. If alloc drops to <50ms (chain <360ms vs current 1037ms), THEN proceed with audio-4 consumer migration.",
+    "alternative_path_2": "Bottleneck is sin/cos compute. Consider sin_table[N] precompute or batch SIMD-style primitive (e.g., sin_array(t_array, hz, sr) -> y_array). This would attack the actual hot path.",
+    "alternative_path_3": "Accept the 3.6x gap vs python worker as fundamental for now; optimize only the call sites where worker spawn overhead exceeds the synthesis cost."
+  },
+  "rollback": {
+    "git_revert_files": [
+      "/Users/ghost/core/hexa-lang/self/hexa_full.hexa",
+      "/Users/ghost/core/hexa-lang/self/runtime.c",
+      "/Users/ghost/core/anima/anima-speak/anima_audio.hexa"
+    ],
+    "rebuild_cmd": "cd /Users/ghost/core/hexa-lang && ./hexa tool/build_interp.hexa",
+    "delete_files": [
+      "/Users/ghost/core/anima/anima-speak/_omega_interp_3_bench.hexa",
+      "/Users/ghost/core/anima/state/omega_interp_3_array_alloc.json"
+    ],
+    "risk": "LOW. array_alloc is additive only — no existing call sites use it. vocal_hexa untouched (vocal_hexa_alloc is parallel sibling). C function is unreachable from interp path. Rollback is purely cosmetic."
+  },
+  "outcome": "primitive LANDED + selftest PASS, but NO speedup achieved on vocal_hexa. Chain stays at ~1037ms. ω-interp-3 is a NULL-RESULT cycle: hypothesis tested, falsified, root cause diagnosed (dispatch arm uses hexa-source pushes, defeating the calloc advantage). Path forward: host-native bridge before any audio-4 consumer migration."
+}

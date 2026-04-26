@@ -1,0 +1,109 @@
+{
+  "cycle": "omega_runner_5",
+  "axis": "runner",
+  "timestamp": "2026-04-26T00:00:00Z",
+  "purpose": "Empirically validate hexa-runner warm-exec ~50ms / cold-start ~5s claims from omega_hexa_4_docker_hard_landing.json",
+  "bench_script": {
+    "path": "/Users/ghost/core/nexus/tool/bench_runner_exec.sh",
+    "loc": 73,
+    "flags": ["--warm-only", "--cold-only", "--samples N"],
+    "default_samples": 5,
+    "method": "python3 time.time()*1000 wallclock around exec; sorted samples for p50/p95"
+  },
+  "environment": {
+    "container": "hexa-exec",
+    "image": "hexa-runner:latest",
+    "image_id": "cc74eea6c8cf",
+    "image_size_virtual_mb": 166,
+    "image_size_compact_mb": 36.2,
+    "container_state_at_bench": "Up 4 hours",
+    "host": "darwin 24.6.0",
+    "docker_runtime": "Docker Desktop (Mac)"
+  },
+  "scenarios_run": [
+    {
+      "id": "A_warm_resolver",
+      "config": "HEXA_RESOLVER_FORCE_DOWN=1 hexa /tmp/_b.hexa (full resolver path including probe + image_inspect + container_inspect + docker exec + hexa interp)",
+      "samples": 5
+    },
+    {
+      "id": "B_warm_exec_only",
+      "config": "docker exec -i -w PWD -e HEXA_RESOLVER_NO_REROUTE=1 hexa-exec /usr/local/bin/hexa /tmp/_b.hexa (skip resolver, direct exec)",
+      "samples": 5
+    },
+    {
+      "id": "C_cold_recreate",
+      "config": "docker rm -f hexa-exec; HEXA_RESOLVER_FORCE_DOWN=1 hexa /tmp/_b.hexa (force fresh container creation + first exec)",
+      "samples": 2
+    },
+    {
+      "id": "D_decomp_docker_exec_true",
+      "config": "docker exec -i hexa-exec /bin/true (isolate pure docker exec overhead, no hexa)",
+      "samples": 5
+    },
+    {
+      "id": "E_decomp_hexa_version",
+      "config": "docker exec -i hexa-exec /usr/local/bin/hexa --version (hexa cold-startup, no script parse)",
+      "samples": 5
+    }
+  ],
+  "measurements_ms": {
+    "A_warm_resolver":      {"n": 5, "mean": 245.2, "p50": 246, "p95": 259, "min": 234, "max": 259},
+    "B_warm_exec_only":     {"n": 5, "mean": 103.0, "p50": 102, "p95": 112, "min": 96,  "max": 112},
+    "C_cold_recreate":      {"n": 2, "mean": 575.0, "p50": 575, "p95": 605, "min": 545, "max": 605},
+    "D_decomp_exec_true":   {"n": 5, "mean": 102.6, "p50": 104, "p95": 106, "min": 99,  "max": 106},
+    "E_decomp_hexa_version":{"n": 5, "mean": 97.8,  "p50": 97,  "p95": 104, "min": 93,  "max": 104},
+    "F_decomp_hexa_script": {"n": 3, "mean": 175.7, "p50": 174, "p95": 184, "min": 169, "max": 184}
+  },
+  "claim_validation": {
+    "warm_exec_overhead_ms_claim": 50,
+    "warm_exec_overhead_ms_actual": 103,
+    "warm_exec_overhead_ms_actual_with_resolver": 245,
+    "warm_exec_verdict": "UNDERSTATED — actual is 2.06x cited (103ms vs 50ms claim) for raw docker-exec path; 4.9x (245ms) when including resolver probe overhead",
+    "cold_start_overhead_s_claim": 5,
+    "cold_start_overhead_s_actual": 0.575,
+    "cold_start_verdict": "OVERSTATED by 8.7x — cold container recreate measured 575ms mean (range 545-605ms), well under cited 5s. Claim was likely a worst-case reasoning estimate, not measurement.",
+    "summary": "Cited figures were directional but inaccurate: warm understated 2x, cold overstated ~9x. Docker exec on Darwin/Docker-Desktop is faster than feared but slower than ideal."
+  },
+  "dominant_components_in_warm_exec": {
+    "docker_exec_setup_ms": 103,
+    "docker_exec_setup_pct": 58.6,
+    "hexa_binary_startup_ms": -5,
+    "hexa_binary_startup_note": "negligible — `hexa --version` runs in 98ms vs `/bin/true` 103ms; binary load is essentially free on top of docker-exec",
+    "hexa_script_parse_dispatch_ms": 73,
+    "hexa_script_parse_dispatch_pct": 41.4,
+    "resolver_overhead_when_used_ms": 142,
+    "resolver_overhead_breakdown": "docker_info + image_inspect + container_inspect + env_hash + connectivity_probe ~= 142ms when not cached; HEXA_ROUTING_CACHE=1 with 5s TTL would eliminate most",
+    "verdict": "Pure docker-exec round-trip is THE dominant cost (~103ms = 59% of warm path). Hexa script parse adds 73ms. Resolver adds another 142ms unless cached."
+  },
+  "recommendation_if_warm_overhead_too_high": [
+    {
+      "option": "omega_runner_6_routing_cache_default_on",
+      "expected_savings_ms": 142,
+      "risk": "low — cache is env_hash invalidated, 5s TTL bounds staleness, fail-loud on stale-route",
+      "effort": "trivial — flip HEXA_ROUTING_CACHE default from 0 to 1"
+    },
+    {
+      "option": "omega_runner_6_persistent_exec_socket",
+      "expected_savings_ms": 80,
+      "approach": "long-lived hexa daemon inside container reading scripts over unix socket; bypass docker exec setup per call",
+      "risk": "medium — adds daemon lifecycle, stdin/stdout pipelining, signal handling",
+      "effort": "moderate — ~200 LOC daemon + client wrapper"
+    },
+    {
+      "option": "omega_runner_6_native_darwin_path_with_audit",
+      "expected_savings_ms": 100,
+      "approach": "skip docker entirely on Darwin via signed darwin-bypass marker (already partially scaffolded — HEXA_RESOLVER_NO_DARWIN_BYPASS env)",
+      "risk": "medium-high — loses container isolation guarantees; only viable when caller is already trusted",
+      "effort": "low — wiring already exists, just default policy"
+    }
+  ],
+  "rollback": {
+    "steps": ["rm /Users/ghost/core/nexus/tool/bench_runner_exec.sh", "rm /Users/ghost/core/anima/state/omega_runner_5_warm_exec_bench.json"],
+    "side_effects": "none — bench is read-only on infra; container hexa-exec was rm/recreated during cold-recreate samples but resolver auto-recreates on next call"
+  },
+  "next_cycles_suggested": [
+    "omega_runner_6: enable HEXA_ROUTING_CACHE default-on + measure warm-resolver delta (predict 245ms→103ms)",
+    "omega_runner_7: investigate persistent-socket exec daemon if 100ms still too high for hot loops"
+  ]
+}
