@@ -1,0 +1,254 @@
+// anima-speak/experiments/piper_v2gen.hexa — Piper TTS A/B v2 (rubberband variant)
+//
+// Variant of piper_ab_gen.hexa: identical pipeline (piper + ffmpeg + persona_lines)
+// except for 4 tuned knobs:
+//   1. OUT_ROOT → piper_ko_v2_rubberband
+//   2. persona 13/14 piper_params (slightly different L/N/W)
+//   3. persona 13 ffmpeg tone (no vibrato)
+//   4. male pitch chain: rubberband=pitch=0.80 (was asetrate+aresample+atempo cascade)
+//
+// Reuses persona_lines/persona_name_for/persona_is_male from piper_ab_gen.hexa
+// is NOT possible (hexa lacks import); function bodies are duplicated. The
+// persona_lines table is large but identical to v1 — lifted verbatim.
+//
+// Created 2026-04-26 by Ω-rules P4 Phase 4 (replace piper_v2gen.sh).
+// raw#9: hexa-only; subprocess to piper (rust) + ffmpeg (canonical pattern).
+
+let PIPER_BIN    = "/home/aiden/bin/tts_tools/piper/piper"
+let PIPER_MODEL  = "/home/aiden/bin/tts_tools/voices/ko/piper-kss-korean.onnx"
+let PIPER_CONFIG = "/home/aiden/bin/tts_tools/voices/ko/piper-kss-korean.onnx.json"
+let OUT_ROOT     = "/home/aiden/mac_home/dev/anima/anima-speak/corpus/ab_test/piper_ko_v2_rubberband"
+let STATE_DIR    = "/home/aiden/mac_home/dev/anima/anima-speak/corpus/ab_test"
+let STAMP        = "20260419"
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn ensure_dir(path: string) {
+    let _ = exec("mkdir -p " + shell_escape(path))
+}
+
+fn file_bytes(path: string) -> int {
+    let out = exec("stat -c %s " + shell_escape(path) + " 2>/dev/null").trim()
+    if len(out) == 0 { return 0 }
+    return to_int(out)
+}
+
+fn audio_duration_s(path: string) -> float {
+    let out = exec("ffprobe -v error -show_entries format=duration -of csv=p=0 "
+                   + shell_escape(path) + " 2>/dev/null").trim()
+    if len(out) == 0 { return 0.0 }
+    return to_float(out)
+}
+
+fn pad2(n: int) -> string {
+    if n < 10 { return "0" + to_string(n) }
+    return to_string(n)
+}
+
+fn persona_name_for(id: int) -> string {
+    if id == 10 { return "ice_queen" }
+    if id == 11 { return "chaebol_heir" }
+    if id == 12 { return "pure_heroine" }
+    if id == 13 { return "tsundere_oppa" }
+    if id == 14 { return "airhead_friend" }
+    if id == 15 { return "charismatic_prez" }
+    if id == 16 { return "thug_returnee" }
+    if id == 17 { return "cold_heiress" }
+    if id == 18 { return "gentle_oppa" }
+    if id == 19 { return "fallen_antagonist" }
+    return "unknown"
+}
+
+fn persona_is_male(id: int) -> bool {
+    if id == 11 { return true }
+    if id == 13 { return true }
+    if id == 15 { return true }
+    if id == 16 { return true }
+    if id == 18 { return true }
+    if id == 19 { return true }
+    return false
+}
+
+// V2 tuning: id 13/14 modified vs v1
+fn persona_piper_params(id: int) -> string {
+    if id == 10 { return "120,55,60"   }
+    if id == 11 { return "110,55,70"   }
+    if id == 12 { return "100,75,85"   }
+    if id == 13 { return "95,65,80"    }  // v2: was 95,80,100
+    if id == 14 { return "85,75,85"    }  // v2: was 80,85,100
+    if id == 15 { return "115,50,60"   }
+    if id == 16 { return "125,70,80"   }
+    if id == 17 { return "115,50,65"   }
+    if id == 18 { return "105,70,80"   }
+    if id == 19 { return "125,75,85"   }
+    return "100,66,80"
+}
+
+// V2 ffmpeg filter: rubberband for male pitch + persona 13 drops vibrato
+fn persona_ffmpeg_filter(id: int) -> string {
+    let is_male = persona_is_male(id)
+    let ln = "loudnorm=I=-18:TP=-2:LRA=7"
+
+    let mut pitch = ""
+    if is_male {
+        pitch = "rubberband=pitch=0.80,"  // v2: was asetrate=22050*0.78,aresample=22050,atempo=1.28,
+    }
+
+    let mut tone = ""
+    if id == 10 {
+        tone = "equalizer=f=200:t=q:w=1.2:g=-2,equalizer=f=3500:t=q:w=1:g=1,"
+    } else if id == 11 {
+        tone = "equalizer=f=150:t=q:w=1:g=3,equalizer=f=4000:t=q:w=1:g=1.5,"
+    } else if id == 12 {
+        tone = "equalizer=f=400:t=q:w=1:g=-1,equalizer=f=6000:t=q:w=1.5:g=2,"
+    } else if id == 13 {
+        tone = "equalizer=f=5000:t=q:w=1:g=1.5,"  // v2: dropped vibrato=f=5:d=0.15
+    } else if id == 14 {
+        tone = "equalizer=f=300:t=q:w=1:g=-1,equalizer=f=5500:t=q:w=1:g=2.5,"
+    } else if id == 15 {
+        tone = "equalizer=f=120:t=q:w=1:g=2.5,equalizer=f=3000:t=q:w=1:g=1,highpass=f=80,"
+    } else if id == 16 {
+        tone = "equalizer=f=180:t=q:w=1:g=2,equalizer=f=4500:t=q:w=1:g=-2,"
+    } else if id == 17 {
+        tone = "equalizer=f=250:t=q:w=1.2:g=-1.5,equalizer=f=4000:t=q:w=1:g=1.5,"
+    } else if id == 18 {
+        tone = "equalizer=f=200:t=q:w=1:g=2,equalizer=f=5500:t=q:w=1:g=1,aecho=0.7:0.6:40:0.18,"
+    } else if id == 19 {
+        tone = "equalizer=f=100:t=q:w=1:g=2,equalizer=f=6000:t=q:w=1:g=-2,aecho=0.8:0.9:80:0.25,"
+    }
+
+    return pitch + tone + ln
+}
+
+// Persona lines IDENTICAL to v1 — lifted from piper_ab_gen.hexa (no import in hexa).
+// Source of truth: piper_ab_gen.hexa lines 173-295 (same Korean lines, same persona ids).
+// If lines change, BOTH v1 and v2 must be updated in lockstep.
+fn persona_lines(id: int) -> array {
+    if id == 10 {
+        return ["흥, 너 따위가 감히 나한테 말을 걸어?","그런 시시한 얘기는 듣고 싶지 않아.","꺼져. 네 얼굴 보기도 싫으니까.","내가 왜 네 부탁을 들어줘야 하는데?","착각하지 마. 우리는 친구가 아니야.","그 정도 실력으로 나를 이기려고?","한심하네. 진짜 한심해.","더 이상 말 걸지 마. 귀찮으니까."]
+    }
+    if id == 11 {
+        return ["내 이름을 그렇게 함부로 부르지 마.","네가 나한테 뭘 증명해야 한다고 생각해?","이 회사는 내 손에 달려 있어. 기억해 둬.","돈으로 해결 못 할 일은 없어.","넌 내가 누군지 아직도 모르는 것 같군.","나한테 이런 식으로 대드는 건 네가 처음이야.","흥미롭군. 조금 더 지켜봐 주지.","잊지 마. 이 세상은 내 것이야."]
+    }
+    if id == 12 {
+        return ["오늘도 좋은 하루 보내세요.","제가 도와드릴 수 있어서 정말 기뻐요.","괜찮아요, 너무 걱정하지 마세요.","당신을 믿어요. 언제나 그랬듯이.","함께 있어 줘서 고마워요.","따뜻한 차 한잔 드릴까요?","웃어요. 웃으면 복이 와요.","제가 곁에 있을게요. 언제든지."]
+    }
+    if id == 13 {
+        return ["뭐, 뭐야? 내가 너 걱정했다고? 아니거든!","이, 이거 너 주려고 산 거 아니야. 그냥 남은 거야.","왜 자꾸 나를 쳐다봐? 부담스럽거든.","아니, 진짜... 너 때문에 정말 피곤해.","괜찮아? 아니, 너 괜찮냐고 물어본 거 아니야.","바보야. 그런 것도 모르냐.","다 너 때문이야. 전부 너 때문.","내가... 내가 널 좋아한다고는 안 했어."]
+    }
+    if id == 14 {
+        return ["오늘 급식에 탕수육 나왔는데 너무 맛있었어!","어? 나비가 날아간다! 예쁘다!","아, 맞다 맞다! 나 어제 엄청 재밌는 꿈 꿨어!","잠깐만, 이거 이상해. 왜 이래? 왜 이래?","우와아아! 진짜? 진짜야? 대박이다!","헤헤, 그거 말이지, 사실 나도 몰라.","배고파! 뭐 먹으러 가자! 응? 응?","히히, 오늘 왠지 기분이 좋아!"]
+    }
+    if id == 15 {
+        return ["전교생 여러분, 잠시 주목해 주시기 바랍니다.","이 학교의 질서는 내가 지킨다.","규칙은 지키라고 있는 것이다. 예외는 없다.","네 의견은 잘 들었다. 하지만 결정은 내가 한다.","이 정도 책임은 내가 감당할 수 있다.","실수는 용납하지 않는다. 두 번은 더욱.","학생회의 이름으로 선언한다.","진정한 리더는 말이 아닌 행동으로 증명한다."]
+    }
+    if id == 16 {
+        return ["야, 저기... 담배 있냐?","아 귀찮아 진짜. 그냥 좀 놔둬라.","왜 자꾸 날 찾아와? 나 그런 사람 아니거든.","어이, 내 앞에서 그런 소리 하지 마라.","됐고, 그냥 넘어가자. 응?","나 복학했다고 다 끝난 거 아니야.","그래, 내가 양아치였다 치자. 근데 지금은 아니야.","뭐 어쩌라고. 살아봐야 아는 거지."]
+    }
+    if id == 17 {
+        return ["그런 제안은 받지 않겠어요.","당신과 같은 수준에서 이야기하고 싶지 않군요.","우아함이란, 타고나는 것이에요.","내 앞에서 무례한 행동은 삼가세요.","결론부터 말하죠. 그 답은 '아니오'예요.","당신이 생각하는 것보다 나는 훨씬 차가운 사람이에요.","감정 따위는 사치일 뿐이죠.","이 자리를 마치죠. 더 이상의 대화는 무의미해요."]
+    }
+    if id == 18 {
+        return ["오늘 많이 힘들었죠? 이리 와요.","내가 옆에 있을게요. 걱정 마세요.","천천히 해도 괜찮아요. 기다릴게요.","당신은 생각보다 훨씬 강한 사람이에요.","따뜻한 거 한잔 할래요? 내가 타 줄게요.","웃는 모습이 참 예뻐요.","오늘도 수고 많았어요. 정말로.","같이 있어 줘서 고마워요."]
+    }
+    if id == 19 {
+        return ["너는... 너는 정말 아무것도 모르는구나.","내가 이렇게 된 건, 전부 너 때문이야.","웃어? 지금 웃어? 내 앞에서?","용서? 그런 단어는 이제 존재하지 않아.","나는 이미 돌아갈 수 없는 길을 걷고 있어.","그래, 끝까지 가보자. 함께.","빛이라고? 나는 이제 어둠이 더 편해.","이 세상이 원망스러워. 너무나도."]
+    }
+    return ["테스트 문장입니다."]
+}
+
+fn parse_param_str(s: string, idx: int) -> float {
+    let parts = s.split(",")
+    if idx >= len(parts) { return 1.0 }
+    return to_float(parts[idx]) / 100.0
+}
+
+fn synth_one(persona_id: int, persona_name: string, line: string, idx: int) -> string {
+    let pdir = OUT_ROOT + "/persona_" + to_string(persona_id) + "_" + persona_name
+    ensure_dir(pdir)
+    let raw = pdir + "/tts_" + pad2(idx) + ".raw.wav"
+    let wav = pdir + "/tts_" + pad2(idx) + ".wav"
+
+    let params = persona_piper_params(persona_id)
+    let ls = parse_param_str(params, 0)
+    let ns = parse_param_str(params, 1)
+    let nw = parse_param_str(params, 2)
+
+    let cmd_piper = "echo " + shell_escape(line)
+                  + " | " + PIPER_BIN
+                  + " --model " + PIPER_MODEL
+                  + " --config " + PIPER_CONFIG
+                  + " --length_scale " + to_string(ls)
+                  + " --noise_scale " + to_string(ns)
+                  + " --noise_w " + to_string(nw)
+                  + " --output_file " + shell_escape(raw)
+                  + " 2>&1"
+    let _ = exec(cmd_piper)
+    if file_bytes(raw) < 5000 {
+        println("  [FAIL] piper empty for persona " + to_string(persona_id) + " idx " + to_string(idx))
+        return ""
+    }
+
+    let af = persona_ffmpeg_filter(persona_id)
+    let cmd_ff = "ffmpeg -y -loglevel error -i " + shell_escape(raw)
+               + " -af " + shell_escape(af)
+               + " -ac 1 -ar 22050 -c:a pcm_s16le "
+               + shell_escape(wav) + " 2>&1"
+    let _ = exec(cmd_ff)
+    if file_bytes(wav) < 1000 {
+        println("  [FAIL] ffmpeg empty for persona " + to_string(persona_id) + " idx " + to_string(idx))
+        return ""
+    }
+    let _ = exec("rm -f " + shell_escape(raw))
+    return wav
+}
+
+fn process_persona(id: int) -> int {
+    let name    = persona_name_for(id)
+    let is_male = persona_is_male(id)
+    let lines   = persona_lines(id)
+    let params  = persona_piper_params(id)
+
+    println("")
+    let mode_tag = "female"
+    if is_male { mode_tag = "male(rubberband)" }
+    println("═══ persona " + to_string(id) + " — " + name + " (mode=" + mode_tag + " params=" + params + ") ═══")
+
+    let n = len(lines)
+    let mut ok_count = 0
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        let wav  = synth_one(id, name, line, i)
+        if len(wav) > 0 {
+            let dur = audio_duration_s(wav)
+            ok_count = ok_count + 1
+            println("  [OK] idx=" + pad2(i) + " dur=" + to_string(dur) + "s → " + wav)
+        } else {
+            println("  [SKIP] idx=" + pad2(i) + " synth failed")
+        }
+        i = i + 1
+    }
+    return ok_count
+}
+
+println("════════════════════════════════════════════════════════════")
+println("  anima-speak piper A/B v2 generator (rubberband variant)")
+println("  engine: piper-kss-korean 22050 Hz + ffmpeg rubberband pitch")
+println("  R37 + raw#9: hexa-only, subprocess to piper/ffmpeg/rubberband")
+println("════════════════════════════════════════════════════════════")
+
+ensure_dir(OUT_ROOT)
+let mut total_ok = 0
+let mut id = 10
+while id <= 19 {
+    total_ok = total_ok + process_persona(id)
+    id = id + 1
+}
+println("")
+println("════════════════════════════════════════════════════════════")
+println("  TOTAL: " + to_string(total_ok) + " / 80 ok")
+println("  OUT_ROOT: " + OUT_ROOT)
+println("════════════════════════════════════════════════════════════")

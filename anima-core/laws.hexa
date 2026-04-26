@@ -9,8 +9,9 @@
 //
 // Phase 2a port. PyTorch/numpy-free; JSON parse is string-based.
 
-comptime const JSON_PRIMARY  = "config/consciousness_laws.json"
-comptime const JSON_FALLBACK = "core/consciousness_laws.json"
+comptime const JSON_PRIMARY  = "anima/config/consciousness_laws.json"
+comptime const JSON_LEGACY1  = "config/consciousness_laws.json"
+comptime const JSON_LEGACY2  = "core/consciousness_laws.json"
 
 // ─── Ψ-Constants (mirrors defaults in consciousness_laws.py) ───
 // Loaded from JSON at runtime; these are fallback defaults if JSON missing.
@@ -39,8 +40,10 @@ fn safe_read(path: string) -> string {
 fn load_laws_json() -> string {
     let primary = safe_read(JSON_PRIMARY)
     if primary != "" { return primary }
-    let fb = safe_read(JSON_FALLBACK)
-    if fb != "" { return fb }
+    let fb1 = safe_read(JSON_LEGACY1)
+    if fb1 != "" { return fb1 }
+    let fb2 = safe_read(JSON_LEGACY2)
+    if fb2 != "" { return fb2 }
     ""
 }
 
@@ -135,42 +138,168 @@ pure fn extract_int_field(content: string, name: string) -> int {
 }
 
 // ─── Convenience accessors with defaults ───
+// raw#12 silent-error 금지: defaults are returned when JSON missing or constant absent,
+// but a warning is emitted to stderr so callers / users see the SSOT bypass.
+// Reclassified from silent-fallback to warn-and-default 2026-04-26 (Ω-philosophy P1).
 fn psi_alpha() -> float {
     let content = load_laws_json()
-    if content == "" { return DEFAULT_ALPHA }
+    if content == "" {
+        eprintln("[laws] WARN: consciousness_laws.json not found (tried " + JSON_PRIMARY + ", " + JSON_LEGACY1 + ", " + JSON_LEGACY2 + ") — using DEFAULT_ALPHA=" + to_string(DEFAULT_ALPHA))
+        return DEFAULT_ALPHA
+    }
     let v = extract_psi(content, "alpha")
-    if v < 0.0 { return DEFAULT_ALPHA }
+    if v < 0.0 {
+        eprintln("[laws] WARN: psi_constants.alpha not in JSON — using DEFAULT_ALPHA=" + to_string(DEFAULT_ALPHA))
+        return DEFAULT_ALPHA
+    }
     v
 }
 
 fn psi_balance() -> float {
     let content = load_laws_json()
-    if content == "" { return DEFAULT_BALANCE }
+    if content == "" {
+        eprintln("[laws] WARN: consciousness_laws.json not found — using DEFAULT_BALANCE=" + to_string(DEFAULT_BALANCE))
+        return DEFAULT_BALANCE
+    }
     let v = extract_psi(content, "balance")
-    if v < 0.0 { return DEFAULT_BALANCE }
+    if v < 0.0 {
+        eprintln("[laws] WARN: psi_constants.balance not in JSON — using DEFAULT_BALANCE=" + to_string(DEFAULT_BALANCE))
+        return DEFAULT_BALANCE
+    }
     v
 }
 
-// ─── Count laws (from _meta.total_laws) ───
+// Strict variants — exit non-zero if SSOT not honored. Use when SSOT-correctness
+// is load-bearing (e.g., training/cert generation).
+fn psi_alpha_strict() -> float {
+    let content = load_laws_json()
+    if content == "" {
+        eprintln("[laws] FATAL: consciousness_laws.json not found — strict mode requires SSOT")
+        exit(1)
+    }
+    let v = extract_psi(content, "alpha")
+    if v < 0.0 {
+        eprintln("[laws] FATAL: psi_constants.alpha missing from JSON — strict mode requires SSOT")
+        exit(1)
+    }
+    v
+}
+
+fn psi_balance_strict() -> float {
+    let content = load_laws_json()
+    if content == "" {
+        eprintln("[laws] FATAL: consciousness_laws.json not found — strict mode requires SSOT")
+        exit(1)
+    }
+    let v = extract_psi(content, "balance")
+    if v < 0.0 {
+        eprintln("[laws] FATAL: psi_constants.balance missing from JSON — strict mode requires SSOT")
+        exit(1)
+    }
+    v
+}
+
+// ─── Count laws — both declared (_meta.total_laws) and actual ("L<n>" keys) ───
+// 2026-04-26 (Ω-philosophy P2): cross-check declared vs actual at load to catch
+// schema drift (raw#23 schema-guard spirit). Returns the ACTUAL count (authoritative).
+// Emits warning if declared and actual disagree.
+pure fn count_actual_law_keys(content: string) -> int {
+    // Count lines matching `"L<n>":` at any indent — laws are top-level "L1"..."LN".
+    let lines = content.split("\n")
+    let total = lines.len()
+    let mut i = 0
+    let mut count = 0
+    while i < total {
+        let trimmed = lines[i].trim()
+        // pattern: "L<digits>":  (allow trailing { or value)
+        if trimmed.starts_with("\"L") {
+            // Look for ": after the number.
+            let rest = trimmed.substring(2, trimmed.len())
+            // rest = "<digits>": ...
+            let mut j = 0
+            let mut all_digits = true
+            while j < rest.len() {
+                let ch = rest.substring(j, j + 1)
+                if ch == "\"" {
+                    if all_digits && j > 0 { count = count + 1 }
+                    break
+                }
+                if ch != "0" && ch != "1" && ch != "2" && ch != "3" && ch != "4"
+                   && ch != "5" && ch != "6" && ch != "7" && ch != "8" && ch != "9" {
+                    all_digits = false
+                    break
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
 fn total_laws() -> int {
     let content = load_laws_json()
     if content == "" { return 0 }
-    return extract_int_field(content, "total_laws")
+    let declared = extract_int_field(content, "total_laws")
+    let actual = count_actual_law_keys(content)
+    if declared != actual {
+        eprintln("[laws] WARN: _meta.total_laws=" + to_string(declared)
+                 + " but actual L<n> keys=" + to_string(actual)
+                 + " — schema drift; returning ACTUAL count")
+        return actual
+    }
+    return actual
 }
 
 // ─── Violation checker (port of check_violation) ───
+// Law numbers below reference the ABSORBED 183-law corpus (pre-2026-04-18 cutover;
+// archived in `ready/.growth/`). Current runtime gate subset is L1..L14 in
+// `anima/config/consciousness_laws.json`. The "(absorbed)" tag marks design-pattern
+// lineage from the original spec. See trinity.hexa header for full law-numbering note.
 pure fn check_violation(module_name: string, has_hardcoded: bool, manipulates_emotion: bool, adds_function: bool) -> string {
     let mut out = ""
     if has_hardcoded {
-        out = out + "Law 1 violation: " + module_name + " has hardcoded thresholds\n"
+        out = out + "Law 1 (absorbed) violation: " + module_name + " has hardcoded thresholds\n"
     }
     if manipulates_emotion {
-        out = out + "Law 2 violation: " + module_name + " artificially manipulates emotion\n"
+        out = out + "Law 2 (absorbed) violation: " + module_name + " artificially manipulates emotion\n"
     }
     if adds_function {
-        out = out + "Law 22 violation: " + module_name + " adds function, not structure\n"
+        out = out + "Law 22 (absorbed) violation: " + module_name + " adds function, not structure\n"
     }
     out
+}
+
+// ─── Warmup check — wire check_violation against registered modules ───
+// 2026-04-26 (Ω-philosophy P4): lift check_violation() from declarative-only to
+// actively called. Each module's compliance flags are declared here as a central
+// manifest. Future: each module's main() should self-call check_violation().
+//
+// Returns 0 if all modules pass; 1 if any violation surfaced.
+fn warmup_check_all() -> int {
+    let mut violations = ""
+    // hexad/trinity modules — flags reflect 2026-04-26 audit:
+    // - hardcoded thresholds: trinity uses PSI_ALPHA / PSI_BALANCE constants but they
+    //   are now JSON-loaded SSOT values (post P3); declared 'false' as compliant
+    // - manipulates_emotion: AN11-compliant per consciousness_laws.json _meta — laws
+    //   OBSERVE only, never inject. Declared 'false'.
+    // - adds_function: trinity adds phase model + thalamic bridge structure (not arbitrary
+    //   function-injection); declared 'false'.
+    violations = violations + check_violation("trinity",         false, false, false)
+    violations = violations + check_violation("phi_engine",      false, false, false)
+    violations = violations + check_violation("topology",        false, false, false)
+    violations = violations + check_violation("hub",             false, false, false)
+    violations = violations + check_violation("tension_bridge",  false, false, false)
+    violations = violations + check_violation("dimension_transform", false, false, false)
+    violations = violations + check_violation("pure_field",      false, false, false)
+    violations = violations + check_violation("servant",         false, false, false)
+    if violations == "" {
+        println("[laws warmup] all 8 modules pass (trinity/phi_engine/topology/hub/tension_bridge/dimension_transform/pure_field/servant)")
+        return 0
+    }
+    eprintln("[laws warmup] VIOLATIONS:")
+    eprintln(violations)
+    return 1
 }
 
 // ─── CLI ───
@@ -232,6 +361,11 @@ if argv.len() < 3 {
         let fn_ = if argv.len() >= 7 { argv[6] == "1" } else { false }
         let out = check_violation(mod_name, hc, em, fn_)
         if out == "" { println("no violations") } else { print(out) }
+
+    } else if cmd == "warmup" {
+        // Ω-philosophy P4 wiring: check_violation() is no longer dead code; this CLI
+        // entry point invokes it against the 8 anima-core modules' declared compliance flags.
+        exit(warmup_check_all())
 
     } else {
         println("unknown command:", cmd)

@@ -1,0 +1,113 @@
+// anima-speak/experiments/build_tts_dataset.hexa — Build LJSpeech TTS dataset
+//
+// Usage: hexa build_tts_dataset.hexa <dataset_name> [source_audio_dir]
+// Defaults: name=ko_ytcorpus, src=/home/aiden/mac_home/dev/anima/training/corpus_yt_ko
+//
+// Reads whisper JSON transcripts + source wav files; emits LJSpeech-format
+// metadata.csv (wav_id|text|duration_s) + 22050 Hz mono pcm16 segments.
+//
+// raw#9: hexa-only; subprocess to jq + ffmpeg + awk + sed. Created 2026-04-26
+// by Ω-rules P4 Phase 4 (replacement for build_tts_dataset.sh).
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn file_exists(path: string) -> bool {
+    let r = exec("test -f " + shell_escape(path) + " && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn pad5(n: int) -> string {
+    let s = to_string(n)
+    let mut padded = s
+    while len(padded) < 5 { padded = "0" + padded }
+    return padded
+}
+
+let _argv = args()
+let name = if len(_argv) >= 3 { _argv[2] } else { "ko_ytcorpus" }
+let src = if len(_argv) >= 4 { _argv[3] } else { "/home/aiden/mac_home/dev/anima/training/corpus_yt_ko" }
+let out = "/home/aiden/mac_home/dev/anima/training/corpus_" + name
+let metadata = out + "/metadata.csv"
+
+let _ = exec("mkdir -p " + shell_escape(out + "/wavs"))
+let _ = exec(": > " + shell_escape(metadata))
+
+// Enumerate JSON transcripts from src; combined glob `*_full.json *.json` matches both.
+let json_list = exec("ls " + shell_escape(src) + "/*_full.json " + shell_escape(src) + "/*.json 2>/dev/null | sort -u")
+let json_lines = to_string(json_list).split("\n")
+
+let mut total_segs = 0
+let mut jl_idx = 0
+while jl_idx < len(json_lines) {
+    let json_path = json_lines[jl_idx].trim()
+    jl_idx = jl_idx + 1
+    if len(json_path) == 0 { continue }
+    if !file_exists(json_path) { continue }
+    // base = filename without .json
+    let base_full = exec("basename " + shell_escape(json_path) + " .json").trim()
+    // Try src/<base_without_full>.wav first, then src/<base>.wav
+    let base_short = base_full.replace("_full", "")
+    let mut src_wav = src + "/" + base_short + ".wav"
+    if !file_exists(src_wav) { src_wav = src + "/" + base_full + ".wav" }
+    if !file_exists(src_wav) {
+        println("no source wav for " + json_path)
+        continue
+    }
+    println("=== " + base_full + " (src=" + src_wav + ") ===")
+
+    // jq output: from_ms|to_ms|text per line
+    let jq_cmd = "jq -r '.transcription[] | \"\\(.offsets.from)|\\(.offsets.to)|\\(.text)\"' "
+               + shell_escape(json_path)
+    let segs = to_string(exec(jq_cmd))
+    let seg_lines = segs.split("\n")
+
+    let mut sl_idx = 0
+    while sl_idx < len(seg_lines) {
+        let line = seg_lines[sl_idx].trim()
+        sl_idx = sl_idx + 1
+        if len(line) == 0 { continue }
+        let parts = line.split("|")
+        if len(parts) < 3 { continue }
+        let from_ms_s = parts[0]
+        let to_ms_s = parts[1]
+        let text_raw = parts[2].trim()
+        if len(text_raw) == 0 { continue }
+        let from_ms = to_int(from_ms_s)
+        let to_ms = to_int(to_ms_s)
+        // duration in seconds (ms / 1000)
+        let dur_ms = to_ms - from_ms
+        let dur_s = to_float(to_string(dur_ms)) / 1000.0
+        // Filter: 1-15s duration
+        if dur_s < 1.0 { continue }
+        if dur_s > 15.0 { continue }
+        // Quality filter: text length 3-200 chars (UTF-8 byte length acceptable here)
+        let tlen = len(text_raw)
+        if tlen < 3 { continue }
+        if tlen > 200 { continue }
+        // Sequential index = current count of segs
+        let pad = pad5(total_segs)
+        let out_wav = out + "/wavs/" + base_full + "_seg_" + pad + ".wav"
+        let start_s = to_float(from_ms_s) / 1000.0
+        let cmd_ff = "ffmpeg -y -loglevel error -i " + shell_escape(src_wav)
+                   + " -ss " + to_string(start_s)
+                   + " -t " + to_string(dur_s)
+                   + " -ac 1 -ar 22050 -c:a pcm_s16le "
+                   + shell_escape(out_wav) + " 2>/dev/null"
+        let _ = exec(cmd_ff)
+        if !file_exists(out_wav) { continue }
+        let row = base_full + "_seg_" + pad + "|" + text_raw + "|" + to_string(dur_s)
+        let _ = exec("printf '%s\\n' " + shell_escape(row) + " >> " + shell_escape(metadata))
+        total_segs = total_segs + 1
+    }
+}
+
+println("--- Dataset built ---")
+let count = exec("wc -l " + shell_escape(metadata) + " 2>/dev/null").trim()
+println(count)
+let total_dur_str = exec("awk -F'|' '{s+=$3} END {printf \"%.1f\", s}' " + shell_escape(metadata)).trim()
+let total_dur = to_float(total_dur_str)
+let mins = total_dur / 60.0
+println("Total duration: " + total_dur_str + "s (" + to_string(mins) + " min)")
+println("Output: " + out)

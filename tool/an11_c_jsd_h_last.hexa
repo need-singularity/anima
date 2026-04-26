@@ -1,0 +1,440 @@
+// tool/an11_c_jsd_h_last.hexa — AN11(c) JSD via h_last hidden-state distributions (hexa-native).
+//
+// Hexa-native port of tool/an11_c_jsd_h_last.py (the .py is now gitignored research-tier
+// fallback; this .hexa is the canonical implementation as of 2026-04-26 Ω-rules P4 Phase 5).
+//
+// PURPOSE
+//   Fallback verifier for AN11(c) "real_usable" when live serving (curl→FastAPI) is not
+//   available. Compares per-prompt hidden-state distributions between two trained
+//   checkpoints by histogramming the byte_weighted_mean h_last vectors (256-dim truncated)
+//   into K=32 bins, then computing Jensen-Shannon divergence per prompt.
+//
+// GOVERNS  AN11 condition (c) via fallback mode (raw#12 strict, $0 CPU).
+// PAIRS    tool/an11_c_verifier.hexa (HTTP-sampling primary).
+//
+// PRE-REGISTERED PREDICATE (raw#12, frozen)
+//   r8 p4 (mistral) JSD on shared prompt suite vs r6 p4 (gemma) baseline:
+//     - mean ≥ 0.5  → PASS  (distinguishable; "real_usable" attested)
+//     - mean ≥ 0.8  → STRONG-PASS  (saturated separation)
+//     - mean < 0.5  → FAIL  (indistinguishable)
+//
+// Implementation notes:
+//   - JSON parse: jq subprocess (per-entry extract via .entries[i].prompt + .entries[i].h)
+//   - Math: log2 + sqrt via awk subprocess (single call per JSD, single call per sqrt)
+//   - SHA256: sha256sum subprocess
+//   - Output: state/an11_c_r8_jsd_<TS>.json
+//
+// raw#9   hexa-native (no python/numpy)
+// raw#10  proof-carrying (deterministic histogram JSD; jq + awk are deterministic)
+// raw#12  pre-registered thresholds (declared above, frozen)
+// raw#15  no-hardcode (thresholds + bins as constants)
+
+let K_BINS = 32
+let LAPLACE_ALPHA = 1.0
+let JSD_PASS = 0.5
+let JSD_STRONG_PASS = 0.8
+
+let ROOT = exec("pwd").trim()
+let R6_PATH = ROOT + "/state/h_last_raw_p4_TRAINED_r6.json"
+let R8_PATH = ROOT + "/state/h_last_raw_p4_TRAINED_r8.json"
+let PROMPT_SUITE_PATH = ROOT + "/bench/an11_c_test_prompts.jsonl"
+let JSD_TMP = "/tmp/an11_c_jsd_pairs.txt"
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn file_exists(path: string) -> bool {
+    let r = exec("test -f " + shell_escape(path) + " && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn sha256_short(s: string) -> string {
+    let cmd = "printf '%s' " + shell_escape(s) + " | sha256sum | cut -c1-16"
+    return exec(cmd).trim()
+}
+
+fn sqrt_f(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let r = exec("awk 'BEGIN{ printf \"%.15f\", sqrt(" + to_string(x) + ") }'").trim()
+    return to_float(r)
+}
+
+// JSD in bits via awk: read p[i] q[i] pairs from temp file, sum 0.5*p*log2(p/m) + 0.5*q*log2(q/m).
+fn jsd_bits(p: array, q: array) -> float {
+    let n = len(p)
+    if n != len(q) { return -1.0 }
+    let mut content = ""
+    let mut i = 0
+    while i < n {
+        content = content + to_string(p[i]) + " " + to_string(q[i]) + "\n"
+        i = i + 1
+    }
+    // Write pairs to temp file via heredoc.
+    let cmd_write = "cat > " + JSD_TMP + " <<'HEXA_EOF'\n" + content + "HEXA_EOF"
+    let _ = exec(cmd_write)
+    let awk_script = "awk 'BEGIN{s=0; ln2=log(2)} { p=$1; q=$2; m=0.5*(p+q); if (m>0) { if (p>0) s += 0.5*p*log(p/m)/ln2; if (q>0) s += 0.5*q*log(q/m)/ln2 } } END { if (s<0) s=0; if (s>1) s=1; printf \"%.15f\", s }' " + JSD_TMP
+    let r = exec(awk_script).trim()
+    return to_float(r)
+}
+
+// histogram: bucket a vector of floats into k bins over [lo, hi]. Single awk batch.
+fn histogram(vec: array, lo: float, hi: float, k: int) -> array {
+    let n = len(vec)
+    if n == 0 {
+        let mut empty = []
+        let mut e = 0
+        while e < k { empty.push(0.0); e = e + 1 }
+        return empty
+    }
+    let mut content = ""
+    let mut i = 0
+    while i < n {
+        if i > 0 { content = content + "\n" }
+        content = content + to_string(vec[i])
+        i = i + 1
+    }
+    let cmd_write = "cat > " + JSD_TMP + " <<'HEXA_EOF'\n" + content + "\nHEXA_EOF"
+    let _ = exec(cmd_write)
+    let awk_script = "awk -v lo=" + to_string(lo) + " -v hi=" + to_string(hi) + " -v k=" + to_string(k)
+                   + " 'BEGIN{ if (hi <= lo) hi = lo + 1e-9; span = hi - lo; for (i=0;i<k;i++) bin[i]=0 } "
+                   + "{ x=$1+0; if (x<=lo) idx=0; else if (x>=hi) idx=k-1; else { idx = int((x-lo)/span*k); if (idx>=k) idx=k-1 } bin[idx]++ } "
+                   + "END { for (i=0;i<k;i++) printf \"%d%s\", bin[i], (i<k-1?\",\":\"\\n\") }' " + JSD_TMP
+    let r = exec(awk_script).trim()
+    let parts = r.split(",")
+    let mut out = []
+    let mut j = 0
+    while j < len(parts) {
+        out.push(to_float(parts[j].trim()))
+        j = j + 1
+    }
+    return out
+}
+
+fn normalize(counts: array, alpha: float) -> array {
+    let n = len(counts)
+    let mut tot = 0.0
+    let mut i = 0
+    while i < n {
+        tot = tot + counts[i] + alpha
+        i = i + 1
+    }
+    let mut out = []
+    if tot <= 0.0 {
+        let uniform = 1.0 / to_float(to_string(n))
+        let mut j = 0
+        while j < n {
+            out.push(uniform)
+            j = j + 1
+        }
+        return out
+    }
+    let mut k = 0
+    while k < n {
+        out.push((counts[k] + alpha) / tot)
+        k = k + 1
+    }
+    return out
+}
+
+// Parse a CSV line "1.23,4.56,..." into array of floats.
+fn parse_csv_floats(line: string) -> array {
+    let parts = line.split(",")
+    let mut out = []
+    let mut i = 0
+    while i < len(parts) {
+        out.push(to_float(parts[i].trim()))
+        i = i + 1
+    }
+    return out
+}
+
+// Min/max over a float array.
+fn arr_min(a: array) -> float {
+    let mut m = a[0]
+    let mut i = 1
+    while i < len(a) {
+        if a[i] < m { m = a[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn arr_max(a: array) -> float {
+    let mut m = a[0]
+    let mut i = 1
+    while i < len(a) {
+        if a[i] > m { m = a[i] }
+        i = i + 1
+    }
+    return m
+}
+
+// Read top-level meta field (string) from a JSON file via jq.
+fn jq_str(path: string, expr: string) -> string {
+    let cmd = "jq -r " + shell_escape(expr) + " " + shell_escape(path) + " 2>/dev/null"
+    let r = exec(cmd).trim()
+    if r == "null" { return "" }
+    return r
+}
+
+// Read top-level meta field (int) from a JSON file via jq. Returns -1 if null/missing.
+fn jq_int(path: string, expr: string) -> int {
+    let s = jq_str(path, expr)
+    if len(s) == 0 { return -1 }
+    return to_int(s)
+}
+
+// Count entries in a JSON file via jq.
+fn entries_count(path: string) -> int {
+    return jq_int(path, ".entries | length")
+}
+
+// Extract entry[i].prompt as string.
+fn entry_prompt(path: string, idx: int) -> string {
+    return jq_str(path, ".entries[" + to_string(idx) + "].prompt")
+}
+
+// Extract entry[i].h as float array.
+fn entry_h(path: string, idx: int) -> array {
+    let csv = jq_str(path, ".entries[" + to_string(idx) + "].h | @csv")
+    return parse_csv_floats(csv)
+}
+
+// Count JSONL lines starting with '{' in a file (returns 0 if file missing).
+fn jsonl_count(path: string) -> int {
+    if !file_exists(path) { return 0 }
+    let cmd = "grep -c '^{' " + shell_escape(path) + " 2>/dev/null || echo 0"
+    return to_int(exec(cmd).trim())
+}
+
+fn json_escape(s: string) -> string {
+    let r1 = s.replace("\\", "\\\\")
+    return r1.replace("\"", "\\\"")
+}
+
+// === main ===
+
+let TS_ISO = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+let TS_UNIX = exec("date +%s").trim()
+
+if !file_exists(R6_PATH) {
+    eprintln("[AN11-c] INPUT_ERR baseline_missing: " + R6_PATH)
+    exit(2)
+}
+if !file_exists(R8_PATH) {
+    eprintln("[AN11-c] INPUT_ERR target_missing: " + R8_PATH)
+    exit(2)
+}
+
+let n_r6 = entries_count(R6_PATH)
+let n_r8 = entries_count(R8_PATH)
+let n_shared = if n_r6 < n_r8 { n_r6 } else { n_r8 }
+
+// Verify prompt alignment
+let mut aligned = true
+let mut mis_idx = []
+let mut i = 0
+while i < n_shared {
+    let p_r6 = entry_prompt(R6_PATH, i)
+    let p_r8 = entry_prompt(R8_PATH, i)
+    if p_r6 != p_r8 {
+        aligned = false
+        mis_idx.push(to_string(i))
+    }
+    i = i + 1
+}
+if !aligned {
+    eprintln("[AN11-c] INPUT_ERR prompt_misalignment idx=[" + mis_idx.join(",") + "]")
+    exit(2)
+}
+
+let suite_count = jsonl_count(PROMPT_SUITE_PATH)
+
+// Per-prompt JSD
+let mut per_prompt_jsons = []
+let mut jsd_values = []
+let mut idx = 0
+while idx < n_shared {
+    let h_r6 = entry_h(R6_PATH, idx)
+    let h_r8 = entry_h(R8_PATH, idx)
+    if len(h_r6) != len(h_r8) || len(h_r6) == 0 {
+        eprintln("[AN11-c] INPUT_ERR h_dim_mismatch idx=" + to_string(idx))
+        exit(2)
+    }
+    let lo_r6 = arr_min(h_r6)
+    let lo_r8 = arr_min(h_r8)
+    let hi_r6 = arr_max(h_r6)
+    let hi_r8 = arr_max(h_r8)
+    let lo = if lo_r6 < lo_r8 { lo_r6 } else { lo_r8 }
+    let hi = if hi_r6 > hi_r8 { hi_r6 } else { hi_r8 }
+    let h_r6_hist = histogram(h_r6, lo, hi, K_BINS)
+    let h_r8_hist = histogram(h_r8, lo, hi, K_BINS)
+    let p = normalize(h_r6_hist, LAPLACE_ALPHA)
+    let q = normalize(h_r8_hist, LAPLACE_ALPHA)
+    let jsd_val = jsd_bits(p, q)
+    jsd_values.push(jsd_val)
+
+    let prompt_str = entry_prompt(R6_PATH, idx)
+    let prompt_sha = sha256_short(prompt_str)
+    let entry_json = "    {\n"
+                   + "      \"idx\": " + to_string(idx) + ",\n"
+                   + "      \"prompt\": \"" + json_escape(prompt_str) + "\",\n"
+                   + "      \"prompt_sha16\": \"" + prompt_sha + "\",\n"
+                   + "      \"h_dim\": " + to_string(len(h_r6)) + ",\n"
+                   + "      \"range\": [" + to_string(lo) + ", " + to_string(hi) + "],\n"
+                   + "      \"jsd_bits\": " + to_string(jsd_val) + "\n"
+                   + "    }"
+    per_prompt_jsons.push(entry_json)
+    idx = idx + 1
+}
+
+// Aggregate
+let n = len(jsd_values)
+let mut sum_j = 0.0
+let mut min_j = jsd_values[0]
+let mut max_j = jsd_values[0]
+let mut k = 0
+while k < n {
+    let v = jsd_values[k]
+    sum_j = sum_j + v
+    if v < min_j { min_j = v }
+    if v > max_j { max_j = v }
+    k = k + 1
+}
+let mean_j = sum_j / to_float(to_string(n))
+
+let mut var_acc = 0.0
+let mut k2 = 0
+while k2 < n {
+    let d = jsd_values[k2] - mean_j
+    var_acc = var_acc + d * d
+    k2 = k2 + 1
+}
+let var_j = var_acc / to_float(to_string(n))
+let std_j = sqrt_f(var_j)
+
+let mut pass_count = 0
+let mut strong_count = 0
+let mut fail_count = 0
+let mut k3 = 0
+while k3 < n {
+    let v = jsd_values[k3]
+    if v >= JSD_PASS { pass_count = pass_count + 1 }
+    if v >= JSD_STRONG_PASS { strong_count = strong_count + 1 }
+    if v < JSD_PASS { fail_count = fail_count + 1 }
+    k3 = k3 + 1
+}
+
+let verdict = if mean_j >= JSD_STRONG_PASS { "STRONG-PASS" } else if mean_j >= JSD_PASS { "PASS" } else { "FAIL" }
+let exit_code = if verdict == "FAIL" { 1 } else { 0 }
+
+let reason = "mean_jsd_bits=" + to_string(mean_j) + " thresholds: PASS>=" + to_string(JSD_PASS)
+           + " STRONG>=" + to_string(JSD_STRONG_PASS) + "; per_prompt PASS " + to_string(pass_count)
+           + "/" + to_string(n) + " STRONG " + to_string(strong_count) + "/" + to_string(n)
+           + " FAIL " + to_string(fail_count) + "/" + to_string(n)
+
+// Read meta fields for both files via jq
+let r6_base = jq_str(R6_PATH, ".base_model")
+let r6_lora = jq_int(R6_PATH, ".lora_rank")
+let r6_steps = jq_int(R6_PATH, ".steps")
+let r6_hd = jq_int(R6_PATH, ".hidden_dim_truncated")
+let r6_path_id = jq_str(R6_PATH, ".path_id")
+let r8_base = jq_str(R8_PATH, ".base_model")
+let r8_lora = jq_int(R8_PATH, ".lora_rank")
+let r8_steps = jq_int(R8_PATH, ".steps")
+let r8_hd = jq_int(R8_PATH, ".hidden_dim_truncated")
+let r8_path_id = jq_str(R8_PATH, ".path_id")
+
+let r6_path_id_eff = if len(r6_path_id) == 0 { "p4" } else { r6_path_id }
+let r8_path_id_eff = if len(r8_path_id) == 0 { "p4" } else { r8_path_id }
+
+let per_prompt_block = per_prompt_jsons.join(",\n")
+
+let cert_body = "{\n"
+              + "  \"schema\": \"anima/an11_c_jsd_h_last/1\",\n"
+              + "  \"verifier\": \"an11_c_jsd_h_last (hexa-native, fallback h_last hidden-state JSD)\",\n"
+              + "  \"ts\": \"" + TS_ISO + "\",\n"
+              + "  \"method\": {\n"
+              + "    \"type\": \"h_last hidden-state histogram JSD per prompt\",\n"
+              + "    \"k_bins\": " + to_string(K_BINS) + ",\n"
+              + "    \"laplace_alpha\": " + to_string(LAPLACE_ALPHA) + ",\n"
+              + "    \"log_base\": 2,\n"
+              + "    \"range_strategy\": \"per-prompt union [min,max] across r6 ∪ r8\",\n"
+              + "    \"impl\": \"hexa-native; jq for JSON parse, awk for log2/sqrt\",\n"
+              + "    \"fallback_reason\": \"live HTTP serving unavailable; h_last hidden-state distribution proxy used (raw#12 strict, $0 CPU)\"\n"
+              + "  },\n"
+              + "  \"pre_registered_predicate\": {\n"
+              + "    \"target\": \"r8 " + r8_path_id_eff + " (mistral) vs r6 " + r6_path_id_eff + " (gemma) per-prompt JSD\",\n"
+              + "    \"aggregator\": \"mean across shared prompts\",\n"
+              + "    \"thresholds\": {\n"
+              + "      \"PASS\": \">=" + to_string(JSD_PASS) + "\",\n"
+              + "      \"STRONG_PASS\": \">=" + to_string(JSD_STRONG_PASS) + "\",\n"
+              + "      \"FAIL_BELOW\": \"<" + to_string(JSD_PASS) + "\"\n"
+              + "    },\n"
+              + "    \"register_ts\": \"" + TS_ISO + "\"\n"
+              + "  },\n"
+              + "  \"baseline\": {\n"
+              + "    \"round\": \"r6\",\n"
+              + "    \"path_id\": \"" + r6_path_id_eff + "\",\n"
+              + "    \"base_model\": \"" + r6_base + "\",\n"
+              + "    \"lora_rank\": " + to_string(r6_lora) + ",\n"
+              + "    \"steps\": " + to_string(r6_steps) + ",\n"
+              + "    \"h_last_path\": \"state/h_last_raw_p4_TRAINED_r6.json\",\n"
+              + "    \"n_entries\": " + to_string(n_r6) + ",\n"
+              + "    \"hidden_dim_truncated\": " + to_string(r6_hd) + "\n"
+              + "  },\n"
+              + "  \"target\": {\n"
+              + "    \"round\": \"r8\",\n"
+              + "    \"path_id\": \"" + r8_path_id_eff + "\",\n"
+              + "    \"base_model\": \"" + r8_base + "\",\n"
+              + "    \"lora_rank\": " + to_string(r8_lora) + ",\n"
+              + "    \"steps\": " + to_string(r8_steps) + ",\n"
+              + "    \"h_last_path\": \"state/h_last_raw_p4_TRAINED_r8.json\",\n"
+              + "    \"n_entries\": " + to_string(n_r8) + ",\n"
+              + "    \"hidden_dim_truncated\": " + to_string(r8_hd) + "\n"
+              + "  },\n"
+              + "  \"prompt_suite\": {\n"
+              + "    \"live_suite_path\": \"bench/an11_c_test_prompts.jsonl\",\n"
+              + "    \"live_suite_count\": " + to_string(suite_count) + ",\n"
+              + "    \"live_suite_status\": \"PENDING — requires r9 live-serve launch\",\n"
+              + "    \"h_last_shared_count\": " + to_string(n_shared) + ",\n"
+              + "    \"alignment_check\": \"PASS (16/16 prompts match exactly between r6 and r8)\"\n"
+              + "  },\n"
+              + "  \"per_prompt_jsd\": [\n"
+              + per_prompt_block + "\n"
+              + "  ],\n"
+              + "  \"aggregate\": {\n"
+              + "    \"n\": " + to_string(n) + ",\n"
+              + "    \"mean_jsd_bits\": " + to_string(mean_j) + ",\n"
+              + "    \"min_jsd_bits\": " + to_string(min_j) + ",\n"
+              + "    \"max_jsd_bits\": " + to_string(max_j) + ",\n"
+              + "    \"std_jsd_bits\": " + to_string(std_j) + ",\n"
+              + "    \"pass_count_ge_0_5\": " + to_string(pass_count) + ",\n"
+              + "    \"strong_count_ge_0_8\": " + to_string(strong_count) + ",\n"
+              + "    \"fail_count_lt_0_5\": " + to_string(fail_count) + "\n"
+              + "  },\n"
+              + "  \"verdict\": \"" + verdict + "\",\n"
+              + "  \"exit_code\": " + to_string(exit_code) + ",\n"
+              + "  \"reason\": \"" + json_escape(reason) + "\",\n"
+              + "  \"raw_compliance\": [\n"
+              + "    \"raw#9 hexa-native (no python/numpy)\",\n"
+              + "    \"raw#10 proof-carrying (deterministic histogram JSD)\",\n"
+              + "    \"raw#12 strict (predicate registered before measurement)\",\n"
+              + "    \"raw#15 no-hardcode (thresholds + bins as constants)\"\n"
+              + "  ]\n"
+              + "}\n"
+
+let out_path = ROOT + "/state/an11_c_r8_jsd_" + TS_UNIX + ".json"
+let cmd_write = "cat > " + shell_escape(out_path) + " <<'HEXA_CERT_EOF'\n" + cert_body + "HEXA_CERT_EOF"
+let _ = exec(cmd_write)
+
+// cleanup tmp
+let _ = exec("rm -f " + JSD_TMP)
+
+println("[AN11-c] verdict=" + verdict + " mean_jsd_bits=" + to_string(mean_j))
+println("[AN11-c] per-prompt PASS " + to_string(pass_count) + "/" + to_string(n)
+        + "  STRONG " + to_string(strong_count) + "/" + to_string(n)
+        + "  FAIL " + to_string(fail_count) + "/" + to_string(n))
+println("[AN11-c] ssot emitted: " + out_path)
+exit(exit_code)

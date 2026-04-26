@@ -1,0 +1,160 @@
+// anima-speak/experiments/corpus_pipeline_full.hexa — End-to-end Korean TTS corpus pipeline
+//
+// Usage: hexa corpus_pipeline_full.hexa <dataset_name> <url1> [url2 ...]
+// Stages: yt-dlp (download) → ffmpeg 16kHz → whisper.cpp (ko transcribe) → jq+ffmpeg segment → LJSpeech CSV
+// Outputs:
+//   /home/aiden/mac_home/dev/anima/training/corpus_<name>/
+//     metadata.csv    (wav_id|text|duration_s)
+//     wavs/           (22050 Hz pcm16 segments)
+//
+// raw#9: hexa-only; subprocess to yt-dlp + ffmpeg + whisper.cpp + jq.
+// Created 2026-04-26 by Ω-rules P4 Phase 4 (replacement for corpus_pipeline_full.sh).
+
+let WORK = "/home/aiden/mac_home/dev/anima/training/corpus_yt_ko"
+let YTDLP = "/home/aiden/bin/tts_tools/yt-dlp"
+let WHISPER = "/home/aiden/bin/tts_tools/whisper.cpp/build/bin/whisper-cli"
+let MODEL = "/home/aiden/bin/tts_tools/whisper.cpp/models/ggml-large-v3-turbo.bin"
+
+fn shell_escape(s: string) -> string {
+    return "'" + s.replace("'", "'" + "\\" + "'" + "'") + "'"
+}
+
+fn file_exists(path: string) -> bool {
+    let r = exec("test -f " + shell_escape(path) + " && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn pad5(n: int) -> string {
+    let s = to_string(n)
+    let mut padded = s
+    while len(padded) < 5 { padded = "0" + padded }
+    return padded
+}
+
+let _argv = args()
+if len(_argv) < 4 {
+    println("usage: hexa corpus_pipeline_full.hexa <dataset_name> <url1> [url2 ...]")
+    exit(2)
+}
+let name = _argv[2]
+let mut urls = []
+let mut ai = 3
+while ai < len(_argv) {
+    urls.push(_argv[ai])
+    ai = ai + 1
+}
+
+let out = "/home/aiden/mac_home/dev/anima/training/corpus_" + name
+let metadata = out + "/metadata.csv"
+
+let _ = exec("mkdir -p " + shell_escape(WORK))
+let _ = exec("mkdir -p " + shell_escape(out + "/wavs"))
+
+println("=== Stage 1: Download ===")
+let mut u = 0
+while u < len(urls) {
+    let url = urls[u]
+    let cmd = YTDLP + " -x --audio-format wav --audio-quality 0 --max-filesize 200M"
+            + " -o " + shell_escape(WORK + "/ko_audiobook_%(id)s.%(ext)s")
+            + " " + shell_escape(url) + " 2>&1 | tail -2"
+    let out_msg = exec(cmd)
+    println(to_string(out_msg))
+    u = u + 1
+}
+
+println("")
+println("=== Stage 2: Transcribe ===")
+let dl_list = exec("ls " + shell_escape(WORK) + "/ko_audiobook_*.wav 2>/dev/null")
+let dl_lines = to_string(dl_list).split("\n")
+let mut wi = 0
+while wi < len(dl_lines) {
+    let wav = dl_lines[wi].trim()
+    wi = wi + 1
+    if len(wav) == 0 { continue }
+    if !file_exists(wav) { continue }
+    let base = exec("basename " + shell_escape(wav) + " .wav").trim()
+    let json_path = WORK + "/" + base + ".json"
+    if file_exists(json_path) {
+        println("skip " + base + " (done)")
+        continue
+    }
+    // resample to 16kHz
+    let wav16 = WORK + "/" + base + "_16k.wav"
+    let _ = exec("ffmpeg -y -loglevel error -i " + shell_escape(wav)
+                 + " -ac 1 -ar 16000 " + shell_escape(wav16))
+    // transcribe — whisper-cli writes <-of>.json
+    let cmd_whisper = WHISPER + " -m " + shell_escape(MODEL)
+                    + " -l ko --output-json -of " + shell_escape(WORK + "/" + base)
+                    + " -t 12 -p 1 " + shell_escape(wav16) + " 2>&1 | tail -3"
+    let whisper_out = exec(cmd_whisper)
+    println(to_string(whisper_out))
+    let _ = exec("rm -f " + shell_escape(wav16))
+}
+
+println("")
+println("=== Stage 3: Segment into (text, wav) pairs ===")
+let json_list = exec("ls " + shell_escape(WORK) + "/ko_audiobook_*.json 2>/dev/null")
+let json_lines = to_string(json_list).split("\n")
+let mut total_segs = 0
+let mut ji = 0
+while ji < len(json_lines) {
+    let json_path = json_lines[ji].trim()
+    ji = ji + 1
+    if len(json_path) == 0 { continue }
+    if !file_exists(json_path) { continue }
+    let base = exec("basename " + shell_escape(json_path) + " .json").trim()
+    let src_wav = WORK + "/" + base + ".wav"
+    if !file_exists(src_wav) { continue }
+    println("-- " + base + " --")
+    let jq_cmd = "jq -r '.transcription[] | \"\\(.offsets.from)|\\(.offsets.to)|\\(.text)\"' "
+               + shell_escape(json_path)
+    let segs = to_string(exec(jq_cmd))
+    let seg_lines = segs.split("\n")
+    let mut si = 0
+    while si < len(seg_lines) {
+        let line = seg_lines[si].trim()
+        si = si + 1
+        if len(line) == 0 { continue }
+        let parts = line.split("|")
+        if len(parts) < 3 { continue }
+        let from_ms_s = parts[0]
+        let to_ms_s = parts[1]
+        let text_raw = parts[2].trim()
+        if len(text_raw) == 0 { continue }
+        let from_ms = to_int(from_ms_s)
+        let to_ms = to_int(to_ms_s)
+        let dur_ms = to_ms - from_ms
+        let dur_s = to_float(to_string(dur_ms)) / 1000.0
+        if dur_s < 1.0 { continue }
+        if dur_s > 15.0 { continue }
+        let tlen = len(text_raw)
+        if tlen < 3 { continue }
+        if tlen > 200 { continue }
+        let pad = pad5(total_segs)
+        let out_wav = out + "/wavs/" + base + "_seg_" + pad + ".wav"
+        let start_s = to_float(from_ms_s) / 1000.0
+        let cmd_ff = "ffmpeg -y -loglevel error -i " + shell_escape(src_wav)
+                   + " -ss " + to_string(start_s)
+                   + " -t " + to_string(dur_s)
+                   + " -ac 1 -ar 22050 -c:a pcm_s16le "
+                   + shell_escape(out_wav) + " 2>/dev/null"
+        let _ = exec(cmd_ff)
+        if !file_exists(out_wav) { continue }
+        let row = base + "_seg_" + pad + "|" + text_raw + "|" + to_string(dur_s)
+        let _ = exec("printf '%s\\n' " + shell_escape(row) + " >> " + shell_escape(metadata))
+        total_segs = total_segs + 1
+    }
+}
+
+println("")
+println("=== Stage 4: Dataset stats ===")
+let n_str = exec("wc -l < " + shell_escape(metadata) + " 2>/dev/null").trim()
+let dur_str = exec("awk -F'|' '{s+=$3} END {printf \"%.1f\", s}' " + shell_escape(metadata)).trim()
+let dur_total = to_float(dur_str)
+let hrs = dur_total / 3600.0
+println("Segments: " + n_str)
+println("Total duration: " + dur_str + "s (" + to_string(hrs) + "h)")
+println("Output: " + out)
+println("")
+println("metadata.csv format: wav_id|text|duration_s")
+println("wavs/: 22050 Hz mono pcm16 segment files")
