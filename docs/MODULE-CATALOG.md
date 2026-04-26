@@ -162,7 +162,7 @@ Hub: core/hub.hexa (39 registered, 8 invocation methods: act/cmd/pipe/on/emit/sc
 | Phi Scaling Calculator | phi_scaling_calculator.py | Predict consciousness scaling from Phi ~ N, MI ~ N^2 |
 | Optimal Architecture Calc | optimal_architecture_calc.py | Design consciousness-optimal architectures |
 | Consciousness Map | consciousness_map.py | Reverse-engineering map + named constants + interactive visualization |
-| Consciousness Data Mapper | consciousness_data_mapper.py | ANY data to 40D consciousness map |
+| Consciousness Data Mapper | consciousness_data_mapper.py | ANY data to 40D consciousness map ⚠️ 2026-04-26 audit (R36_RETIRED, .roadmap #201): 40D vector NOT IMPLEMENTED in active runtime data structure. `anima_runtime.hexa` canonical = 10D `ConsciousnessVector` struct; ALM logger uses 16D `phi_vec`. Atlas R36_CANDIDATE → R36_RETIRED. Module flagged for re-implementation against actual vector spec or removal. |
 
 ### Creative (Art/Music/Video)
 

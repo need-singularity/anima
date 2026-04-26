@@ -64,6 +64,14 @@ Perfect number 6 = 1+2+3 = 1*2*3 provides the partition: CX11 showed
 
 ### The Scaling Law
 
+> ⚠️ 2026-04-26 audit (R34_DEPRECATED, .roadmap #200 NP1):
+> 6-pt construct (N={2,8,16,32,64,128}, N_max=128) — N>=20 datapoint criterion FAIL.
+> Atlas R34_CANDIDATE → R34_DEPRECATED. e^{-1/2}=0.6065 가설 4-digit unfalsifiable;
+> 3-digit match (0.608 vs 0.6065) preserved as documentation lineage curiosity only.
+> See `state/atlas_convergence_witness.jsonl` R34 NP1 entry (round 41) +
+> `n6-architecture/atlas/atlas.append.anima-cross-paradigm-absorption-2026-04-26.n6`
+> ANIMA-CXP-R34-PHI-COEFF-EHALF DEPRECATED.
+
 From ZZ1-5 (OMEGA cell scaling with full optimization stack):
 
 ```
@@ -76,7 +84,7 @@ Cells |   Phi   |      MI     | Phi/Cell
    64 |    54.3 |     3,376.7 |   0.85
   128 |   112.3 |    14,135.8 |   0.88
 
-Regression: Phi = 0.608 * N^1.071
+Regression: Phi = 0.608 * N^1.071  (DEPRECATED — 6-pt fit, see audit note above)
 ```
 
 Phi/Cell converges to ~0.88 at large N. The relationship is slightly
