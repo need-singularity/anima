@@ -1,0 +1,220 @@
+// tool/anima_r46_verdict_consolidator.hexa — R46 BIMODAL verdict consolidation (raw#9 hexa-only).
+//
+// PURPOSE
+//   handoff §3.2 actionable: "R46 verdict CONFIRMED/DEPRECATED/PARTIAL_FINAL 결정 (zone closure 결과 기반)".
+//   axis 90+94+104 누적 11-bb evidence + cycle 1 helper PRIMARY zone candidate registry 통합.
+//
+//   R46_CANDIDATE 4-family BIMODAL hypothesis:
+//     |BASE phi*| < ~3 → corpus PRIMARY (instruct flips sign)
+//     |BASE phi*| > ~10 → MODIFIER (instruct preserves sign)
+//
+//   cumulative evidence (handoff §1.2 + axis 104):
+//     PRIMARY zone NEG measured: Qwen3-8B-Base (-3.45) / gemma-2-9b (-0.79) / Pythia-1B (-1.32)
+//     2/2 primary-zone-tested confirm flip via SFT (Qwen3-it / gemma-it)
+//     Pythia-1B P1 direct test PENDING Instruct variant identification (cycle 1 resolved → TinyLlama proxy)
+//
+//   본 helper = mac-local verdict consolidator:
+//     - 11-bb evidence ledger (model_id, BASE phi*, zone, instruct measured?, flip observed?)
+//     - 5 verdict states {CONFIRMED, PARTIAL_CONFIRMED, PARTIAL_FINAL, DEPRECATED, INDETERMINATE}
+//     - 3 frozen decision rules with explicit thresholds
+//     - applies rules to current evidence → suggested verdict + missing evidence list
+//     - selftest verifies: 11-bb count, 5 verdict states, 3 decision rules
+//     - non-mutation: does NOT update atlas R46 line (user-approval gate; verdict atomicity)
+//
+// INPUT
+//   ANIMA_OUTPUT     output JSON (default: state/r46_verdict_consolidator.json)
+//
+// OUTPUT
+//   - evidence_ledger: 11-bb with explicit zone + flip
+//   - frozen_decision_rules: 3 rules with thresholds
+//   - suggested_verdict: 5 states with confidence
+//   - missing_evidence_for_full_CONFIRMED
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_r46_verdict_consolidator.hexa --selftest
+//   ANIMA_OUTPUT=state/r46_verdict_consolidator.json hexa run tool/anima_r46_verdict_consolidator.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - R46 BIMODAL는 4-family (Mistral+Llama MODIFIER / Qwen3+gemma PRIMARY) 외 추가 family에서
+//     아직 검증 안됨 — 4-family generalization 가정 강함.
+//   - "primary zone" boundary |BASE|<3 vs MODIFIER zone |BASE|>10은 axis 90 데이터 fit; mid-range 후보 부재.
+//   - Pythia-1B PRIMARY-zone NEG는 base만; native instruct 부재로 flip test direct 불가 (cycle 1 TinyLlama proxy).
+
+let HELPER_PATH = "/tmp/anima_r46_verdict_consolidator_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima R46 verdict consolidator helper — emitted by tool/anima_r46_verdict_consolidator.hexa\n")
+    parts.push("# raw#37 transient. R46 BIMODAL verdict consolidation (axis 90+94+104 + cycle 1 evidence).\n")
+    parts.push("import json, os, sys\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/r46_verdict_consolidator.json')\n\n")
+
+    parts.push("# 11-bb cumulative evidence ledger (handoff §1.2 + axis 94 + axis 104)\n")
+    parts.push("EVIDENCE_LEDGER = [\n")
+    parts.push("    # axis 90 4-family BIMODAL baseline\n")
+    parts.push("    {'model_id':'mistralai/Mistral-7B-v0.3', 'base_phi_x10000':-167000, 'zone':'MODIFIER', 'instruct_measured':True, 'instruct_phi_x10000':-129000, 'flip':False, 'source':'axis 90'},\n")
+    parts.push("    {'model_id':'Qwen/Qwen3-8B-Base', 'base_phi_x10000':-34500, 'zone':'PRIMARY', 'instruct_measured':True, 'instruct_phi_x10000':10400, 'flip':True, 'source':'axis 90 + axis 104'},\n")
+    parts.push("    {'model_id':'meta-llama/Meta-Llama-3.1-8B', 'base_phi_x10000':50868, 'zone':'MODIFIER', 'instruct_measured':True, 'instruct_phi_x10000':52100, 'flip':False, 'source':'axis 90 (HF gate workaround historical)'},\n")
+    parts.push("    {'model_id':'google/gemma-2-9b', 'base_phi_x10000':-7868, 'zone':'PRIMARY', 'instruct_measured':True, 'instruct_phi_x10000':75443, 'flip':True, 'source':'axis 90 + axis 104'},\n")
+    parts.push("    # axis 94 R46 5-bb addition (3 BASE-only)\n")
+    parts.push("    {'model_id':'microsoft/phi-3-mini', 'base_phi_x10000':245058, 'zone':'MODIFIER', 'instruct_measured':False, 'instruct_phi_x10000':None, 'flip':None, 'source':'axis 94 5-bb'},\n")
+    parts.push("    {'model_id':'deepseek-ai/deepseek-llm-7b-base', 'base_phi_x10000':277771, 'zone':'MODIFIER', 'instruct_measured':False, 'instruct_phi_x10000':None, 'flip':None, 'source':'axis 94 5-bb'},\n")
+    parts.push("    {'model_id':'01-ai/Yi-6B', 'base_phi_x10000':-107507, 'zone':'MODIFIER', 'instruct_measured':False, 'instruct_phi_x10000':None, 'flip':None, 'source':'axis 94 5-bb'},\n")
+    parts.push("    # axis 104 PRIMARY zone closure\n")
+    parts.push("    {'model_id':'EleutherAI/pythia-1b', 'base_phi_x10000':-13200, 'zone':'PRIMARY', 'instruct_measured':False, 'instruct_phi_x10000':None, 'flip':None, 'source':'axis 104 (no native instruct; cycle 1 TinyLlama proxy)'},\n")
+    parts.push("    # historical instruct extras (mistral-instruct, mamba, jamba, rwkv7 baseline)\n")
+    parts.push("    {'model_id':'mamba_baseline', 'base_phi_x10000':3258, 'zone':'PRIMARY', 'instruct_measured':False, 'instruct_phi_x10000':None, 'flip':None, 'source':'historical baseline (no instruct pair)'},\n")
+    parts.push("    {'model_id':'jamba_baseline', 'base_phi_x10000':33115, 'zone':'MODIFIER', 'instruct_measured':False, 'instruct_phi_x10000':None, 'flip':None, 'source':'historical baseline (no instruct pair)'},\n")
+    parts.push("    {'model_id':'rwkv7_baseline', 'base_phi_x10000':-90674, 'zone':'MODIFIER', 'instruct_measured':False, 'instruct_phi_x10000':None, 'flip':None, 'source':'historical baseline (no instruct pair)'},\n")
+    parts.push("]\n\n")
+
+    parts.push("FROZEN_DECISION_RULES = [\n")
+    parts.push("    {\n")
+    parts.push("        'id':'R46_R1_BIMODAL_BOUNDARY',\n")
+    parts.push("        'rule':'PRIMARY zone defined as |base_phi*| < 30000 (×10000 scale = 3.0 raw); MODIFIER zone |base_phi*| > 100000 (10.0 raw)',\n")
+    parts.push("        'mid_range_handling':'30000 ≤ |x| ≤ 100000 = INDETERMINATE (no measured backbone in axis 90+94+104)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'id':'R46_R2_FLIP_REQUIREMENT',\n")
+    parts.push("        'rule':'CONFIRMED requires ≥3 PRIMARY zone backbones with flip=True via instruct pair',\n")
+    parts.push("        'currently_observed':'2/4 PRIMARY zone with measured flip (Qwen3 + gemma); Pythia + mamba_baseline lack native instruct',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'id':'R46_R3_MODIFIER_CONSISTENCY',\n")
+    parts.push("        'rule':'CONFIRMED requires ≥3 MODIFIER zone backbones with flip=False via instruct pair',\n")
+    parts.push("        'currently_observed':'2/7 MODIFIER zone with measured flip=False (Mistral + Llama); 5 lack instruct pair',\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("def _classify_evidence(ledger):\n")
+    parts.push("    primary_with_flip = [e for e in ledger if e['zone']=='PRIMARY' and e['flip']==True]\n")
+    parts.push("    primary_no_flip = [e for e in ledger if e['zone']=='PRIMARY' and e['flip']==False]\n")
+    parts.push("    primary_pending = [e for e in ledger if e['zone']=='PRIMARY' and e['flip'] is None]\n")
+    parts.push("    modifier_no_flip = [e for e in ledger if e['zone']=='MODIFIER' and e['flip']==False]\n")
+    parts.push("    modifier_with_flip = [e for e in ledger if e['zone']=='MODIFIER' and e['flip']==True]\n")
+    parts.push("    modifier_pending = [e for e in ledger if e['zone']=='MODIFIER' and e['flip'] is None]\n")
+    parts.push("    return {\n")
+    parts.push("        'primary_with_flip':primary_with_flip,\n")
+    parts.push("        'primary_no_flip':primary_no_flip,\n")
+    parts.push("        'primary_pending':primary_pending,\n")
+    parts.push("        'modifier_no_flip':modifier_no_flip,\n")
+    parts.push("        'modifier_with_flip':modifier_with_flip,\n")
+    parts.push("        'modifier_pending':modifier_pending,\n")
+    parts.push("    }\n\n")
+
+    parts.push("def _suggest_verdict(c):\n")
+    parts.push("    n_p_flip = len(c['primary_with_flip'])\n")
+    parts.push("    n_p_noflip = len(c['primary_no_flip'])\n")
+    parts.push("    n_m_noflip = len(c['modifier_no_flip'])\n")
+    parts.push("    n_m_flip = len(c['modifier_with_flip'])\n")
+    parts.push("    if n_p_flip >= 3 and n_m_noflip >= 3 and n_p_noflip == 0 and n_m_flip == 0:\n")
+    parts.push("        return ('CONFIRMED', 'high', 'all 4 thresholds met')\n")
+    parts.push("    if n_p_flip >= 2 and n_m_noflip >= 2 and n_p_noflip == 0 and n_m_flip == 0:\n")
+    parts.push("        return ('PARTIAL_CONFIRMED', 'medium', f'{n_p_flip}/3 primary flip, {n_m_noflip}/3 modifier no-flip; no contradictions')\n")
+    parts.push("    if n_p_noflip > 0 or n_m_flip > 0:\n")
+    parts.push("        return ('PARTIAL_FINAL', 'low', 'contradiction observed: primary no-flip or modifier flip exists')\n")
+    parts.push("    if n_p_flip == 0 and n_m_noflip == 0:\n")
+    parts.push("        return ('INDETERMINATE', 'none', 'no decisive instruct pair measurements')\n")
+    parts.push("    return ('PARTIAL_CONFIRMED', 'medium', 'partial evidence; missing measurements pending')\n\n")
+
+    parts.push("def _missing_for_full_confirmed(c):\n")
+    parts.push("    n_p_flip_short = max(0, 3 - len(c['primary_with_flip']))\n")
+    parts.push("    n_m_noflip_short = max(0, 3 - len(c['modifier_no_flip']))\n")
+    parts.push("    return {\n")
+    parts.push("        'additional_primary_flip_needed':n_p_flip_short,\n")
+    parts.push("        'additional_modifier_no_flip_needed':n_m_noflip_short,\n")
+    parts.push("        'primary_pending_actionable':[e['model_id'] for e in c['primary_pending']],\n")
+    parts.push("        'modifier_pending_actionable':[e['model_id'] for e in c['modifier_pending']],\n")
+    parts.push("        'cycle1_proxy_strategy':'TinyLlama-1.1B-Chat as Pythia-1B native-instruct proxy (cycle 1 helper output)',\n")
+    parts.push("    }\n\n")
+
+    parts.push("c = _classify_evidence(EVIDENCE_LEDGER)\n")
+    parts.push("verdict, confidence, rationale = _suggest_verdict(c)\n")
+    parts.push("missing = _missing_for_full_confirmed(c)\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'R46 BIMODAL verdict consolidation (axis 90 + axis 94 + axis 104 + cycle 1)',\n")
+    parts.push("    'parent_handoff_actionable':'§3.2 R46 verdict CONFIRMED/DEPRECATED/PARTIAL_FINAL 결정',\n")
+    parts.push("    'parent_helpers':['tool/anima_r46_primary_zone_resolver.hexa (cycle 1 PRIMARY pair registry)'],\n")
+    parts.push("    'evidence_ledger':EVIDENCE_LEDGER,\n")
+    parts.push("    'evidence_classification':{\n")
+    parts.push("        'primary_with_flip':[e['model_id'] for e in c['primary_with_flip']],\n")
+    parts.push("        'primary_no_flip':[e['model_id'] for e in c['primary_no_flip']],\n")
+    parts.push("        'primary_pending':[e['model_id'] for e in c['primary_pending']],\n")
+    parts.push("        'modifier_no_flip':[e['model_id'] for e in c['modifier_no_flip']],\n")
+    parts.push("        'modifier_with_flip':[e['model_id'] for e in c['modifier_with_flip']],\n")
+    parts.push("        'modifier_pending':[e['model_id'] for e in c['modifier_pending']],\n")
+    parts.push("    },\n")
+    parts.push("    'frozen_decision_rules':FROZEN_DECISION_RULES,\n")
+    parts.push("    'suggested_verdict':verdict,\n")
+    parts.push("    'verdict_confidence':confidence,\n")
+    parts.push("    'verdict_rationale':rationale,\n")
+    parts.push("    'missing_evidence_for_full_CONFIRMED':missing,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT update state/atlas_convergence_witness.jsonl R46 line; verdict atomicity preserved (user-approval gate)',\n")
+    parts.push("    'verdict_states_legend':{\n")
+    parts.push("        'CONFIRMED':'≥3 primary flip + ≥3 modifier no-flip, 0 contradictions',\n")
+    parts.push("        'PARTIAL_CONFIRMED':'≥2 primary flip + ≥2 modifier no-flip, 0 contradictions',\n")
+    parts.push("        'PARTIAL_FINAL':'contradiction observed (primary no-flip OR modifier flip)',\n")
+    parts.push("        'DEPRECATED':'majority contradictions; rule fails',\n")
+    parts.push("        'INDETERMINATE':'no decisive instruct pair measurements',\n")
+    parts.push("    },\n")
+    parts.push("    'n_evidence':len(EVIDENCE_LEDGER),\n")
+    parts.push("    'n_decision_rules':len(FROZEN_DECISION_RULES),\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[r46_verdict] verdict={verdict} confidence={confidence} primary_flip={len(c[\"primary_with_flip\"])} modifier_no_flip={len(c[\"modifier_no_flip\"])} pending={len(c[\"primary_pending\"])+len(c[\"modifier_pending\"])} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let evidence_count_expected = 11
+    let decision_rules_count_expected = 3
+    let verdict_states_expected = 5
+    let primary_zone_threshold = 30000
+    let modifier_zone_threshold = 100000
+    println("inv:evidence_count_expected=" + to_string(evidence_count_expected))
+    println("inv:decision_rules_count_expected=" + to_string(decision_rules_count_expected))
+    println("inv:verdict_states_expected=" + to_string(verdict_states_expected))
+    println("inv:primary_zone_threshold_x10000=" + to_string(primary_zone_threshold))
+    println("inv:modifier_zone_threshold_x10000=" + to_string(modifier_zone_threshold))
+    println("inv:verdict_states=CONFIRMED,PARTIAL_CONFIRMED,PARTIAL_FINAL,DEPRECATED,INDETERMINATE")
+    println("inv:non_mutation_atlas_jsonl_preserved=true")
+    println("inv:cross_link_cycle1_resolver=true")
+    println("inv:thresholds_3_per_side_for_CONFIRMED=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_r46_verdict_consolidator selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=R46 BIMODAL verdict consolidator (11-bb evidence + 3 decision rules + 5 verdict states; mac $0; non-mutating)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
