@@ -1,0 +1,130 @@
+{
+  "cycle": "omega-stdlib-5",
+  "axis": "non-IO dispatch arm sweep (string / iteration / collection / type / math)",
+  "timestamp": "2026-04-26T00:00:00Z",
+  "predecessors": ["omega-stdlib-3 (file_size)", "omega-stdlib-4 (28 IO arms; 8 fixed, 20 clean)"],
+  "categories_sampled": ["string", "iteration", "collection", "type", "math"],
+  "arms_audited": {
+    "string": 18,
+    "iteration": 9,
+    "collection": 24,
+    "type": 8,
+    "math": 12,
+    "total_sampled": 71
+  },
+  "total_arms_in_dispatch": 474,
+  "audit_completeness": "sampled 71 of 474 (~15%); focus was on arms whose impl visibly looked suspicious (mixed-type accumulators, missing tag guards, hardcoded -1, shellouts, read_file/len antipatterns). Remaining ~403 arms include large blocks of ML/tensor builtins (attention, matmul, lora_*, kv_cache_*, conv1d, group_norm, etc.) that were NOT audited this cycle.",
+  "antipatterns_searched": [
+    "len(read_file(...)) — file_size-style RAM blowup → 0 hits in non-IO arms",
+    "exec(\"bash -c '...'\") with un-escaped path inputs — 0 hits in non-IO arms (already swept in stdlib-4)",
+    "return val_int(-1) on error vs cleaner contract — found 1 (array_index_of) but contract is correct (Python-style 'not found' sentinel)",
+    "mixed int/float accumulator with val_int return — FOUND in 3 arms (array_sum, array_product, map_sum_values)",
+    "type-naive .int_val read on unknown tag — FOUND in 2 arms (array_min, array_max)",
+    "missing tag guard on get_array(args[0]) — FOUND in 1 arm (array_concat) and the 5 fixed above"
+  ],
+  "findings": {
+    "broken_fixed": [
+      {
+        "arm": "array_sum",
+        "line": 15783,
+        "category": "collection",
+        "before": "single int accumulator; `total = total + items[i].float_val` silently promoted to float, then `return val_int(total)` truncated the fractional part",
+        "after": "split int_total / float_total + has_float flag; return val_float when any float seen (mirrors `sum` arm at L14403)",
+        "impact": "array_sum([1, 2.5]) returned 3 (int), now returns 3.5 (float)"
+      },
+      {
+        "arm": "array_product",
+        "line": 15794,
+        "category": "collection",
+        "before": "same int-truncation antipattern as array_sum",
+        "after": "split accumulators; val_float when any float seen",
+        "impact": "array_product([1.5, 2.0]) silently truncated; now returns 3.0"
+      },
+      {
+        "arm": "array_min",
+        "line": 15807,
+        "category": "collection",
+        "before": "`let v = items[i].int_val` unconditionally — float Vals have garbage/0 in their int_val slot, so float arrays returned spurious values (typically 0)",
+        "after": "two-pass: detect any TAG_FLOAT, then use to_float_val for comparison; preserves int-only fast path",
+        "impact": "array_min([3.5, 1.2, 9.0]) returned 0 (broken), now returns 1.2"
+      },
+      {
+        "arm": "array_max",
+        "line": 15820,
+        "category": "collection",
+        "before": "same .int_val-only antipattern as array_min",
+        "after": "two-pass float-aware (mirror of array_min fix)",
+        "impact": "array_max([3.5, 1.2, 9.0]) returned 0 (broken), now returns 9.0"
+      },
+      {
+        "arm": "array_concat",
+        "line": 15833,
+        "category": "collection",
+        "before": "no tag guard on args[0]/args[1] — non-array input would either crash get_array or silently produce []",
+        "after": "explicit `if args[i].tag == TAG_ARRAY` per side; non-array sides treated as empty",
+        "impact": "defensive — no known crash sites in tree, but matches the conservative pattern of every other array_* arm"
+      },
+      {
+        "arm": "map_sum_values",
+        "line": 15926,
+        "category": "collection",
+        "before": "same single-accumulator int-truncation antipattern as array_sum",
+        "after": "split int_total / float_total + has_float; val_float when needed; added len(args)==0 guard",
+        "impact": "map_sum_values({\"a\":1,\"b\":2.5}) returned 3 (broken), now returns 3.5"
+      }
+    ],
+    "clean_confirmed": [
+      "string: starts_with, ends_with, contains, str_contains, split, trim, repeat, pad_left, pad_right, char_at, char_code, from_char_code, reverse, str_count, format, str_trim_start, str_trim_end, is_whitespace",
+      "iteration: range, sort (delegating arm L13276), enumerate, zip, find, flat_map, any, all, count",
+      "collection: push, slice, array_reverse, array_contains, array_index_of, array_take, array_drop, array_count, sum (L14403 — already correct), sort (L14422), map_size, map_contains_key, map_get_or, map_keys, map_values, map_entries, map_is_empty, map_count_values, has_key, keys, len, is_empty",
+      "type: int/to_int/to_i64 (already hardened in hxa-20260424-006), float/to_float (T24-hardened), bool, to_string, type_of, char, ord, parse_int",
+      "math: abs, floor, sqrt, sign, gcd, lcm, mod, pow, min, max, round, ceil"
+    ],
+    "non_bugs_noted": [
+      "duplicate dispatch arms for `len`, `chars`, `push`, `to_string`, `type_of`, `int`, `float`, `bool`, `read_file`, `read_lines`, `write_file`, `sort`, `random`, `time`, `sleep`, `range`, `assert` at L13577+/L13957+ are dead code (unreachable after first match returns) — not bugs, just stale scaffolding",
+      "pad_left/pad_right with multi-char `ch` arg can overshoot `width` by up to (len(ch)-1) chars — minor contract drift, no caller bug observed",
+      "array_index_of returns -1 (not 0) on miss — Python-style sentinel, intentional and matches hexa convention"
+    ]
+  },
+  "validation": {
+    "selftest_path": "/tmp/omega_stdlib_5_selftest.hexa",
+    "results": {
+      "array_sum_int=6": "PASS",
+      "array_sum_float=7": "PASS",
+      "array_sum_mixed=3.5": "PASS (was broken)",
+      "array_product_int=24": "PASS",
+      "array_product_float=3": "PASS",
+      "array_min_int=1": "PASS",
+      "array_min_float=1.2": "PASS (was 0)",
+      "array_max_int=5": "PASS",
+      "array_max_float=9": "PASS (was 0)",
+      "array_concat_ok=4": "PASS",
+      "OK_marker": "PASS"
+    },
+    "verdict": "all 11 assertions pass via rebuilt build/hexa_interp.real"
+  },
+  "host_rebuild": {
+    "required": true,
+    "reason": "hexa_full.hexa is the SSOT for the self-hosted interp; arm changes must be transpiled+compiled to take effect",
+    "command": "./hexa tool/build_interp.hexa",
+    "output": "build/hexa_interp.real (2797552 bytes, smoke OK)",
+    "runtime_c_changes": "none — fixes are interp-side hexa only; runtime.c was already correct (these arms only affected the interpreter dispatch path, AOT path uses C builtins directly)"
+  },
+  "runtime_c_changes": "none",
+  "files_modified": [
+    "/Users/ghost/core/hexa-lang/self/hexa_full.hexa (6 arms: array_sum, array_product, array_min, array_max, array_concat, map_sum_values)"
+  ],
+  "next_cycle_recommendation": {
+    "warranted": true,
+    "ω-stdlib-6_proposal": "Sweep the ML/tensor block (~150 arms: attention, matmul_into*, lora_*, kv_cache_*, conv1d, group_norm, multi_head_attention, grouped_query_attention, sliding_window_attention, qkv_fused_into, repeat_kv). These are most likely to have silent-precision or shape-validation bugs that interp-vs-AOT divergence tests would surface. Sample by cross-checking each arm's tensor shape assertions against the corresponding runtime.c builtin contract.",
+    "ω-stdlib-7_proposal": "Sweep the math/activation block (sigmoid, gelu, swish, softmax, layer_norm, rms_norm, batch_norm, dropout, embedding) for numerical edge cases (NaN/Inf propagation, zero-variance, empty arrays).",
+    "ω-stdlib-8_proposal": "Audit the ~17 dead/duplicate dispatch arms (len, chars, push, to_string, type_of, int, float, bool, read_file, read_lines, write_file, sort, random, time, sleep, range, assert at L13577+/L13957+) — either delete them or hoist them above the live arm to make their guards take effect. Currently they are pure dead code that drifts independently from the live arm and creates audit confusion."
+  },
+  "honesty_notes": [
+    "audit was sampled, NOT exhaustive — 71/474 arms (~15%)",
+    "the fixes mirror existing-correct patterns elsewhere in the file (sum at L14403); not novel logic",
+    "the duplicate-dispatch dead code blocks were noted but NOT consolidated this cycle (out of scope, would require careful hoist/delete decision)",
+    "runtime.c was not touched — AOT path was already correct via runtime.c builtins; this cycle only fixed the interp-side dispatch",
+    "no regression test in tree exists for these specific arms — the new selftest at /tmp is ad-hoc and not committed"
+  ]
+}
