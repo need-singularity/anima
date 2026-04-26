@@ -282,6 +282,7 @@ v3 ledger landed 직후 다음 line 을 `state/atlas_convergence_witness.jsonl` 
 - aggregator v2 source: `anima-physics/tool/mk_xii_substrate_witness_ledger_aggregator_v2.hexa` (lines 240-251 = `classify_live_hw` strict pattern matcher)
 - v2 ledger body: `state/v10_anima_physics_cloud_facade/integration_ledger/witness_ledger_v2.json` (fingerprint `661882989`, body sha `df545c5e15404539cea6f1b61c8d46565089f6d266277234b50a124d066e49ba`)
 - silent-land marker (this cycle): `state/v10_anima_physics_cloud_facade/integration_ledger/v3_trigger_spec_landed.json`
+- **§8.5 + §2 CLI flag 결정 후속 (v2.1 prerequisite)**: `anima-physics/docs/mk_xii_substrate_witness_ledger_aggregator_v2_1_prerequisite_landing.md` (2026-04-27) — env-var override 4종 (`LEDGER_VERSION`/`LEDGER_CYCLE_ID_OVERRIDE`/`LEDGER_SUPERSEDES_OVERRIDE`/`MARKER_OUT`) 추가, v2 byte-identical PASS, v3 dry-run synthetic LIVE PASS. spec §2 CLI flag 형식은 invalid (argv parse 미지원) → env-var form 으로 정정. 사용자 cloud signup 도착 시 그대로 발동 가능.
 
 ---
 
