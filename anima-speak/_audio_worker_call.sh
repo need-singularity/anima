@@ -30,7 +30,19 @@ KEEP_FILE="$WD/keepalive"
 FIFO_IN="$WD/in"
 FIFO_OUT="$WD/out"
 LOG_FILE="$WD/log"
-WORKER_PY="$(dirname "$0")/anima_audio_worker.py"
+# Worker source-of-truth lives in hexa-lang/stdlib (no .py exclusion there);
+# anima/.gitignore bans **/*.py so we cannot keep the worker beside this script.
+# Resolution order: explicit ANIMA_AUDIO_WORKER_PY > $HEXA_LANG/stdlib > absolute fallback.
+if [ -n "${ANIMA_AUDIO_WORKER_PY:-}" ] && [ -f "$ANIMA_AUDIO_WORKER_PY" ]; then
+  WORKER_PY="$ANIMA_AUDIO_WORKER_PY"
+elif [ -n "${HEXA_LANG:-}" ] && [ -f "$HEXA_LANG/stdlib/anima_audio_worker.py" ]; then
+  WORKER_PY="$HEXA_LANG/stdlib/anima_audio_worker.py"
+elif [ -f "/Users/ghost/core/hexa-lang/stdlib/anima_audio_worker.py" ]; then
+  WORKER_PY="/Users/ghost/core/hexa-lang/stdlib/anima_audio_worker.py"
+else
+  echo '{"id":null,"ok":false,"err":"worker_py_not_found","elapsed_ms":0,"bytes_out":0}'
+  exit 1
+fi
 PYTHON_BIN="${ANIMA_AUDIO_PYTHON:-/opt/homebrew/bin/python3}"
 [ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"
 

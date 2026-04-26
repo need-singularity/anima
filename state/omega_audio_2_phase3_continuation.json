@@ -1,0 +1,109 @@
+{
+  "cycle": "omega-audio-2-phase3",
+  "axis": "Phase 3 chain bench + policy resolution via worker relocation to hexa-lang/stdlib",
+  "timestamp": "2026-04-26",
+  "predecessor": "/Users/ghost/core/anima/state/omega_audio_2_poc_results.json (Phase 1 + Phase 2 vocal POC)",
+  "design_ref": "/Users/ghost/core/anima/state/omega_audio_2_persistent_worker_design.json",
+  "harness": {
+    "file": "/Users/ghost/core/anima/anima-speak/_omega_audio_2_phase3_bench.hexa (created, run, removed)",
+    "shape": "5 runs each of vocal(440,0.5,100) / breath(2000,4000,0.3,100) / vocal_lf(180,0.5,100) / chain=pipe(vocal(180,0.5,100),700,1100,6.0)",
+    "interpreter": "/Users/ghost/.hx/bin/hexa_real (bypass dispatcher; the default `hexa` shim auto-routed to remote ubu2 where numpy is unavailable, so all WAV writes silently failed and timings were meaningless ~46ms shell-only)",
+    "ms_units": "wallclock per call, captured via date +%s%N before/after the organ call inside hexa, divided by 1e6 in this JSON"
+  },
+  "phase3_bench": {
+    "vocal_only": {
+      "baseline_runs_ms": [233.47, 146.77, 136.30, 151.08, 139.40],
+      "baseline_warm_mean_ms": 143.39,
+      "worker_runs_ms": [961.08, 62.39, 76.90, 65.56, 66.60],
+      "worker_cold_ms": 961.08,
+      "worker_warm_mean_ms": 67.86,
+      "speedup_warm": "2.11x",
+      "note": "Matches Phase 2 POC (which reported 2.34x for vocal). Single-organ workload bottoms out at the bash exec()-fork + FIFO IPC floor (~50-70ms)."
+    },
+    "breath_only": {
+      "baseline_runs_ms": [1612.17, 1118.29, 1181.00, 1031.15, 1093.52],
+      "baseline_warm_mean_ms": 1105.99,
+      "worker_runs_ms": [71.93, 64.67, 67.79, 67.38, 66.15],
+      "worker_cold_ms": 71.93,
+      "worker_warm_mean_ms": 66.50,
+      "speedup_warm": "16.6x",
+      "note": "Largest single-organ win because baseline pays full scipy.signal.butter+sosfilt import per call (~1s on this Darwin host). Worker pre-imports butter+sosfilt at boot, so per-call cost collapses to the ~67ms IPC floor. The breath cold call (71.93ms) is essentially warm because worker stays alive across the test set; the first per-organ call only pays the ~961ms worker spawn that vocal absorbed."
+    },
+    "vocal_lf_only": {
+      "baseline_runs_ms": [169.81, 169.02, 173.91, 177.56, 164.65],
+      "baseline_warm_mean_ms": 170.99,
+      "worker_runs_ms": [64.64, 69.42, 80.09, 77.98, 65.27],
+      "worker_cold_ms": 64.64,
+      "worker_warm_mean_ms": 71.48,
+      "speedup_warm": "2.39x",
+      "note": "vocal_lf baseline is ~28ms slower than vocal due to Liljencrants-Fant np.where branching and peak-norm pass; worker squashes that to the same IPC floor as vocal because numpy is already loaded."
+    },
+    "vocal_pipe_chain": {
+      "baseline_runs_ms": [1227.42, 1191.47, 1159.89, 1830.51, 1901.52],
+      "baseline_warm_mean_ms_all5": 1462.16,
+      "baseline_warm_mean_ms_first3": 1192.93,
+      "worker_runs_ms": [157.38, 155.80, 141.73, 150.72, 137.38],
+      "worker_cold_ms": 157.38,
+      "worker_warm_mean_ms": 148.60,
+      "speedup_warm_first3_baseline": "8.03x",
+      "speedup_warm_all5_baseline": "9.84x",
+      "design_prediction_60x_check": "MISS. Phase 2 design projected 60x on chain (1177ms -> ~20ms). Achieved 8-10x (~150ms warm). Each chain link is two _run_py calls (vocal + pipe), so the chain pays 2x the bash exec() floor (~95-100ms) plus 2x scipy lfilter import savings on baseline. Worker eliminates per-call scipy import (~500ms saved per pipe call) but cannot eliminate the bash-fork + FIFO open/close (~70ms each, x2 links = ~140-150ms observed). To approach 60x, hexa runtime would need a persistent-pipe primitive that bypasses the per-call /bin/bash + /bin/cat + /bin/base64 fork chain. Filed as ω-runtime-1 follow-up.",
+      "note_outliers": "Baseline chain runs 4 and 5 (1830, 1901 ms) are ~600ms above the first 3 — likely transient system load (Darwin filesystem cache contention or background indexer). first3-mean is the more honest baseline; all5-mean inflates the speedup. Worker chain runs are tight (137-157ms, sigma ~8ms) so the bottleneck is genuinely deterministic IPC overhead, not scipy."
+    },
+    "per_organ_speedup_observations": "Worker speedup is dominated by which scipy modules the baseline reimports each call: (a) breath does butter+sosfilt -> ~1000ms saved per call -> 16.6x; (b) chain does lfilter -> ~500ms saved per pipe link -> 8-10x; (c) vocal/vocal_lf do only numpy -> ~80ms saved -> 2.1-2.4x. The bash exec()+FIFO IPC floor is ~67-75ms regardless. So the design's 60x target is achievable only when shell+IPC overhead drops below 5ms (i.e. hexa runtime owns the FIFO write/read primitive directly)."
+  },
+  "policy_resolution": {
+    "path_chosen": "c (relocate to hexa-lang/stdlib)",
+    "rationale": "anima/.gitignore enforces R37/AN13/L3-PY 'no python source in anima/' rule. hexa-lang/.gitignore has no .py exclusion. Moving the worker source-of-truth to hexa-lang/stdlib/ keeps the rule intact while making the worker tracked (deployable on fresh checkout via `git add`) — the worker is conceptually a hexa-runtime helper anyway, not anima domain code.",
+    "files_moved": [
+      {"from": "/Users/ghost/core/anima/anima-speak/anima_audio_worker.py", "to": "/Users/ghost/core/hexa-lang/stdlib/anima_audio_worker.py", "size_bytes": 5851}
+    ],
+    "files_updated": [
+      {"path": "/Users/ghost/core/anima/anima-speak/_audio_worker_call.sh", "change": "Replaced fixed `WORKER_PY=$(dirname $0)/anima_audio_worker.py` with 3-tier resolution: (1) explicit $ANIMA_AUDIO_WORKER_PY env if set+exists, (2) $HEXA_LANG/stdlib/anima_audio_worker.py if env set, (3) absolute fallback /Users/ghost/core/hexa-lang/stdlib/anima_audio_worker.py. Emits NDJSON error and exits 1 if none found."}
+    ],
+    "files_unchanged": [
+      "/Users/ghost/core/anima/anima-speak/anima_audio.hexa (WORKER_CALL_SH points to the .sh which stays in anima-speak; only the .py reference inside the .sh changed)"
+    ],
+    "verification_after_relocation": {
+      "vocal_smoke_via_worker": "PASS",
+      "evidence": "Phase 3 bench (above) ran ANIMA_AUDIO_WORKER=1 against the relocated worker and produced 25 WAVs (5 vocal + 5 breath + 5 vocal_lf + 5 chain*[vocal,pipe]) all exactly 4844 bytes (100ms @ 24kHz mono int16 + 44-byte WAV header). Worker spawned via the new resolution path (no /Users/ghost/core/anima/anima-speak/anima_audio_worker.py existed at run time — verified by `ls` returning No such file), confirming the .sh found the relocated copy.",
+      "git_status_after": {
+        "anima_repo": "anima-speak/_audio_worker_call.sh modified; anima-speak/anima_audio_worker.py absent (gitignore matches it via **/*.py rule which now has nothing to ignore)",
+        "hexa_lang_repo": "stdlib/anima_audio_worker.py untracked, NOT gitignored (verified with `git check-ignore -v` returning empty)",
+        "anima_ignore_check": ".gitignore:3:**/*.py would still match the path if it existed in anima — rule intact"
+      }
+    }
+  },
+  "phase3_bug_findings": [
+    {
+      "id": "BUG-1",
+      "severity": "blocker (workaround applied, not in production code)",
+      "title": "default `hexa` shim auto-routes to remote ubu2 which lacks numpy",
+      "evidence": "First baseline bench using /Users/ghost/core/hexa-lang/hexa printed `hexa_remote: ubu2 에서 원격 실행 중` then `ModuleNotFoundError: No module named 'numpy'` for every organ; timings dropped to ~46ms (just shell+exec wallclock, no actual python work). 0 WAVs were produced.",
+      "resolution": "Used /Users/ghost/.hx/bin/hexa_real for both baseline and worker benches to force local execution. This is a harness concern, not a regression in anima_audio.hexa.",
+      "follow_up": "Either (a) install numpy/scipy on ubu2/ubu1 remotes, or (b) add a local-only annotation to anima_audio.hexa, or (c) document that ANIMA_AUDIO_* benches must run against hexa_real."
+    },
+    {
+      "id": "BUG-2 (non-issue, documented for completeness)",
+      "severity": "info",
+      "title": "shell pipeline `| head -10` truncates hexa output and triggers SIGPIPE deadlock",
+      "evidence": "First worker-bench attempt was piped through `grep ... | head -10` which closed stdin on the upstream after 10 lines, leaving hexa_real waiting for the worker IPC and the worker waiting for parent_alive — produced exit 144 after kill. Replaced with `> /tmp/bench_worker.out` redirect. No code change needed."
+    },
+    {
+      "id": "FINDING-1",
+      "severity": "info",
+      "title": "no per-organ allowlist needed",
+      "evidence": "All 4 tested organs (vocal, breath, pipe-via-chain, vocal_lf) work identically through the worker. No namespace contamination, no scipy-fn missing, no FIFO deadlock. Worker pre-imports cover all 4 organs' scipy needs (lfilter, lfiltic, butter, sosfilt, fftconvolve, resample_poly). pipe inside the chain validates lfilter dispatch."
+    }
+  ],
+  "deferred_to_later_phases": [
+    "Phase 3 remaining organs — pipe3, pipe_glide, tone, chirp, silence, lpf/hpf/bpf/notch, gain, envelope, reverb, cat, mix (all use _run_py; based on this phase's evidence, no per-organ work needed beyond a smoke check; worker handles them via the same dispatch path)",
+    "Phase 4 cutover (default-on ANIMA_AUDIO_WORKER=1)",
+    "Phase 5 remove ANIMA_AUDIO_WORKER=0 escape hatch",
+    "ω-runtime-1 hexa persistent-pipe primitive — direct FIFO write/read from hexa runtime bypassing /bin/bash + /bin/cat + /bin/base64 fork chain, projected to drop chain warm from 148ms to <20ms and approach the design's 60x target",
+    "harness portability — replace /Users/ghost/.hx/bin/hexa_real explicit path with a `hexa --local` flag or `HEXA_FORCE_LOCAL=1` env once the dispatcher exposes it"
+  ],
+  "cleanup_verified": true,
+  "cleanup_evidence": "post-bench: pgrep anima_audio_worker -> 0; pgrep hexa_real -> 0; ls /tmp/anima_audio_worker_* -> no matches; ls /tmp/anima_audio_*.wav -> no matches; rm /Users/ghost/core/anima/anima-speak/_omega_audio_2_phase3_bench.hexa (harness removed); /tmp/bench_baseline.* and /tmp/bench_worker.* removed.",
+  "rollback": "git checkout HEAD -- /Users/ghost/core/anima/anima-speak/_audio_worker_call.sh; mv /Users/ghost/core/hexa-lang/stdlib/anima_audio_worker.py /Users/ghost/core/anima/anima-speak/anima_audio_worker.py (restores Phase 2 layout). Note: anima/.gitignore still excludes the .py at the anima-speak path, so this rollback restores the on-disk-only state too. To fully revert, also restore _audio_worker_call.sh's original `WORKER_PY=$(dirname \"$0\")/anima_audio_worker.py` line."
+}
