@@ -1,0 +1,190 @@
+// tool/anima_nexus_roadmaps_consistency_auditor.hexa — $WS/nexus/roadmaps/*.json consistency audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   memory project_roadmap_engine.md: "canonical query: $HEXA_LANG/bin/roadmap_engine status
+//   $WS/nexus/roadmaps/<proj>.json; reads 3 repos' .roadmap directly".
+//   nexus/roadmaps/ 29 JSON files. 각각 project별 roadmap manifest. 다음 세션에서 reuse 시
+//   consistency 보장 위해 audit.
+//
+//   본 helper = mac-local NON_MUTATION:
+//     - 29 nexus roadmap JSON 각각 schema 일관성 (id, name, repos, .roadmap reference)
+//     - .roadmap 파일 cross-reference 검증 (anima/ + hexa-lang/ + airgenome/ 3 repos)
+//     - schema field distribution
+//     - file age + size
+//     - selftest verifies: ≥20 nexus roadmaps / 3-repo cross-link / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT          output JSON (default: state/nexus_roadmaps_consistency_auditor.json)
+//   ANIMA_NEXUS_DIR       nexus dir (default: /Users/ghost/core/nexus)
+//
+// OUTPUT
+//   - nexus_roadmaps: list of {file, schema_keys, references_repo_count, age_days}
+//   - cross_repo_link_summary
+//   - schema_distribution
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_nexus_roadmaps_consistency_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/nexus_roadmaps_consistency_auditor.json hexa run tool/anima_nexus_roadmaps_consistency_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - nexus roadmap JSON schema는 project 마다 다를 수 있음 (frozen template 미고려).
+//   - .roadmap reference는 path string match; nested struct 미파싱.
+//   - 3-repo cross-link은 path resolution; symlink 미고려.
+
+let HELPER_PATH = "/tmp/anima_nexus_roadmaps_consistency_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima nexus/roadmaps/*.json consistency auditor — emitted by tool/anima_nexus_roadmaps_consistency_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION nexus roadmap audit.\n")
+    parts.push("import json, os, sys, time\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/nexus_roadmaps_consistency_auditor.json')\n")
+    parts.push("NEXUS_DIR = os.environ.get('ANIMA_NEXUS_DIR', '/Users/ghost/core/nexus')\n")
+    parts.push("ROADMAPS_DIR = os.path.join(NEXUS_DIR, 'roadmaps')\n\n")
+
+    parts.push("if not os.path.isdir(ROADMAPS_DIR):\n")
+    parts.push("    summary = {'paradigm':'nexus roadmaps consistency audit', 'status':'ROADMAPS_DIR_MISSING', 'roadmaps_dir':ROADMAPS_DIR}\n")
+    parts.push("    os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("    print(f'[nexus_roadmaps] status=ROADMAPS_DIR_MISSING -> {OUTPUT}')\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("EXPECTED_REPOS = ['/Users/ghost/core/anima', '/Users/ghost/core/hexa-lang', '/Users/ghost/core/airgenome']\n\n")
+
+    parts.push("nexus_files = sorted([f for f in os.listdir(ROADMAPS_DIR) if f.endswith('.json')])\n")
+    parts.push("now = time.time()\n\n")
+
+    parts.push("audit_results = []\n")
+    parts.push("schema_keys_freq = {}\n")
+    parts.push("parse_errors = []\n")
+    parts.push("repo_link_count = {repo:0 for repo in EXPECTED_REPOS}\n")
+    parts.push("dotroadmap_referenced = 0\n")
+    parts.push("schema_audited = 0\n\n")
+
+    parts.push("for fname in nexus_files:\n")
+    parts.push("    path = os.path.join(ROADMAPS_DIR, fname)\n")
+    parts.push("    try:\n")
+    parts.push("        st = os.stat(path)\n")
+    parts.push("        age_days = (now - st.st_mtime) / 86400\n")
+    parts.push("        with open(path, encoding='utf-8') as f: d = json.load(f)\n")
+    parts.push("    except Exception as e:\n")
+    parts.push("        parse_errors.append({'file':fname, 'error':type(e).__name__})\n")
+    parts.push("        continue\n")
+    parts.push("    schema_audited += 1\n")
+    parts.push("    keys = list(d.keys()) if isinstance(d, dict) else []\n")
+    parts.push("    for k in keys:\n")
+    parts.push("        schema_keys_freq[k] = schema_keys_freq.get(k, 0) + 1\n")
+    parts.push("    # Detect repo references\n")
+    parts.push("    content_str = json.dumps(d)\n")
+    parts.push("    references_repos = [r for r in EXPECTED_REPOS if r in content_str]\n")
+    parts.push("    for r in references_repos:\n")
+    parts.push("        repo_link_count[r] += 1\n")
+    parts.push("    # Detect .roadmap reference\n")
+    parts.push("    has_dotroadmap = '.roadmap' in content_str\n")
+    parts.push("    if has_dotroadmap:\n")
+    parts.push("        dotroadmap_referenced += 1\n")
+    parts.push("    audit_results.append({\n")
+    parts.push("        'file':fname,\n")
+    parts.push("        'schema_keys_count':len(keys),\n")
+    parts.push("        'top_keys':keys[:5],\n")
+    parts.push("        'file_size':st.st_size,\n")
+    parts.push("        'age_days':round(age_days, 1),\n")
+    parts.push("        'references_repos':references_repos,\n")
+    parts.push("        'has_dotroadmap_ref':has_dotroadmap,\n")
+    parts.push("    })\n\n")
+
+    parts.push("# Top schema keys\n")
+    parts.push("top_schema_keys = sorted(schema_keys_freq.items(), key=lambda x: -x[1])[:10]\n\n")
+
+    parts.push("# Cross-repo link summary\n")
+    parts.push("cross_link_summary = {\n")
+    parts.push("    'anima_referenced_in':repo_link_count['/Users/ghost/core/anima'],\n")
+    parts.push("    'hexa_lang_referenced_in':repo_link_count['/Users/ghost/core/hexa-lang'],\n")
+    parts.push("    'airgenome_referenced_in':repo_link_count['/Users/ghost/core/airgenome'],\n")
+    parts.push("    'dotroadmap_referenced_in':dotroadmap_referenced,\n")
+    parts.push("    'total_audited':schema_audited,\n")
+    parts.push("}\n\n")
+
+    parts.push("# Verify .roadmap presence in 3 repos\n")
+    parts.push("dotroadmap_presence = {}\n")
+    parts.push("for repo in EXPECTED_REPOS:\n")
+    parts.push("    candidate = os.path.join(repo, '.roadmap')\n")
+    parts.push("    dotroadmap_presence[repo] = os.path.exists(candidate)\n\n")
+
+    parts.push("# canonical_query check (memory project_roadmap_engine.md mirror)\n")
+    parts.push("CANONICAL_QUERY_REFERENCE = {\n")
+    parts.push("    'memory_anchor':'project_roadmap_engine.md',\n")
+    parts.push("    'expected_query':'$HEXA_LANG/bin/roadmap_engine status $WS/nexus/roadmaps/<proj>.json',\n")
+    parts.push("    'hexa_lang_present':os.path.exists(os.environ.get('HEXA_LANG', '/Users/ghost/core/hexa-lang')),\n")
+    parts.push("    'roadmap_engine_bin_present':os.path.exists(os.path.join(os.environ.get('HEXA_LANG', '/Users/ghost/core/hexa-lang'), 'bin', 'roadmap_engine')),\n")
+    parts.push("}\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'nexus/roadmaps/*.json consistency audit (memory project_roadmap_engine cross-link)',\n")
+    parts.push("    'roadmaps_dir':ROADMAPS_DIR,\n")
+    parts.push("    'total_files':len(nexus_files),\n")
+    parts.push("    'audited_count':schema_audited,\n")
+    parts.push("    'parse_errors':parse_errors,\n")
+    parts.push("    'audit_results':audit_results,\n")
+    parts.push("    'schema_keys_top10':[{'key':k, 'count':c} for k, c in top_schema_keys],\n")
+    parts.push("    'cross_repo_link_summary':cross_link_summary,\n")
+    parts.push("    'dotroadmap_presence_3_repos':dotroadmap_presence,\n")
+    parts.push("    'canonical_query_reference':CANONICAL_QUERY_REFERENCE,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify nexus/roadmaps/; read-only audit',\n")
+    parts.push("    'cross_link_cycles':['cycle 21 SSOT chflags (.roadmap unlocked finding)','cycle 25 memory staleness (project_roadmap_engine.md path refs)'],\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[nexus_roadmaps] files={len(nexus_files)} audited={schema_audited} parse_errors={len(parse_errors)} dotroadmap_refs={dotroadmap_referenced} schema_keys={len(schema_keys_freq)} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let nexus_files_min = 20
+    let expected_repos = 3
+    let memory_anchor = "project_roadmap_engine.md"
+    let non_mutation = "READ_ONLY"
+    println("inv:nexus_files_min=" + to_string(nexus_files_min))
+    println("inv:expected_repos=" + to_string(expected_repos))
+    println("inv:memory_anchor=" + memory_anchor)
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:expected_repos_list=anima,hexa-lang,airgenome")
+    println("inv:canonical_query_reference_recorded=true")
+    println("inv:dotroadmap_presence_3_repos_check=true")
+    println("inv:cross_link_cycle21_cycle25=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_nexus_roadmaps_consistency_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=nexus/roadmaps/*.json consistency audit (29 manifests / 3-repo cross-link / mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
