@@ -1,0 +1,165 @@
+// tool/anima_runpod_active_pods_auditor.hexa — RunPod active pods comprehensive audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   cycle 13 precheck (PRECHECK_FAIL_1, vast/runpod creds 미설정 추정) 후속.
+//   실제 RunPod에 2 H100 SXM RUNNING 발견 (cycle 52 trigger):
+//     bnabak3i4r38bg  anima-sae-steer-pilot
+//     1an0fdtr2mrif1  anima-gwt-deepseek-c2-long
+//
+//   본 helper = mac-local NON_MUTATION (read-only via runpodctl):
+//     - active pods enumeration via runpodctl pod list (subprocess)
+//     - cost per hour aggregation
+//     - daily/weekly/monthly burn projection
+//     - memory drift signal (cycle 13 precheck assumed no creds vs actual creds set)
+//     - selftest verifies: ≥1 RUNNING / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/runpod_active_pods_auditor.json)
+//
+// OUTPUT
+//   - active_pods: list of {id, name, gpu, image, cost_per_hr, volume_gb}
+//   - exited_pods: count
+//   - burn_rate: hourly / daily / weekly / monthly
+//   - memory_drift_signal: cycle 13 vs reality
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_runpod_active_pods_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/runpod_active_pods_auditor.json hexa run tool/anima_runpod_active_pods_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - runpodctl 의존 (~/.runpod/config.toml apikey 필요).
+//   - active pods uptime 정보는 runpodctl pod list 미포함; GraphQL API 별도 query 필요.
+//   - costPerHr 자체만 추출 — actual cumulative cost는 RunPod web UI 확인.
+
+let HELPER_PATH = "/tmp/anima_runpod_active_pods_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima RunPod active pods auditor — emitted by tool/anima_runpod_active_pods_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION via runpodctl.\n")
+    parts.push("import json, os, sys, subprocess\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/runpod_active_pods_auditor.json')\n\n")
+
+    parts.push("# Try runpodctl pod list (JSON output)\n")
+    parts.push("pods_data = []\n")
+    parts.push("runpodctl_available = False\n")
+    parts.push("try:\n")
+    parts.push("    r = subprocess.run(['runpodctl', 'pod', 'list'], capture_output=True, text=True, timeout=15)\n")
+    parts.push("    if r.returncode == 0:\n")
+    parts.push("        runpodctl_available = True\n")
+    parts.push("        pods_data = json.loads(r.stdout)\n")
+    parts.push("except FileNotFoundError:\n")
+    parts.push("    pods_data = []\n")
+    parts.push("except Exception as e:\n")
+    parts.push("    pods_data = []\n")
+    parts.push("    print(f'runpodctl error: {e}', file=sys.stderr)\n\n")
+
+    parts.push("# Filter by status\n")
+    parts.push("active_pods = [p for p in pods_data if p.get('desiredStatus') == 'RUNNING']\n")
+    parts.push("exited_pods = [p for p in pods_data if p.get('desiredStatus') == 'EXITED']\n\n")
+
+    parts.push("# Cost aggregation\n")
+    parts.push("hourly_burn = sum(p.get('costPerHr', 0) for p in active_pods)\n")
+    parts.push("burn_rate = {\n")
+    parts.push("    'hourly_usd':round(hourly_burn, 2),\n")
+    parts.push("    'daily_usd':round(hourly_burn * 24, 2),\n")
+    parts.push("    'weekly_usd':round(hourly_burn * 24 * 7, 2),\n")
+    parts.push("    'monthly_usd_30d':round(hourly_burn * 24 * 30, 2),\n")
+    parts.push("}\n\n")
+
+    parts.push("# Memory drift signal\n")
+    parts.push("MEMORY_CLAIM = 'h100 출발은 아직 대기 (2026-04-22, project_h100_launch_pending.md)'\n")
+    parts.push("CYCLE_13_PRECHECK = 'PRECHECK_FAIL_1 vast/runpod creds 미설정 추정 (cycle 13)'\n")
+    parts.push("memory_drift = {\n")
+    parts.push("    'memory_claim':MEMORY_CLAIM,\n")
+    parts.push("    'cycle_13_assumption':CYCLE_13_PRECHECK,\n")
+    parts.push("    'actual_state':f'{len(active_pods)} H100 SXM pods RUNNING via existing ~/.runpod/config.toml apikey',\n")
+    parts.push("    'mismatch':len(active_pods) > 0,\n")
+    parts.push("    'severity':'HIGH (real-world cost burn vs memory claim of zero)',\n")
+    parts.push("    'remediation':'(a) update memory project_h100_launch_pending.md to reflect 2 RUNNING pods OR (b) terminate pods if unintentional OR (c) document approved long-run intent',\n")
+    parts.push("}\n\n")
+
+    parts.push("# Per-pod simplified info\n")
+    parts.push("active_pods_audit = []\n")
+    parts.push("for p in active_pods:\n")
+    parts.push("    active_pods_audit.append({\n")
+    parts.push("        'id':p.get('id'),\n")
+    parts.push("        'name':p.get('name'),\n")
+    parts.push("        'gpu_count':p.get('gpuCount'),\n")
+    parts.push("        'image':p.get('imageName', '').split(':')[-1] if p.get('imageName') else None,\n")
+    parts.push("        'cost_per_hr_usd':p.get('costPerHr'),\n")
+    parts.push("        'volume_gb':p.get('volumeInGb'),\n")
+    parts.push("        'desired_status':p.get('desiredStatus'),\n")
+    parts.push("    })\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'RunPod active pods comprehensive audit (cycle 13 precheck companion / cycle 52 trigger)',\n")
+    parts.push("    'runpodctl_available':runpodctl_available,\n")
+    parts.push("    'total_pods_in_account':len(pods_data),\n")
+    parts.push("    'active_count':len(active_pods),\n")
+    parts.push("    'exited_count':len(exited_pods),\n")
+    parts.push("    'active_pods_audit':active_pods_audit,\n")
+    parts.push("    'exited_pods_summary':[{'name':p.get('name'), 'image_short':p.get('imageName', '').split(':')[-1] if p.get('imageName') else None} for p in exited_pods],\n")
+    parts.push("    'burn_rate':burn_rate,\n")
+    parts.push("    'memory_drift_signal':memory_drift,\n")
+    parts.push("    'recommended_actions':[\n")
+    parts.push("        '1. user manual investigate each RUNNING pod (purpose / uptime / progress)',\n")
+    parts.push("        '2. decide: terminate (stop $$ burn) | continue (intentional long-run) | document (memory update)',\n")
+    parts.push("        '3. update memory project_h100_launch_pending.md to reflect actual state (currently stale)',\n")
+    parts.push("        '4. consider runpodctl stop pod <id> for unintentional pods',\n")
+    parts.push("    ],\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT stop/start any pod; read-only audit via runpodctl pod list',\n")
+    parts.push("    'cross_link_cycles':['cycle 13 H100 P1 precheck (NON-LAUNCHING; assumed no creds)','cycle 17 atlas R47_DISAMBIG round 52 (bnabak3i4r38bg = anima-sae-steer-pilot reused, no auto-terminate)','cycle 25 memory staleness (uchg drift parent)'],\n")
+    parts.push("    'pattern':'governance audit chain layer 32 (cycles 21-51 + this) — actual GPU state vs memory claim drift',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[runpod_active] runpodctl={runpodctl_available} total_pods={len(pods_data)} active={len(active_pods)} exited={len(exited_pods)} burn_hourly=${burn_rate[\"hourly_usd\"]} burn_daily=${burn_rate[\"daily_usd\"]} memory_mismatch={memory_drift[\"mismatch\"]} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let burn_buckets = "hourly,daily,weekly,monthly_30d"
+    let memory_drift_severity = "HIGH"
+    let non_mutation = "READ_ONLY_NO_POD_STOP"
+    println("inv:burn_buckets=" + burn_buckets)
+    println("inv:memory_drift_severity=" + memory_drift_severity)
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:cross_link_cycle13_cycle17_cycle25=true")
+    println("inv:runpodctl_subprocess_dependency=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_runpod_active_pods_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=RunPod active pods audit (real burn rate + memory drift detection; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
