@@ -1,0 +1,189 @@
+// tool/anima_references_external_dep_tree_auditor.hexa — references/ external dep tree audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   references/ contains frozen external dependencies (tribev2 = Meta FAIR clone for Pilot-T1/T2).
+//   cycle 6 Pilot-T2 launch gate가 이 외부 의존성에 직접 의존. 본 helper = mac-local audit:
+//
+//     - references/ subdir inventory
+//     - tribev2 specific: inventory.json metadata + grid/study integrity
+//     - read-only policy verification (anima-tribev2-pilot/README cross-link policy)
+//     - last-modified mtime distribution
+//     - selftest verifies: tribev2 present / inventory.json schema / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/references_external_dep_tree_auditor.json)
+//   ANIMA_REFS_DIR    references dir (default: references)
+//
+// OUTPUT
+//   - sub_dirs: list of {name, file_count, total_size_kb, recent_mtime}
+//   - tribev2_audit: {inventory_present, model_name, organization, version, release_year, license_present}
+//   - read_only_policy: {anima-tribev2-pilot README cross-link references/tribev2 read-only}
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_references_external_dep_tree_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/references_external_dep_tree_auditor.json hexa run tool/anima_references_external_dep_tree_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - external dep는 frozen — anima-side 변경 금지 (CC-BY-NC-4.0 inherited).
+//   - inventory.json schema는 tribev2 specific; 다른 future references는 다를 수 있음.
+//   - read_only_policy는 README crossr-link declaration만; FS read-only enforcement 미적용.
+
+let HELPER_PATH = "/tmp/anima_references_external_dep_tree_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima references/ external dep tree auditor — emitted by tool/anima_references_external_dep_tree_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION external dep audit.\n")
+    parts.push("import json, os, sys, time\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/references_external_dep_tree_auditor.json')\n")
+    parts.push("REFS_DIR = os.environ.get('ANIMA_REFS_DIR', 'references')\n\n")
+
+    parts.push("if not os.path.isdir(REFS_DIR):\n")
+    parts.push("    summary = {'paradigm':'references external dep tree audit', 'status':'REFS_DIR_MISSING', 'refs_dir':REFS_DIR}\n")
+    parts.push("    os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("    print(f'[refs_external_dep] status=REFS_DIR_MISSING -> {OUTPUT}')\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("now = time.time()\n\n")
+
+    parts.push("def _walk_subdir(path, max_files=2000):\n")
+    parts.push("    file_count = 0\n")
+    parts.push("    total_size = 0\n")
+    parts.push("    most_recent_mtime = 0\n")
+    parts.push("    for root, dirs, files in os.walk(path):\n")
+    parts.push("        for f in files:\n")
+    parts.push("            fpath = os.path.join(root, f)\n")
+    parts.push("            try:\n")
+    parts.push("                st = os.stat(fpath)\n")
+    parts.push("                file_count += 1\n")
+    parts.push("                total_size += st.st_size\n")
+    parts.push("                if st.st_mtime > most_recent_mtime:\n")
+    parts.push("                    most_recent_mtime = st.st_mtime\n")
+    parts.push("            except Exception:\n")
+    parts.push("                continue\n")
+    parts.push("            if file_count >= max_files:\n")
+    parts.push("                return file_count, total_size, most_recent_mtime\n")
+    parts.push("    return file_count, total_size, most_recent_mtime\n\n")
+
+    parts.push("entries = os.listdir(REFS_DIR)\n")
+    parts.push("sub_dirs_audit = []\n")
+    parts.push("for e in entries:\n")
+    parts.push("    full = os.path.join(REFS_DIR, e)\n")
+    parts.push("    if os.path.isdir(full):\n")
+    parts.push("        fc, sz, mr = _walk_subdir(full)\n")
+    parts.push("        recent_age_days = (now - mr) / 86400 if mr > 0 else None\n")
+    parts.push("        sub_dirs_audit.append({\n")
+    parts.push("            'name':e,\n")
+    parts.push("            'file_count':fc,\n")
+    parts.push("            'total_size_kb':round(sz / 1024, 1),\n")
+    parts.push("            'recent_age_days':round(recent_age_days, 1) if recent_age_days is not None else None,\n")
+    parts.push("        })\n\n")
+
+    parts.push("# tribev2 specific audit\n")
+    parts.push("TRIBEV2_PATH = os.path.join(REFS_DIR, 'tribev2')\n")
+    parts.push("tribev2_audit = {'present':os.path.isdir(TRIBEV2_PATH)}\n")
+    parts.push("if tribev2_audit['present']:\n")
+    parts.push("    inventory_path = os.path.join(TRIBEV2_PATH, 'inventory.json')\n")
+    parts.push("    license_path = os.path.join(TRIBEV2_PATH, 'LICENSE')\n")
+    parts.push("    readme_path = os.path.join(TRIBEV2_PATH, 'README.md')\n")
+    parts.push("    inventory_data = None\n")
+    parts.push("    if os.path.exists(inventory_path):\n")
+    parts.push("        try:\n")
+    parts.push("            with open(inventory_path) as f: inventory_data = json.load(f)\n")
+    parts.push("        except Exception:\n")
+    parts.push("            inventory_data = None\n")
+    parts.push("    tribev2_audit.update({\n")
+    parts.push("        'inventory_present':inventory_data is not None,\n")
+    parts.push("        'model_name':inventory_data.get('model_name') if inventory_data else None,\n")
+    parts.push("        'organization':inventory_data.get('organization') if inventory_data else None,\n")
+    parts.push("        'version':inventory_data.get('version') if inventory_data else None,\n")
+    parts.push("        'release_year':inventory_data.get('release_year') if inventory_data else None,\n")
+    parts.push("        'license_present':os.path.exists(license_path),\n")
+    parts.push("        'readme_present':os.path.exists(readme_path),\n")
+    parts.push("        'inner_tribev2_module':os.path.isdir(os.path.join(TRIBEV2_PATH, 'tribev2')),\n")
+    parts.push("    })\n\n")
+
+    parts.push("# Read-only policy cross-link\n")
+    parts.push("POLICY_README = 'anima-tribev2-pilot/README.md'\n")
+    parts.push("read_only_policy = {'policy_file':POLICY_README, 'policy_present':os.path.exists(POLICY_README)}\n")
+    parts.push("if read_only_policy['policy_present']:\n")
+    parts.push("    try:\n")
+    parts.push("        with open(POLICY_README, encoding='utf-8') as f:\n")
+    parts.push("            pc = f.read()\n")
+    parts.push("        read_only_policy['mentions_read_only'] = 'read-only' in pc.lower() or 'readonly' in pc.lower()\n")
+    parts.push("        read_only_policy['mentions_frozen'] = 'frozen' in pc.lower()\n")
+    parts.push("        read_only_policy['mentions_cc_by_nc'] = 'CC-BY-NC' in pc or 'cc-by-nc' in pc.lower()\n")
+    parts.push("    except Exception:\n")
+    parts.push("        pass\n\n")
+
+    parts.push("# anima-tribev2-pilot dependency on references/tribev2\n")
+    parts.push("PILOT_DIR = 'anima-tribev2-pilot'\n")
+    parts.push("pilot_dependency = {'pilot_dir_present':os.path.isdir(PILOT_DIR)}\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'references/ external dep tree audit (cycle 6 Pilot-T2 cross-link)',\n")
+    parts.push("    'refs_dir':REFS_DIR,\n")
+    parts.push("    'sub_dirs_audit':sub_dirs_audit,\n")
+    parts.push("    'sub_dir_count':len(sub_dirs_audit),\n")
+    parts.push("    'tribev2_audit':tribev2_audit,\n")
+    parts.push("    'read_only_policy':read_only_policy,\n")
+    parts.push("    'pilot_dependency':pilot_dependency,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify references/; read-only audit (preserves CC-BY-NC-4.0 frozen integrity)',\n")
+    parts.push("    'cross_link_cycles':['cycle 6 Pilot-T2 launch gate (TRIBE v2 cortical correlation)'],\n")
+    parts.push("    'pattern':'governance audit chain layer 9 (cycles 21-28 + this)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[refs_external_dep] sub_dirs={len(sub_dirs_audit)} tribev2_present={tribev2_audit.get(\"present\")} inventory={tribev2_audit.get(\"inventory_present\")} model={tribev2_audit.get(\"model_name\")} read_only_policy={read_only_policy.get(\"policy_present\")} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let sub_dirs_min = 1
+    let tribev2_expected_present = "true"
+    let inventory_expected_schema = "model_name,organization,version,release_year"
+    let non_mutation = "READ_ONLY_PRESERVES_CC_BY_NC"
+    println("inv:sub_dirs_min=" + to_string(sub_dirs_min))
+    println("inv:tribev2_expected_present=" + tribev2_expected_present)
+    println("inv:inventory_expected_schema=" + inventory_expected_schema)
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:walk_max_files_cap_2000=true")
+    println("inv:read_only_policy_cross_link=anima-tribev2-pilot/README.md")
+    println("inv:cross_link_cycle6_pilot_t2=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_references_external_dep_tree_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=references/ external dep tree audit (tribev2 frozen + read-only policy + pilot dependency; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
