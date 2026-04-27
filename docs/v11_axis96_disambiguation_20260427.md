@@ -143,9 +143,63 @@ Layer stride 1, all 64 layers swept.
 5. Tokenizer-mismatch confound (Falcon BPE vs Llama)
 
 **Updated next-cycle priority**:
-1. (high) HF Llama-3.1-8B license unblock → stride=1 + family-internal Llama 8b/70b dual purpose
+1. ~~(high) HF Llama-3.1-8B license unblock → stride=1 + family-internal Llama 8b/70b dual purpose~~ **HF UNBLOCKED 2026-04-27** — see Step 5 below.
 2. (medium) Yi-9B + Qwen2.5-7B as weak controls — narrow HFD-B scope (Llama-arch-only vs broader transformer-with-attention)
 3. (medium) Mamba-7B (state-spaces/mamba-7b, non-Falcon) as 2nd SSM — n=2 SSM convergence test
+
+---
+
+## Step 5 — Llama-3.1-8B stride=4 partial measurement via Mk.XII Phase 3b — 2026-04-27
+
+Backbone: `meta-llama/Llama-3.1-8B` (LlamaForCausalLM fp16, n_layers=32, h_dim=4096).
+Helper: anima_cmt v3-default (MLP-only ablation, residual-passthrough hook).
+Layer stride 4, 8 layers swept (indices 0,4,8,12,16,20,24,28). 16 prompts.
+- pod_id: `3csbgbnf2hf3gg` (H100 SXM 80GB SECURE) · cost_actual=$1.10 (Mk.XII Phase 3b composite, 8B is single cell ~$0.10) · 8B wallclock=114.4s · download=102s + load=10.8s + sweep+CMT=~1.5s
+- result: `state/v11_mk_xii_phase3b_llama/out_pod/out/cmt_v3_llama_3_1_8b.json` (4.1KB)
+- summary: `state/v11_mk_xii_phase3b_llama/verdict.json`
+
+**Diagnostics** (axis 96 metrics):
+- `rel_std=0.004698` (just below 0.005 informative threshold)
+- `rel_mean=0.007420`
+- `saturation_frac=0.0` (no degenerate cells, passthrough yielded non-trivial dy)
+- `informative=false` (rel_std < 0.005)
+
+**Per-family depth std (variance across 8 sampled layers)**:
+- Hexad: mean=0.008112 std=0.005588 (max=0.021397 min=0.003253)
+- Law: mean=0.007589 std=0.004016 (max=0.017590 min=0.004287)
+- Phi: mean=0.006289 std=0.003879 (max=0.014121 min=0.001965)
+- SelfRef: mean=0.007688 std=0.004901 (max=0.016499 min=0.003857)
+- **depth_std_overall = 0.004596** (mean of per-family stds)
+
+**Comparison to baseline**:
+| Backbone | depth_std stride=4 | Notes |
+|---|---|---|
+| Mistral/Qwen/DeepSeek/gemma family baseline | **0.3248** | from earlier ω-cycle |
+| Llama-3.1-8B | **0.004596** | **70× LOWER than baseline** |
+| Falcon-mamba | bba=0.229, depth via different metric | COUPLED verdict (Step 4) |
+
+**Implication for HFD-A/B/C**:
+- **HFD-A LIVING_AXIS = REJECTED (additional evidence)**: family-decoupling is NOT universal across all transformer families. Llama-3.1-8B is "informative=false" — the 4 family axes are nearly indistinguishable in residual stream projections.
+- **HFD-B SUB_AXIS = RE-INTERPRETED**: rather than "Llama-arch confined" (which Step 4 implied), the data now suggests Llama family shows the OPPOSITE of decoupling — extreme uniformity across families. So HFD-B might better be framed as "specific family-attention architectures preserve residual-axis differentiation, while Llama-3.1-8B specifically suppresses it."
+- **HFD-C ARTIFACT = STRENGTHENED**: 70× variance gap between Llama and other-family backbones suggests the metric IS sensitive to architecture-specific properties (h_dim=4096 with HIDDEN_TRUNCATED=128 = sub-32 axes per family in 4096-d residual space). Smaller h_dim relative to family axis density may compress all measurements toward zero.
+
+**raw#10 caveats**:
+1. Stride=4 (8 sample points only) may miss high-variance layers — axis 96 step 1 stride=1 dispatch (pod dqviqkw1jp5yej, in pre-SSH at ~14min) will give 32-layer resolution for confirmation.
+2. Single Llama backbone (n=1) — Llama-3.2-3B (axis 105 Pilot-T1) is dispatched in parallel. n=2 Llama needed for "Llama family suppresses" claim.
+3. Family axes are random projections (`make_family_axes` with seed 20260427) — result depends on the specific seed × h_dim interaction.
+4. "informative" threshold 0.005 is heuristic — Llama-3.1-8B's 0.004698 is JUST below; closer to a tie than a clear FAIL.
+
+**Updated 6-bb decoupling tally** (now 7-bb with Llama-3.1-8B):
+- DECOUPLED (3): Llama-3.1-8B (originally claimed but now reframed via 70× depth_std), DeepSeek
+- WEAKLY (1): gemma
+- COUPLED (3): Mistral, Qwen3, Falcon-mamba
+- INFORMATIVE_FALSE (1): **Llama-3.1-8B** (newly observed) — neither decoupled nor coupled, just uniform
+
+**Updated next-cycle priority**:
+1. (in flight) axis 96 step 1 stride=1 — pod dqviqkw1jp5yej (anima-axis96-step1-llama-stride1-recover-144232) currently in pre-SSH window
+2. (in flight) axis 105 Pilot-T1 alt-1 — Llama-3.2-3B forward — agent a0c3e63d38d30403e
+3. (post-axis-96-step1) Yi-9B + Qwen2.5-7B as weak controls — narrow HFD-B scope refinement
+4. (post) Mamba-7B (state-spaces/mamba-7b, non-Falcon) as 2nd SSM — n=2 SSM convergence test
 
 ---
 
