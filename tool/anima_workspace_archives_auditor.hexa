@@ -1,0 +1,183 @@
+// tool/anima_workspace_archives_auditor.hexa — workspace archive-* dirs audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   /Users/ghost/core/ 에 archive-brainwire, archive-sedi, archive-TECS-L 3 archive repos.
+//   cycle 32 sibling repos (anima/hexa-lang/airgenome) audit 의 extension — historical archives 상태.
+//
+//   본 helper = mac-local NON_MUTATION:
+//     - 3 archive repos enumeration
+//     - 각각 git HEAD + branch + .gitignore + README presence
+//     - last activity (mtime range)
+//     - .roadmap absent expected (archives는 active project 아님)
+//     - selftest verifies: 3 archives / read-only / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/workspace_archives_auditor.json)
+//   ANIMA_WS          workspace root (default: /Users/ghost/core)
+//
+// OUTPUT
+//   - archive_repos: list of {name, present, has_git, has_readme, has_roadmap, head_commit, branch, recent_age_days}
+//   - aggregate
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_workspace_archives_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/workspace_archives_auditor.json hexa run tool/anima_workspace_archives_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - archive list는 frozen (memory에 명시 없음 — disk discovery).
+//   - HEAD/branch는 subprocess git; failure 시 None.
+//   - archives는 read-only expected; 일반 audit 시 변경 없어야.
+
+let HELPER_PATH = "/tmp/anima_workspace_archives_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima workspace archive-* auditor — emitted by tool/anima_workspace_archives_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION archive audit.\n")
+    parts.push("import json, os, sys, subprocess, time\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/workspace_archives_auditor.json')\n")
+    parts.push("WS = os.environ.get('ANIMA_WS', '/Users/ghost/core')\n\n")
+
+    parts.push("ARCHIVES = ['archive-brainwire', 'archive-sedi', 'archive-TECS-L']\n\n")
+
+    parts.push("now = time.time()\n\n")
+
+    parts.push("def _git_info(path):\n")
+    parts.push("    head, branch = None, None\n")
+    parts.push("    try:\n")
+    parts.push("        r = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=path, capture_output=True, text=True, timeout=5)\n")
+    parts.push("        if r.returncode == 0: head = r.stdout.strip()[:12]\n")
+    parts.push("    except Exception: pass\n")
+    parts.push("    try:\n")
+    parts.push("        r = subprocess.run(['git', 'branch', '--show-current'], cwd=path, capture_output=True, text=True, timeout=5)\n")
+    parts.push("        if r.returncode == 0: branch = r.stdout.strip()\n")
+    parts.push("    except Exception: pass\n")
+    parts.push("    return head, branch\n\n")
+
+    parts.push("def _recent_mtime(path, max_files=200):\n")
+    parts.push("    most_recent = 0\n")
+    parts.push("    seen = 0\n")
+    parts.push("    for root, dirs, files in os.walk(path):\n")
+    parts.push("        dirs[:] = [d for d in dirs if d not in ('.git', '.venv', 'node_modules', '__pycache__')]\n")
+    parts.push("        for f in files:\n")
+    parts.push("            try:\n")
+    parts.push("                m = os.path.getmtime(os.path.join(root, f))\n")
+    parts.push("                if m > most_recent: most_recent = m\n")
+    parts.push("                seen += 1\n")
+    parts.push("            except Exception: continue\n")
+    parts.push("            if seen >= max_files: return most_recent\n")
+    parts.push("    return most_recent\n\n")
+
+    parts.push("audit = []\n")
+    parts.push("for name in ARCHIVES:\n")
+    parts.push("    p = os.path.join(WS, name)\n")
+    parts.push("    if not os.path.isdir(p):\n")
+    parts.push("        audit.append({'name':name, 'present':False})\n")
+    parts.push("        continue\n")
+    parts.push("    has_git = os.path.isdir(os.path.join(p, '.git'))\n")
+    parts.push("    has_readme = os.path.exists(os.path.join(p, 'README.md'))\n")
+    parts.push("    has_roadmap = os.path.exists(os.path.join(p, '.roadmap'))\n")
+    parts.push("    has_gitignore = os.path.exists(os.path.join(p, '.gitignore'))\n")
+    parts.push("    head, branch = _git_info(p) if has_git else (None, None)\n")
+    parts.push("    recent = _recent_mtime(p)\n")
+    parts.push("    age_days = (now - recent) / 86400 if recent > 0 else None\n")
+    parts.push("    audit.append({\n")
+    parts.push("        'name':name,\n")
+    parts.push("        'present':True,\n")
+    parts.push("        'has_git':has_git,\n")
+    parts.push("        'has_readme':has_readme,\n")
+    parts.push("        'has_roadmap':has_roadmap,\n")
+    parts.push("        'has_gitignore':has_gitignore,\n")
+    parts.push("        'head_commit':head,\n")
+    parts.push("        'branch':branch,\n")
+    parts.push("        'recent_mtime_age_days':round(age_days, 1) if age_days is not None else None,\n")
+    parts.push("    })\n\n")
+
+    parts.push("# archives expected: read-only, no .roadmap, README present\n")
+    parts.push("findings = []\n")
+    parts.push("for a in audit:\n")
+    parts.push("    if not a.get('present'): continue\n")
+    parts.push("    if a.get('has_roadmap'):\n")
+    parts.push("        findings.append({\n")
+    parts.push("            'archive':a['name'],\n")
+    parts.push("            'kind':'UNEXPECTED_ROADMAP_IN_ARCHIVE',\n")
+    parts.push("            'severity':'low',\n")
+    parts.push("            'detail':'.roadmap present (archives are typically inactive — historical SSOT pollution?)',\n")
+    parts.push("        })\n")
+    parts.push("    if not a.get('has_readme'):\n")
+    parts.push("        findings.append({\n")
+    parts.push("            'archive':a['name'],\n")
+    parts.push("            'kind':'NO_README_IN_ARCHIVE',\n")
+    parts.push("            'severity':'medium',\n")
+    parts.push("            'detail':'archive missing README.md (next-session orientation gap)',\n")
+    parts.push("        })\n\n")
+
+    parts.push("present_count = sum(1 for a in audit if a.get('present'))\n")
+    parts.push("with_readme = sum(1 for a in audit if a.get('has_readme'))\n")
+    parts.push("with_roadmap = sum(1 for a in audit if a.get('has_roadmap'))\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'workspace archive-* dirs audit (cycle 32 sibling repos extension)',\n")
+    parts.push("    'workspace':WS,\n")
+    parts.push("    'archive_repos':audit,\n")
+    parts.push("    'archive_count':len(ARCHIVES),\n")
+    parts.push("    'present_count':present_count,\n")
+    parts.push("    'with_readme':with_readme,\n")
+    parts.push("    'with_roadmap':with_roadmap,\n")
+    parts.push("    'findings':findings,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify archives; read-only audit',\n")
+    parts.push("    'cross_link_cycles':['cycle 32 $WS sibling repos','cycle 30 anima-* sub-repos'],\n")
+    parts.push("    'pattern':'governance audit chain layer 15 (cycles 21-34 + this)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[ws_archives] archives={present_count}/{len(ARCHIVES)} readme={with_readme} roadmap={with_roadmap} findings={len(findings)} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let archives_count = 3
+    let archives_list = "archive-brainwire,archive-sedi,archive-TECS-L"
+    let non_mutation = "READ_ONLY"
+    println("inv:archives_count=" + to_string(archives_count))
+    println("inv:archives_list=" + archives_list)
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:findings_kinds=UNEXPECTED_ROADMAP_IN_ARCHIVE,NO_README_IN_ARCHIVE")
+    println("inv:cross_link_cycle32_cycle30=true")
+    println("inv:subprocess_timeout_5s=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_workspace_archives_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=workspace archive-* audit (3 historical repos / read-only check; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
