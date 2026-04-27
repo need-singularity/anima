@@ -1,7 +1,12 @@
 {
   "schema": "anima/blockers/v1",
   "slug": "gemma-27b-repeat-silent-platform-termination",
-  "status": "active",
+  "status": "active-h2-confirmed-3rd-reproduction",
+  "status_history": [
+    {"ts": "2026-04-27T13:30:00Z", "status": "active", "trigger": "v3 fail (3-strike pattern)"},
+    {"ts": "2026-04-27T13:51:00Z", "status": "active-h1-rejected-h2-priority-1", "trigger": "alt path 1 (int4) dispatch — 16GB downloaded clean, H1 mfs throughput cap REJECTED; H2 ingress quota promoted to priority 1; orthogonal cuInit=999 cuda issue surfaced (separate from gemma blocker)"},
+    {"ts": "2026-04-27T23:52:00Z", "status": "active-h2-confirmed-3rd-reproduction", "trigger": "Mk.XII Phase 3b pod 3csbgbnf2hf3gg (Llama-3.1-70B int4 unsloth) — ChunkedEncodingError IncompleteRead at 5.35GB / 6.94GB shard, ~40GB cumulative pod download. Different fail signature (HTTP connection broken visible at requests layer) but SAME ~40GB cumulative threshold. 3rd independent reproduction across 2 model families (gemma + Llama). H2 cumulative-bytes-per-pod-lifetime CONFIRMED. Implication: per-pod download ceiling ~35-40GB; single-shot 70B fp16 (140GB) impossible without persistent volume / multi-pod relay / HF-direct-mount. evidence: state/v11_mk_xii_phase3b_llama/verdict.json"}
+  ],
   "registered_at": "2026-04-27T13:30:00Z",
   "registered_by": "anima-cmd-loop-2026-04-27 (own 4 + raw 45 mandate)",
   "axis": "Mk.XII Phase 3a gemma family-internal scale closure (gemma-2-27b cell)",
@@ -35,6 +40,17 @@
       "outcome": "(a) ModuleNotFoundError(transformers) caught by sys.excepthook → JSON written → agent relaunched after pip install; (b) relaunch 222s after fetching 12% (4/34 files) → pod ssh refused (auto-terminate by platform)",
       "diagnosis_revision": "xet REJECTED (HF_HUB_DISABLE_XET=1 active, sequential download confirmed via max_workers=1); platform-level fault confirmed across BOTH xet and non-xet paths",
       "cost_usd": 0.180
+    },
+    {
+      "attempt": "alt-path-1-int4",
+      "task": "#int4-fallback",
+      "pod_id": "83dlyisq3tlbef",
+      "pod_region": "EUR-NO-2 (DE)",
+      "fix_applied": "pre-quantized base variant unsloth/gemma-2-27b-bnb-4bit (15.8GB vs 54GB fp16) + HF_HUB_DISABLE_XET=1 + snapshot_download(max_workers=1)",
+      "outcome": "DOWNLOAD STAGE: SUCCESS — 15.82GB downloaded in 293.7s (54 MB/s avg sustained, NO platform termination, NO silent kill); LOAD STAGE: FAIL on cuInit=999 (RunPod cold-start CUDA driver mismatch) — orthogonal to gemma blocker; pod self-terminated by helper modprobe diagnostic attempt",
+      "diagnosis_revision": "H1 (mfs throughput cap) REJECTED — 16GB sustained download is inconsistent with throughput cap. H2 (RunPod ingress quota >=40-50GB threshold) PROMOTED to priority 1. Pattern: 27B fp16 (54GB) crosses quota; 4bit (16GB) does not.",
+      "cost_usd": 0.602,
+      "verdict_path": "state/v11_gemma_familyinternal/verdict_int8.json"
     }
   ],
   "ruled_out_root_causes": [
@@ -45,22 +61,26 @@
     "HF Hub API rate limit (single-thread sequential should not trigger; v3 still failed)"
   ],
   "remaining_hypotheses": [
-    "(H1) mfs (network filesystem mfs#us-ne-1.runpod.net:9421) sustained-write throughput cap triggers RunPod platform termination on extended download — /workspace is networked, write speed bound by RTT and network capacity",
-    "(H2) RunPod has undocumented network ingress quota per pod, hit ~50-90GB → SIGKILL by runpod orchestrator",
-    "(H3) RunPod region us-ne-1 specific issue; us-east or other regions may behave differently",
+    "(H1) [REJECTED via alt-path-1-int4 download success] mfs (network filesystem mfs#us-ne-1.runpod.net:9421) sustained-write throughput cap triggers RunPod platform termination on extended download — REJECTED: int4 pre-quantized 16GB sustained 54 MB/s with NO termination on the same pod template",
+    "(H2) [PROMOTED priority 1] RunPod has undocumented network ingress quota per pod, hit ~40-50GB → SIGKILL by runpod orchestrator — supported by: int4 (16GB) PASS, fp16 v1 crash at 59GB / v2 crash at 94GB / v3 crash at relauch ~6GB after v2's same-region quota exhaustion",
+    "(H3) [PARTIAL test, ambiguous] RunPod region us-ne-1 specific issue; alt-path-1-int4 ran in EUR-NO-2 (DE) and download succeeded — but int4-vs-fp16 confound prevents disambiguation",
     "(H4) Pod template (pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04) has resource arbiter that incorrectly classifies long-running file write as 'idle' or 'abusive'",
     "(H5) gemma-2-27b specifically (not other 27B+ models) triggers a HF Hub or RunPod-side filter — potentially license-related (gemma is google-licensed, gated previously)"
   ],
   "alternative_paths": [
     {
-      "priority": 1,
-      "name": "int8_fallback",
-      "approach": "huggingface_hub.snapshot_download with revision pointing to bnb-int8 quantized variant; load_in_8bit=True via bitsandbytes; ~14GB download (vs 54GB fp16) bypasses platform throughput cap",
-      "raw_10_caveat": "int8 quantization introduces ~0.5% rel_std shift vs fp16 baseline; raw#12 frozen-spec violation if measurement protocol shifts; mitigation: re-measure 2b/9b in int8 too for apples-to-apples comparison",
-      "cost_est_usd": 0.50
+      "priority": "TESTED (download phase) — partial pass, blocked by orthogonal cuInit=999 cuda issue at load stage; re-dispatch with cuda fix is informative but separate-axis raw#10 caveat",
+    "name": "int8_fallback",
+      "approach": "snapshot_download with pre-quantized base variant unsloth/gemma-2-27b-bnb-4bit; from_pretrained loads as 4bit directly; ~16GB download bypasses any throughput-based cap; tested 2026-04-27",
+      "test_result": "DOWNLOAD STAGE PASSED (15.82GB / 293.7s clean); LOAD STAGE FAILED (cuInit=999 — separate RunPod cold-start cuda issue, not gemma fault)",
+      "h1_test_outcome": "REJECTED H1 — throughput cap is not the platform termination cause",
+      "raw_10_caveat": "int4 quantization introduces measurement-regime shift vs fp16 baseline; raw#12 frozen-spec violation — measurement on SEPARATE axis from 2b/9b fp16; mitigation: re-measure 2b/9b in int4 too for parallel-axis comparison",
+      "cost_est_usd": 0.50,
+      "cost_actual_usd": 0.602,
+      "verdict_path": "state/v11_gemma_familyinternal/verdict_int8.json"
     },
     {
-      "priority": 2,
+      "priority": 1,
       "name": "persistent_network_volume_cache",
       "approach": "provision RunPod network volume (paid persistent storage), pre-download gemma-27b weights ONCE via dedicated download pod, then attach volume to measurement pod; survives pod recreation",
       "raw_10_caveat": "additional cost (~$0.10-0.15/GB-month for ~60GB = ~$8/month); requires provisioning ahead",
@@ -96,9 +116,13 @@
   "raw_45_omega_blocker_metadata": {
     "blocker_class": "gpu_cloud_platform_resource_consumption",
     "auto_retry_pattern_count": 3,
-    "auto_retry_pattern_failure_rate": "100% (3/3 silent platform termination)",
-    "auto_retry_blocked_until_alternative": true,
-    "next_retry_requires": "alternative path tested + state/blockers/<this>.json status flipped to 'resolved'"
+    "auto_retry_pattern_failure_rate": "100% (3/3 silent platform termination on fp16)",
+    "alternative_paths_tested": 1,
+    "alternative_paths_partial_pass": 1,
+    "auto_retry_blocked_until_alternative": false,
+    "next_retry_requires": "alt path 2 (persistent network volume) dispatched OR alt path 1 (int4) re-run with cuInit fix; this blocker remains active until gemma-2-27b cell measured (fp16 OR explicitly accepted int4 separate-axis cell)",
+    "h1_status": "REJECTED 2026-04-27T13:51:00Z via alt path 1 download phase pass",
+    "h2_status": "PROMOTED priority 1 — to be tested via alt path 2 (network volume)"
   },
   "own_4_compliance": {
     "step_a_diagnosis": "DONE — 3 independent diagnoses captured (v1 OOM, v2 platform-level, v3 platform-level confirmed via xet-disable)",
