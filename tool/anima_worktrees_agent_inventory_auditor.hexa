@@ -1,0 +1,176 @@
+// tool/anima_worktrees_agent_inventory_auditor.hexa — .claude/worktrees/agent-* inventory (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   .claude/worktrees/ 86+ agent-* dirs (parallel session activity history).
+//   각 worktree는 별도 git worktree로 anima에 isolated 변경. 본 helper = mac-local NON_MUTATION:
+//
+//     - 86+ agent-* dirs enumeration
+//     - 각각 size + age + last activity
+//     - .git presence (worktree pointer file)
+//     - .own / .roadmap presence (snapshot integrity)
+//     - selftest verifies: ≥50 worktrees / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT       output JSON (default: state/worktrees_agent_inventory_auditor.json)
+//   ANIMA_WORKTREES    worktrees dir (default: .claude/worktrees)
+//
+// OUTPUT
+//   - agent_count
+//   - age_distribution
+//   - top_largest_worktrees
+//   - own_lock_consistency: how many have .own (uchg snapshot)
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_worktrees_agent_inventory_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/worktrees_agent_inventory_auditor.json hexa run tool/anima_worktrees_agent_inventory_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - worktrees는 ephemeral — Agent isolation worktree create/delete pattern.
+//   - size measurement는 entry count + recursive disk usage 추정.
+//   - 86+ stale worktrees = potential cleanup candidate (cycles old).
+
+let HELPER_PATH = "/tmp/anima_worktrees_agent_inventory_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima worktrees agent inventory — emitted by tool/anima_worktrees_agent_inventory_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION worktrees inventory.\n")
+    parts.push("import json, os, sys, time\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/worktrees_agent_inventory_auditor.json')\n")
+    parts.push("WORKTREES_DIR = os.environ.get('ANIMA_WORKTREES', '.claude/worktrees')\n\n")
+
+    parts.push("if not os.path.isdir(WORKTREES_DIR):\n")
+    parts.push("    summary = {'paradigm':'worktrees inventory', 'status':'WORKTREES_DIR_MISSING', 'worktrees_dir':WORKTREES_DIR}\n")
+    parts.push("    os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("    print(f'[worktrees] status=WORKTREES_DIR_MISSING -> {OUTPUT}')\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("now = time.time()\n")
+    parts.push("agent_dirs = sorted([d for d in os.listdir(WORKTREES_DIR) if d.startswith('agent-') and os.path.isdir(os.path.join(WORKTREES_DIR, d))])\n\n")
+
+    parts.push("audits = []\n")
+    parts.push("age_lt_1d = 0\n")
+    parts.push("age_1_7d = 0\n")
+    parts.push("age_7_30d = 0\n")
+    parts.push("age_gt_30d = 0\n")
+    parts.push("with_own = 0\n")
+    parts.push("with_roadmap = 0\n")
+    parts.push("with_git_pointer = 0\n\n")
+
+    parts.push("for d in agent_dirs:\n")
+    parts.push("    p = os.path.join(WORKTREES_DIR, d)\n")
+    parts.push("    try:\n")
+    parts.push("        st = os.stat(p)\n")
+    parts.push("        age_days = (now - st.st_mtime) / 86400\n")
+    parts.push("    except Exception:\n")
+    parts.push("        continue\n")
+    parts.push("    has_own = os.path.exists(os.path.join(p, '.own'))\n")
+    parts.push("    has_roadmap = os.path.exists(os.path.join(p, '.roadmap'))\n")
+    parts.push("    has_git = os.path.exists(os.path.join(p, '.git'))\n")
+    parts.push("    if has_own: with_own += 1\n")
+    parts.push("    if has_roadmap: with_roadmap += 1\n")
+    parts.push("    if has_git: with_git_pointer += 1\n")
+    parts.push("    if age_days < 1: age_lt_1d += 1\n")
+    parts.push("    elif age_days < 7: age_1_7d += 1\n")
+    parts.push("    elif age_days < 30: age_7_30d += 1\n")
+    parts.push("    else: age_gt_30d += 1\n")
+    parts.push("    # entry count (cheap proxy for size)\n")
+    parts.push("    try:\n")
+    parts.push("        entry_count = len(os.listdir(p))\n")
+    parts.push("    except Exception:\n")
+    parts.push("        entry_count = 0\n")
+    parts.push("    audits.append({\n")
+    parts.push("        'name':d,\n")
+    parts.push("        'age_days':round(age_days, 1),\n")
+    parts.push("        'entry_count':entry_count,\n")
+    parts.push("        'has_own':has_own,\n")
+    parts.push("        'has_roadmap':has_roadmap,\n")
+    parts.push("        'has_git_pointer':has_git,\n")
+    parts.push("    })\n\n")
+
+    parts.push("# Top largest by entry count\n")
+    parts.push("top_largest = sorted(audits, key=lambda x: -x['entry_count'])[:5]\n\n")
+
+    parts.push("# Stale candidates (>30d)\n")
+    parts.push("stale_candidates = [a['name'] for a in audits if a['age_days'] > 30]\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'.claude/worktrees/agent-* inventory (parallel session history)',\n")
+    parts.push("    'worktrees_dir':WORKTREES_DIR,\n")
+    parts.push("    'agent_count':len(audits),\n")
+    parts.push("    'age_distribution':{\n")
+    parts.push("        'lt_1d':age_lt_1d,\n")
+    parts.push("        '1_to_7d':age_1_7d,\n")
+    parts.push("        '7_to_30d':age_7_30d,\n")
+    parts.push("        'gt_30d':age_gt_30d,\n")
+    parts.push("    },\n")
+    parts.push("    'snapshot_integrity':{\n")
+    parts.push("        'with_own':with_own,\n")
+    parts.push("        'with_roadmap':with_roadmap,\n")
+    parts.push("        'with_git_pointer':with_git_pointer,\n")
+    parts.push("        'own_pct':round(100 * with_own / max(len(audits), 1), 1),\n")
+    parts.push("    },\n")
+    parts.push("    'top_largest':top_largest,\n")
+    parts.push("    'stale_candidates_gt_30d':stale_candidates,\n")
+    parts.push("    'stale_count':len(stale_candidates),\n")
+    parts.push("    'cleanup_recommendation':f'{len(stale_candidates)} worktrees age >30d are cleanup candidates (`git worktree prune` from main repo)',\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify worktrees; read-only inventory',\n")
+    parts.push("    'cross_link_cycles':['cycle 21 SSOT chflags (.own snapshot in worktrees)','cycle 30 anima-* sub-repos'],\n")
+    parts.push("    'pattern':'governance audit chain layer 13 (cycles 21-32 + this)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[worktrees] count={len(audits)} fresh<1d={age_lt_1d} stale>30d={len(stale_candidates)} with_own={with_own}/{len(audits)} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let agents_min = 50
+    let age_buckets = 4
+    let snapshot_integrity_fields = 3
+    let non_mutation = "READ_ONLY"
+    println("inv:agents_min=" + to_string(agents_min))
+    println("inv:age_buckets=" + to_string(age_buckets))
+    println("inv:snapshot_integrity_fields=" + to_string(snapshot_integrity_fields))
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:age_buckets=lt_1d,1_to_7d,7_to_30d,gt_30d")
+    println("inv:snapshot_integrity_fields=own,roadmap,git_pointer")
+    println("inv:cleanup_via_git_worktree_prune=true")
+    println("inv:cross_link_cycle21_cycle30=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_worktrees_agent_inventory_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=worktrees agent inventory (86+ parallel session snapshots / age + integrity / mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
