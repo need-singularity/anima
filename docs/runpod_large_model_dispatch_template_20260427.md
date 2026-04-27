@@ -122,6 +122,49 @@ runpodctl pod create --name measure --gpu-id "..." \
     --command "python wrapper.py --local-path /weights/<model_id>"
 ```
 
+### Pattern 6b — Pre-flight cumulative-bytes ceiling check (CONFIRMED ~35-40GB, added 2026-04-27 from Mk.XII Phase 3b finding)
+
+**Why**: Pattern 6 identified the cumulative-bytes hypothesis but treated it as inferred. Mk.XII Phase 3b dispatch (pod 3csbgbnf2hf3gg) provided 3rd independent reproduction across a 2nd model family (Llama vs gemma), confirming the ceiling at ~35-40GB cumulative per pod lifetime. The H2 hypothesis is now CONFIRMED, not inferred.
+
+**Evidence chain (4 attempts across 2 model families)**:
+- gemma-27b v1 (it5ku4iviw7w6h): silent SIGKILL at ~59GB cache (75% of 80GB target, partial download)
+- gemma-27b v2 (3q7pqjhsmnulm6): silent platform termination at ~94GB cache (xet phase, 75% files)
+- gemma-27b v3 (d8qrg4y40io8fy): platform ssh-refused at 12% download (<10GB) — different stage but same fault class
+- Mk.XII Phase 3b (3csbgbnf2hf3gg): ChunkedEncodingError IncompleteRead at 5.35GB / 6.94GB shard, ~40GB cumulative pod download. HTTP connection BROKEN at requests layer (visible signature, NOT silent SIGKILL).
+- alt path 1 int8 (83dlyisq3tlbef): clean 16GB download PASS — well under ceiling, confirms ceiling exists.
+
+**Confirmed ceiling**: ~35-40GB per pod cumulative download (sum of all model fetches in one pod lifetime).
+
+**Implementation** (replaces Pattern 6 inferred guidance):
+```python
+# Pre-flight check before any model download
+def estimate_total_download_gb(repo_ids: list) -> float:
+    """Sum allow_patterns sizes from HF Hub API."""
+    from huggingface_hub import HfApi
+    api = HfApi()
+    total = 0.0
+    for repo_id in repo_ids:
+        info = api.repo_info(repo_id, files_metadata=True)
+        for s in info.siblings:
+            if s.rfilename.endswith(('.safetensors', '.bin', '.pt')):
+                total += (s.size or 0) / 1e9
+    return total
+
+CUMULATIVE_CEILING_GB = 35.0
+expected = estimate_total_download_gb([MODEL_8B, MODEL_70B])
+if expected > CUMULATIVE_CEILING_GB:
+    raise RuntimeError(f"Pre-flight ABORT: expected total {expected:.1f}GB > ceiling {CUMULATIVE_CEILING_GB}GB. Use multi-pod relay OR persistent network volume.")
+```
+
+**Multi-pod relay strategy** (when expected > ceiling):
+1. Pod A: download model A only (e.g., 8B = 16GB) → measure → terminate
+2. Pod B: download model B only (e.g., 70B fp16 = 140GB) — STILL EXCEEDS, must use persistent volume
+3. Pod B alternative: persistent network volume + sequential pod attach (download pod → measurement pod with same volume)
+
+**raw#10 caveat**: ceiling appears to be cumulative pod download, NOT just single-shard. Even chunked retry-with-resume on the SAME pod hits the ceiling. Multi-pod is the only known workaround.
+
+**Cross-reference**: state/blockers/gemma_27b_repeat_silent_platform_termination.json status_history#3 (H2 CONFIRMED via Mk.XII Phase 3b 3rd reproduction).
+
 ### Pattern 7 — bnb GPU wheel pre-flight check before launch
 
 **Why**: pip-installed `bitsandbytes` may be CPU-only wheel even on CUDA-capable systems. RuntimeError comes mid-load, wasting download time.
