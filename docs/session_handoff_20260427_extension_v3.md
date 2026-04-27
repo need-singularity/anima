@@ -40,6 +40,10 @@
 | 78 | `own3_de_apply_ready_package` | `843ba354` | own#3 (d)+(e) wording 9-step apply procedure |
 | 79 | `cycle_36_46_false_alarm_sweep` | `94b5640b` | 6 audits sweep: 5 VERIFIED / 1 MIXED / 1 FALSE_ALARM |
 | 80 | `frontmatter_policy_proposer` | `a72f0ee3` | frontmatter 정책 4 옵션 (OPT_C 권장) |
+| 81 | (handoff v3 itself) | `76063da5` | cycles 63-80 closure doc |
+| 82 | `pixie_deep_audit` | `f9aca110` | pixie = need-singularity Discord channel secretary (8 channels) |
+| 83 | `unknown_4_repos_deep_audit` | `d65f6b21` | 잔여 4 repo deep — skynet-timer ↔ anima cross-link 발견 |
+| 84 | (this closure entry) | — | cron 418019a7 종료 + cycle 1-83 grand closure |
 
 ## §2 — 3 clusters
 
@@ -61,6 +65,17 @@ cluster 2 (73-78) governance fix queue 마무리
 cluster 3 (79-80) false alarm sweep + frontmatter
   ecosystem audits 6/7 정확 / 1 false alarm (39) / 1 metric ambiguity (41)
   frontmatter 0% claim → 1.2% actual (false-zero pattern)
+
+cluster 4 (81)    handoff v3 (cycles 63-80 closure doc)
+
+cluster 5 (82-83) 미상 5 repo deep audit (cycle 70 metadata 정밀화)
+  pixie     : Discord channel secretary (8 channels, Cloudflare Workers)
+  gohive.sh : hive marketing landing
+  skynet-timer : anima docs/singularity-heaven-or-skynet.md cross-link 발견
+  hexa-os   : AI Inference Appliance OS (unikernel/Firecracker)
+  secret    : workspace credentials vault (cycle 62 invariant)
+
+cluster 6 (84)    grand closure (cron 종료 + 새 entry prompt)
 ```
 
 ## §3 — 사용자 결정 대기 항목 (4개)
