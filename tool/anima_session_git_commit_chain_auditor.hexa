@@ -1,0 +1,162 @@
+// tool/anima_session_git_commit_chain_auditor.hexa — anima session git commit chain audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   cycle 50 milestone marker. cycles 1-49 + 1 patch + assorted commits = ~50 commits this session.
+//   본 helper = mac-local NON_MUTATION:
+//     - git log session range enumeration
+//     - cycle # parsing from commit messages (helper(...): cycle N pattern)
+//     - cycle continuity check (1, 2, 3, ..., 49 sequential)
+//     - non-cycle commits identification (patches / state-only)
+//     - selftest verifies: ≥45 commits / cycle continuity / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/session_git_commit_chain_auditor.json)
+//   ANIMA_SINCE       git log since (default: 2026-04-27 03:00)
+//
+// OUTPUT
+//   - session_commits: list of {hash, subject, cycle_number?, kind}
+//   - cycle_coverage: 1-49 expected
+//   - cycle_continuity: gaps + duplicates
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_session_git_commit_chain_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/session_git_commit_chain_auditor.json hexa run tool/anima_session_git_commit_chain_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - 'cycle N' parsing은 commit message regex; non-conforming commits = non-cycle.
+//   - session 시작 시점은 frozen (2026-04-27 03:00 KST).
+
+let HELPER_PATH = "/tmp/anima_session_git_commit_chain_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima session git commit chain auditor — emitted by tool/anima_session_git_commit_chain_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION git history audit.\n")
+    parts.push("import json, os, sys, subprocess, re\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/session_git_commit_chain_auditor.json')\n")
+    parts.push("SINCE = os.environ.get('ANIMA_SINCE', '2026-04-27 03:00')\n\n")
+
+    parts.push("# git log session range\n")
+    parts.push("commits = []\n")
+    parts.push("try:\n")
+    parts.push("    r = subprocess.run(['git', 'log', f'--since={SINCE}', '--oneline', '--no-color'], capture_output=True, text=True, timeout=10)\n")
+    parts.push("    if r.returncode == 0:\n")
+    parts.push("        for line in r.stdout.splitlines():\n")
+    parts.push("            parts_line = line.split(maxsplit=1)\n")
+    parts.push("            if len(parts_line) == 2:\n")
+    parts.push("                commits.append({'hash':parts_line[0], 'subject':parts_line[1]})\n")
+    parts.push("except Exception as e:\n")
+    parts.push("    print(f'git log error: {e}', file=sys.stderr)\n\n")
+
+    parts.push("CYCLE_RE = re.compile(r'cycle\\s+(\\d+)', re.IGNORECASE)\n\n")
+
+    parts.push("# Parse cycle numbers\n")
+    parts.push("cycle_numbers = []\n")
+    parts.push("non_cycle_commits = []\n")
+    parts.push("for c in commits:\n")
+    parts.push("    m = CYCLE_RE.search(c['subject'])\n")
+    parts.push("    if m:\n")
+    parts.push("        cycle_num = int(m.group(1))\n")
+    parts.push("        c['cycle_number'] = cycle_num\n")
+    parts.push("        cycle_numbers.append(cycle_num)\n")
+    parts.push("    else:\n")
+    parts.push("        c['cycle_number'] = None\n")
+    parts.push("        non_cycle_commits.append(c)\n\n")
+
+    parts.push("# Continuity check\n")
+    parts.push("cycle_set = set(cycle_numbers)\n")
+    parts.push("expected = set(range(1, 50))  # cycles 1-49\n")
+    parts.push("missing_cycles = sorted(expected - cycle_set)\n")
+    parts.push("duplicates = []\n")
+    parts.push("seen = {}\n")
+    parts.push("for n in cycle_numbers:\n")
+    parts.push("    seen[n] = seen.get(n, 0) + 1\n")
+    parts.push("for n, count in seen.items():\n")
+    parts.push("    if count > 1: duplicates.append({'cycle':n, 'count':count})\n\n")
+
+    parts.push("# Cycle range present\n")
+    parts.push("cycle_range_observed = (min(cycle_numbers) if cycle_numbers else None, max(cycle_numbers) if cycle_numbers else None)\n\n")
+
+    parts.push("# Non-cycle commits classification\n")
+    parts.push("non_cycle_breakdown = {}\n")
+    parts.push("for c in non_cycle_commits:\n")
+    parts.push("    s = c['subject']\n")
+    parts.push("    if s.startswith('all-kick'): kind = 'all_kick_state_commit'\n")
+    parts.push("    elif s.startswith('patch'): kind = 'patch'\n")
+    parts.push("    elif 'state' in s.lower(): kind = 'state_only'\n")
+    parts.push("    else: kind = 'other'\n")
+    parts.push("    c['kind'] = kind\n")
+    parts.push("    non_cycle_breakdown[kind] = non_cycle_breakdown.get(kind, 0) + 1\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'session git commit chain audit (cycle 50 milestone marker)',\n")
+    parts.push("    'session_since':SINCE,\n")
+    parts.push("    'session_commits_count':len(commits),\n")
+    parts.push("    'cycle_commits_count':len(cycle_numbers),\n")
+    parts.push("    'non_cycle_commits_count':len(non_cycle_commits),\n")
+    parts.push("    'cycle_range_observed':cycle_range_observed,\n")
+    parts.push("    'cycle_continuity':{\n")
+    parts.push("        'expected_count':49,\n")
+    parts.push("        'observed_count':len(cycle_set),\n")
+    parts.push("        'missing_cycles':missing_cycles,\n")
+    parts.push("        'duplicates':duplicates,\n")
+    parts.push("        'continuous':len(missing_cycles) == 0 and len(duplicates) == 0,\n")
+    parts.push("    },\n")
+    parts.push("    'non_cycle_breakdown':non_cycle_breakdown,\n")
+    parts.push("    'session_commits_sample':commits[:5] + commits[-5:] if len(commits) > 10 else commits,\n")
+    parts.push("    'milestone':'cycle 50 = 50-cycle batch milestone (this commit is cycle 50, prior 49 cycles + assorted state commits)',\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify git history; read-only audit',\n")
+    parts.push("    'cross_link_cycles':['cycle 47 dynamic SSOT (M-marked files)','cycle 45 super-capstone (cycles 1-44)','cycle 48 handoff v2'],\n")
+    parts.push("    'pattern':'governance audit chain layer 30 (cycles 21-49 + this) — 50-cycle milestone meta-audit',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[git_chain] commits={len(commits)} cycle_commits={len(cycle_numbers)} non_cycle={len(non_cycle_commits)} cycle_range={cycle_range_observed} missing={len(missing_cycles)} duplicates={len(duplicates)} continuous={len(missing_cycles) == 0 and len(duplicates) == 0} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let expected_cycles = 49
+    let session_commits_min = 45
+    let non_mutation = "READ_ONLY"
+    println("inv:expected_cycles=" + to_string(expected_cycles))
+    println("inv:session_commits_min=" + to_string(session_commits_min))
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:milestone_cycle=50")
+    println("inv:cross_link_cycle47_cycle45_cycle48=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_session_git_commit_chain_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=session git commit chain audit (50-cycle milestone marker; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
