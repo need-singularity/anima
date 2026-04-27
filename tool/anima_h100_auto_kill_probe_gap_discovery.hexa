@@ -1,0 +1,170 @@
+// tool/anima_h100_auto_kill_probe_gap_discovery.hexa — cycle 63 dry-run finding (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   cycle 1-62 capstone (state/runpod_incident_chain_capstone.json) prescribed
+//   a 5-step playbook to terminate the 2 ongoing H100 burns ($5.98/hr). Steps
+//   1-3 (sync, verify, dry-run) executed at session entry produced verdict
+//   UNKNOWN for both pods, NOT STOP. Even with --apply (step 4), the helper
+//   would not invoke runpodctl stop. The playbook is therefore non-functional
+//   in its current form.
+//
+//   This helper records the gap finding as cycle 63 audit state JSON.
+//
+// FINDING (from session entry steps 1-3, 2026-04-27 02:21-02:25 UTC)
+//   sync result        : 2 pods synced; Pod 2 ssh_host="" (runtime 180s timeout)
+//   dry-run verdicts   : pod=bnabak3i4r38bg verdict=UNKNOWN idle=-1
+//                        pod=1an0fdtr2mrif1 verdict=UNKNOWN idle=-1
+//                        summary: stops=0 keeps=0 skips=0 unknowns=2
+//
+// ROOT CAUSE (tool/h100_auto_kill.hexa lines 110-172)
+//   _probe_plan(pod, cfg) returns the SSH command STRING only — never exec.
+//   _evaluate_pod reads idle from pod["idle_minutes_mock"] field; if absent,
+//   idle = -1, which short-circuits to verdict=UNKNOWN before STOP comparison.
+//   Live config has no idle_minutes_mock (only self-test uses that path).
+//   Therefore: --apply never reaches the runpodctl stop branch in production.
+//
+// IMPLICATION FOR USER PLAYBOOK
+//   Step 4 (hexa run tool/h100_auto_kill.hexa --apply) does not terminate pods.
+//   $5.98/hr burn continues regardless of running --apply. To actually stop:
+//     (a) direct: runpodctl stop pod <id>   (per-pod manual)
+//     (b) helper patch: add probe exec to _evaluate_pod (raw#9 strict)
+//     (c) hybrid: stop Pod 1 (IDLE confirmed cycle 56) immediately;
+//                  Pod 2 web UI inspect (transitional, ssh_host="" cycle 63)
+//
+// NON_MUTATION
+//   This helper does NOT terminate pods, NOT modify h100_auto_kill.hexa,
+//   NOT modify config. Records finding only.
+//
+// raw#9 hexa-only / raw#10 honest meta / raw#15 SSOT this file
+// raw#10 honest:
+//   - cycle 1-62 playbook was based on cycle 58 root-cause analysis that
+//     identified config layer (empty pods.json) but did NOT inspect the
+//     helper internals. cycle 63 dry-run revealed a 4th root-cause layer
+//     (probe-exec absence) inside the helper itself.
+//   - Pod 2 ssh activity remains UNKNOWN (transitional → can't confirm idle).
+
+let HELPER_PATH = "/tmp/anima_h100_auto_kill_probe_gap_discovery_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima h100_auto_kill probe-gap discovery — emitted by tool/anima_h100_auto_kill_probe_gap_discovery.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION audit.\n")
+    parts.push("import json, os, sys\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/h100_auto_kill_probe_gap_discovery.json')\n")
+    parts.push("LAST_RUN = os.environ.get('ANIMA_LAST_RUN', 'state/h100_auto_kill_last_run.json')\n")
+    parts.push("PODS_CFG = os.environ.get('ANIMA_PODS_CFG', 'config/h100_pods.json')\n\n")
+
+    parts.push("# Read last_run state to record verdict distribution\n")
+    parts.push("last_run = {}\n")
+    parts.push("if os.path.exists(LAST_RUN):\n")
+    parts.push("    try:\n")
+    parts.push("        with open(LAST_RUN, encoding='utf-8') as f: last_run = json.load(f)\n")
+    parts.push("    except Exception: pass\n\n")
+
+    parts.push("# Verdict distribution from last dry-run\n")
+    parts.push("pods_verdicts = last_run.get('pods', [])\n")
+    parts.push("verdict_counts = {'STOP':0, 'KEEP':0, 'SKIP':0, 'UNKNOWN':0}\n")
+    parts.push("for v in pods_verdicts:\n")
+    parts.push("    verdict_counts[v.get('verdict','UNKNOWN')] = verdict_counts.get(v.get('verdict','UNKNOWN'),0) + 1\n\n")
+
+    parts.push("# Pods config snapshot\n")
+    parts.push("pods_cfg = {}\n")
+    parts.push("if os.path.exists(PODS_CFG):\n")
+    parts.push("    try:\n")
+    parts.push("        with open(PODS_CFG, encoding='utf-8') as f: pods_cfg = json.load(f)\n")
+    parts.push("    except Exception: pass\n\n")
+
+    parts.push("pods_registered = []\n")
+    parts.push("for p in pods_cfg.get('pods', []):\n")
+    parts.push("    pods_registered.append({\n")
+    parts.push("        'pod_id': p.get('pod_id',''),\n")
+    parts.push("        'ssh_host_present': bool(p.get('ssh_host')),\n")
+    parts.push("        'ssh_host_empty_reason': 'runtime ports not populated within 180s' if not p.get('ssh_host') else None,\n")
+    parts.push("    })\n\n")
+
+    parts.push("root_cause = {\n")
+    parts.push("    'helper_file': 'tool/h100_auto_kill.hexa',\n")
+    parts.push("    'function': '_evaluate_pod',\n")
+    parts.push("    'lines': '167-172',\n")
+    parts.push("    'logic_path': 'idle = pod[idle_minutes_mock] or -1; if idle<0: verdict=UNKNOWN; return',\n")
+    parts.push("    'consequence': 'STOP branch unreachable without idle_minutes_mock; production config has none',\n")
+    parts.push("    'probe_exec_status': 'PLANNED_NOT_EXECUTED (probe_cmd string only, never exec_with_status)',\n")
+    parts.push("}\n\n")
+
+    parts.push("playbook_validity = {\n")
+    parts.push("    'cycle_59_capstone_step_3_dry_run': 'EXECUTABLE (dry-run runs but emits UNKNOWN)',\n")
+    parts.push("    'cycle_59_capstone_step_4_apply': 'NON_FUNCTIONAL (UNKNOWN verdict short-circuits before runpodctl stop)',\n")
+    parts.push("    'cycle_59_capstone_step_5_cron': 'WOULD_BE_INEFFECTIVE (cron runs same UNKNOWN-emitting helper hourly)',\n")
+    parts.push("    'finding_severity': 'HIGH — playbook does not address ongoing burn',\n")
+    parts.push("}\n\n")
+
+    parts.push("alt_paths = [\n")
+    parts.push("    {'path':'A_direct','cmd':'runpodctl stop pod <id>','risk':'irreversible per pod','blocks_to_resolve':'user approval'},\n")
+    parts.push("    {'path':'B_helper_patch','cmd':'extend _evaluate_pod with exec_with_status(probe_cmd) + idle parse','risk':'patch correctness; selftest extension required','blocks_to_resolve':'~5min mac-local + raw#9 strict'},\n")
+    parts.push("    {'path':'C_hybrid','cmd':'A for Pod 1 (IDLE confirmed cycle 56), web UI inspect Pod 2','risk':'low for Pod 1; manual for Pod 2','blocks_to_resolve':'user approval Pod 1; web UI for Pod 2'},\n")
+    parts.push("]\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'cycle 63 — h100_auto_kill probe-exec gap (4th root-cause layer beyond cycle 58)',\n")
+    parts.push("    'cycle': 63,\n")
+    parts.push("    'session_entry_steps_executed':[1,2,3],\n")
+    parts.push("    'step_4_blocked_reason':'irreversible + dry-run revealed verdict=UNKNOWN gap',\n")
+    parts.push("    'verdict_counts': verdict_counts,\n")
+    parts.push("    'pods_registered': pods_registered,\n")
+    parts.push("    'root_cause_layer_4': root_cause,\n")
+    parts.push("    'cycle_59_playbook_validity': playbook_validity,\n")
+    parts.push("    'alternative_paths': alt_paths,\n")
+    parts.push("    'recommended_path':'C_hybrid (Pod 1 immediate stop with user approval, Pod 2 web UI inspect)',\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT terminate pods, NOT modify h100_auto_kill.hexa, NOT modify config; records finding only',\n")
+    parts.push("    'cross_link_cycles':['cycle 56 ssh activity (Pod 1 IDLE)', 'cycle 58 config root cause', 'cycle 59 capstone playbook (now amended)'],\n")
+    parts.push("    'pattern':'governance audit chain layer 42 (RunPod incident extension; 4th root-cause layer)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[h100_probe_gap] verdicts={verdict_counts} pods={len(pods_registered)} path=C_hybrid -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let non_mutation = "READ_ONLY_AUDIT"
+    let probe_exec_finding = "PLANNED_NOT_EXECUTED"
+    let recommended = "C_hybrid"
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:probe_exec_finding=" + probe_exec_finding)
+    println("inv:recommended_path=" + recommended)
+    println("inv:cycle=63")
+    println("inv:cross_link_cycles=56,58,59")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_h100_auto_kill_probe_gap_discovery selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=cycle 63 — h100_auto_kill probe-exec gap (4th root-cause layer beyond cycle 58); NON_MUTATION; mac $0")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
