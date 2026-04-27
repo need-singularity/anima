@@ -205,6 +205,41 @@ ssh hetzner "python verify_witness.py /shared/output.json"
 
 **Cross-reference**: state/blockers/runpod_pod_pre_ssh_orchestrator_stuck.json (4-strike sustained fault) + design/kick/2026-04-27_mk-xii-phase3b-70b-alt-vendor-strategy-runpod-4-strike-bypas_omega_cycle.json (alt-vendor strategy).
 
+### Pattern 7c — Post-hoc kick result trailer wrapper (raw 136 enforcement, low-risk alt to kick_dispatch.hexa edit, added 2026-04-28)
+
+**Why**: raw 136 kick-result-return-ai-native-trailer mandates reason+fix structured trailer at __KICK_RESULT__ sentinel. Direct kick_dispatch.hexa edit is high-risk (63KB chflags uchg production file, 122+ active witnesses). Pattern 7c wrapper provides post-hoc trailer emission as low-risk alternative.
+
+**Evidence**: anima/.roadmap commit 296a9133 (tool/kick_with_trailer_wrapper.hexa, 110 LoC raw#9 hexa-only). Production test PASS on cycle 1 anima evolution witness:
+```
+reason: joint-3-axis-ceiling-witness (raw 72): banach-fixpoint + bekenstein-bound + halting-turing-diagonal...
+fix: 1) absorb 4 tier_1 to /Users/ghost/core/nexus/state/discovery_absorption/registry.jsonl
+     2) review witness 2026-04-27_anima-evolution-metacog-...
+     3) carry_forward to next cycle per witness.carry_forward_to_next_cycle field
+```
+
+**Implementation**:
+```bash
+# After firing nexus kick, invoke wrapper with witness path
+nexus kick "<topic>" --stratum L8 --axes a,b,c
+# (sentinel emits __KICK_RESULT__ <PASS|FAIL>)
+
+# Post-hoc trailer emission
+hexa run /Users/ghost/core/anima/tool/kick_with_trailer_wrapper.hexa --selftest > /dev/null
+python3 /tmp/kick_with_trailer_wrapper_helper.hexa_tmp <witness_path>
+# Emits:
+#   reason: <fixpoint_marker[:120]>
+#   fix: 1) absorb <N> tier_1 to <repo>/state/discovery_absorption/registry.jsonl
+#        2) review witness <basename>
+#        3) carry_forward to next cycle per witness.carry_forward_to_next_cycle field
+```
+
+**raw#10 caveats**:
+1. POST-HOC emission (after sentinel printed), NOT at-emission per raw 136 strict timing — wrapper mitigates risk vs cli edit
+2. Requires CALLER integration — not auto-active until wrappers wire kick fires (not auto-injected into nexus kick CLI)
+3. raw 136 baseline 6.6% (8/122 historical compliance) ramps via authoring discipline + Pattern 7c integration
+
+**Cross-reference**: design/kick/2026-04-27_nexus-kick-cli-auto-emit-trailer-at-sentinel-emission-deferred_omega_cycle.json (deferred direct edit rationale + Pattern 7c alt path)
+
 ### Pattern 7 — bnb GPU wheel pre-flight check before launch
 
 **Why**: pip-installed `bitsandbytes` may be CPU-only wheel even on CUDA-capable systems. RuntimeError comes mid-load, wasting download time.
