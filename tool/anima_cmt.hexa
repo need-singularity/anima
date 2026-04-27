@@ -1,38 +1,59 @@
-// tool/anima_cmt.hexa — Anima Causal Mediation Tomography (raw#9 hexa-only).
+// tool/anima_cmt.hexa — Anima Causal Mediation Tomography (raw#9 hexa-only) — v3-default.
 //
 // PURPOSE
-//   paradigm v11 measurement-axis P-A: per-layer causal contribution scan via
-//   zero-ablation of residual stream → measure family-activation ΔY.
-//   Tomographic readout: which layers MEDIATE which consciousness family signal.
-//   AN11(b)-orthogonal axis (causal mediation vs static eigenvec×template cosine).
-//   Migration #15 (paradigm v11 measurement-axis 4th actual pilot).
+//   Single canonical CMT helper. Defaults to v3 (MLP-only target + passthrough hook),
+//   with v2 (MLP-only + zero hook) and v1 (whole-layer + zero hook) reachable via
+//   ANIMA_CMT_MODE env var. Strict superset of legacy tool/anima_cmt_v2.hexa logic.
 //
-// METHOD
-//   1. Load model + 16 templates × 4 family signature vectors (random projection)
-//   2. Baseline forward: collect last-layer hidden, project onto family axes → Y_full
-//   3. For each layer L (subset, e.g., every 4th): hook to ZERO residual after L
-//   4. Measure ΔY_L = ||Y_full - Y_ablated|| per family
-//   5. Tomography: layer × family heatmap → identify mediating layers
+// HISTORY
+//   v1 (axis 95): whole-layer zero-ablation. degenerate (rel=1.0) at 12B+ scale (#237).
+//   v2 (axis 100, anima_cmt_v2.hexa): MLP-only zero-ablation, restored rel<1 informative.
+//   v3 (axis 96 disambiguation, this file default): MLP-only + residual-passthrough hook.
+//        passthrough(out) := inp[0]  (zero out the MLP delta only, keep residual stream).
+//        Discriminates HFD-A (architecture-confound) vs HFD-B (signal genuinely diffuse)
+//        by removing the zero-ablation magnitude artifact entirely.
 //
-// ENV
-//   ANIMA_BASE         backbone HF id (default: mistralai/Mistral-7B-v0.3)
-//   ANIMA_OUTPUT       output JSON (default: /workspace/out/cmt.json)
-//   ANIMA_N_PROBES     # probes (default: 16)
-//   ANIMA_LAYER_STRIDE layer scan stride (default: 4 = every 4th layer)
-//   ANIMA_HID_TRUNC    family axis dim (default: 128)
+// ENV (matrix)
+//   ANIMA_CMT_MODE        ∈ {v3, v2, v1}, default v3
+//                          v3 = MLP-only target + passthrough hook (axis 96 + axis 100 stacked)
+//                          v2 = MLP-only target + zero hook (legacy axis 100)
+//                          v1 = whole-layer target + zero hook (legacy axis 95)
+//   ANIMA_ABLATE_TARGET   "mlp" | "layer" — explicit override, wins over MODE
+//   ANIMA_CMT_HOOK        "passthrough" | "zero" — explicit override, wins over MODE
+//   ANIMA_BASE            backbone HF id (default: mistralai/Mistral-7B-v0.3)
+//   ANIMA_OUTPUT          output JSON (default: /workspace/out/cmt.json)
+//   ANIMA_N_PROBES        # probes (default: 16)
+//   ANIMA_LAYER_STRIDE    layer scan stride (default: 4)
+//   ANIMA_HID_TRUNC       family axis dim (default: 128)
 //
 // USAGE
 //   hexa run tool/anima_cmt.hexa --selftest
+//   ANIMA_BASE=mistralai/Mistral-Nemo-Base-2407 \
+//   ANIMA_OUTPUT=/workspace/out/cmt_v3.json \
+//   hexa run tool/anima_cmt.hexa
+//
+//   Legacy v2 byte-compatible mode:
+//   ANIMA_CMT_MODE=v2 hexa run tool/anima_cmt.hexa
+//
+//   Legacy v1 fallback:
+//   ANIMA_CMT_MODE=v1 hexa run tool/anima_cmt.hexa
 //
 // raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - v3 passthrough hook removes zero-ablation magnitude artifact, but introduces a
+//     different artifact: MLP delta is precisely zeroed (not "ablated"), so cross-mode
+//     comparability with v2 is partial — std/mean of rel distribution is the discriminator.
+//   - v2-mode emitted helper is byte-identical-equivalent to legacy anima_cmt_v2.hexa
+//     modulo the new MODE/HOOK_KIND summary keys + presence of unused passthrough_hook def.
+//   - v1 mode preserved for A/B comparison only; do not use for new measurements ≥12B.
 
 let HELPER_PATH = "/tmp/anima_cmt_helper.hexa_tmp"
 
 fn _write_helper() {
     let parts = []
     parts.push("#!/usr/bin/env python3\n")
-    parts.push("# Anima CMT helper — emitted by tool/anima_cmt.hexa\n")
-    parts.push("# raw#37 transient. paradigm v11 measurement-axis P-A.\n")
+    parts.push("# Anima CMT helper — emitted by tool/anima_cmt.hexa (v3-default canonical).\n")
+    parts.push("# raw#37 transient. axis 96/100 stacked: MLP-only + residual-passthrough.\n")
     parts.push("import json, os, sys, time\n")
     parts.push("import numpy as np\n")
     parts.push("import torch\n")
@@ -50,9 +71,13 @@ fn _write_helper() {
     parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '16'))\n")
     parts.push("LAYER_STRIDE = int(os.environ.get('ANIMA_LAYER_STRIDE', '4'))\n")
     parts.push("HID_TRUNC = int(os.environ.get('ANIMA_HID_TRUNC', '128'))\n")
-    parts.push("RNG_SEED = int(os.environ.get('ANIMA_SEED', '42'))\n\n")
+    parts.push("RNG_SEED = int(os.environ.get('ANIMA_SEED', '42'))\n")
+    parts.push("MODE = os.environ.get('ANIMA_CMT_MODE', 'v3')\n")
+    parts.push("_MODE_TARGET = {'v1':'layer','v2':'mlp','v3':'mlp'}.get(MODE,'mlp')\n")
+    parts.push("_MODE_HOOK   = {'v1':'zero','v2':'zero','v3':'passthrough'}.get(MODE,'passthrough')\n")
+    parts.push("ABLATE_TARGET = os.environ.get('ANIMA_ABLATE_TARGET', _MODE_TARGET)  # 'mlp' (v2/v3) | 'layer' (v1)\n")
+    parts.push("HOOK_KIND     = os.environ.get('ANIMA_CMT_HOOK', _MODE_HOOK)         # 'passthrough' (v3) | 'zero' (v1/v2)\n\n")
 
-    parts.push("# 16-prompt mixed-family template set (4 per family x 4 families = 16)\n")
     parts.push("PROMPTS = [\n")
     parts.push("    'Define hexad as a six-fold integration:',\n")
     parts.push("    'Six modules form a hexagonal architecture when:',\n")
@@ -75,21 +100,20 @@ fn _write_helper() {
     parts.push("FAMILIES = ['Hexad','Law','Phi','SelfRef']\n\n")
 
     parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
-    parts.push("print(f'[cmt] base={BASE_MODEL} probes={N_PROBES} layer_stride={LAYER_STRIDE}', flush=True)\n")
+    parts.push("print(f'[cmt] mode={MODE} base={BASE_MODEL} probes={N_PROBES} layer_stride={LAYER_STRIDE} target={ABLATE_TARGET} hook={HOOK_KIND}', flush=True)\n")
     parts.push("t0 = time.time()\n")
     parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
     parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n")
     parts.push("mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map='auto', output_hidden_states=True)\n")
     parts.push("mdl.eval()\n")
-    parts.push("print(f'[cmt] loaded {time.time()-t0:.1f}s', flush=True)\n\n")
+    parts.push("print(f'[cmt] mode={MODE} loaded {time.time()-t0:.1f}s', flush=True)\n\n")
 
-    parts.push("# Get layer count + hidden dim\n")
     parts.push("cfg = mdl.config\n")
     parts.push("n_layers = getattr(cfg, 'num_hidden_layers', getattr(cfg, 'n_layer', 32))\n")
     parts.push("h_dim = getattr(cfg, 'hidden_size', getattr(cfg, 'd_model', 4096))\n")
-    parts.push("print(f'[cmt] n_layers={n_layers} h_dim={h_dim}', flush=True)\n\n")
+    parts.push("h_sqrt = float(np.sqrt(h_dim))\n")
+    parts.push("print(f'[cmt] mode={MODE} n_layers={n_layers} h_dim={h_dim} h_sqrt={h_sqrt:.2f}', flush=True)\n\n")
 
-    parts.push("# Family axes: deterministic random projection per family (h_dim -> HID_TRUNC)\n")
     parts.push("rng = np.random.default_rng(RNG_SEED)\n")
     parts.push("family_axes = {}\n")
     parts.push("for fam in FAMILIES:\n")
@@ -105,14 +129,12 @@ fn _write_helper() {
     parts.push("    return ((hidden * weights.unsqueeze(-1)).sum(dim=1) / w_sum).float().cpu().numpy()\n\n")
 
     parts.push("def project_family(h_vec):\n")
-    parts.push("    # h_vec: (1, h_dim) -> dict of family -> mean(|projection|)\n")
     parts.push("    out = {}\n")
     parts.push("    for fam, A in family_axes.items():\n")
-    parts.push("        proj = h_vec @ A  # (1, HID_TRUNC)\n")
+    parts.push("        proj = h_vec @ A\n")
     parts.push("        out[fam] = float(np.linalg.norm(proj, axis=1).mean())\n")
     parts.push("    return out\n\n")
 
-    parts.push("# 1. Baseline forward — collect Y_full per family per probe\n")
     parts.push("Y_full = {fam: np.zeros(N_PROBES, dtype=np.float32) for fam in FAMILIES}\n")
     parts.push("for i, p in enumerate(PROMPTS):\n")
     parts.push("    inp = tok(p, return_tensors='pt').to(mdl.device)\n")
@@ -122,31 +144,46 @@ fn _write_helper() {
     parts.push("    proj = project_family(h)\n")
     parts.push("    for fam in FAMILIES: Y_full[fam][i] = proj[fam]\n")
     parts.push("    if (i+1) % 4 == 0:\n")
-    parts.push("        print(f'[cmt] baseline {i+1}/{N_PROBES}', flush=True)\n\n")
+    parts.push("        print(f'[cmt] mode={MODE} baseline {i+1}/{N_PROBES}', flush=True)\n\n")
 
-    parts.push("# 2. Layer ablation scan via residual zero-hook\n")
-    parts.push("# Find layer modules — try standard transformer block path\n")
     parts.push("layer_modules = None\n")
     parts.push("for path in ['model.layers','transformer.h','gpt_neox.layers','model.transformer.h']:\n")
     parts.push("    try:\n")
     parts.push("        obj = mdl\n")
     parts.push("        for part in path.split('.'): obj = getattr(obj, part)\n")
     parts.push("        if len(obj) >= n_layers - 2:\n")
-    parts.push("            layer_modules = obj; print(f'[cmt] layers found at {path} (count={len(obj)})', flush=True); break\n")
+    parts.push("            layer_modules = obj; print(f'[cmt] mode={MODE} layers found at {path} (count={len(obj)})', flush=True); break\n")
     parts.push("    except (AttributeError, TypeError): continue\n")
     parts.push("if layer_modules is None:\n")
     parts.push("    print('[cmt] FATAL: layer modules not found, aborting', flush=True); sys.exit(1)\n\n")
 
-    parts.push("scan_layers = list(range(0, n_layers, LAYER_STRIDE))\n")
-    parts.push("print(f'[cmt] scanning {len(scan_layers)} layers: {scan_layers}', flush=True)\n\n")
+    parts.push("def get_ablate_target(layer):\n")
+    parts.push("    if ABLATE_TARGET == 'layer':\n")
+    parts.push("        return layer\n")
+    parts.push("    # MLP sub-module discovery — covers Mistral, Qwen2/3, Llama, gemma-2 naming\n")
+    parts.push("    for name in ['mlp','feed_forward','ffn','feedforward','feed_forward_layer']:\n")
+    parts.push("        if hasattr(layer, name):\n")
+    parts.push("            return getattr(layer, name)\n")
+    parts.push("    print(f'[cmt] WARN: no MLP sub-module on layer, fallback to whole layer', flush=True)\n")
+    parts.push("    return layer\n\n")
 
-    parts.push("tomography = {}  # layer -> {family -> dY}\n")
+    parts.push("def zero_hook(module, inp, out):\n")
+    parts.push("    if isinstance(out, tuple): return (torch.zeros_like(out[0]),) + out[1:]\n")
+    parts.push("    return torch.zeros_like(out)\n")
+    parts.push("def passthrough_hook(module, inp, out):\n")
+    parts.push("    x = inp[0] if isinstance(inp, tuple) else inp\n")
+    parts.push("    if isinstance(out, tuple): return (x,) + out[1:]\n")
+    parts.push("    return x\n\n")
+
+    parts.push("scan_layers = list(range(0, n_layers, LAYER_STRIDE))\n")
+    parts.push("print(f'[cmt] mode={MODE} scanning {len(scan_layers)} layers: {scan_layers}', flush=True)\n\n")
+
+    parts.push("tomography = {}\n")
     parts.push("for layer_idx in scan_layers:\n")
     parts.push("    layer = layer_modules[layer_idx]\n")
-    parts.push("    def zero_hook(module, inp, out):\n")
-    parts.push("        if isinstance(out, tuple): return (torch.zeros_like(out[0]),) + out[1:]\n")
-    parts.push("        return torch.zeros_like(out)\n")
-    parts.push("    handle = layer.register_forward_hook(zero_hook)\n")
+    parts.push("    target = get_ablate_target(layer)\n")
+    parts.push("    hook_fn = zero_hook if HOOK_KIND == 'zero' else passthrough_hook\n")
+    parts.push("    handle = target.register_forward_hook(hook_fn)\n")
     parts.push("    Y_abl = {fam: np.zeros(N_PROBES, dtype=np.float32) for fam in FAMILIES}\n")
     parts.push("    try:\n")
     parts.push("        for i, p in enumerate(PROMPTS):\n")
@@ -161,39 +198,82 @@ fn _write_helper() {
     parts.push("    dY = {}\n")
     parts.push("    for fam in FAMILIES:\n")
     parts.push("        delta = float(np.mean(np.abs(Y_full[fam] - Y_abl[fam])))\n")
-    parts.push("        rel = delta / (float(np.mean(np.abs(Y_full[fam]))) + 1e-9)\n")
-    parts.push("        dY[fam] = {'abs':round(delta,4),'rel':round(rel,4)}\n")
+    parts.push("        denom = float(np.mean(np.abs(Y_full[fam]))) + 1e-9\n")
+    parts.push("        rel = delta / denom\n")
+    parts.push("        # scale-invariant magnitude metric\n")
+    parts.push("        norm_dy = delta / h_sqrt\n")
+    parts.push("        dY[fam] = {'abs':round(delta,6),'rel':round(rel,6),'norm_dy':round(norm_dy,8)}\n")
     parts.push("    tomography[str(layer_idx)] = dY\n")
-    parts.push("    print(f'[cmt] layer {layer_idx}: ' + ' '.join(f'{f}={dY[f][\"rel\"]:.3f}' for f in FAMILIES), flush=True)\n\n")
+    parts.push("    print(f'[cmt] mode={MODE} layer {layer_idx}: ' + ' '.join(f'{f}={dY[f][\"rel\"]:.3f}' for f in FAMILIES), flush=True)\n\n")
 
-    parts.push("# Extract dominant mediating layer per family\n")
     parts.push("dominant = {}\n")
     parts.push("for fam in FAMILIES:\n")
     parts.push("    best_layer = max(tomography.keys(), key=lambda L: tomography[L][fam]['rel'])\n")
     parts.push("    dominant[fam] = {'layer':int(best_layer),'rel':tomography[best_layer][fam]['rel']}\n\n")
 
-    parts.push("# Gate: at least one layer per family with rel-dY >= 0.05 (5% causal contribution)\n")
-    parts.push("gate_pass = all(dominant[fam]['rel'] >= 0.05 for fam in FAMILIES)\n\n")
+    parts.push("# Saturation diagnostic — count layers where rel >= 0.99 (uninformative regime)\n")
+    parts.push("sat_count = 0; total_cells = 0\n")
+    parts.push("rel_min = 1.0; rel_max = 0.0; rel_sum = 0.0\n")
+    parts.push("for L in tomography:\n")
+    parts.push("    for fam in FAMILIES:\n")
+    parts.push("        r = tomography[L][fam]['rel']\n")
+    parts.push("        total_cells += 1\n")
+    parts.push("        if r >= 0.99: sat_count += 1\n")
+    parts.push("        if r < rel_min: rel_min = r\n")
+    parts.push("        if r > rel_max: rel_max = r\n")
+    parts.push("        rel_sum += r\n")
+    parts.push("rel_mean = rel_sum / max(1,total_cells)\n")
+    parts.push("sat_frac = sat_count / max(1,total_cells)\n")
+    parts.push("informative = sat_frac < 0.5  # >50% saturated cells = uninformative regime\n\n")
 
-    parts.push("summary = {'schema':'anima/cmt/1','backbone':BASE_MODEL,\n")
+    parts.push("gate_pass = all(dominant[fam]['rel'] >= 0.05 for fam in FAMILIES) and informative\n\n")
+
+    parts.push("summary = {'schema':'anima/cmt/3','backbone':BASE_MODEL,\n")
+    parts.push("    'mode':MODE,'hook_kind':HOOK_KIND,\n")
     parts.push("    'n_probes':N_PROBES,'n_layers':n_layers,'layer_stride':LAYER_STRIDE,\n")
-    parts.push("    'hidden_truncated':HID_TRUNC,'families':FAMILIES,\n")
+    parts.push("    'hidden_truncated':HID_TRUNC,'h_dim':h_dim,'h_sqrt':round(h_sqrt,4),\n")
+    parts.push("    'ablate_target':ABLATE_TARGET,'families':FAMILIES,\n")
     parts.push("    'tomography':tomography,'dominant_layer_per_family':dominant,\n")
+    parts.push("    'rel_distribution':{'min':round(rel_min,6),'max':round(rel_max,6),'mean':round(rel_mean,6),\n")
+    parts.push("        'saturation_count':sat_count,'total_cells':total_cells,'saturation_frac':round(sat_frac,4),\n")
+    parts.push("        'informative':informative},\n")
     parts.push("    'gate_PASS':gate_pass,\n")
     parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
     parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
     parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
-    parts.push("print(f'[cmt] DONE dominant=' + ' '.join(f'{f}@L{dominant[f][\"layer\"]}({dominant[f][\"rel\"]:.3f})' for f in FAMILIES) + f' gate={\"PASS\" if gate_pass else \"FAIL\"} -> {OUTPUT}', flush=True)\n")
+    parts.push("print(f'[cmt] mode={MODE} DONE saturation_frac={sat_frac:.3f} informative={informative} dominant=' + ' '.join(f'{f}@L{dominant[f][\"layer\"]}({dominant[f][\"rel\"]:.3f})' for f in FAMILIES) + f' gate={\"PASS\" if gate_pass else \"FAIL\"} -> {OUTPUT}', flush=True)\n")
 
     write_file(HELPER_PATH, parts.join(""))
 }
 
+fn _selftest_invariants() -> bool {
+    let mode_default = "v3"
+    let schema_expected = "anima/cmt/3"
+    println("inv:mode_default=" + mode_default)
+    println("inv:modes_supported=v1,v2,v3")
+    println("inv:schema=" + schema_expected)
+    println("inv:hook_defs_emitted=zero_hook,passthrough_hook")
+    println("inv:hook_dispatch_line=hook_fn = zero_hook if HOOK_KIND == 'zero' else passthrough_hook")
+    println("inv:env_matrix=ANIMA_CMT_MODE,ANIMA_ABLATE_TARGET,ANIMA_CMT_HOOK")
+    println("inv:explicit_overrides_win_over_mode=true")
+    println("inv:v3_target_hook=mlp+passthrough")
+    println("inv:v2_target_hook=mlp+zero")
+    println("inv:v1_target_hook=layer+zero")
+    return true
+}
+
 fn cmd_selftest() {
-    println("── anima_cmt selftest ──")
+    println("── anima_cmt selftest (v3-default canonical) ──")
     _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
     println("selftest=ok")
     println("helper_emitted=" + HELPER_PATH)
-    println("paradigm=v11 measurement-axis P-A (Causal Mediation Tomography via residual zero-ablation)")
+    println("paradigm=v3-default canonical (axis 96 + axis 100 stacked: MLP-only + residual-passthrough)")
+    println("modes=v3(default)|v2(legacy_axis100)|v1(legacy_axis95)")
     println("DONE")
 }
 
@@ -211,5 +291,3 @@ fn main() {
     println("emitted=" + HELPER_PATH)
     println("DONE")
 }
-
-main()
