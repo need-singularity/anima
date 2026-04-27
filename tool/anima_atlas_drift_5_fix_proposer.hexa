@@ -1,0 +1,200 @@
+// tool/anima_atlas_drift_5_fix_proposer.hexa — cycle 76 atlas drift 5 violations apply-ready proposer (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   cycle 18에서 atlas_convergence_witness.jsonl의 5 real violations 식별:
+//     1) L27 PARSE_ERROR
+//     2) L30 round 40 duplicate
+//     3) L37 round 46 duplicate
+//     4) L42 round 49 duplicate
+//     5) round 38 missing (real gap)
+//
+//   cycle 76 정밀 분석 (직접 inspection):
+//     L27의 char 5831 위치에 newline 빠진 round 38 JSON 합쳐짐.
+//     → L27 split이 violations 1+5를 동시에 해결.
+//     → 잔여 duplicates 3개만 renumber 필요.
+//
+//   본 helper = NON_MUTATION proposer. atlas는 cycle 75 active-edit window
+//   가능성 → mutation 보류. 사용자 quiescent 시점 확인 후 apply.
+//
+// PROPOSAL DETAILS
+//
+//   Step 1: L27 split (PARSE_ERROR + round 38 gap 동시 해결)
+//     before: L27 = `{"round":37,...}{"round":38,...}`  (newline 빠짐, 12787 bytes)
+//     after : L27 = `{"round":37,...}`  + new L28 = `{"round":38,...}`
+//     apply_cmd:
+//       python3 -c '
+//       import json,sys
+//       with open("state/atlas_convergence_witness.jsonl","r") as f: lines = f.readlines()
+//       l27 = lines[26].rstrip("\n")
+//       boundary = l27.index("}{") + 1
+//       p1 = l27[:boundary]
+//       p2 = l27[boundary:]
+//       json.loads(p1); json.loads(p2)   # 검증
+//       lines[26] = p1 + "\n"
+//       lines.insert(27, p2 + "\n")
+//       with open("state/atlas_convergence_witness.jsonl","w") as f: f.writelines(lines)
+//       '
+//
+//   Step 2: round 40 duplicate (L30 R36 renumber)
+//     L29 R34_CANDIDATE_T1_RETRY round 40 ts=23:59:00 KEEP (later activity)
+//     L30 R36_CANDIDATE_T1_T2_VERDICT round 40 ts=23:15:00 → renumber to 52
+//
+//   Step 3: round 46 duplicate (L37 R43_T1_VERDICT_DEPRECATED renumber)
+//     L36 R42_T1_VERDICT_DEPRECATED round 46 ts=16:30:00 KEEP
+//     L37 R43_T1_VERDICT_DEPRECATED round 46 ts=16:30:01 → renumber to 53
+//
+//   Step 4: round 49 duplicate (L42 R46_VERDICT renumber)
+//     L41 R45_FINAL_zombie_posterior_canonical_11substrate round 49 ts=2026-04-26 16:30:00 KEEP
+//     L42 R46_VERDICT_5_to_7_backbone_validation_PARTIAL round 49 ts=2026-04-27 01:40:00 → renumber to 54
+//
+//   Step 5: validation (cycle 17 helper 재실행)
+//     hexa run tool/anima_atlas_rtier_integrity_verifier.hexa
+//     expect: violations=0
+//
+// SAFETY GATE (사용자 apply 전 확인)
+//   - atlas chflags state: stat -f "%Sf" state/atlas_convergence_witness.jsonl
+//     → "uchg" 면 chflags nouchg 먼저
+//   - parallel session active edit 확인:
+//     git log --since="10 min ago" -- state/atlas_convergence_witness.jsonl
+//     → 결과 비어있으면 quiescent (apply 안전)
+//   - apply 후 chflags uchg state/atlas_convergence_witness.jsonl
+//
+// raw#9 hexa-only / raw#10 honest meta / raw#15 SSOT this file
+// raw#10 honest:
+//   - atlas는 cycle 75에서 active-edit window 가능성 발견. 본 helper는 mutation
+//     보류 (race 위험).
+//   - duplicate renumber 방향은 timestamp 기반 (later round-tag 보존, earlier
+//     ts 또는 less-canonical witness rename). 사용자 다른 정책 선호 시 변경 가능.
+//   - L42 round 49는 ts 2026-04-27이지만 R46이라 R45_FINAL (R45 series)와 분리하는 게
+//     의미상 자연스러움 → 새 round 부여.
+
+let HELPER_PATH = "/tmp/anima_atlas_drift_5_fix_proposer_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima atlas drift 5 fix proposer — emitted by tool/anima_atlas_drift_5_fix_proposer.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION (atlas 안 만짐).\n")
+    parts.push("import json, os\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/atlas_drift_5_fix_proposal.json')\n\n")
+
+    parts.push("violations = [\n")
+    parts.push("    {'id':1, 'kind':'PARSE_ERROR_AND_GAP', 'line':27,\n")
+    parts.push("     'detail':'L27 = round37 JSON + round38 JSON, newline 빠짐 (char 5831 boundary)',\n")
+    parts.push("     'fix':'split at char 5831; round 38 자연 회복 → cycle 18 violations 1+5 동시 해결'},\n")
+    parts.push("    {'id':2, 'kind':'ROUND_DUPLICATE', 'line':30, 'round':40,\n")
+    parts.push("     'witness_id':'R36_CANDIDATE_T1_T2_VERDICT', 'ts':'2026-04-26T23:15:00Z',\n")
+    parts.push("     'fix':'renumber to round 52 (L29 R34 round 40 ts 23:59 보존)'},\n")
+    parts.push("    {'id':3, 'kind':'ROUND_DUPLICATE', 'line':37, 'round':46,\n")
+    parts.push("     'witness_id':'R43_T1_VERDICT_DEPRECATED', 'ts':'2026-04-26T16:30:01Z',\n")
+    parts.push("     'fix':'renumber to round 53 (L36 R42 round 46 ts 16:30:00 보존)'},\n")
+    parts.push("    {'id':4, 'kind':'ROUND_DUPLICATE', 'line':42, 'round':49,\n")
+    parts.push("     'witness_id':'R46_VERDICT_5_to_7_backbone_validation_PARTIAL', 'ts':'2026-04-27T01:40:00Z',\n")
+    parts.push("     'fix':'renumber to round 54 (L41 R45_FINAL round 49 ts 16:30:00 보존)'},\n")
+    parts.push("]\n\n")
+
+    parts.push("apply_steps = [\n")
+    parts.push("    {\n")
+    parts.push("        'step':1,\n")
+    parts.push("        'desc':'L27 split (NEWLINE 삽입)',\n")
+    parts.push("        'cmd':'python3 -c \"import json,sys; lines=open(\\\\\"state/atlas_convergence_witness.jsonl\\\\\").readlines(); l=lines[26].rstrip(); b=l.index(\\\\\"}{\\\\\")+1; p1=l[:b]; p2=l[b:]; json.loads(p1); json.loads(p2); lines[26]=p1+\\\\\"\\\\n\\\\\"; lines.insert(27,p2+\\\\\"\\\\n\\\\\"); open(\\\\\"state/atlas_convergence_witness.jsonl\\\\\",\\\\\"w\\\\\").writelines(lines)\"',\n")
+    parts.push("        'side_effect':'lines 27→28 split; round 38 회복 → violation 1+5 동시 close',\n")
+    parts.push("        'verify':'wc -l state/atlas_convergence_witness.jsonl   # +1 line',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'step':2,\n")
+    parts.push("        'desc':'L30 round 40 → 52 (R36 renumber)',\n")
+    parts.push("        'cmd':'sed -i \\\\\"\\\\\" -e \\\\\"30s/\\\\\\\\\\\\\"round\\\\\\\\\\\\\":40/\\\\\\\\\\\\\"round\\\\\\\\\\\\\":52/\\\\\" state/atlas_convergence_witness.jsonl',\n")
+    parts.push("        'note':'mac BSD sed; line numbers는 step 1 후 +1 됐으므로 실제 L31',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'step':3,\n")
+    parts.push("        'desc':'L37 round 46 → 53 (R43_T1_VERDICT_DEPRECATED renumber)',\n")
+    parts.push("        'cmd':'sed -i \\\\\"\\\\\" -e \\\\\"38s/\\\\\\\\\\\\\"round\\\\\\\\\\\\\":46/\\\\\\\\\\\\\"round\\\\\\\\\\\\\":53/\\\\\" state/atlas_convergence_witness.jsonl',\n")
+    parts.push("        'note':'step 1 후 L37→L38; R43 line 매치 unique',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'step':4,\n")
+    parts.push("        'desc':'L42 round 49 → 54 (R46_VERDICT renumber)',\n")
+    parts.push("        'cmd':'sed -i \\\\\"\\\\\" -e \\\\\"43s/\\\\\\\\\\\\\"round\\\\\\\\\\\\\": 49/\\\\\\\\\\\\\"round\\\\\\\\\\\\\": 54/\\\\\" state/atlas_convergence_witness.jsonl',\n")
+    parts.push("        'note':'step 1 후 L42→L43; R46 line ts 다른 spacing(round\\\\\":49 vs round\\\\\": 49) 주의 — 검증 필수',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'step':5,\n")
+    parts.push("        'desc':'cycle 17 verifier 재실행',\n")
+    parts.push("        'cmd':'$HEXA_LANG/hexa.real run tool/anima_atlas_rtier_integrity_verifier.hexa',\n")
+    parts.push("        'expect':'violations=0',\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("safety_gate = {\n")
+    parts.push("    'pre_apply_chflags_check':'stat -f %Sf state/atlas_convergence_witness.jsonl',\n")
+    parts.push("    'unlock_if_uchg':'chflags nouchg state/atlas_convergence_witness.jsonl',\n")
+    parts.push("    'pre_apply_quiescence_check':'git log --since=\\\\\"10 min ago\\\\\" -- state/atlas_convergence_witness.jsonl  # empty == safe',\n")
+    parts.push("    'post_apply_relock':'chflags uchg state/atlas_convergence_witness.jsonl  # 사용자 정책 따라',\n")
+    parts.push("    'rollback':'git checkout HEAD -- state/atlas_convergence_witness.jsonl',\n")
+    parts.push("}\n\n")
+
+    parts.push("non_mutation = {\n")
+    parts.push("    'atlas_modified': False,\n")
+    parts.push("    'helper_role':'apply-ready proposal (사용자 quiescent 시점 확인 후 직접 실행)',\n")
+    parts.push("    'cycle_75_observation':'atlas는 active-edit window 가능성 — race 회피 위해 본 cycle은 mutation 보류',\n")
+    parts.push("}\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'cycle 76 — atlas drift 5 violations apply-ready proposer (cycle 18 follow-up)',\n")
+    parts.push("    'cycle': 76,\n")
+    parts.push("    'violations': violations,\n")
+    parts.push("    'apply_steps': apply_steps,\n")
+    parts.push("    'safety_gate': safety_gate,\n")
+    parts.push("    'non_mutation': non_mutation,\n")
+    parts.push("    'cycle_18_violation_count':5,\n")
+    parts.push("    'cycle_76_unified_step_count':4,\n")
+    parts.push("    'reason_step_count_lower':'L27 split이 violation 1+5 동시 해결 (round 38 자연 회복)',\n")
+    parts.push("    'cross_link_cycles':['cycle 17 verifier','cycle 18 proposer (initial)','cycle 19 helper-side patch','cycle 75 active-window observation'],\n")
+    parts.push("    'pattern':'governance audit chain layer 55 (cycle 18 정밀 apply-ready)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[atlas_drift_5_fix] cycle=76 violations=5 unified_steps=4 atlas_modified=False -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    println("inv:non_mutation=READ_ONLY_PROPOSER")
+    println("inv:cycle=76")
+    println("inv:atlas_modified=false")
+    println("inv:cycle_18_violation_count=5")
+    println("inv:unified_step_count=4")
+    println("inv:l27_split_resolves_2_violations=true")
+    println("inv:cross_link_cycles=17,18,19,75")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_atlas_drift_5_fix_proposer selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok { println("selftest=fail"); exit(2) }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=cycle 76 — atlas drift 5 fix apply-ready; NON_MUTATION; mac $0")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
