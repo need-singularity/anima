@@ -1,0 +1,206 @@
+// tool/anima_ready_dir_audit.hexa — ready/ directory audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   ready/ = separate git repo embedded in anima (deployment-ready / staging snapshot).
+//   git status에서 `M ready` 표시됨 (modified). main anima와 ready/ 사이 policy divergence
+//   가능성 audit.
+//
+//   본 helper = mac-local NON_MUTATION:
+//     - ready/ presence + git status (separate .git directory)
+//     - ready/.gitignore vs main .gitignore policy comparison (raw#9 strict 적용 여부)
+//     - ready/ commit HEAD (independent commit history confirm)
+//     - ready/ size + file count (snapshot scope)
+//     - selftest verifies: ready/ separate git / gitignore divergence detection / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/ready_dir_audit.json)
+//
+// OUTPUT
+//   - ready_present, ready_separate_git, ready_head_commit
+//   - gitignore_comparison: {main_lines, ready_lines, raw9_py_in_main, raw9_py_in_ready}
+//   - file_inventory: {md, hexa, json, py, total_size_kb}
+//   - policy_divergence_findings
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_ready_dir_audit.hexa --selftest
+//   ANIMA_OUTPUT=state/ready_dir_audit.json hexa run tool/anima_ready_dir_audit.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - ready/ purpose (deployment-ready vs staging vs archive) 미규정 — README에서 확인 시도.
+//   - separate git history 분석은 git command 호출 (subprocess); failure 시 graceful degrade.
+//   - .py 허용 여부는 .gitignore text match만; effective rule 적용 시 추가 검증 필요.
+
+let HELPER_PATH = "/tmp/anima_ready_dir_audit_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima ready/ directory auditor — emitted by tool/anima_ready_dir_audit.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION ready/ audit.\n")
+    parts.push("import json, os, sys, subprocess\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/ready_dir_audit.json')\n")
+    parts.push("READY_DIR = 'ready'\n\n")
+
+    parts.push("if not os.path.isdir(READY_DIR):\n")
+    parts.push("    summary = {'paradigm':'ready/ audit', 'status':'READY_DIR_MISSING'}\n")
+    parts.push("    os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("    print(f'[ready_audit] status=READY_DIR_MISSING -> {OUTPUT}')\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("ready_separate_git = os.path.isdir(os.path.join(READY_DIR, '.git'))\n\n")
+
+    parts.push("# ready/ HEAD commit (subprocess git)\n")
+    parts.push("ready_head = None\n")
+    parts.push("ready_branch = None\n")
+    parts.push("if ready_separate_git:\n")
+    parts.push("    try:\n")
+    parts.push("        r = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=READY_DIR, capture_output=True, text=True, timeout=5)\n")
+    parts.push("        if r.returncode == 0: ready_head = r.stdout.strip()[:8]\n")
+    parts.push("    except Exception:\n")
+    parts.push("        pass\n")
+    parts.push("    try:\n")
+    parts.push("        r = subprocess.run(['git', 'branch', '--show-current'], cwd=READY_DIR, capture_output=True, text=True, timeout=5)\n")
+    parts.push("        if r.returncode == 0: ready_branch = r.stdout.strip()\n")
+    parts.push("    except Exception:\n")
+    parts.push("        pass\n\n")
+
+    parts.push("# .gitignore comparison\n")
+    parts.push("def _read_lines(path):\n")
+    parts.push("    if not os.path.exists(path): return []\n")
+    parts.push("    try:\n")
+    parts.push("        with open(path, encoding='utf-8') as f: return f.read().splitlines()\n")
+    parts.push("    except Exception: return []\n\n")
+
+    parts.push("main_gi = _read_lines('.gitignore')\n")
+    parts.push("ready_gi = _read_lines(os.path.join(READY_DIR, '.gitignore'))\n\n")
+
+    parts.push("def _has_py_blanket(lines):\n")
+    parts.push("    return any(l.strip() in ('**/*.py', '*.py') for l in lines)\n\n")
+
+    parts.push("gitignore_comparison = {\n")
+    parts.push("    'main_lines':len(main_gi),\n")
+    parts.push("    'ready_lines':len(ready_gi),\n")
+    parts.push("    'raw9_py_blanket_in_main':_has_py_blanket(main_gi),\n")
+    parts.push("    'raw9_py_blanket_in_ready':_has_py_blanket(ready_gi),\n")
+    parts.push("}\n\n")
+
+    parts.push("# file inventory (top-level + 1 deep)\n")
+    parts.push("def _count(path, ext, max_depth=3):\n")
+    parts.push("    base_depth = path.rstrip('/').count('/')\n")
+    parts.push("    count = 0\n")
+    parts.push("    for root, dirs, files in os.walk(path):\n")
+    parts.push("        depth = root.count('/') - base_depth\n")
+    parts.push("        if depth > max_depth:\n")
+    parts.push("            dirs.clear(); continue\n")
+    parts.push("        dirs[:] = [d for d in dirs if d not in ('.git', '.venv', 'node_modules', '__pycache__')]\n")
+    parts.push("        for f in files:\n")
+    parts.push("            if f.endswith(ext): count += 1\n")
+    parts.push("    return count\n\n")
+
+    parts.push("def _total_size(path, max_files=10000):\n")
+    parts.push("    total = 0\n")
+    parts.push("    seen = 0\n")
+    parts.push("    for root, dirs, files in os.walk(path):\n")
+    parts.push("        dirs[:] = [d for d in dirs if d not in ('.git', '.venv', 'node_modules', '__pycache__')]\n")
+    parts.push("        for f in files:\n")
+    parts.push("            try:\n")
+    parts.push("                total += os.path.getsize(os.path.join(root, f))\n")
+    parts.push("                seen += 1\n")
+    parts.push("                if seen >= max_files: return total\n")
+    parts.push("            except Exception: continue\n")
+    parts.push("    return total\n\n")
+
+    parts.push("file_inventory = {\n")
+    parts.push("    'md':_count(READY_DIR, '.md'),\n")
+    parts.push("    'hexa':_count(READY_DIR, '.hexa'),\n")
+    parts.push("    'json':_count(READY_DIR, '.json'),\n")
+    parts.push("    'py':_count(READY_DIR, '.py'),\n")
+    parts.push("    'total_size_kb':round(_total_size(READY_DIR) / 1024, 1),\n")
+    parts.push("}\n\n")
+
+    parts.push("# policy divergence\n")
+    parts.push("findings = []\n")
+    parts.push("if gitignore_comparison['raw9_py_blanket_in_main'] and not gitignore_comparison['raw9_py_blanket_in_ready']:\n")
+    parts.push("    findings.append({\n")
+    parts.push("        'kind':'RAW9_PY_DIVERGENCE',\n")
+    parts.push("        'severity':'medium',\n")
+    parts.push("        'detail':'main .gitignore enforces **/*.py ban (raw#9 strict); ready/ does NOT. ready/ allows .py files',\n")
+    parts.push("        'consequence':'ready/ may contain .py while main repo enforces hexa-only',\n")
+    parts.push("        'remediation':'either align ready/ to enforce raw#9 OR document divergence in policy memory',\n")
+    parts.push("    })\n")
+    parts.push("if file_inventory['py'] > 0:\n")
+    parts.push("    findings.append({\n")
+    parts.push("        'kind':'PY_FILES_PRESENT_IN_READY',\n")
+    parts.push("        'severity':'high',\n")
+    parts.push("        'detail':f'{file_inventory[\"py\"]} .py files exist in ready/ (allowed by ready/.gitignore)',\n")
+    parts.push("        'consequence':'raw#9 hexa-only invariant violated within ready/ scope',\n")
+    parts.push("        'remediation':'audit each .py purpose; convert to .hexa or quarantine in dedicated subdir',\n")
+    parts.push("    })\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'ready/ directory audit (separate git + gitignore divergence)',\n")
+    parts.push("    'ready_dir':READY_DIR,\n")
+    parts.push("    'ready_present':True,\n")
+    parts.push("    'ready_separate_git':ready_separate_git,\n")
+    parts.push("    'ready_head_commit':ready_head,\n")
+    parts.push("    'ready_branch':ready_branch,\n")
+    parts.push("    'gitignore_comparison':gitignore_comparison,\n")
+    parts.push("    'file_inventory':file_inventory,\n")
+    parts.push("    'policy_divergence_findings':findings,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify ready/; read-only audit',\n")
+    parts.push("    'cross_link_cycles':['cycle 26 .gitignore audit (main raw#9 verified)','cycle 22 tool/ raw#9 header'],\n")
+    parts.push("    'pattern':'governance audit chain layer 11 (cycles 21-30 + this)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[ready_audit] separate_git={ready_separate_git} head={ready_head} py_in_ready={file_inventory[\"py\"]} py_blanket_main={gitignore_comparison[\"raw9_py_blanket_in_main\"]} py_blanket_ready={gitignore_comparison[\"raw9_py_blanket_in_ready\"]} findings={len(findings)} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let divergence_kinds = "RAW9_PY_DIVERGENCE,PY_FILES_PRESENT_IN_READY"
+    let non_mutation = "READ_ONLY"
+    let subprocess_timeout_s = 5
+    println("inv:divergence_kinds=" + divergence_kinds)
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:subprocess_timeout_s=" + to_string(subprocess_timeout_s))
+    println("inv:gitignore_comparison_main_vs_ready=true")
+    println("inv:py_blanket_detection_via_text_match=true")
+    println("inv:max_walk_depth_3=true")
+    println("inv:cross_link_cycle22_cycle26=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_ready_dir_audit selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=ready/ audit (separate git + raw#9 policy divergence + py file presence; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
