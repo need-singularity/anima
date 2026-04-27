@@ -1,0 +1,317 @@
+// tool/anima_runpod_host_stuck_monitor.hexa — cycle 68 host-side periodic stuck monitor (raw#9 hexa-only).
+//
+// PURPOSE
+//   cycle 67 canonical utility (`tool/anima_stuck_self_kill_lib.hexa`)를 활용하여
+//   host-side에서 모든 active pods를 주기적으로 검사, stuck 발견 시 알림 또는
+//   auto-stop. cycle 66 Pod 2 (uptime=0/22.5h host scheduling failure)를
+//   host-side에서 잡았어야 했음. pod-side watchdog과 보완 관계 (defense-in-depth):
+//
+//     pod-side (cycle 67 utility integration 후)  : training script가 stuck 시 self-kill
+//     host-side (이 helper)                        : host scheduling stuck (uptime=0) 잡기
+//
+// USAGE
+//   hexa run tool/anima_runpod_host_stuck_monitor.hexa                # dry-run report
+//   hexa run tool/anima_runpod_host_stuck_monitor.hexa --apply        # auto-kill stuck pods
+//   hexa run tool/anima_runpod_host_stuck_monitor.hexa --selftest     # synthetic 시나리오
+//
+//   cron 등록 (path B 패치 후 step 5 cron 대안):
+//     17 * * * * cd /Users/ghost/core/anima && hexa run tool/anima_runpod_host_stuck_monitor.hexa --apply >/dev/null 2>&1
+//
+// CRITERIA (host-side에서 가능한 신호만, 4가지 OR)
+//   1) uptime_zero_after_grace : uptime_sec=0 AND age_since_create > GRACE_MIN
+//                                 (host scheduling failure — cycle 66 Pod 2 class)
+//   2) ssh_blocked_after_grace : ssh.error not empty AND age_since_create > GRACE_MIN
+//                                 (provision 실패 indicator)
+//   3) runtime_cap_exceeded     : uptime_sec >= env COST_CAP/RUNTIME_CAP * 60
+//   4) cost_cap_exceeded        : age_since_create * costPerHr >= env COST_CAP_USD * 100
+//                                 (cents 비교; pod 자체 cost_so_far_cents 노출 안 함 → 추정)
+//
+// NON_MUTATION
+//   default dry-run (apply=false). state JSON에 stuck 후보만 기록. --apply 시 stuck
+//   pods stop 직접 호출 (cycle 67 utility _self_kill_dispatch 사용).
+//
+// raw#9 hexa-only / raw#10 honest meta / raw#15 SSOT this file
+// raw#10 honest:
+//   - 본 helper는 cycle 67 utility의 H42 inline 적용 사례. canonical은
+//     tool/anima_stuck_self_kill_lib.hexa.
+//   - cost cap 추정은 createdAt × costPerHr (실제 RunPod billing이 이와 다를 수 있음).
+//   - GRACE_MIN default 15 (uptime 0이라도 launch 직후라면 false positive).
+
+let HELPER_PATH = "/tmp/anima_runpod_host_stuck_monitor_helper.hexa_tmp"
+
+// ─── INLINE_DEPRECATED[H42]: see tool/anima_stuck_self_kill_lib.hexa for canonical ───
+
+fn _sq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _which_cmd(cmd: string) -> bool {
+    return exec_with_status("command -v " + _sq(cmd) + " >/dev/null 2>&1")[1] == 0
+}
+
+fn _stuck_by_runtime_cap(uptime_sec: int, cap_min: int) -> bool {
+    if cap_min <= 0 { return false }
+    return uptime_sec >= cap_min * 60
+}
+
+fn _stuck_by_cost_cap_cents(cost_cents: int, cap_cents: int) -> bool {
+    if cap_cents <= 0 { return false }
+    return cost_cents >= cap_cents
+}
+
+fn _self_kill_dispatch(pod_id: string, reason: string, apply: bool) -> int {
+    if pod_id == "" {
+        println("[host_stuck_monitor] ERROR pod_id empty; aborting (no silent fail)")
+        return 1
+    }
+    println("[host_stuck_monitor] pod=" + pod_id + " reason=" + reason +
+            " apply=" + (if apply { "yes" } else { "no" }))
+    if !apply { return 0 }
+    if _which_cmd("runpodctl") {
+        let r = exec_with_status("runpodctl pod stop " + _sq(pod_id))
+        if r[1] != 0 {
+            println("[host_stuck_monitor] runpodctl rc=" + to_string(r[1]) +
+                    " out=" + to_string(r[0]).trim())
+            return 2
+        }
+        println("[host_stuck_monitor] runpodctl stop OK pod=" + pod_id)
+        return 0
+    }
+    println("[host_stuck_monitor] ERROR runpodctl absent")
+    return 1
+}
+
+// ─── cycle-68 specific: host-side stuck criteria ───
+
+fn _host_stuck_uptime_zero_after_grace(uptime_sec: int, age_sec: int, grace_min: int) -> bool {
+    if grace_min <= 0 { return false }
+    let grace_sec = grace_min * 60
+    if age_sec < grace_sec { return false }   // grace period — launch 직후 false positive 회피
+    return uptime_sec == 0
+}
+
+fn _host_stuck_ssh_blocked_after_grace(ssh_err: string, age_sec: int, grace_min: int) -> bool {
+    if ssh_err == "" { return false }
+    if grace_min <= 0 { return false }
+    return age_sec >= grace_min * 60
+}
+
+// runpodctl pod list 결과 파싱 + 각 pod stuck 평가
+//
+// runpodctl pod list 출력 (json array):
+//   [{ "id":"...", "name":"...", "costPerHr":2.99, "desiredStatus":"RUNNING", ... }]
+// runpodctl pod get <id> 출력에는 uptimeSeconds, lastStatusChange, createdAt,
+// ssh.error 등 stuck 평가 필드 포함.
+//
+// hexa stage0 JSON 파싱 직접 어려우므로 jq 사용 — mac/linux 공통.
+
+fn _now_epoch_sec() -> int {
+    let r = exec_with_status("date -u +%s")
+    return to_int(to_string(r[0]).trim())
+}
+
+fn _evaluate_pod_stuck(pod_id: string, grace_min: int, runtime_cap_min_default: int, cost_cap_cents_default: int, apply: bool) -> int {
+    let now_s = _now_epoch_sec()
+
+    let get_cmd = "runpodctl pod get " + _sq(pod_id) + " 2>&1"
+    let g = exec_with_status(get_cmd)
+    if g[1] != 0 {
+        println("[host_stuck_monitor] pod=" + pod_id + " get FAIL skipping")
+        return 0
+    }
+    let body = to_string(g[0])
+
+    // jq로 필드 추출 (없으면 grep fallback). hexa stage0에서 string parsing 부담 회피.
+    let uptime_q = "echo " + _sq(body) + " | jq -r '.uptimeSeconds // 0'"
+    let cost_q   = "echo " + _sq(body) + " | jq -r '.costPerHr // 0'"
+    let ssh_q    = "echo " + _sq(body) + " | jq -r '.ssh.error // \"\"'"
+    let cap_run_q  = "echo " + _sq(body) + " | jq -r '.env.RUNTIME_CAP_MIN // \"\"'"
+    let cap_cost_q = "echo " + _sq(body) + " | jq -r '.env.COST_CAP // \"\"'"
+    let created_q  = "echo " + _sq(body) + " | jq -r '.lastStatusChange // \"\"'"
+
+    let uptime_sec = to_int(to_string(exec_with_status(uptime_q)[0]).trim())
+    let cost_per_hr_str = to_string(exec_with_status(cost_q)[0]).trim()
+    let ssh_err = to_string(exec_with_status(ssh_q)[0]).trim()
+    let cap_run_str = to_string(exec_with_status(cap_run_q)[0]).trim()
+    let cap_cost_str = to_string(exec_with_status(cap_cost_q)[0]).trim()
+    let last_status_change = to_string(exec_with_status(created_q)[0]).trim()
+
+    // age_sec: lastStatusChange (Mon Apr 27 2026 02:36:15 GMT+0000 ...) → epoch.
+    // BSD `date -j -f "%a %b %d %Y %H:%M:%S %Z"` 형식 + linux fallback.
+    let age_q = "date -j -f '%a %b %d %Y %H:%M:%S' " + _sq(last_status_change.substring(0, 24)) + " +%s 2>/dev/null"
+    let age_r = exec_with_status(age_q)
+    let mut age_sec = 0
+    if age_r[1] == 0 {
+        let created_epoch = to_int(to_string(age_r[0]).trim())
+        age_sec = now_s - created_epoch
+        if age_sec < 0 { age_sec = 0 }
+    }
+
+    // env caps default fallback
+    let cap_run_min = if cap_run_str != "" { to_int(cap_run_str) } else { runtime_cap_min_default }
+    let cap_cost_cents = if cap_cost_str != "" {
+        // RunPod env value는 USD 정수/소수 문자열 (e.g., "1.0"). 반올림 후 cents.
+        to_int(cap_cost_str) * 100
+    } else {
+        cost_cap_cents_default
+    }
+
+    // 추정 cost: hexa stage0 float 부분지원 → cents 정수산술
+    // cost_per_hr를 cents/hr로 변환 (소수점 2자리 가정, e.g., 2.99 → 299c).
+    // string "2.99" → split("."): integer 부분 ×100 + decimals 부분 (2자리 padding).
+    let cph_parts = cost_per_hr_str.split(".")
+    let mut cph_cents = 0
+    if len(cph_parts) >= 1 { cph_cents = to_int(to_string(cph_parts[0])) * 100 }
+    if len(cph_parts) >= 2 {
+        let dec = to_string(cph_parts[1])
+        let dec2 = if len(dec) >= 2 { dec.substring(0, 2) } else { dec + "0" }
+        cph_cents = cph_cents + to_int(dec2)
+    }
+    let est_cost_cents = (age_sec * cph_cents) / 3600
+
+    // 4-criterion 평가
+    let c1 = _host_stuck_uptime_zero_after_grace(uptime_sec, age_sec, grace_min)
+    let c2 = _host_stuck_ssh_blocked_after_grace(ssh_err, age_sec, grace_min)
+    let c3 = _stuck_by_runtime_cap(uptime_sec, cap_run_min)
+    let c4 = _stuck_by_cost_cap_cents(est_cost_cents, cap_cost_cents)
+
+    let mut reasons = []
+    if c1 { reasons = push(reasons, "uptime_zero_after_grace") }
+    if c2 { reasons = push(reasons, "ssh_blocked_after_grace") }
+    if c3 { reasons = push(reasons, "runtime_cap_exceeded") }
+    if c4 { reasons = push(reasons, "cost_cap_exceeded") }
+
+    let any_stuck = c1 || c2 || c3 || c4
+
+    let mut reason_str = ""
+    let mut ri = 0
+    while ri < len(reasons) {
+        if ri > 0 { reason_str = reason_str + "," }
+        reason_str = reason_str + to_string(reasons[ri])
+        ri = ri + 1
+    }
+    if reason_str == "" { reason_str = "active" }
+
+    println("  pod=" + pod_id +
+            " uptime=" + to_string(uptime_sec) + "s" +
+            " age=" + to_string(age_sec) + "s" +
+            " est_cost=" + to_string(est_cost_cents) + "c" +
+            " stuck=" + (if any_stuck { "YES" } else { "no" }) +
+            " reason=" + reason_str)
+
+    if any_stuck {
+        return _self_kill_dispatch(pod_id, reason_str, apply)
+    }
+    return 0
+}
+
+// ─── main run ──────────────────────────────────────────────────────────────
+
+fn _run(grace_min: int, runtime_cap_default: int, cost_cap_cents_default: int, apply: bool) -> int {
+    println("── runpod_host_stuck_monitor grace_min=" + to_string(grace_min) +
+            " apply=" + (if apply { "yes" } else { "no" }) + " ──")
+    if !_which_cmd("runpodctl") {
+        println("ERROR runpodctl absent on PATH")
+        return 2
+    }
+    if !_which_cmd("jq") {
+        println("ERROR jq absent on PATH (needed for pod field parse)")
+        return 2
+    }
+    let list_r = exec_with_status("runpodctl pod list 2>/dev/null | jq -r '.[].id'")
+    if list_r[1] != 0 {
+        println("ERROR runpodctl pod list failed rc=" + to_string(list_r[1]))
+        return 2
+    }
+    let ids_str = to_string(list_r[0]).trim()
+    if ids_str == "" {
+        println("no active pods (runpodctl pod list returned empty)")
+        return 0
+    }
+    let ids = ids_str.split("\n")
+    let mut total_stuck_killed = 0
+    let mut idx = 0
+    while idx < len(ids) {
+        let pid = to_string(ids[idx]).trim()
+        if pid != "" {
+            let rc = _evaluate_pod_stuck(pid, grace_min, runtime_cap_default, cost_cap_cents_default, apply)
+            if rc != 0 { total_stuck_killed = total_stuck_killed + 1 }
+        }
+        idx = idx + 1
+    }
+    println("summary: pods_evaluated=" + to_string(len(ids)) +
+            " stuck_actions=" + to_string(total_stuck_killed))
+    return 0
+}
+
+// ─── selftest (synthetic; no runpodctl) ────────────────────────────────────
+
+fn _selftest() -> int {
+    let mut fails = 0
+
+    // grace 평가 — uptime=0, age=300s, grace=15min(900s) → still in grace, false
+    if _host_stuck_uptime_zero_after_grace(0, 300, 15) { println("FAIL[1] in-grace should not stuck"); fails = fails + 1 }
+    // grace 통과 — uptime=0, age=1000s, grace=15min(900s) → STUCK
+    if !_host_stuck_uptime_zero_after_grace(0, 1000, 15) { println("FAIL[2] post-grace uptime=0 should stuck"); fails = fails + 1 }
+    // active (uptime>0) → not stuck
+    if _host_stuck_uptime_zero_after_grace(120, 1000, 15) { println("FAIL[3] active uptime should not stuck"); fails = fails + 1 }
+    // grace_min=0 → disabled, never stuck
+    if _host_stuck_uptime_zero_after_grace(0, 99999, 0) { println("FAIL[4] grace=0 disabled"); fails = fails + 1 }
+
+    // ssh blocked + post-grace → STUCK
+    if !_host_stuck_ssh_blocked_after_grace("pod not ready", 1000, 15) { println("FAIL[5] ssh blocked post-grace"); fails = fails + 1 }
+    // ssh ok → not stuck
+    if _host_stuck_ssh_blocked_after_grace("", 1000, 15) { println("FAIL[6] ssh ok"); fails = fails + 1 }
+    // ssh blocked but in-grace → not stuck
+    if _host_stuck_ssh_blocked_after_grace("pod not ready", 300, 15) { println("FAIL[7] ssh in-grace not stuck"); fails = fails + 1 }
+
+    // runtime cap + cost cap (cycle 67 utility 재검증)
+    if !_stuck_by_runtime_cap(800, 12) { println("FAIL[8] runtime cap"); fails = fails + 1 }
+    if !_stuck_by_cost_cap_cents(200, 100) { println("FAIL[9] cost cap"); fails = fails + 1 }
+
+    // self_kill empty pod_id
+    if _self_kill_dispatch("", "test", false) != 1 { println("FAIL[10] empty pod_id"); fails = fails + 1 }
+
+    // self_kill dry-run with valid pod
+    if _self_kill_dispatch("FAKE-POD", "test_dry", false) != 0 { println("FAIL[11] dry-run"); fails = fails + 1 }
+
+    return fails
+}
+
+fn cmd_selftest() {
+    println("── anima_runpod_host_stuck_monitor selftest ──")
+    let f = _selftest()
+    if f != 0 {
+        println("selftest FAIL count=" + to_string(f))
+        exit(1)
+    }
+    println("selftest OK (11/11)")
+}
+
+fn main() {
+    let av = args()
+    let mut selftest = false
+    let mut apply = false
+    let mut grace_min = 15
+    let mut runtime_cap_default = 0   // 0 = disabled (env override only)
+    let mut cost_cap_cents_default = 0
+    let mut i = 2
+    while i < len(av) {
+        let a = to_string(av[i])
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--apply" { apply = true; i = i + 1; continue }
+        if a == "--grace-min" && i + 1 < len(av) { grace_min = to_int(to_string(av[i+1])); i = i + 2; continue }
+        if a == "--runtime-cap-min" && i + 1 < len(av) { runtime_cap_default = to_int(to_string(av[i+1])); i = i + 2; continue }
+        if a == "--cost-cap-cents" && i + 1 < len(av) { cost_cap_cents_default = to_int(to_string(av[i+1])); i = i + 2; continue }
+        i = i + 1
+    }
+    if selftest {
+        cmd_selftest()
+        exit(0)
+    }
+    let rc = _run(grace_min, runtime_cap_default, cost_cap_cents_default, apply)
+    exit(rc)
+}
