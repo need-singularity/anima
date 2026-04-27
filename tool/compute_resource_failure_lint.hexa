@@ -18,12 +18,23 @@
 // USAGE
 //   hexa run tool/compute_resource_failure_lint.hexa --selftest
 //   hexa run tool/compute_resource_failure_lint.hexa --scan-blockers
+//   hexa run tool/compute_resource_failure_lint.hexa --aggregate-30d
+//
+// --aggregate-30d (Agent D rec #3 — F-ATLAS-1 measurement emitter):
+//   Scans state/blockers/*.json + state/discovery_absorption/registry.jsonl rows in
+//   trailing 30-day window; computes 4-step compliance ratio per failure event:
+//     (a) diagnosis paragraph in verdict.json  (b) canonical-helper code-fix mention
+//     (c) defensive harden additions           (d) canonicalization evolve absorbed
+//   Emits JSON {window_start, window_end, total_failures, compliance_count,
+//   compliance_ratio, F-ATLAS-1_threshold=0.50, verdict (PASS|FAIL)} to stdout.
 //
 // raw#9 hexa-only · raw#10 honest · raw#37 transient helper.
 // ─────────────────────────────────────────────────────────────────────────────
 
 let HELPER_PATH = "/tmp/compute_resource_failure_helper.hexa_tmp"
+let AGG30_HELPER_PATH = "/tmp/compute_resource_failure_aggregate30d.hexa_tmp"
 let LINT_VERSION = "v1"
+let F_ATLAS_1_THRESHOLD = "0.50"
 
 fn _emit_helper() -> str {
     let lines = [
@@ -98,6 +109,110 @@ fn _emit_helper() -> str {
     return HELPER_PATH
 }
 
+fn _emit_agg30_helper() -> str {
+    let lines = [
+        "#!/usr/bin/env python3",
+        "# compute_resource_failure_aggregate30d.py — raw#37 transient (F-ATLAS-1 emitter)",
+        "import os, sys, json, glob, re, datetime",
+        "",
+        "REPO = '/Users/ghost/core/anima'",
+        "BLOCKERS_DIR = os.path.join(REPO, 'state/blockers')",
+        "REGISTRY = os.path.join(REPO, 'state/discovery_absorption/registry.jsonl')",
+        "WINDOW_DAYS = 30",
+        "F_ATLAS_1_THRESHOLD = 0.50",
+        "",
+        "STEP_A_DIAGNOSIS = re.compile(r'diagnosis|root[ _]?cause|exit[ _]?code|why[ _]?failed', re.IGNORECASE)",
+        "STEP_B_CANONICAL_FIX = re.compile(r'canonical[ _]?helper|tool/[a-z0-9_]+\\.hexa|absorbed?[ _]?back', re.IGNORECASE)",
+        "STEP_C_HARDEN = re.compile(r'sentinel|probe|retry[ _]?guard|harden|defensive', re.IGNORECASE)",
+        "STEP_D_EVOLVE = re.compile(r'canonicaliz|evolve|absorb|raw[ _]?\\d+|pattern[ _]?\\d+', re.IGNORECASE)",
+        "",
+        "def parse_ts(s):",
+        "    if not s: return None",
+        "    try: return datetime.datetime.strptime(s.replace('Z',''), '%Y-%m-%dT%H:%M:%S')",
+        "    except Exception:",
+        "        try: return datetime.datetime.strptime(s[:10], '%Y-%m-%d')",
+        "        except Exception: return None",
+        "",
+        "def collect_failures(now):",
+        "    cutoff = now - datetime.timedelta(days=WINDOW_DAYS)",
+        "    events = []",
+        "    for p in sorted(glob.glob(os.path.join(BLOCKERS_DIR, '*.json'))):",
+        "        try:",
+        "            txt = open(p).read()",
+        "            d = json.loads(txt)",
+        "        except Exception: continue",
+        "        ts = parse_ts(d.get('registered_at') or d.get('ts'))",
+        "        if ts is None or ts < cutoff: continue",
+        "        events.append({'src': 'blocker', 'path': os.path.basename(p), 'ts': ts.isoformat()+'Z', 'text': txt})",
+        "    if os.path.exists(REGISTRY):",
+        "        for ln in open(REGISTRY):",
+        "            ln = ln.strip()",
+        "            if not ln: continue",
+        "            try: r = json.loads(ln)",
+        "            except Exception: continue",
+        "            ts = parse_ts(r.get('ts'))",
+        "            if ts is None or ts < cutoff: continue",
+        "            events.append({'src': 'registry', 'path': r.get('finding_id','?'), 'ts': ts.isoformat()+'Z', 'text': ln})",
+        "    return events, cutoff",
+        "",
+        "def check_4step(text):",
+        "    return {",
+        "        'a_diagnosis': bool(STEP_A_DIAGNOSIS.search(text)),",
+        "        'b_canonical_fix': bool(STEP_B_CANONICAL_FIX.search(text)),",
+        "        'c_harden': bool(STEP_C_HARDEN.search(text)),",
+        "        'd_evolve': bool(STEP_D_EVOLVE.search(text)),",
+        "    }",
+        "",
+        "def main():",
+        "    now = datetime.datetime.utcnow()",
+        "    events, cutoff = collect_failures(now)",
+        "    total = len(events)",
+        "    compliant = 0",
+        "    per_event = []",
+        "    for e in events:",
+        "        steps = check_4step(e['text'])",
+        "        all4 = all(steps.values())",
+        "        if all4: compliant += 1",
+        "        per_event.append({'src': e['src'], 'path': e['path'], 'ts': e['ts'], 'steps': steps, 'all4': all4})",
+        "    ratio = (compliant / total) if total > 0 else 1.0",
+        "    verdict = 'PASS' if ratio >= F_ATLAS_1_THRESHOLD else 'FAIL'",
+        "    out = {",
+        "        'lint': 'compute_resource_failure_lint',",
+        "        'mode': 'aggregate-30d',",
+        "        'version': 'v1',",
+        "        'window_start': cutoff.strftime('%Y-%m-%dT%H:%M:%SZ'),",
+        "        'window_end': now.strftime('%Y-%m-%dT%H:%M:%SZ'),",
+        "        'total_failures': total,",
+        "        'compliance_count': compliant,",
+        "        'compliance_ratio': round(ratio, 4),",
+        "        'F-ATLAS-1_threshold': F_ATLAS_1_THRESHOLD,",
+        "        'verdict': verdict,",
+        "        'per_event': per_event,",
+        "    }",
+        "    print(json.dumps(out, indent=2))",
+        "",
+        "if __name__ == '__main__': main()",
+    ]
+    let mut text = ""
+    let mut i = 0
+    while i < lines.len() {
+        text = text + lines[i] + "\n"
+        i = i + 1
+    }
+    write_file(AGG30_HELPER_PATH, text)
+    return AGG30_HELPER_PATH
+}
+
+fn _aggregate_30d() {
+    println("__COMPUTE_RESOURCE_FAILURE_LINT_BEGIN__ aggregate-30d F-ATLAS-1 emitter own 4")
+    let _path = _emit_agg30_helper()
+    println("agg30_helper_emitted=" + AGG30_HELPER_PATH)
+    println("F_ATLAS_1_threshold=" + F_ATLAS_1_THRESHOLD)
+    println("__COMPUTE_RESOURCE_FAILURE_LINT_RESULT__ HELPER_READY")
+    println("reason=F-ATLAS-1 measurement helper emitted; invoke python3 to compute compliance ratio")
+    println("fix: 1) python3 " + AGG30_HELPER_PATH + "  2) read JSON {compliance_ratio, verdict}  3) verdict PASS if ratio >= 0.50")
+}
+
 fn _selftest() {
     println("__COMPUTE_RESOURCE_FAILURE_LINT_BEGIN__ selftest own 4 raw#9 raw#10 raw#37")
     println("4_step_mandate=diagnosis+canonical_fix+harden+evolve")
@@ -123,9 +238,12 @@ fn _selftest() {
     let v2_detected = has_tmp && !has_canonical
     println("fixture_fail_V2_tmp_wrapper_without_canonical_mirror_detected=" + str(v2_detected))
     let _path = _emit_helper()
+    let _path2 = _emit_agg30_helper()
     println("scan_helper_emitted=" + HELPER_PATH)
+    println("agg30_helper_emitted=" + AGG30_HELPER_PATH)
     println("invariant_check_lint_version=" + LINT_VERSION)
     println("invariant_check_5_violation_signatures=V1+V2+V3+V4+V5")
+    println("invariant_check_F_ATLAS_1_threshold=" + F_ATLAS_1_THRESHOLD)
     let all_pass = pass_ok && v1_detected && v2_detected
     if all_pass {
         println("__COMPUTE_RESOURCE_FAILURE_LINT_RESULT__ PASS_SELFTEST")
@@ -150,16 +268,19 @@ fn main() {
     let av = argv()
     let mut has_selftest = false
     let mut has_scan = false
+    let mut has_agg30 = false
     let mut k = 0
     while k < av.len() {
         if av[k] == "--selftest" { has_selftest = true }
         if av[k] == "--scan-blockers" { has_scan = true }
+        if av[k] == "--aggregate-30d" { has_agg30 = true }
         k = k + 1
     }
     if has_selftest { _selftest() }
     else if has_scan { _scan() }
+    else if has_agg30 { _aggregate_30d() }
     else {
-        println("usage: hexa run tool/compute_resource_failure_lint.hexa --selftest | --scan-blockers")
+        println("usage: hexa run tool/compute_resource_failure_lint.hexa --selftest | --scan-blockers | --aggregate-30d")
         println("raw 10 caveat: lint is advisory (own 4 promotion candidate L2 layer)")
     }
     return 0
