@@ -1,0 +1,415 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/an_lix_01_alpha_bridge_synthetic_marker.hexa
+//
+//  PURPOSE
+//    Per anima-clm-eeg/docs/clm_lix_eeg_alpha_direct_mapping_spec.md §5.5
+//    (AN-LIX-01 alpha bridge synthetic positive marker), emit a JSON marker
+//    with synthetic-only PASS verdict for:
+//      B1 — V_RG positive               (CLM Kuramoto r > 0 over LIX phases)
+//      B2 — alpha-LIX correlation       (Pearson r ≥ 0.4 between α and LIX)
+//      B3 — numerical correspondence    (|r_clm - alpha_coh| within 20%)
+//
+//    Real-data bridge_v1.json is DEFERRED to D+3 (post-EEG-arrival).  This
+//    marker is synthetic-only and serves as the witness for ω-cycle Tier-1
+//    candidate C2 (rank 2): strengthens F3 (P2 TLR) and activates F10_neg.
+//
+//  CONSTRAINTS
+//    raw#9   hexa-only, no .py, no float, no LLM
+//    raw#10  honest: synthetic seed + N samples + every limit recorded
+//    raw#15  SSOT: marker is the witness, no hand-edit post-emission
+//    raw#37  transient: synthetic computation inline
+//    Deterministic — FNV-hash seed → byte-identical re-run produces same marker
+//
+//  OUTPUT
+//    state/markers/an_lix_01_alpha_bridge_synthetic_positive.marker  (JSON)
+//
+//  ENV
+//    AN_LIX_01_OUT  override output path
+//
+//  USAGE
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run \
+//        anima-clm-eeg/tool/an_lix_01_alpha_bridge_synthetic_marker.hexa
+//
+//  RAW
+//    raw#9 · raw#10 · raw#15 · raw#37 · hexa-only · deterministic · llm=none
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── synthetic protocol constants (frozen, this file = SSOT) ────────────────
+let SYN_SEED          = 20260427     // FNV seed (frozen — date of cycle)
+let SYN_N_SAMPLES     = 10           // paired (alpha, LIX) sample count
+let TS_FROZEN         = "2026-04-27T00:00:00Z"   // byte-identical date stamp
+
+// thresholds (per user task spec)
+let B1_V_RG_MIN_X1000     = 1        // r > 0 (any positive)
+let B2_R_MIN_X1000        = 400      // Pearson r ≥ 0.4
+let B3_TOLERANCE_PCT_X10  = 200      // within 20.0% (×10 = 200)
+
+// integer fixed-point + Kuramoto constants
+let TAU_PERM      = 6283
+let HALF_PI_PERM  = 1571
+let M32           = 4294967296
+let POLY_PRIME    = 2654435761
+let POLY_SEED     = 1
+let FNV_PRIME     = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+// ─── FNV-32 step (mirrors clm_eeg_synthetic_fixture.hexa) ───────────────────
+fn fnv_step(h: int, byte: int) -> int {
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fnv_mix_int(h: int, val: int) -> int {
+    let mut hh = h
+    hh = fnv_step(hh, val % 256)
+    hh = fnv_step(hh, (val / 256) % 256)
+    hh = fnv_step(hh, (val / 65536) % 256)
+    hh = fnv_step(hh, (val / 16777216) % 256)
+    return hh
+}
+
+// ─── poly hash (mirror v_sync_kuramoto.hexa) ────────────────────────────────
+fn poly_hash_int32(h: int, v: int) -> int {
+    let mut x = h * POLY_PRIME
+    x = x + v
+    x = x % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+// ─── 24-bin cos/sin lookup (×1000; mirror v_sync_kuramoto.hexa) ─────────────
+fn cos_perm_x1000(theta_perm: int) -> int {
+    let mut t = theta_perm % TAU_PERM
+    if t < 0 { t = t + TAU_PERM }
+    if t < 131  { return 1000 }
+    if t < 393  { return 966 }
+    if t < 655  { return 866 }
+    if t < 916  { return 707 }
+    if t < 1178 { return 500 }
+    if t < 1440 { return 259 }
+    if t < 1702 { return 0 }
+    if t < 1963 { return 0 - 259 }
+    if t < 2225 { return 0 - 500 }
+    if t < 2487 { return 0 - 707 }
+    if t < 2749 { return 0 - 866 }
+    if t < 3010 { return 0 - 966 }
+    if t < 3272 { return 0 - 1000 }
+    if t < 3534 { return 0 - 966 }
+    if t < 3796 { return 0 - 866 }
+    if t < 4057 { return 0 - 707 }
+    if t < 4319 { return 0 - 500 }
+    if t < 4581 { return 0 - 259 }
+    if t < 4843 { return 0 }
+    if t < 5104 { return 259 }
+    if t < 5366 { return 500 }
+    if t < 5628 { return 707 }
+    if t < 5890 { return 866 }
+    if t < 6151 { return 966 }
+    return 1000
+}
+
+fn sin_perm_x1000(theta_perm: int) -> int {
+    return cos_perm_x1000(theta_perm - HALF_PI_PERM)
+}
+
+// ─── integer sqrt (Newton, 24 iter; mirror v_sync_kuramoto.hexa) ────────────
+fn isqrt_x1000(m: int) -> int {
+    if m <= 0 { return 0 }
+    let mut y = 1000
+    let mut k = 0
+    while k < 24 {
+        if y == 0 { y = 1 }
+        y = (y + m / y) / 2
+        k = k + 1
+    }
+    return y
+}
+
+// ─── Kuramoto r order parameter (×1000; mirror clm_eeg_p2_tlr_pre_register) ─
+fn r_order_param_x1000(thetas: list, n_nodes: int) -> int {
+    if n_nodes <= 0 { return 0 }
+    let mut sum_c = 0
+    let mut sum_s = 0
+    let mut i = 0
+    while i < n_nodes {
+        sum_c = sum_c + cos_perm_x1000(thetas[i])
+        sum_s = sum_s + sin_perm_x1000(thetas[i])
+        i = i + 1
+    }
+    let mag2 = sum_c * sum_c + sum_s * sum_s
+    if mag2 <= 0 { return 0 }
+    let mag = isqrt_x1000(mag2)
+    let mut r = mag / n_nodes
+    if r > 1000 { r = 1000 }
+    if r < 0 { r = 0 }
+    return r
+}
+
+// ─── synthetic paired (alpha, LIX) generator ────────────────────────────────
+//   Build N samples deterministically:
+//     base_k    = FNV(seed, k)            # shared latent
+//     alpha_k   = base_k mod 600 + 400    # ∈ [400, 1000]  (high-α-rich)
+//     lix_k     = alpha_k * 4/5 + jitter  # 0.8 × α + small FNV jitter
+//   Yields strong positive correlation (target r ≈ 0.7–0.9), guaranteed
+//   ≥ 0.4 threshold, all integer arithmetic.
+fn gen_pair(seed: int, k: int, alphas: list, lixes: list) {
+    let h = fnv_mix_int(seed, k)
+    let alpha_v = (h % 600) + 400
+    // jitter ∈ [-50, +49]; second-moment hash for non-trivial scatter
+    let h2 = fnv_mix_int(h, k * 7919)
+    let jitter = (h2 % 100) - 50
+    let mut lix_v = (alpha_v * 4) / 5 + jitter
+    if lix_v < 0 { lix_v = 0 }
+    alphas.push(alpha_v)
+    lixes.push(lix_v)
+}
+
+// ─── integer Pearson correlation × 1000 ─────────────────────────────────────
+//   r_x1000 = round( 1000 * cov / (sd_x * sd_y) )
+//   All steps in integer; numerator scaled to preserve precision.
+fn pearson_x1000(xs: list, ys: list, n: int) -> int {
+    if n <= 1 { return 0 }
+    let mut sum_x = 0
+    let mut sum_y = 0
+    let mut i = 0
+    while i < n {
+        sum_x = sum_x + xs[i]
+        sum_y = sum_y + ys[i]
+        i = i + 1
+    }
+    let mean_x = sum_x / n
+    let mean_y = sum_y / n
+    let mut s_xy = 0
+    let mut s_xx = 0
+    let mut s_yy = 0
+    let mut j = 0
+    while j < n {
+        let dx = xs[j] - mean_x
+        let dy = ys[j] - mean_y
+        s_xy = s_xy + dx * dy
+        s_xx = s_xx + dx * dx
+        s_yy = s_yy + dy * dy
+        j = j + 1
+    }
+    if s_xx <= 0 { return 0 }
+    if s_yy <= 0 { return 0 }
+    // r = s_xy / sqrt(s_xx * s_yy)
+    // r_x1000 = (s_xy * 1000) / sqrt(s_xx * s_yy)
+    let denom_sq = s_xx * s_yy
+    if denom_sq <= 0 { return 0 }
+    // isqrt_x1000 expects (×1) val and returns approx sqrt; we need
+    // sqrt(denom_sq) — compute via integer Newton directly.
+    let mut y = 1
+    let mut k2 = 0
+    while k2 < 40 {
+        if y == 0 { y = 1 }
+        y = (y + denom_sq / y) / 2
+        k2 = k2 + 1
+    }
+    let denom = y
+    if denom <= 0 { return 0 }
+    let mut r_num = s_xy * 1000
+    let r_x1000 = r_num / denom
+    return r_x1000
+}
+
+// ─── alpha-coh proxy over synthetic alphas (mirror p2_tlr proxy) ────────────
+fn alpha_coherence_proxy_x1000(alphas: list, n: int) -> int {
+    if n <= 1 { return 1000 }
+    let mut maxa = 0
+    let mut i = 0
+    while i < n {
+        if alphas[i] > maxa { maxa = alphas[i] }
+        i = i + 1
+    }
+    if maxa <= 0 { return 0 }
+    let pairs = n * (n - 1) / 2
+    let mut acc = 0
+    let mut a = 0
+    while a < n {
+        let mut b = a + 1
+        while b < n {
+            let diff = if alphas[a] > alphas[b] {
+                alphas[a] - alphas[b]
+            } else {
+                alphas[b] - alphas[a]
+            }
+            let norm = (diff * 1000) / maxa
+            acc = acc + norm
+            b = b + 1
+        }
+        a = a + 1
+    }
+    let avg_norm = acc / pairs
+    let mut coh = 1000 - avg_norm
+    if coh < 0 { coh = 0 }
+    if coh > 1000 { coh = 1000 }
+    return coh
+}
+
+// ─── LIX → θ projection (mirror v_sync_kuramoto fold) ───────────────────────
+fn lix_to_theta_perm(lix_x1000: int) -> int {
+    let h = poly_hash_int32(POLY_SEED, lix_x1000)
+    let mut t = h % TAU_PERM
+    if t < 0 { t = t + TAU_PERM }
+    return t
+}
+
+// ─── helpers: list → JSON-array string ──────────────────────────────────────
+fn list_to_json_int_array(xs: list, n: int) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < n {
+        if i > 0 { s = s + ", " }
+        s = s + str(xs[i])
+        i = i + 1
+    }
+    s = s + "]"
+    return s
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    let out_path = env_str(
+        "AN_LIX_01_OUT",
+        "state/markers/an_lix_01_alpha_bridge_synthetic_positive.marker"
+    )
+
+    // ── 1. Generate synthetic paired (alpha, LIX) sequence ───────────────
+    let mut alphas = []
+    let mut lixes = []
+    let mut k = 0
+    while k < SYN_N_SAMPLES {
+        gen_pair(SYN_SEED, k, alphas, lixes)
+        k = k + 1
+    }
+
+    // ── 2. B1 — V_RG (Kuramoto r over LIX phase projection) ──────────────
+    //   Project each LIX sample to θ via poly_hash, compute order param r.
+    //   B1 PASS  iff  r_x1000 > 0  (positive V_RG).
+    let mut thetas = []
+    let mut t = 0
+    while t < SYN_N_SAMPLES {
+        thetas.push(lix_to_theta_perm(lixes[t]))
+        t = t + 1
+    }
+    let v_rg_x1000 = r_order_param_x1000(thetas, SYN_N_SAMPLES)
+    let b1_pass = if v_rg_x1000 >= B1_V_RG_MIN_X1000 { 1 } else { 0 }
+
+    // ── 3. B2 — Pearson correlation (alpha, LIX) ─────────────────────────
+    let r_corr_x1000 = pearson_x1000(alphas, lixes, SYN_N_SAMPLES)
+    let r_corr_abs = if r_corr_x1000 < 0 { 0 - r_corr_x1000 } else { r_corr_x1000 }
+    let b2_pass = if r_corr_abs >= B2_R_MIN_X1000 { 1 } else { 0 }
+
+    // ── 4. B3 — Numerical correspondence (clm_r vs alpha_coh proxy) ──────
+    //   alpha_coh_x1000 over synthetic alphas (pairwise spread proxy)
+    //   |r_clm - alpha_coh| / max(r_clm, alpha_coh)  ≤  20%
+    let alpha_coh_x1000 = alpha_coherence_proxy_x1000(alphas, SYN_N_SAMPLES)
+    let max_metric = if v_rg_x1000 > alpha_coh_x1000 {
+        v_rg_x1000
+    } else {
+        alpha_coh_x1000
+    }
+    let abs_diff = if v_rg_x1000 > alpha_coh_x1000 {
+        v_rg_x1000 - alpha_coh_x1000
+    } else {
+        alpha_coh_x1000 - v_rg_x1000
+    }
+    // pct_x10 = (abs_diff * 1000) / max_metric  ∈ [0, 1000] for 0–100.0%
+    let mut pct_x10 = 0
+    if max_metric > 0 {
+        pct_x10 = (abs_diff * 1000) / max_metric
+    }
+    let b3_pass = if pct_x10 <= B3_TOLERANCE_PCT_X10 { 1 } else { 0 }
+
+    // ── 5. composite verdict ─────────────────────────────────────────────
+    let all_pass = if b1_pass == 1 && b2_pass == 1 && b3_pass == 1 { 1 } else { 0 }
+    let verdict = if all_pass == 1 {
+        "SYNTHETIC_POSITIVE_PASS_REAL_DATA_DEFERRED"
+    } else {
+        "SYNTHETIC_NEGATIVE_FAIL_REAL_DATA_DEFERRED"
+    }
+
+    // ── 6. emit JSON marker (raw#15: marker IS the witness) ──────────────
+    let raw_alpha_json = list_to_json_int_array(alphas, SYN_N_SAMPLES)
+    let raw_lix_json = list_to_json_int_array(lixes, SYN_N_SAMPLES)
+
+    let mut m = "{\n"
+    m = m + "  \"schema\": \"an_lix_01_alpha_bridge_synthetic_positive/v1\",\n"
+    m = m + "  \"verdict\": \"" + verdict + "\",\n"
+    m = m + "  \"ts\": \"" + TS_FROZEN + "\",\n"
+    m = m + "  \"ts_note\": \"frozen logical date for byte-identical reruns; not wall-clock\",\n"
+    m = m + "  \"B1_v_rg_positive\": " + (if b1_pass == 1 { "true" } else { "false" }) + ",\n"
+    m = m + "  \"B1_v_rg_x1000\": " + str(v_rg_x1000) + ",\n"
+    m = m + "  \"B1_threshold_x1000\": " + str(B1_V_RG_MIN_X1000) + ",\n"
+    m = m + "  \"B2_alpha_lix_correlation_r\": " + str(r_corr_x1000) + ",\n"
+    m = m + "  \"B2_alpha_lix_correlation_r_x1000\": " + str(r_corr_x1000) + ",\n"
+    m = m + "  \"B2_threshold_x1000\": " + str(B2_R_MIN_X1000) + ",\n"
+    m = m + "  \"B2_pass\": " + (if b2_pass == 1 { "true" } else { "false" }) + ",\n"
+    m = m + "  \"B3_numerical_correspondence_pct\": " + str(pct_x10) + ",\n"
+    m = m + "  \"B3_numerical_correspondence_pct_x10_units\": \"tenths of percent (200 == 20.0%)\",\n"
+    m = m + "  \"B3_tolerance_pct_x10\": " + str(B3_TOLERANCE_PCT_X10) + ",\n"
+    m = m + "  \"B3_pass\": " + (if b3_pass == 1 { "true" } else { "false" }) + ",\n"
+    m = m + "  \"B3_clm_r_x1000\": " + str(v_rg_x1000) + ",\n"
+    m = m + "  \"B3_alpha_coh_proxy_x1000\": " + str(alpha_coh_x1000) + ",\n"
+    m = m + "  \"synthetic_seed\": " + str(SYN_SEED) + ",\n"
+    m = m + "  \"synthetic_n_samples\": " + str(SYN_N_SAMPLES) + ",\n"
+    m = m + "  \"raw_alphas_x1000\": " + raw_alpha_json + ",\n"
+    m = m + "  \"raw_lixes_x1000\": " + raw_lix_json + ",\n"
+    m = m + "  \"raw_10_honest\": [\n"
+    m = m + "    \"synthetic-only — no real EEG, no GPU, no cloud, $0 mac local\",\n"
+    m = m + "    \"small N: only " + str(SYN_N_SAMPLES) + " paired samples (≥30 desirable for asymptotic Pearson)\",\n"
+    m = m + "    \"LIX series synthesized as 0.8*alpha + FNV jitter — built-in correlation by construction\",\n"
+    m = m + "    \"V_RG = Kuramoto r over poly_hash(LIX) — mirror v_sync_kuramoto.hexa, NOT live (A,B) atan2 lattice\",\n"
+    m = m + "    \"alpha-coh proxy = 1000 - mean(|α_i-α_j|/max_α), NOT Welch's coherence\",\n"
+    m = m + "    \"B2 single-window correlation; lag-1 echo / sustained-window check awaits real EEG (D+3)\",\n"
+    m = m + "    \"phenomenal substrate identity NOT claimed — mathematical homomorphism only (raw#10)\"\n"
+    m = m + "  ],\n"
+    m = m + "  \"deferred_real_data\": \"anima-clm-eeg/state/clm_lix_eeg_bridge_v1.json (post-D+3)\",\n"
+    m = m + "  \"linked_falsifiers\": [\"F3\", \"F10_neg\"],\n"
+    m = m + "  \"spec_ssot\": \"anima-clm-eeg/docs/clm_lix_eeg_alpha_direct_mapping_spec.md\",\n"
+    m = m + "  \"pre_register_ref\": \"anima-clm-eeg/state/clm_eeg_pre_register_v1_1.json\",\n"
+    m = m + "  \"raw_rank\": 9,\n"
+    m = m + "  \"raw_honest\": 10,\n"
+    m = m + "  \"raw_ssot\": 15,\n"
+    m = m + "  \"raw_transient\": 37,\n"
+    m = m + "  \"hexa_only\": true,\n"
+    m = m + "  \"deterministic\": true,\n"
+    m = m + "  \"llm\": \"none\",\n"
+    m = m + "  \"hardware\": false,\n"
+    m = m + "  \"cost_usd\": 0,\n"
+    m = m + "  \"omega_cycle\": \"2026-04-27 anima-clm-eeg comprehensive Tier-1 candidate C2 rank 2\"\n"
+    m = m + "}\n"
+    write_file(out_path, m)
+
+    // ── stdout report ────────────────────────────────────────────────────
+    println("─── an_lix_01_alpha_bridge_synthetic_marker (raw#9 hexa-only) ───")
+    println("  synthetic_seed         = " + str(SYN_SEED))
+    println("  synthetic_n_samples    = " + str(SYN_N_SAMPLES))
+    println("  B1 v_rg_x1000          = " + str(v_rg_x1000) + "  (threshold ≥ " + str(B1_V_RG_MIN_X1000) + ")")
+    println("  B1_pass                = " + str(b1_pass))
+    println("  B2 r_corr_x1000        = " + str(r_corr_x1000) + "  (threshold ≥ " + str(B2_R_MIN_X1000) + ")")
+    println("  B2_pass                = " + str(b2_pass))
+    println("  B3 pct_x10             = " + str(pct_x10) + "  (tolerance ≤ " + str(B3_TOLERANCE_PCT_X10) + " = 20.0%)")
+    println("  B3 alpha_coh_proxy     = " + str(alpha_coh_x1000))
+    println("  B3_pass                = " + str(b3_pass))
+    println("  verdict                = " + verdict)
+    println("  output                 = " + out_path)
+
+    if all_pass == 1 {
+        exit(0)
+    }
+    exit(1)
+}
+
+main()
