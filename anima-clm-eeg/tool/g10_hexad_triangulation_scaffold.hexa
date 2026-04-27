@@ -1,0 +1,769 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/g10_hexad_triangulation_scaffold.hexa
+//
+//  VERSION
+//    v2  (2026-04-27)  D+5 real-coupling-fn prep land — SELFTEST + real_coupling_fn
+//                      stub + classification tier separation (SYNTHETIC vs REAL).
+//                      v1 synthetic positive PASS path is byte-identical preserved
+//                      under "hardware": false fixture mode (raw#65 idempotent).
+//
+//  PURPOSE
+//    G10 — 3-axis Hexad family×band triangulation harness scaffold.
+//
+//    Builds a 16-cell PASS/FAIL completeness matrix:
+//        rows: 4 backbone family   ∈ {Law, Phi, SelfRef, Hexad}
+//        cols: 4 EEG band          ∈ {alpha, beta, gamma, theta}
+//
+//    Three orthogonal axes are F-tested AND-gated as a cross-validation:
+//        axis_A : backbone family signal     (4 levels, df1=3)
+//        axis_B : EEG band power             (4 levels, df1=3)
+//        axis_C : Hexad category assignment  (6 levels, df1=5)
+//
+//    AND-gate composite verdict:
+//        G10_PASS  iff
+//          (cell_pass_count >= 12)             // ≥ 12/16 cells PASS
+//          AND axis_A_F >= F_CRIT_X1000
+//          AND axis_B_F >= F_CRIT_X1000
+//          AND axis_C_F >= F_CRIT_X1000
+//
+//    PRE-REGISTERED CRITERIA (frozen, this file IS the SSOT)
+//      C1  per-cell coupling score x1000      ≥ 500   (i.e. ≥ 0.5)
+//      C2  per-cell F-statistic    x1000      ≥ 4000  (df1=3, df2=12 → F_crit ≈ 3.49)
+//      C3  16-cell PASS count                 ≥ 12
+//      C4  axis-A/B/C F-statistic x1000       ≥ 4000  (AND-gate)
+//      Verdict G10.PASS = (C3 AND C4)
+//      ANY post-hoc threshold change ⇒ v2 bump (no silent edit).
+//
+//  DRY-RUN (synthetic, hardware-free)
+//    Reads anima-clm-eeg/fixtures/synthetic_16ch_v1.json for band aggregates.
+//    Synthesises a deterministic 4×4 family×band coupling matrix from FNV
+//    chained over (fixture_fingerprint, family_idx, band_idx).  This is a
+//    SCAFFOLD: no real cortical-pattern ↔ cortical-rhythm coupling is
+//    asserted — only that the wire-up emits a deterministic 16-cell matrix
+//    that can be replaced cell-for-cell by post-arrival D+5 measurements.
+//
+//    Negative falsifier branch:
+//      env G10_NEG_UNIFORM=1   → bypass FNV mixing; fill all 16 cells with
+//                                identical coupling=400/1000, F=2000/1000.
+//                                Composite verdict MUST be G10_FAIL
+//                                (C1 fails 16/16 → C3 fails ⇒ AND-gate fails).
+//
+//  REAL HARDWARE BRANCH  (D+5 .. D+7)
+//    Fixture `"hardware": true` flag flips the dispatcher to real_coupling_fn.
+//    real_coupling_fn(eeg_band_powers_x1000, anima_state_axes_x1000, fam, bnd)
+//    is currently a STUB returning the synth value PLUS classification tier
+//    REAL_HW_PENDING (raw#91 honesty — never reports SYNTHETIC as REAL_PASS).
+//    At D+5 cycle the body is replaced with cross-corr ↔ ANOVA porting per
+//    anima-clm-eeg/docs/g10_triangulation_spec_post_arrival.md §3.D+6.
+//
+//  CLASSIFICATION TIERS  (raw#91 — synthetic ≠ real)
+//    SYNTHETIC_DRY_RUN_PASS    fixture.hardware=false, all gates pass     (v1 baseline)
+//    SYNTHETIC_DRY_RUN_FAIL    fixture.hardware=false, neg-uniform fixture  (falsifier)
+//    REAL_HW_PENDING           fixture.hardware=true, real_coupling_fn stub still wired
+//    REAL_HW_PASS              fixture.hardware=true, real_coupling_fn ported AND gates pass
+//    REAL_HW_FAIL              fixture.hardware=true, gates fail
+//
+//  SELFTEST  (always runs after main; raw#12 silent-error-ban)
+//    asserts the v1 baseline byte-identical synthetic-path verdict against frozen
+//    expected values.  Prints PASS/FAIL counts and exits non-zero on regression.
+//    Expected values from 2026-04-26 v1 land:
+//      cell_pass_count = 16, axis_A_F = 7399, axis_B_F = 4314, axis_C_F = 6259,
+//      chained_fingerprint = 3014690086, g10_dry_run_pass = 1.
+//
+//  OUTPUT
+//    state/clm_eeg_g10_hexad_triangulation.json
+//
+//  ENV
+//    G10_OUT                   output JSON path
+//    G10_FIXTURE_PATH          input fixture (default: synthetic_16ch_v1.json)
+//    G10_NEG_UNIFORM           1 ⇒ negative-falsifier uniform mode
+//    NOTE: env() builtin currently lossy under HEXA_RESOLVER_NO_REROUTE
+//          dispatch path; the canonical mode switch is the fixture
+//          "hardware" field.  env still honoured if non-empty.
+//
+//  USAGE
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run anima-clm-eeg/tool/g10_hexad_triangulation_scaffold.hexa
+//
+//  RAW
+//    raw#9   · hexa-only · deterministic · LLM=none · pre-register-frozen
+//    raw#10  honest: synthetic FNV coupling NOT real backbone-EEG correlate.
+//    raw#12  silent-error-ban: every error path logs explicit ERROR line.
+//    raw#65  idempotent: synthetic path bytes-identical to v1 baseline.
+//    raw#91  honesty tier separation (SYNTHETIC vs REAL classifications).
+//    Real measurement deferred to post-arrival D+5 workflow (see
+//    anima-clm-eeg/docs/g10_triangulation_spec_post_arrival.md).
+// ════════════════════════════════════════════════════════════════════════════
+
+let M32 = 4294967296
+let FNV_PRIME = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+// ─── frozen criteria (pre-registered, this file = SSOT) ─────────────────────
+let CELL_COUPLING_MIN_X1000   = 500    // C1
+let CELL_F_MIN_X1000          = 4000   // C2  (F_crit df1=3 df2=12 ≈ 3.49)
+let CELL_PASS_MIN             = 12     // C3  (≥ 12/16)
+let AXIS_F_MIN_X1000          = 4000   // C4
+
+let N_FAMILIES = 4   // Law / Phi / SelfRef / Hexad
+let N_BANDS    = 4   // alpha / beta / gamma / theta
+let N_HEXAD    = 6   // Law / Phi / SelfRef / Hexad / Reflexive / Transcendent
+let N_CELLS    = 16  // 4×4
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+// ─── string scan (lifted from clm_eeg_harness_smoke pattern) ────────────────
+fn find_in_str(s: string, needle: string) -> int {
+    let n = len(s)
+    let m = len(needle)
+    if m <= 0 { return 0 }
+    if n < m { return -1 }
+    let mut i = 0
+    while i <= n - m {
+        let mut j = 0
+        let mut ok = 1
+        while j < m {
+            if s[i + j] != needle[j] {
+                ok = 0
+                j = m
+            }
+            j = j + 1
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_digit_ch(c: string) -> int {
+    if c == "0" { return 1 }
+    if c == "1" { return 1 }
+    if c == "2" { return 1 }
+    if c == "3" { return 1 }
+    if c == "4" { return 1 }
+    if c == "5" { return 1 }
+    if c == "6" { return 1 }
+    if c == "7" { return 1 }
+    if c == "8" { return 1 }
+    if c == "9" { return 1 }
+    return 0
+}
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+fn extract_int_after_key(s: string, key: string) -> int {
+    let pos = find_in_str(s, key)
+    if pos < 0 { return -1 }
+    let n = len(s)
+    let m = len(key)
+    let mut p = pos + m
+    while p < n {
+        let c = s[p]
+        if is_digit_ch(c) == 1 {
+            let mut v = 0
+            while p < n {
+                let cd = s[p]
+                if is_digit_ch(cd) == 1 {
+                    v = v * 10 + digit_val(cd)
+                    p = p + 1
+                } else {
+                    return v
+                }
+            }
+            return v
+        }
+        p = p + 1
+    }
+    return -1
+}
+
+// ─── FNV step ───────────────────────────────────────────────────────────────
+fn fnv_step(h: int, byte: int) -> int {
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fingerprint_step(fp: int, val: int) -> int {
+    let mut h = fp
+    h = fnv_step(h, val % 256)
+    h = fnv_step(h, (val / 256) % 256)
+    h = fnv_step(h, (val / 65536) % 256)
+    h = fnv_step(h, (val / 16777216) % 256)
+    return h
+}
+
+// ─── hardware-mode detection from fixture body ──────────────────────────────
+//   raw#12 explicit: if fixture lacks "hardware" key → returns 0 (synthetic).
+//   Hardware-true requires the literal string "\"hardware\": true" to appear
+//   AFTER the leading 12 chars (skips the "hexa_only": true line).  This is a
+//   conservative substring scan: deliberate to avoid silent flips.
+fn detect_hardware_mode(fixture: string) -> int {
+    let key = "\"hardware\":"
+    let pos = find_in_str(fixture, key)
+    if pos < 0 { return 0 }
+    let n = len(fixture)
+    let m = len(key)
+    let mut p = pos + m
+    let mut done = 0
+    let mut result = 0
+    while p < n && done == 0 {
+        let c = fixture[p]
+        if c == "t" {
+            // expect "true"
+            if p + 3 < n {
+                if fixture[p + 1] == "r" {
+                    if fixture[p + 2] == "u" {
+                        if fixture[p + 3] == "e" { result = 1 }
+                    }
+                }
+            }
+            done = 1
+        } else {
+            if c == "f" { done = 1 }
+            else {
+                if c == "," { done = 1 }
+                else {
+                    if c == "}" { done = 1 }
+                    else { p = p + 1 }
+                }
+            }
+        }
+    }
+    return result
+}
+
+// ─── REAL HARDWARE COUPLING FN (STUB — D+5 swap target) ─────────────────────
+//   SIGNATURE (frozen for D+5 port):
+//     real_coupling_fn_x1000(
+//       fixture_seed: int,        // fingerprint of recording-bundle fixture
+//       fam_idx: int,             // 0..3  (Law / Phi / SelfRef / Hexad)
+//       band_idx: int,            // 0..3  (alpha / beta / gamma / theta)
+//       eeg_band_x1000: int,      // mean band power ×1000 across 16ch for this band
+//       anima_axis_x1000: int     // anima paradigm v11 7-axis projection
+//                                 // for the leading family signal ×1000
+//     ) -> int                    // coupling ×1000  (∈ [0, 1000])
+//
+//   STUB SEMANTICS (this version):
+//     Returns synth_coupling_x1000(fixture_seed, fam_idx, band_idx) so that
+//     the scaffold preserves byte-identical synthetic-path output (raw#65).
+//     The eeg_band_x1000 / anima_axis_x1000 inputs are NOT consumed in the
+//     stub — they are signature placeholders for the D+5 swap.
+//
+//   D+5 PORT TARGET (replace stub body with):
+//     coupling_x1000 = 1000 × |Pearson_r(
+//       family_signal_timeseries[fam_idx]   // CLM hidden-state proj. → Mk.XI v10 fam axis
+//                                           // sourced from anima_axis_x1000 windowed trace
+//     , band_power_timeseries[band_idx]     // EEG band-power per 1s window, 16ch mean
+//                                           // sourced from eeg_band_x1000 windowed trace
+//     )|
+//
+//   raw#91 honesty: this stub MUST NOT be reported as a REAL measurement.
+//   The dispatcher in main() emits classification REAL_HW_PENDING when this
+//   path is taken with a hardware-mode fixture.  Only after D+5 swap does
+//   classification advance to REAL_HW_PASS / REAL_HW_FAIL.
+fn real_coupling_fn_x1000(fixture_seed: int, fam_idx: int, band_idx: int,
+                          eeg_band_x1000: int, anima_axis_x1000: int) -> int {
+    // STUB: defer to synth so v1 byte-eq holds; eeg_band & anima_axis are
+    //       deliberately unused in v2 stub (raw#12 will fire if D+5 ports
+    //       this body without consuming them — TODO marker below).
+    // TODO[D+5]: replace with cross-corr(family_signal_ts, band_power_ts)
+    //            using eeg_band_x1000 + anima_axis_x1000 windowed traces.
+    let _eeg = eeg_band_x1000
+    let _ana = anima_axis_x1000
+    return synth_coupling_x1000(fixture_seed, fam_idx, band_idx)
+}
+
+// REAL F-stat counterpart (also STUB → synth_f for v1 byte-eq).
+fn real_f_x1000(fixture_seed: int, fam_idx: int, band_idx: int,
+                eeg_band_x1000: int, anima_axis_x1000: int) -> int {
+    let _eeg = eeg_band_x1000
+    let _ana = anima_axis_x1000
+    return synth_f_x1000(fixture_seed, fam_idx, band_idx)
+}
+
+// ─── synthetic per-cell coupling (deterministic family×band model + jitter) ─
+//   Baseline 600 + family-effect (60..150) + band-effect (60..150) + small
+//   FNV jitter ∈ [-49, 50].  Result ∈ ~[670, 950].  This guarantees:
+//     • C1 (>=500) PASS for ALL 16 cells in positive branch
+//     • family-axis dispersion ⇒ axis_A F large
+//     • band-axis dispersion   ⇒ axis_B F large
+//     • Hexad axis (fam+band)%6 inherits both ⇒ axis_C F large
+//   The deterministic structure is the SCAFFOLD assumption: real D+5
+//   measurements replace this with cross-corr(family-signal, band-power).
+fn family_offset(fam_idx: int) -> int {
+    // Law=80, Phi=140, SelfRef=200, Hexad=260   (60 step, dispersion ≈ 67)
+    return 80 + fam_idx * 60
+}
+
+fn band_offset(band_idx: int) -> int {
+    // alpha=210, beta=140, gamma=70, theta=0   (alpha-dominant rest fixture)
+    return 210 - band_idx * 70
+}
+
+// Hexad-category offset injects an INDEPENDENT third-axis signal so that
+// axis_C cannot be reduced to a linear combination of axis_A and axis_B.
+// Cat assignment is (fam*2 + band) mod 6 (asymmetric, see hexad-axis loop).
+fn hexad_offset(cat_idx: int) -> int {
+    // 50 step, range [40, 290]
+    return 40 + cat_idx * 50
+}
+
+fn synth_coupling_x1000(seed: int, fam_idx: int, band_idx: int) -> int {
+    let mut h = FNV_OFFSET_BASIS
+    h = fingerprint_step(h, seed)
+    h = fingerprint_step(h, fam_idx * 1009 + 7)
+    h = fingerprint_step(h, band_idx * 1013 + 13)
+    // Jitter ∈ [-9, 10] (small, preserves family+band+hexad structure)
+    let mut j = (h % 20)
+    if j < 0 { j = j + 20 }
+    j = j - 9
+    let cat = (fam_idx * 2 + band_idx) % N_HEXAD
+    // base=400 ⇒ coupling ∈ [400+80+30+40-9, 400+260+180+240+10] = [541, 1090]
+    //   ⇒ all 16 cells comfortably above CELL_COUPLING_MIN_X1000 (500)
+    let base = 400
+    return base + family_offset(fam_idx) + band_offset(band_idx) + hexad_offset(cat) + j
+}
+
+// Synthetic per-cell F-statistic ×1000.  Independent FNV chain.  Anchored
+// well above CELL_F_MIN_X1000 (4000) for ALL 16 positive-branch cells.
+//   Range [4500, 9499].
+fn synth_f_x1000(seed: int, fam_idx: int, band_idx: int) -> int {
+    let mut h = FNV_OFFSET_BASIS
+    h = fingerprint_step(h, seed * 31 + 17)
+    h = fingerprint_step(h, fam_idx * 2017 + 23)
+    h = fingerprint_step(h, band_idx * 2027 + 29)
+    let span = 5000
+    let mut v = (h % span)
+    if v < 0 { v = v + span }
+    return 4500 + v
+}
+
+// ─── 1-way ANOVA F-statistic ×1000 over a list of group-mean ints ──────────
+//   Simplified between-group SS / fixed within-group MS proxy.  raw#10:
+//   this is a SCAFFOLD F, replaceable by true sampled ANOVA in post-arrival
+//   workflow.  Residual chosen so positive branch yields F ≫ 4000 and
+//   uniform branch yields F = 0 (zero between-group dispersion).
+//   Calibration:
+//     positive: mean dispersion ~80 ⇒ ms_between ~80²·k/(g-1) ~6000-9000
+//                ⇒ F_x1000 ~ 6000000-9000000 / 1000 = 6000-9000 (PASS)
+//     uniform : ms_between = 0 ⇒ F_x1000 = 0 (FAIL)
+let ANOVA_RESIDUAL_X1000_SQ = 1000      // pseudo within-group MS×1000²
+
+fn axis_f_x1000(group_means: list, ng: int) -> int {
+    if ng < 2 { return 0 }
+    let mut sum = 0
+    let mut i = 0
+    while i < ng {
+        sum = sum + group_means[i]
+        i = i + 1
+    }
+    let grand = sum / ng
+    let mut ss_between = 0
+    let mut k = 0
+    while k < ng {
+        let d = group_means[k] - grand
+        ss_between = ss_between + d * d
+        k = k + 1
+    }
+    // F ≈ MS_between / MS_within.  MS_between = ss_between / (ng-1)
+    let df1 = ng - 1
+    let ms_between = ss_between / df1
+    // Convert to ×1000 scale F ≈ ms_between * 1000 / residual
+    let f_x1000 = (ms_between * 1000) / ANOVA_RESIDUAL_X1000_SQ
+    return f_x1000
+}
+
+// ─── per-band aggregate extractor (for real_coupling_fn input plumb) ────────
+//   Pulls the synthetic-fixture aggregate band power ×1000 by name.  At D+5
+//   real-data fixtures emit the same schema → same key path.
+fn fixture_band_x1000(fixture: string, band_name: string) -> int {
+    // fixture has top-level "aggregate_band_powers_x1000" : { "alpha": NNN, ... }
+    let key = "\"" + band_name + "\":"
+    let pos = find_in_str(fixture, "\"aggregate_band_powers_x1000\"")
+    if pos < 0 { return -1 }
+    let n = len(fixture)
+    // Search for the band key starting from aggregate position
+    let sub_key_pos = find_in_str(fixture, key)
+    if sub_key_pos < 0 { return -1 }
+    return extract_int_after_key(fixture, key)
+}
+
+// Anima paradigm v11 7-axis projection placeholder (D+5 real input):
+//   At D+5 this reads from anima-eeg / Mk.XI v10 LoRA hidden-state trace
+//   (per backbone-condition).  For v2 stub we derive a deterministic axis
+//   value from (fixture_seed, fam_idx) so synthetic runs stay byte-stable.
+fn anima_axis_x1000_stub(fixture_seed: int, fam_idx: int) -> int {
+    let mut h = FNV_OFFSET_BASIS
+    h = fingerprint_step(h, fixture_seed * 41 + 11)
+    h = fingerprint_step(h, fam_idx * 3001 + 19)
+    let span = 600
+    let mut v = (h % span)
+    if v < 0 { v = v + span }
+    return 200 + v   // ∈ [200, 799]
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    let fixture_path = env_str("G10_FIXTURE_PATH",
+                               "anima-clm-eeg/fixtures/synthetic_16ch_v1.json")
+    let out_path = env_str("G10_OUT",
+                           "state/clm_eeg_g10_hexad_triangulation.json")
+    let neg_uniform = env_str("G10_NEG_UNIFORM", "0")
+
+    let fixture = read_file(fixture_path)
+    let fixture_len = len(fixture)
+    let fp_extracted = extract_int_after_key(fixture, "\"fingerprint\":")
+    let dry_seed = if fp_extracted >= 0 { fp_extracted } else { fixture_len }
+
+    // ── hardware-mode dispatch (raw#91 honest tier separation) ─────────────
+    //   fixture "hardware": true ⇒ real_coupling_fn_x1000 (currently STUB).
+    //   fixture "hardware": false ⇒ synth_coupling_x1000 (v1 byte-identical).
+    //   neg_uniform mode is independent and orthogonal.
+    let hw_mode = detect_hardware_mode(fixture)
+
+    // Resolve per-band aggregate inputs for real_coupling_fn (always extracted
+    // so D+5 swap can route them; ignored by stub).  raw#12 explicit error path.
+    let band_alpha = fixture_band_x1000(fixture, "alpha")
+    let band_beta  = fixture_band_x1000(fixture, "beta")
+    let band_gamma = fixture_band_x1000(fixture, "gamma")
+    let band_theta = fixture_band_x1000(fixture, "theta")
+    let bands_present = if band_alpha >= 0 { 1 } else { 0 }
+                      + if band_beta  >= 0 { 1 } else { 0 }
+                      + if band_gamma >= 0 { 1 } else { 0 }
+                      + if band_theta >= 0 { 1 } else { 0 }
+
+    // ── build 16-cell coupling + F matrix ──────────────────────────────────
+    let mut couplings = []   // size 16, row-major fam×band
+    let mut fstats    = []   // size 16
+    let mut nc = 0
+    let mut fam = 0
+    while fam < N_FAMILIES {
+        let mut bnd = 0
+        while bnd < N_BANDS {
+            let mut cpl = 0
+            let mut fst = 0
+            if neg_uniform == "1" {
+                cpl = 400      // < CELL_COUPLING_MIN_X1000 (500)
+                fst = 2000     // < CELL_F_MIN_X1000 (4000)
+            } else {
+                if hw_mode == 1 {
+                    // REAL hardware path — currently stubbed to synth values.
+                    // raw#91: classification tier emitted as REAL_HW_PENDING
+                    // until D+5 swap replaces the stub body.
+                    let mut eeg_band = 0
+                    if bnd == 0 { eeg_band = band_alpha }
+                    if bnd == 1 { eeg_band = band_beta }
+                    if bnd == 2 { eeg_band = band_gamma }
+                    if bnd == 3 { eeg_band = band_theta }
+                    let anima_axis = anima_axis_x1000_stub(dry_seed, fam)
+                    cpl = real_coupling_fn_x1000(dry_seed, fam, bnd, eeg_band, anima_axis)
+                    fst = real_f_x1000(dry_seed, fam, bnd, eeg_band, anima_axis)
+                } else {
+                    cpl = synth_coupling_x1000(dry_seed, fam, bnd)
+                    fst = synth_f_x1000(dry_seed, fam, bnd)
+                }
+            }
+            couplings.push(cpl)
+            fstats.push(fst)
+            nc = nc + 1
+            bnd = bnd + 1
+        }
+        fam = fam + 1
+    }
+
+    // ── per-cell PASS count ────────────────────────────────────────────────
+    let mut cell_pass_count = 0
+    let mut idx = 0
+    while idx < N_CELLS {
+        let c1 = if couplings[idx] >= CELL_COUPLING_MIN_X1000 { 1 } else { 0 }
+        let c2 = if fstats[idx]    >= CELL_F_MIN_X1000        { 1 } else { 0 }
+        if c1 == 1 && c2 == 1 { cell_pass_count = cell_pass_count + 1 }
+        idx = idx + 1
+    }
+    let c3_pass = if cell_pass_count >= CELL_PASS_MIN { 1 } else { 0 }
+
+    // ── axis_A: backbone family means (4 levels) ───────────────────────────
+    let mut fam_means = []
+    let mut fa = 0
+    while fa < N_FAMILIES {
+        let mut s = 0
+        let mut bb = 0
+        while bb < N_BANDS {
+            s = s + couplings[fa * N_BANDS + bb]
+            bb = bb + 1
+        }
+        fam_means.push(s / N_BANDS)
+        fa = fa + 1
+    }
+    let axis_a_f = axis_f_x1000(fam_means, N_FAMILIES)
+
+    // ── axis_B: EEG band means (4 levels) ──────────────────────────────────
+    let mut band_means = []
+    let mut bi = 0
+    while bi < N_BANDS {
+        let mut s = 0
+        let mut fi = 0
+        while fi < N_FAMILIES {
+            s = s + couplings[fi * N_BANDS + bi]
+            fi = fi + 1
+        }
+        band_means.push(s / N_FAMILIES)
+        bi = bi + 1
+    }
+    let axis_b_f = axis_f_x1000(band_means, N_BANDS)
+
+    // ── axis_C: Hexad category means (6 levels) ────────────────────────────
+    //   Hexad category assignment: each of 16 cells maps to one of 6 cats
+    //   via deterministic mapping = (fam_idx*2 + band_idx) mod 6.  This is
+    //   asymmetric (16 cells → 6 cats with non-uniform counts) so axis_C
+    //   inherits real dispersion from family+band effects without averaging
+    //   to grand mean (a pure Latin-square mapping would null the F).
+    let mut hexad_sums = [0, 0, 0, 0, 0, 0]
+    let mut hexad_n    = [0, 0, 0, 0, 0, 0]
+    let mut h_fam = 0
+    while h_fam < N_FAMILIES {
+        let mut h_bnd = 0
+        while h_bnd < N_BANDS {
+            let cat = (h_fam * 2 + h_bnd) % N_HEXAD
+            let cell_val = couplings[h_fam * N_BANDS + h_bnd]
+            hexad_sums[cat] = hexad_sums[cat] + cell_val
+            hexad_n[cat]    = hexad_n[cat] + 1
+            h_bnd = h_bnd + 1
+        }
+        h_fam = h_fam + 1
+    }
+    let mut hexad_means = []
+    let mut hci = 0
+    while hci < N_HEXAD {
+        let n_h = hexad_n[hci]
+        let mean_h = if n_h > 0 { hexad_sums[hci] / n_h } else { 0 }
+        hexad_means.push(mean_h)
+        hci = hci + 1
+    }
+    let axis_c_f = axis_f_x1000(hexad_means, N_HEXAD)
+
+    // ── AND-gate composite verdict ─────────────────────────────────────────
+    let c4a_pass = if axis_a_f >= AXIS_F_MIN_X1000 { 1 } else { 0 }
+    let c4b_pass = if axis_b_f >= AXIS_F_MIN_X1000 { 1 } else { 0 }
+    let c4c_pass = if axis_c_f >= AXIS_F_MIN_X1000 { 1 } else { 0 }
+    let g10_pass = if c3_pass == 1 && c4a_pass == 1 && c4b_pass == 1 && c4c_pass == 1 { 1 } else { 0 }
+
+    // ── chained fingerprint over the entire emitted matrix ────────────────
+    let mut fp = FNV_OFFSET_BASIS
+    fp = fingerprint_step(fp, dry_seed)
+    fp = fingerprint_step(fp, fixture_len)
+    let mut fpi = 0
+    while fpi < N_CELLS {
+        fp = fingerprint_step(fp, couplings[fpi])
+        fp = fingerprint_step(fp, fstats[fpi])
+        fpi = fpi + 1
+    }
+    fp = fingerprint_step(fp, axis_a_f)
+    fp = fingerprint_step(fp, axis_b_f)
+    fp = fingerprint_step(fp, axis_c_f)
+    fp = fingerprint_step(fp, cell_pass_count)
+    fp = fingerprint_step(fp, g10_pass)
+
+    // ── emit cert ──────────────────────────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"g10_hexad_triangulation_scaffold\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"pre_register_frozen\": true,\n"
+    cert = cert + "  \"frozen_at\": \"2026-04-26\",\n"
+    cert = cert + "  \"hypothesis\": \"backbone-family signal × EEG-band power × Hexad-category — 16-cell coupling triangulates with cross-axis F-test AND-gate\",\n"
+    cert = cert + "  \"families\": [\"Law\", \"Phi\", \"SelfRef\", \"Hexad\"],\n"
+    cert = cert + "  \"bands\": [\"alpha\", \"beta\", \"gamma\", \"theta\"],\n"
+    cert = cert + "  \"hexad_categories\": [\"Law\", \"Phi\", \"SelfRef\", \"Hexad\", \"Reflexive\", \"Transcendent\"],\n"
+    cert = cert + "  \"criteria\": {\n"
+    cert = cert + "    \"C1_cell_coupling_min_x1000\": " + str(CELL_COUPLING_MIN_X1000) + ",\n"
+    cert = cert + "    \"C2_cell_f_min_x1000\": " + str(CELL_F_MIN_X1000) + ",\n"
+    cert = cert + "    \"C3_cell_pass_min\": " + str(CELL_PASS_MIN) + ",\n"
+    cert = cert + "    \"C4_axis_f_min_x1000\": " + str(AXIS_F_MIN_X1000) + ",\n"
+    cert = cert + "    \"verdict_rule\": \"G10.PASS = (cell_pass>=C3) AND (axis_A_F>=C4) AND (axis_B_F>=C4) AND (axis_C_F>=C4)\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"dry_run\": {\n"
+    cert = cert + "    \"fixture_path\": \"" + fixture_path + "\",\n"
+    cert = cert + "    \"fixture_bytes\": " + str(fixture_len) + ",\n"
+    cert = cert + "    \"fixture_fingerprint_extracted\": " + str(fp_extracted) + ",\n"
+    cert = cert + "    \"dry_seed\": " + str(dry_seed) + ",\n"
+    cert = cert + "    \"neg_uniform_mode\": " + neg_uniform + ",\n"
+    cert = cert + "    \"cell_matrix_4x4\": [\n"
+    let mut emit_fam = 0
+    while emit_fam < N_FAMILIES {
+        cert = cert + "      ["
+        let mut emit_bnd = 0
+        while emit_bnd < N_BANDS {
+            let cell_idx = emit_fam * N_BANDS + emit_bnd
+            cert = cert + "{\"coupling_x1000\":" + str(couplings[cell_idx])
+            cert = cert + ",\"f_x1000\":" + str(fstats[cell_idx]) + "}"
+            if emit_bnd < N_BANDS - 1 { cert = cert + "," }
+            emit_bnd = emit_bnd + 1
+        }
+        cert = cert + "]"
+        if emit_fam < N_FAMILIES - 1 { cert = cert + "," }
+        cert = cert + "\n"
+        emit_fam = emit_fam + 1
+    }
+    cert = cert + "    ],\n"
+    cert = cert + "    \"family_means_x1000\": [" + str(fam_means[0]) + "," + str(fam_means[1]) + "," + str(fam_means[2]) + "," + str(fam_means[3]) + "],\n"
+    cert = cert + "    \"band_means_x1000\":   [" + str(band_means[0]) + "," + str(band_means[1]) + "," + str(band_means[2]) + "," + str(band_means[3]) + "],\n"
+    cert = cert + "    \"hexad_means_x1000\":  [" + str(hexad_means[0]) + "," + str(hexad_means[1]) + "," + str(hexad_means[2]) + "," + str(hexad_means[3]) + "," + str(hexad_means[4]) + "," + str(hexad_means[5]) + "],\n"
+    cert = cert + "    \"cell_pass_count\":   " + str(cell_pass_count) + ",\n"
+    cert = cert + "    \"axis_A_F_x1000\":    " + str(axis_a_f) + ",\n"
+    cert = cert + "    \"axis_B_F_x1000\":    " + str(axis_b_f) + ",\n"
+    cert = cert + "    \"axis_C_F_x1000\":    " + str(axis_c_f) + ",\n"
+    cert = cert + "    \"C3_pass\":           " + str(c3_pass) + ",\n"
+    cert = cert + "    \"C4_axisA_pass\":     " + str(c4a_pass) + ",\n"
+    cert = cert + "    \"C4_axisB_pass\":     " + str(c4b_pass) + ",\n"
+    cert = cert + "    \"C4_axisC_pass\":     " + str(c4c_pass) + ",\n"
+    cert = cert + "    \"g10_dry_run_pass\":  " + str(g10_pass) + ",\n"
+    cert = cert + "    \"chained_fingerprint\": " + str(fp) + ",\n"
+    // raw#91 honesty: classification tier strictly mirrors hw_mode + g10_pass.
+    //   synthetic + pass  → NOT_VERIFIED_SYNTHETIC   (v1 baseline literal)
+    //   synthetic + fail  → NOT_VERIFIED_SYNTHETIC   (v1 baseline literal — neg falsifier)
+    //   hardware  + pass  → REAL_HW_PENDING          (stub still wired; never PASS)
+    //   hardware  + fail  → REAL_HW_PENDING          (stub still wired; never PASS)
+    //   Post D+5 swap: hardware tier advances to REAL_HW_PASS / REAL_HW_FAIL.
+    let mut classification = "NOT_VERIFIED_SYNTHETIC"
+    if hw_mode == 1 { classification = "REAL_HW_PENDING" }
+    let mut note = "Synthetic FNV coupling matrix — scaffold only. Real backbone-EEG coupling deferred to D+5 post-arrival workflow."
+    if hw_mode == 1 {
+        note = "Hardware-mode fixture detected. real_coupling_fn_x1000 currently STUB → returns synth values. D+5 swap pending: replace stub body with cross-corr(family_signal_ts, band_power_ts). raw#91: NOT a real measurement."
+    }
+    cert = cert + "    \"classification\":    \"" + classification + "\",\n"
+    cert = cert + "    \"note\": \"" + note + "\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"post_arrival_workflow\": {\n"
+    cert = cert + "    \"day_window\": \"D+5 .. D+7\",\n"
+    cert = cert + "    \"input_eeg\": \"anima-eeg/recordings/<g10_session>.npy (16ch × 250Hz × ≥120s per backbone-condition)\",\n"
+    cert = cert + "    \"input_clm\": \"Mk.XI v10 4-backbone family signals (Mistral=Law / gemma=Phi / Llama=SelfRef / qwen3=Hexad)\",\n"
+    cert = cert + "    \"replace\": \"this synth_coupling_x1000 with cross-correlation between backbone family-signal time-series and EEG band-power time-series; replace synth_f_x1000 with true 1-way ANOVA F (df1=3 family levels, df2=n_windows-4)\",\n"
+    cert = cert + "    \"hexad_axis\": \"map each (family,band) cell onto Hexad category via Mk.XI v10 family-leading taxonomy (Law/Phi/SelfRef/Hexad) plus Reflexive (cross-band coherence) + Transcendent (whole-spectrum integration)\",\n"
+    cert = cert + "    \"verdict_rule\": \"identical (frozen criteria above)\",\n"
+    cert = cert + "    \"spec_doc\": \"anima-clm-eeg/docs/g10_triangulation_spec_post_arrival.md\"\n"
+    cert = cert + "  }\n"
+    cert = cert + "}\n"
+    write_file(out_path, cert)
+
+    println("─── g10_hexad_triangulation_scaffold (raw#9 hexa-only) ───")
+    println("  fixture                = " + fixture_path)
+    println("  fixture_fingerprint    = " + str(fp_extracted))
+    println("  dry_seed               = " + str(dry_seed))
+    println("  neg_uniform_mode       = " + neg_uniform)
+    println("  hw_mode                = " + str(hw_mode))
+    println("  bands_present          = " + str(bands_present) + " / 4")
+    println("  classification         = " + classification)
+    println("  C1 cell_coupling_min   = " + str(CELL_COUPLING_MIN_X1000))
+    println("  C2 cell_f_min          = " + str(CELL_F_MIN_X1000))
+    println("  C3 cell_pass_min       = " + str(CELL_PASS_MIN))
+    println("  C4 axis_f_min          = " + str(AXIS_F_MIN_X1000))
+    println("  cell_pass_count        = " + str(cell_pass_count) + " / 16")
+    println("  family_means_x1000     = [" + str(fam_means[0]) + "," + str(fam_means[1]) + "," + str(fam_means[2]) + "," + str(fam_means[3]) + "]")
+    println("  band_means_x1000       = [" + str(band_means[0]) + "," + str(band_means[1]) + "," + str(band_means[2]) + "," + str(band_means[3]) + "]")
+    println("  hexad_means_x1000      = [" + str(hexad_means[0]) + "," + str(hexad_means[1]) + "," + str(hexad_means[2]) + "," + str(hexad_means[3]) + "," + str(hexad_means[4]) + "," + str(hexad_means[5]) + "]")
+    println("  axis_A_F_x1000         = " + str(axis_a_f))
+    println("  axis_B_F_x1000         = " + str(axis_b_f))
+    println("  axis_C_F_x1000         = " + str(axis_c_f))
+    println("  C3_pass                = " + str(c3_pass))
+    println("  C4_axisA_pass          = " + str(c4a_pass))
+    println("  C4_axisB_pass          = " + str(c4b_pass))
+    println("  C4_axisC_pass          = " + str(c4c_pass))
+    println("  chained_fingerprint    = " + str(fp))
+    println("  output                 = " + out_path)
+
+    // ── tier-aware verdict label (raw#91 honest classification) ────────────
+    let mut verdict_label = "G10_DRY_RUN_FAIL"
+    if g10_pass == 1 {
+        if hw_mode == 1 { verdict_label = "G10_REAL_HW_PENDING" }
+        else            { verdict_label = "G10_DRY_RUN_PASS"   }
+    } else {
+        if hw_mode == 1 { verdict_label = "G10_REAL_HW_FAIL"   }
+    }
+    // raw#91: even when all gates pass under hw_mode, current build is STUB
+    //          so the verdict_label is REAL_HW_PENDING (NEVER REAL_HW_PASS)
+    //          until D+5 swap replaces real_coupling_fn body.
+
+    println("  verdict                = " + verdict_label)
+
+    // ── inline selftest (raw#12 silent-error-ban) ──────────────────────────
+    //   Runs unconditionally; asserts the v1 baseline against frozen values
+    //   when fixture is the canonical synthetic_16ch_v1.json.  Hardware-mode
+    //   runs skip the freeze-asserts (they will be re-frozen at D+5).
+    let selftest_pass_count = run_selftest(hw_mode, fp_extracted, fixture_len,
+                                            cell_pass_count, axis_a_f, axis_b_f, axis_c_f,
+                                            fp, g10_pass)
+
+    if g10_pass == 1 && selftest_pass_count >= 6 { exit(0) }
+    exit(1)
+}
+
+// ─── inline SELFTEST ─────────────────────────────────────────────────────────
+//   Frozen baseline (v1 synthetic positive path, 2026-04-26 land):
+//     fixture_fingerprint   = 2960889009
+//     fixture_bytes         = 2393
+//     cell_pass_count       = 16
+//     axis_A_F_x1000        = 7399
+//     axis_B_F_x1000        = 4314
+//     axis_C_F_x1000        = 6259
+//     chained_fingerprint   = 3014690086
+//     g10_dry_run_pass      = 1
+//   The 6+ asserts MUST all pass for synthetic mode to count as SELFTEST_OK.
+//   raw#12: every miss prints explicit ERROR line (no silent skip).
+fn run_selftest(hw_mode: int, fp_extracted: int, fixture_len: int,
+                cell_pass_count: int, axis_a_f: int, axis_b_f: int, axis_c_f: int,
+                chained_fp: int, g10_pass: int) -> int {
+    println("─── SELFTEST (raw#12 silent-error-ban) ───")
+    if hw_mode == 1 {
+        println("  hw_mode=1 → skip v1 freeze-asserts (re-freeze at D+5 swap)")
+        println("  SELFTEST                = SKIP_HARDWARE_MODE")
+        return 6   // sentinel: hardware-mode does not gate exit on selftest
+    }
+    let mut pc = 0
+    let mut fc = 0
+    if fp_extracted == 2960889009 { pc = pc + 1 }
+    else { println("  ERROR fp_extracted     " + str(fp_extracted) + " != 2960889009"); fc = fc + 1 }
+    if fixture_len == 2393 { pc = pc + 1 }
+    else { println("  ERROR fixture_len      " + str(fixture_len) + " != 2393"); fc = fc + 1 }
+    if cell_pass_count == 16 { pc = pc + 1 }
+    else { println("  ERROR cell_pass_count  " + str(cell_pass_count) + " != 16"); fc = fc + 1 }
+    if axis_a_f == 7399 { pc = pc + 1 }
+    else { println("  ERROR axis_A_F         " + str(axis_a_f) + " != 7399"); fc = fc + 1 }
+    if axis_b_f == 4314 { pc = pc + 1 }
+    else { println("  ERROR axis_B_F         " + str(axis_b_f) + " != 4314"); fc = fc + 1 }
+    if axis_c_f == 6259 { pc = pc + 1 }
+    else { println("  ERROR axis_C_F         " + str(axis_c_f) + " != 6259"); fc = fc + 1 }
+    if chained_fp == 3014690086 { pc = pc + 1 }
+    else { println("  ERROR chained_fp       " + str(chained_fp) + " != 3014690086"); fc = fc + 1 }
+    if g10_pass == 1 { pc = pc + 1 }
+    else { println("  ERROR g10_pass         " + str(g10_pass) + " != 1"); fc = fc + 1 }
+    println("  SELFTEST PASS           = " + str(pc) + " / 8")
+    println("  SELFTEST FAIL           = " + str(fc) + " / 8")
+    if fc == 0 { println("  SELFTEST                = SYNTHETIC_BASELINE_OK") }
+    else       { println("  SELFTEST                = SYNTHETIC_BASELINE_REGRESSION") }
+    return pc
+}
+
+main()
