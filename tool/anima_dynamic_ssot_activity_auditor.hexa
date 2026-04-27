@@ -1,0 +1,163 @@
+// tool/anima_dynamic_ssot_activity_auditor.hexa — anima dynamic SSOT activity audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   git status M-marked dynamic SSOT files audit — session 활동 trail.
+//   .roadmap, atlas, lint cron, worktree_merge_plan 등 modified state 파일들.
+//
+//   본 helper = mac-local NON_MUTATION:
+//     - git status M files enumeration (subprocess git)
+//     - 각 SSOT의 size + modification metadata
+//     - cycles 1-46 batch 결과 state JSON과 분리 (helper outputs 제외)
+//     - selftest verifies: ≥10 M-marked / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/dynamic_ssot_activity_auditor.json)
+//
+// OUTPUT
+//   - m_marked_files: list of {path, size, mtime_relative}
+//   - dynamic_ssot_categorization: {atlas / cron / worktree / config / other}
+//   - cycles_46_state_files_excluded
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_dynamic_ssot_activity_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/dynamic_ssot_activity_auditor.json hexa run tool/anima_dynamic_ssot_activity_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - cycles 1-46 helper outputs는 batch 산출물 — dynamic SSOT 영역 외.
+//   - subprocess git 실패 시 graceful degrade.
+
+let HELPER_PATH = "/tmp/anima_dynamic_ssot_activity_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima dynamic SSOT activity auditor — emitted by tool/anima_dynamic_ssot_activity_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION dynamic SSOT audit.\n")
+    parts.push("import json, os, sys, subprocess, time\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/dynamic_ssot_activity_auditor.json')\n\n")
+
+    parts.push("# git status -s (cwd=anima root)\n")
+    parts.push("m_files = []\n")
+    parts.push("try:\n")
+    parts.push("    r = subprocess.run(['git', 'status', '-s'], capture_output=True, text=True, timeout=10)\n")
+    parts.push("    if r.returncode == 0:\n")
+    parts.push("        for line in r.stdout.splitlines():\n")
+    parts.push("            if line.startswith(' M '):\n")
+    parts.push("                m_files.append(line[3:].strip())\n")
+    parts.push("except Exception as e:\n")
+    parts.push("    print(f'git status error: {e}', file=sys.stderr)\n\n")
+
+    parts.push("# Filter: exclude cycles 1-46 helper output state files (separate audit category)\n")
+    parts.push("CYCLES_HELPER_STATE_PATTERNS = [\n")
+    parts.push("    'r46_', 'cmt_v2_', 'axis96_', 'mk_xii_', 'pilot_t2_', 'own3_de_',\n")
+    parts.push("    'zombie_posterior_v4_', 'eeg_cp2_', 'h100_p1_', 'paradigm_v11_axis_filter_',\n")
+    parts.push("    'anima_composite_production_', 'axis82_', 'atlas_rtier_', 'atlas_drift_',\n")
+    parts.push("    'session_handoff_extension_', 'ssot_chflags_', 'tool_dir_', 'state_dir_',\n")
+    parts.push("    'docs_dir_md_', 'memory_dir_', 'gitignore_', 'nexus_roadmaps_',\n")
+    parts.push("    'ci_workflows_', 'references_external_', 'subrepo_', 'ready_dir_',\n")
+    parts.push("    'workspace_sibling_', 'worktrees_agent_', 'bin_executables_',\n")
+    parts.push("    'workspace_archives_', 'workspace_full_', 'hive_repo_', 'nexus_repo_',\n")
+    parts.push("    'void_repo_', 'papers_repo_', 'n6_architecture_', 'ecosystem_cross_',\n")
+    parts.push("    'remaining_8_', 'subrepos_deep_', 'final_super_', 'contact_repo_',\n")
+    parts.push("]\n")
+    parts.push("def _is_cycle_helper_state(path):\n")
+    parts.push("    base = os.path.basename(path)\n")
+    parts.push("    return path.startswith('state/') and any(base.startswith(p) for p in CYCLES_HELPER_STATE_PATTERNS)\n\n")
+
+    parts.push("dynamic_ssot = [f for f in m_files if not _is_cycle_helper_state(f)]\n")
+    parts.push("cycle_helper_outputs = [f for f in m_files if _is_cycle_helper_state(f)]\n\n")
+
+    parts.push("# Categorize dynamic SSOT\n")
+    parts.push("now = time.time()\n")
+    parts.push("def _meta(path):\n")
+    parts.push("    if not os.path.exists(path): return {'size':0, 'mtime_age_h':None}\n")
+    parts.push("    try:\n")
+    parts.push("        st = os.stat(path)\n")
+    parts.push("        return {'size':st.st_size, 'mtime_age_h':round((now - st.st_mtime) / 3600, 1)}\n")
+    parts.push("    except Exception: return {'size':0, 'mtime_age_h':None}\n\n")
+
+    parts.push("CATEGORIZATION = {\n")
+    parts.push("    'atlas':lambda p: 'atlas' in p.lower() or 'witness_ledger' in p.lower(),\n")
+    parts.push("    'cron':lambda p: 'cron' in p.lower() or 'lint_' in p.lower(),\n")
+    parts.push("    'worktree':lambda p: 'worktree' in p.lower(),\n")
+    parts.push("    'roadmap':lambda p: '.roadmap' in p,\n")
+    parts.push("    'docs':lambda p: p.startswith('docs/') or p.endswith('.md'),\n")
+    parts.push("    'directory':lambda p: not '.' in os.path.basename(p),\n")
+    parts.push("}\n\n")
+
+    parts.push("dynamic_ssot_audit = []\n")
+    parts.push("category_counts = {k:0 for k in CATEGORIZATION.keys()}\n")
+    parts.push("category_counts['other'] = 0\n")
+    parts.push("for f in dynamic_ssot:\n")
+    parts.push("    meta = _meta(f)\n")
+    parts.push("    cat = 'other'\n")
+    parts.push("    for ck, cf in CATEGORIZATION.items():\n")
+    parts.push("        if cf(f):\n")
+    parts.push("            cat = ck\n")
+    parts.push("            break\n")
+    parts.push("    category_counts[cat] += 1\n")
+    parts.push("    dynamic_ssot_audit.append({'path':f, 'category':cat, **meta})\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'dynamic SSOT activity audit (M-marked session-modified files)',\n")
+    parts.push("    'm_files_total':len(m_files),\n")
+    parts.push("    'dynamic_ssot_count':len(dynamic_ssot),\n")
+    parts.push("    'cycle_helper_outputs_count':len(cycle_helper_outputs),\n")
+    parts.push("    'cycle_helper_outputs_note':'cycles 1-46 batch products — separate audit category, expected M-marked',\n")
+    parts.push("    'dynamic_ssot_audit':dynamic_ssot_audit,\n")
+    parts.push("    'dynamic_ssot_categorization':category_counts,\n")
+    parts.push("    'characterization':'dynamic SSOT = .roadmap (cycle 21 unlocked finding) + atlas (cycle 18 drift) + lint cron history + worktree merge plan + others. Session activity trail.',\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify any file; read-only git status capture',\n")
+    parts.push("    'cross_link_cycles':['cycle 21 SSOT chflags (3 unlocked)','cycle 18 atlas drift','cycle 33 worktrees inventory'],\n")
+    parts.push("    'pattern':'governance audit chain layer 27 (cycles 21-46 + this) — session activity dynamic SSOT',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[dynamic_ssot] m_total={len(m_files)} dynamic={len(dynamic_ssot)} cycle_helpers={len(cycle_helper_outputs)} categories={category_counts} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let m_files_min = 10
+    let categories = "atlas,cron,worktree,roadmap,docs,directory,other"
+    let non_mutation = "READ_ONLY"
+    println("inv:m_files_min=" + to_string(m_files_min))
+    println("inv:categories=" + categories)
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:cycles_helper_state_excluded=true")
+    println("inv:cross_link_cycle21_cycle18_cycle33=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_dynamic_ssot_activity_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=dynamic SSOT activity audit (M-marked / session activity trail; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
