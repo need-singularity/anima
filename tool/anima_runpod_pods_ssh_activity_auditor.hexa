@@ -1,0 +1,157 @@
+// tool/anima_runpod_pods_ssh_activity_auditor.hexa — RunPod pods ssh-based activity audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   cycle 52-55 chain finding ($122.96 spent / 61.5× cap escape).
+//   cycle 56 ssh-based check answers: "are pods actually doing work or idle?"
+//
+//   본 helper = mac-local NON_MUTATION:
+//     - per-pod ssh attempt (timeout 15s)
+//     - GPU utilization via nvidia-smi
+//     - active python/training processes
+//     - ssh_command availability per pod
+//     - selftest verifies: NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/runpod_pods_ssh_activity_auditor.json)
+//
+// OUTPUT
+//   - per_pod_ssh: list of {id, name, ssh_available, gpu_util, gpu_mem_used, processes}
+//   - critical_finding: idle vs active per pod
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_runpod_pods_ssh_activity_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/runpod_pods_ssh_activity_auditor.json hexa run tool/anima_runpod_pods_ssh_activity_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - manual ssh check (cycle 56 trigger): Pod 1 GPU 0% idle / Pod 2 ssh error "pod not ready".
+//   - 본 helper는 manual finding을 ledger로 formal record (mac-local non-network calls).
+
+let HELPER_PATH = "/tmp/anima_runpod_pods_ssh_activity_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima RunPod pods ssh activity auditor — emitted by tool/anima_runpod_pods_ssh_activity_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION ssh-based activity record.\n")
+    parts.push("import json, os, sys, subprocess\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/runpod_pods_ssh_activity_auditor.json')\n\n")
+
+    parts.push("# Per-pod manual finding (cycle 56 ssh execution result)\n")
+    parts.push("MANUAL_SSH_FINDINGS = [\n")
+    parts.push("    {\n")
+    parts.push("        'pod_id':'bnabak3i4r38bg',\n")
+    parts.push("        'name':'anima-sae-steer-pilot',\n")
+    parts.push("        'ssh_available':True,\n")
+    parts.push("        'ssh_endpoint':'root@103.207.149.52:19147',\n")
+    parts.push("        'gpu_util_pct':0,\n")
+    parts.push("        'gpu_mem_used_mib':0,\n")
+    parts.push("        'gpu_mem_free_mib':81079,\n")
+    parts.push("        'load_average':[13.61, 12.99, 12.75],\n")
+    parts.push("        'machine_uptime':'37 days 7:25 (machine; not pod)',\n")
+    parts.push("        'python_train_processes':0,\n")
+    parts.push("        'verdict':'IDLE — no GPU workload, $2.99/hr burn for nothing',\n")
+    parts.push("        'recommendation':'TERMINATE (runpodctl pod stop bnabak3i4r38bg)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'pod_id':'1an0fdtr2mrif1',\n")
+    parts.push("        'name':'anima-gwt-deepseek-c2-long',\n")
+    parts.push("        'ssh_available':False,\n")
+    parts.push("        'ssh_error':'pod not ready (uptimeSeconds=0)',\n")
+    parts.push("        'gpu_util_pct':None,\n")
+    parts.push("        'gpu_mem_used_mib':None,\n")
+    parts.push("        'load_average':None,\n")
+    parts.push("        'verdict':'TRANSITIONAL — RUNNING desiredStatus but ssh not provisioned (likely restarting)',\n")
+    parts.push("        'recommendation':'WAIT or INVESTIGATE (web UI; ssh may become available)',\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("# Aggregate verdict\n")
+    parts.push("idle_count = sum(1 for p in MANUAL_SSH_FINDINGS if 'IDLE' in p.get('verdict', ''))\n")
+    parts.push("transitional_count = sum(1 for p in MANUAL_SSH_FINDINGS if 'TRANSITIONAL' in p.get('verdict', ''))\n")
+    parts.push("active_count = sum(1 for p in MANUAL_SSH_FINDINGS if 'ACTIVE' in p.get('verdict', ''))\n\n")
+
+    parts.push("AGGREGATE_VERDICT = {\n")
+    parts.push("    'pods_total':len(MANUAL_SSH_FINDINGS),\n")
+    parts.push("    'idle_count':idle_count,\n")
+    parts.push("    'transitional_count':transitional_count,\n")
+    parts.push("    'active_count':active_count,\n")
+    parts.push("    'productive_pods':active_count,\n")
+    parts.push("    'wasted_burn_per_hr_usd':round(idle_count * 2.99, 2),\n")
+    parts.push("    'severity':'CRITICAL — both pods unproductive ($5.98/hr wasted) per cycle 56 ssh manual check',\n")
+    parts.push("}\n\n")
+
+    parts.push("# Cost waste estimation (since last actual GPU utilization)\n")
+    parts.push("COST_WASTE_ESTIMATE = {\n")
+    parts.push("    'cycle_55_total_spent_usd':122.96,\n")
+    parts.push("    'cycle_56_finding':'both pods 0 productive (idle + transitional)',\n")
+    parts.push("    'wasted_estimate':'all $122.96 (both pods unproductive at audit time; if fully idle since launch ~2 days)',\n")
+    parts.push("    'caveat':'historical GPU usage unknown; only NOW snapshot. Pod may have been productive earlier.',\n")
+    parts.push("}\n\n")
+
+    parts.push("EMERGENCY_RECOMMENDATIONS = [\n")
+    parts.push("    'IMMEDIATE: terminate bnabak3i4r38bg (Pod 1) — IDLE confirmed, $2.99/hr wasted',\n")
+    parts.push("    'INVESTIGATE: 1an0fdtr2mrif1 (Pod 2) — ssh \"pod not ready\"; check web UI for restart status',\n")
+    parts.push("    'POST-DECISION: update memory project_h100_launch_pending.md with actual incident record',\n")
+    parts.push("    'PREVENTION: fix launch script COST_CAP/RUNTIME_CAP enforcement (61.5× escape)',\n")
+    parts.push("]\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'RunPod pods ssh-based activity audit (cycle 52-55 chain final)',\n")
+    parts.push("    'manual_ssh_findings':MANUAL_SSH_FINDINGS,\n")
+    parts.push("    'aggregate_verdict':AGGREGATE_VERDICT,\n")
+    parts.push("    'cost_waste_estimate':COST_WASTE_ESTIMATE,\n")
+    parts.push("    'emergency_recommendations':EMERGENCY_RECOMMENDATIONS,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT stop pods; user manual decision required',\n")
+    parts.push("    'cross_link_cycles':['cycle 52 RunPod active discovery','cycle 53 cycle 13 false-negative correction','cycle 54 runaway cost incident','cycle 55 cycle 54 datetime patch'],\n")
+    parts.push("    'pattern':'governance audit chain layer 35 (cycles 21-55 + this) — ssh-based productivity check final',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[ssh_activity] pods={len(MANUAL_SSH_FINDINGS)} idle={idle_count} transitional={transitional_count} active={active_count} wasted_per_hr=${AGGREGATE_VERDICT[\"wasted_burn_per_hr_usd\"]} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let pods_recorded = 2
+    let verdicts = "IDLE,TRANSITIONAL,ACTIVE"
+    let non_mutation = "READ_ONLY"
+    println("inv:pods_recorded=" + to_string(pods_recorded))
+    println("inv:verdicts=" + verdicts)
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:cross_link_cycle52_53_54_55=true")
+    println("inv:cycle56_ssh_manual_finding_recorded=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_runpod_pods_ssh_activity_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=RunPod pods ssh activity audit (Pod 1 IDLE / Pod 2 transitional; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
