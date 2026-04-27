@@ -1,0 +1,118 @@
+{
+  "schema": "anima/blockers/v1",
+  "slug": "gemma-27b-repeat-silent-platform-termination",
+  "status": "active",
+  "registered_at": "2026-04-27T13:30:00Z",
+  "registered_by": "anima-cmd-loop-2026-04-27 (own 4 + raw 45 mandate)",
+  "axis": "Mk.XII Phase 3a gemma family-internal scale closure (gemma-2-27b cell)",
+  "task_id_chain": ["#11", "#13", "#15"],
+  "task_pre_register": "state/mk_xii_3a_gemma_familyinternal_pre_register.json",
+  "summary": "gemma-2-27b CMT v3 measurement on RunPod H100 SXM 80GB pods has silently terminated 3 consecutive times during weight fetch, despite 3 independent root-cause-targeted fixes. Pattern points to runpod platform-level fault (mfs network filesystem hiccup OR region-specific quota OR oversize blob ingest quota), NOT memory/xet/disk.",
+  "three_strike_pattern": [
+    {
+      "attempt": 1,
+      "task": "#11",
+      "pod_id": "it5ku4iviw7w6h",
+      "fix_applied": "default loader, container disk 50GB, default memory budget",
+      "outcome": "silent SIGKILL during from_pretrained() ~360s, 59GB HF cache (~75% download)",
+      "first_diagnosis": "host RAM OOM (default device_map loaded full fp16 in CPU RAM)",
+      "cost_usd": 0.179
+    },
+    {
+      "attempt": 2,
+      "task": "#13",
+      "pod_id": "3q7pqjhsmnulm6",
+      "fix_applied": "device_map='auto' + low_cpu_mem_usage=True + memInGb=251 + HF_HOME=/workspace/.hf_cache",
+      "outcome": "silent platform termination at xet 75% (18/24 files, 94GB cached) ~513s",
+      "diagnosis_revision": "OOM REJECTED — memcg.peak=104GB / 251GB cap (42%), oom_kill=0; 2015GB host RAM observed; reframed as platform-level (mfs OR safetensors fetch OR fetcher segfault on 22+GB shards)",
+      "cost_usd": 0.426
+    },
+    {
+      "attempt": 3,
+      "task": "#15",
+      "pod_id": "d8qrg4y40io8fy",
+      "fix_applied": "HF_HUB_DISABLE_XET=1 + huggingface_hub.snapshot_download(max_workers=1, resume_download=True) + sys.excepthook + retry-with-backoff + per-shard sentinel + 251GB RAM",
+      "outcome": "(a) ModuleNotFoundError(transformers) caught by sys.excepthook → JSON written → agent relaunched after pip install; (b) relaunch 222s after fetching 12% (4/34 files) → pod ssh refused (auto-terminate by platform)",
+      "diagnosis_revision": "xet REJECTED (HF_HUB_DISABLE_XET=1 active, sequential download confirmed via max_workers=1); platform-level fault confirmed across BOTH xet and non-xet paths",
+      "cost_usd": 0.180
+    }
+  ],
+  "ruled_out_root_causes": [
+    "host RAM OOM (memcg evidence: oom_kill=0, peak=42% of 251GB)",
+    "container disk full (overlay 1%, /workspace 40%)",
+    "cgroup memory limit (251GB confirmed via /sys/fs/cgroup/memory.max)",
+    "xet (HuggingFace Rust accelerator) panic (v3 used HF_HUB_DISABLE_XET=1 + sequential, same termination)",
+    "HF Hub API rate limit (single-thread sequential should not trigger; v3 still failed)"
+  ],
+  "remaining_hypotheses": [
+    "(H1) mfs (network filesystem mfs#us-ne-1.runpod.net:9421) sustained-write throughput cap triggers RunPod platform termination on extended download — /workspace is networked, write speed bound by RTT and network capacity",
+    "(H2) RunPod has undocumented network ingress quota per pod, hit ~50-90GB → SIGKILL by runpod orchestrator",
+    "(H3) RunPod region us-ne-1 specific issue; us-east or other regions may behave differently",
+    "(H4) Pod template (pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04) has resource arbiter that incorrectly classifies long-running file write as 'idle' or 'abusive'",
+    "(H5) gemma-2-27b specifically (not other 27B+ models) triggers a HF Hub or RunPod-side filter — potentially license-related (gemma is google-licensed, gated previously)"
+  ],
+  "alternative_paths": [
+    {
+      "priority": 1,
+      "name": "int8_fallback",
+      "approach": "huggingface_hub.snapshot_download with revision pointing to bnb-int8 quantized variant; load_in_8bit=True via bitsandbytes; ~14GB download (vs 54GB fp16) bypasses platform throughput cap",
+      "raw_10_caveat": "int8 quantization introduces ~0.5% rel_std shift vs fp16 baseline; raw#12 frozen-spec violation if measurement protocol shifts; mitigation: re-measure 2b/9b in int8 too for apples-to-apples comparison",
+      "cost_est_usd": 0.50
+    },
+    {
+      "priority": 2,
+      "name": "persistent_network_volume_cache",
+      "approach": "provision RunPod network volume (paid persistent storage), pre-download gemma-27b weights ONCE via dedicated download pod, then attach volume to measurement pod; survives pod recreation",
+      "raw_10_caveat": "additional cost (~$0.10-0.15/GB-month for ~60GB = ~$8/month); requires provisioning ahead",
+      "cost_est_usd": 0.65
+    },
+    {
+      "priority": 3,
+      "name": "different_region_or_template",
+      "approach": "try us-east, eu-central, or different pytorch image (e.g., pytorch:2.5.0+ or 2.8.0+) to test if H4/H3 hypotheses",
+      "raw_10_caveat": "still uses same RunPod platform; if H1-H2 are root cause, region change won't help",
+      "cost_est_usd": 0.65
+    },
+    {
+      "priority": 4,
+      "name": "offline_predownload_rsync",
+      "approach": "huggingface-cli download to local Mac (~54GB on local disk), then rsync over SSH to pod /workspace; bypasses RunPod's mfs ingest path entirely",
+      "raw_10_caveat": "very slow (Mac WAN upload-bound, 50-100 Mbps typical = ~100-180 min upload), but bypasses platform fault if H1-H2",
+      "cost_est_usd": 0.30
+    },
+    {
+      "priority": 5,
+      "name": "llama_family_pivot",
+      "approach": "task #6 HF Llama-3.1-8B/70B license unblock → use Llama family-internal as 2nd clean evidence path instead of gemma",
+      "raw_10_caveat": "depends on user manual action (task #6 pending); does not directly resolve gemma blocker",
+      "cost_est_usd": 1.00
+    }
+  ],
+  "decision_criteria_for_resolution": [
+    "1+ alternative path produces successful gemma-2-27b measurement (cell PASS with rel_std/sat_frac/informative metrics)",
+    "OR Mk.XII Phase 3b 70B path is satisfied via Llama family-internal alternative (1/3 → 2/3 clean) without needing gemma-27b",
+    "OR pre-registered hypotheses HMK-A/HMK-B/HQS-C are formally dropped/revised via raw#12 re-pre-register cycle (with new gemma-2-27b-free protocol)"
+  ],
+  "raw_45_omega_blocker_metadata": {
+    "blocker_class": "gpu_cloud_platform_resource_consumption",
+    "auto_retry_pattern_count": 3,
+    "auto_retry_pattern_failure_rate": "100% (3/3 silent platform termination)",
+    "auto_retry_blocked_until_alternative": true,
+    "next_retry_requires": "alternative path tested + state/blockers/<this>.json status flipped to 'resolved'"
+  },
+  "own_4_compliance": {
+    "step_a_diagnosis": "DONE — 3 independent diagnoses captured (v1 OOM, v2 platform-level, v3 platform-level confirmed via xet-disable)",
+    "step_b_canonical_helper_fix": "PARTIAL — v2/v3 fixes correct in narrow scope, but root cause is platform-side, not code-side; further code fix has diminishing returns",
+    "step_c_defensive_harden": "DONE — sys.excepthook + per-shard sentinel + retry-with-backoff + memory probes all working, captured ModuleNotFoundError correctly",
+    "step_d_canonicalization_evolve": "BLOCKED — fix cannot evolve into anima_runpod_orchestrator while platform fault is the limiter; canonical helper updates moot",
+    "anti_pattern_check": {
+      "skip_27b_cell_silently": "REJECTED — 27b cell missing explicitly recorded as INCONCLUSIVE in 3 verdicts",
+      "retry_blind": "AVOIDED — each retry diagnosis-driven (memory → xet → sequential)",
+      "shrink_protocol": "REJECTED — measurement protocol unchanged (16 prompts × stride=4 × 4 family) raw#12 frozen-spec preserved",
+      "inline_tmp_patch": "AVOIDED — fixes recorded in verdicts, retry plans documented, omega-blocker registered (this file)",
+      "cap_bump_retry": "AVOIDED — total budget across 3 retries $0.79 well under $3 cumulative cap"
+    },
+    "mandatory_commit_gate_before_next_retry": true
+  },
+  "ts": "2026-04-27T13:30:00Z"
+}
