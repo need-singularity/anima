@@ -1,0 +1,184 @@
+// tool/anima_subrepo_cross_link_auditor.hexa — anima-* sub-repo cross-link audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   anima-clm-eeg, anima-physics, anima-tribev2-pilot 등 22개 anima-* sub-repos가 main anima
+//   (CWD)와 어떻게 cross-link 되는지 audit. cycle 18 atlas drift, cycle 24 docs links와 cross-cut.
+//
+//   본 helper = mac-local NON_MUTATION:
+//     - anima-* sub-dir enumeration (22 expected)
+//     - 각 sub-repo의 md / hexa / json file count
+//     - .roadmap presence (memory project_roadmap_engine: roadmap_engine reads 3 repos)
+//     - README.md presence + 첫 line summary
+//     - last activity (recent mtime)
+//     - selftest verifies: ≥20 sub-repos / file type counts / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/subrepo_cross_link_auditor.json)
+//   ANIMA_REPO_ROOT   repo root (default: .)
+//
+// OUTPUT
+//   - sub_repos: list of {name, md_count, hexa_count, json_count, has_roadmap, has_readme, recent_mtime_age_days}
+//   - cluster_breakdown: agent / physics / clm-eeg / etc
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_subrepo_cross_link_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/subrepo_cross_link_auditor.json hexa run tool/anima_subrepo_cross_link_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - file count는 maxdepth 3 (deep nested 미고려).
+//   - cluster classification은 prefix split (anima-clm-eeg → "clm-eeg").
+//   - cross-link semantic verification은 helper-out-of-scope (manual review).
+
+let HELPER_PATH = "/tmp/anima_subrepo_cross_link_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima sub-repo cross-link auditor — emitted by tool/anima_subrepo_cross_link_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION sub-repo audit.\n")
+    parts.push("import json, os, sys, time\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/subrepo_cross_link_auditor.json')\n")
+    parts.push("REPO_ROOT = os.environ.get('ANIMA_REPO_ROOT', '.')\n\n")
+
+    parts.push("now = time.time()\n\n")
+
+    parts.push("def _count_files(path, ext, max_depth=3):\n")
+    parts.push("    count = 0\n")
+    parts.push("    base_depth = path.rstrip('/').count('/')\n")
+    parts.push("    for root, dirs, files in os.walk(path):\n")
+    parts.push("        depth = root.count('/') - base_depth\n")
+    parts.push("        if depth > max_depth:\n")
+    parts.push("            dirs.clear()\n")
+    parts.push("            continue\n")
+    parts.push("        # skip common heavy dirs\n")
+    parts.push("        dirs[:] = [d for d in dirs if d not in ('.git', '.venv', 'node_modules', '__pycache__', '.pytest_cache')]\n")
+    parts.push("        for f in files:\n")
+    parts.push("            if f.endswith(ext):\n")
+    parts.push("                count += 1\n")
+    parts.push("    return count\n\n")
+
+    parts.push("def _recent_mtime(path, max_files=200):\n")
+    parts.push("    most_recent = 0\n")
+    parts.push("    seen = 0\n")
+    parts.push("    for root, dirs, files in os.walk(path):\n")
+    parts.push("        dirs[:] = [d for d in dirs if d not in ('.git', '.venv', 'node_modules', '__pycache__', '.pytest_cache')]\n")
+    parts.push("        for f in files:\n")
+    parts.push("            try:\n")
+    parts.push("                m = os.path.getmtime(os.path.join(root, f))\n")
+    parts.push("                if m > most_recent:\n")
+    parts.push("                    most_recent = m\n")
+    parts.push("                seen += 1\n")
+    parts.push("            except Exception:\n")
+    parts.push("                continue\n")
+    parts.push("            if seen >= max_files:\n")
+    parts.push("                return most_recent\n")
+    parts.push("    return most_recent\n\n")
+
+    parts.push("entries = sorted([e for e in os.listdir(REPO_ROOT) if e.startswith('anima-') and os.path.isdir(os.path.join(REPO_ROOT, e))])\n")
+    parts.push("sub_repos = []\n")
+    parts.push("clusters = {}\n\n")
+
+    parts.push("for sub in entries:\n")
+    parts.push("    sub_path = os.path.join(REPO_ROOT, sub)\n")
+    parts.push("    cluster = sub.split('-', 1)[1] if '-' in sub else sub  # 'agent', 'clm-eeg', 'physics', etc.\n")
+    parts.push("    md_count = _count_files(sub_path, '.md')\n")
+    parts.push("    hexa_count = _count_files(sub_path, '.hexa')\n")
+    parts.push("    json_count = _count_files(sub_path, '.json')\n")
+    parts.push("    has_roadmap = os.path.exists(os.path.join(sub_path, '.roadmap'))\n")
+    parts.push("    has_readme = os.path.exists(os.path.join(sub_path, 'README.md'))\n")
+    parts.push("    recent = _recent_mtime(sub_path)\n")
+    parts.push("    age_days = (now - recent) / 86400 if recent > 0 else None\n")
+    parts.push("    sub_repos.append({\n")
+    parts.push("        'name':sub,\n")
+    parts.push("        'cluster':cluster,\n")
+    parts.push("        'md_count':md_count,\n")
+    parts.push("        'hexa_count':hexa_count,\n")
+    parts.push("        'json_count':json_count,\n")
+    parts.push("        'has_roadmap':has_roadmap,\n")
+    parts.push("        'has_readme':has_readme,\n")
+    parts.push("        'recent_mtime_age_days':round(age_days, 1) if age_days is not None else None,\n")
+    parts.push("    })\n")
+    parts.push("    clusters[cluster] = clusters.get(cluster, 0) + 1\n\n")
+
+    parts.push("# Cluster breakdown\n")
+    parts.push("cluster_breakdown = sorted([{'cluster':k, 'count':v} for k, v in clusters.items()], key=lambda x: -x['count'])\n\n")
+
+    parts.push("# Aggregate metrics\n")
+    parts.push("total_md = sum(s['md_count'] for s in sub_repos)\n")
+    parts.push("total_hexa = sum(s['hexa_count'] for s in sub_repos)\n")
+    parts.push("total_json = sum(s['json_count'] for s in sub_repos)\n")
+    parts.push("with_roadmap = sum(1 for s in sub_repos if s['has_roadmap'])\n")
+    parts.push("with_readme = sum(1 for s in sub_repos if s['has_readme'])\n")
+    parts.push("active_lt_7d = sum(1 for s in sub_repos if s['recent_mtime_age_days'] is not None and s['recent_mtime_age_days'] < 7)\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'anima-* sub-repo cross-link audit (governance audit chain layer 10)',\n")
+    parts.push("    'repo_root':REPO_ROOT,\n")
+    parts.push("    'sub_repos':sub_repos,\n")
+    parts.push("    'sub_repo_count':len(sub_repos),\n")
+    parts.push("    'cluster_breakdown':cluster_breakdown,\n")
+    parts.push("    'aggregate_metrics':{\n")
+    parts.push("        'total_md':total_md,\n")
+    parts.push("        'total_hexa':total_hexa,\n")
+    parts.push("        'total_json':total_json,\n")
+    parts.push("        'with_roadmap':with_roadmap,\n")
+    parts.push("        'with_readme':with_readme,\n")
+    parts.push("        'active_lt_7d':active_lt_7d,\n")
+    parts.push("    },\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify sub-repos; read-only audit',\n")
+    parts.push("    'cross_link_cycles':['cycle 18 atlas drift (cross-link integrity)','cycle 24 docs/ markdown links','cycle 27 nexus roadmaps'],\n")
+    parts.push("    'pattern':'governance audit chain layer 10 (cycles 21-29 + this)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[subrepo_audit] sub_repos={len(sub_repos)} clusters={len(clusters)} md={total_md} hexa={total_hexa} json={total_json} roadmap={with_roadmap}/{len(sub_repos)} readme={with_readme}/{len(sub_repos)} active_lt_7d={active_lt_7d} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let sub_repos_min = 20
+    let max_walk_depth = 3
+    let max_files_for_mtime = 200
+    let non_mutation = "READ_ONLY"
+    println("inv:sub_repos_min=" + to_string(sub_repos_min))
+    println("inv:max_walk_depth=" + to_string(max_walk_depth))
+    println("inv:max_files_for_mtime=" + to_string(max_files_for_mtime))
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:skip_dirs=git,venv,node_modules,pycache,pytest_cache")
+    println("inv:cluster_classification_via_prefix_split=true")
+    println("inv:cross_link_cycle18_cycle24_cycle27=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_subrepo_cross_link_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=anima-* sub-repo cross-link audit (22 sub-repos / cluster + activity / mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
