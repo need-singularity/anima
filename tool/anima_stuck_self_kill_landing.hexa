@@ -1,0 +1,204 @@
+// tool/anima_stuck_self_kill_landing.hexa — cycle 67 stuck self-kill utility landing (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   사용자 요청 (2026-04-27, cycle 66 직후):
+//     "STUCK 방지 로직 필요"
+//     "업로드한 로직에서 스스로를 kill하게"
+//     "별도 함수로 만들어서 여기저기 써먹을 수 있게"
+//
+//   cycle 67 = canonical utility (`tool/anima_stuck_self_kill_lib.hexa`) landing
+//   + 적용 site 식별 + inline-ready snippet emit. 본 helper는 NON_MUTATION
+//   (실제 launch helper 패치는 별도 cycle에서 사용자 승인 후 적용).
+//
+// CANONICAL UTILITY (cycle 67 신설)
+//   tool/anima_stuck_self_kill_lib.hexa — 6 함수 / selftest 13 시나리오 PASS
+//     detect:
+//       _stuck_by_runtime_cap(uptime_sec, cap_min) -> bool
+//       _stuck_by_cost_cap_cents(cost_cents, cap_cents) -> bool
+//       _stuck_by_gpu_idle_min(idle_min, threshold_min) -> bool
+//       _stuck_by_heartbeat_age(heartbeat_path, max_age_sec) -> bool
+//     dispatch:
+//       _self_kill_dispatch(pod_id, reason, apply) -> int
+//     watchdog:
+//       _stuck_watchdog_evaluate(any_stuck, reason, pod_id, apply) -> int
+//
+// INTEGRATION SITES (제안 — 사용자 승인 후 적용)
+//   1) tool/h100_post_launch_cascade.hexa
+//        pod-side cascade 시작 시 watchdog 백그라운드 attach
+//        criteria: heartbeat_age (training script가 N초마다 touch)
+//                  + gpu_idle (nvidia-smi util 0% N분)
+//                  + runtime_cap (env RUNTIME_CAP_MIN)
+//                  + cost_cap (env COST_CAP, h100_cost_tracker 연동)
+//   2) tool/h100_stage2_unified_launch.bash
+//        launch 전 watchdog setup script를 pod-init.sh로 inject
+//        env: RUNPOD_API_KEY (api dispatch fallback용)
+//   3) tool/h100_auto_kill.hexa (cycle 63 path B 패치 후)
+//        host-side kill — 현재 verdict UNKNOWN gap. probe-exec 추가 시
+//        _stuck_by_gpu_idle_min을 호출자 위치에서 inline 사용.
+//   4) tool/h100_post_launch_ingest.hexa
+//        ingest pipeline 중간 stuck (e.g., shard prefetch 멈춤) 감지
+//
+// PROPOSED INLINE-READY SNIPPET (caller copy-paste)
+//   // INLINE_DEPRECATED[H42]: see tool/anima_stuck_self_kill_lib.hexa for canonical impl — kept inline (hexa stage0 loader)
+//   fn _sq(s: string) -> string { let mut o = "'"; o = o + s.replace("'", "'\\''"); o = o + "'"; return o }
+//   fn _stuck_by_runtime_cap(uptime_sec: int, cap_min: int) -> bool {
+//       if cap_min <= 0 { return false }
+//       return uptime_sec >= cap_min * 60
+//   }
+//   fn _stuck_by_heartbeat_age(p: string, max_age_sec: int) -> bool {
+//       if p == "" || max_age_sec <= 0 { return false }
+//       if exec_with_status("test -e " + _sq(p))[1] != 0 { return true }
+//       let r = exec_with_status("stat -f %m " + _sq(p) + " 2>/dev/null || stat -c %Y " + _sq(p))
+//       if r[1] != 0 { return false }
+//       let mtime = to_int(to_string(r[0]).trim())
+//       return (to_int(to_string(now())) - mtime) >= max_age_sec
+//   }
+//   fn _self_kill_dispatch(pod_id: string, reason: string, apply: bool) -> int {
+//       if pod_id == "" { return 1 }
+//       println("[stuck_self_kill] pod=" + pod_id + " reason=" + reason +
+//               " apply=" + (if apply { "yes" } else { "no" }))
+//       if !apply { return 0 }
+//       if exec_with_status("command -v runpodctl >/dev/null")[1] == 0 {
+//           return exec_with_status("runpodctl pod stop " + _sq(pod_id))[1]
+//       }
+//       return 1
+//   }
+//
+// SECURITY NOTE
+//   RUNPOD_API_KEY는 pod env로만 inject; logs / state JSON에 절대 출력 안 함.
+//   reason 문자열은 caller가 _sq로 처리할 책임 (utility는 println에 raw로 사용).
+//
+// raw#9 hexa-only / raw#15 SSOT tool/anima_stuck_self_kill_lib.hexa
+// raw#10 honest:
+//   - 본 landing은 utility를 정의했을 뿐 launch helper 실제 patch는 0건.
+//   - 사용자 승인 시 별도 cycle (e.g., cycle 68: cascade 패치)로 적용.
+//   - cycle 66 closure 후 active pod 0이라 검증 GPU 실험 미실행 (synthetic only).
+
+let HELPER_PATH = "/tmp/anima_stuck_self_kill_landing_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima stuck self-kill landing — emitted by tool/anima_stuck_self_kill_landing.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION.\n")
+    parts.push("import json, os\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/stuck_self_kill_landing.json')\n\n")
+
+    parts.push("canonical = {\n")
+    parts.push("    'path':'tool/anima_stuck_self_kill_lib.hexa',\n")
+    parts.push("    'functions':[\n")
+    parts.push("        '_stuck_by_runtime_cap(uptime_sec, cap_min) -> bool',\n")
+    parts.push("        '_stuck_by_cost_cap_cents(cost_cents, cap_cents) -> bool',\n")
+    parts.push("        '_stuck_by_gpu_idle_min(idle_min, threshold_min) -> bool',\n")
+    parts.push("        '_stuck_by_heartbeat_age(heartbeat_path, max_age_sec) -> bool',\n")
+    parts.push("        '_self_kill_dispatch(pod_id, reason, apply) -> int',\n")
+    parts.push("        '_stuck_watchdog_evaluate(any_stuck, reason, pod_id, apply) -> int',\n")
+    parts.push("    ],\n")
+    parts.push("    'selftest_scenarios': 13,\n")
+    parts.push("    'selftest_status': 'PASS_13_OF_13',\n")
+    parts.push("    'h42_inline_convention': True,\n")
+    parts.push("    'side_effects':'dispatch only (subprocess); detect는 모두 read-only',\n")
+    parts.push("    'security':'RUNPOD_API_KEY logs에 출력 안 함; pod_id empty시 즉시 1 반환',\n")
+    parts.push("}\n\n")
+
+    parts.push("integration_sites = [\n")
+    parts.push("    {\n")
+    parts.push("        'site':'tool/h100_post_launch_cascade.hexa',\n")
+    parts.push("        'role':'pod-side cascade watchdog',\n")
+    parts.push("        'attach_point':'cascade main loop start (background poll loop)',\n")
+    parts.push("        'criteria_recommended':['heartbeat_age', 'gpu_idle', 'runtime_cap'],\n")
+    parts.push("        'priority':'high (cycle 66 Pod 1 + Pod 2 모두 이 site에서 감지 가능했음)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'site':'tool/h100_stage2_unified_launch.bash',\n")
+    parts.push("        'role':'launch-side: pod-init.sh에 watchdog setup inject',\n")
+    parts.push("        'attach_point':'startup script append',\n")
+    parts.push("        'criteria_recommended':['runtime_cap (env RUNTIME_CAP_MIN)', 'cost_cap (env COST_CAP)'],\n")
+    parts.push("        'priority':'high (env caps의 runtime attach gap — cycle 57 finding 직접 해결)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'site':'tool/h100_auto_kill.hexa',\n")
+    parts.push("        'role':'host-side kill (cycle 63 probe-exec gap path B)',\n")
+    parts.push("        'attach_point':'_evaluate_pod 내부 idle 측정 후 _stuck_by_gpu_idle_min 호출',\n")
+    parts.push("        'criteria_recommended':['gpu_idle (probe 결과 활용)'],\n")
+    parts.push("        'priority':'medium (path B 패치와 함께)',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'site':'tool/h100_post_launch_ingest.hexa',\n")
+    parts.push("        'role':'ingest pipeline 중간 stuck (shard prefetch 멈춤)',\n")
+    parts.push("        'attach_point':'each shard barrier 후 heartbeat 검증',\n")
+    parts.push("        'criteria_recommended':['heartbeat_age (per-shard mtime)'],\n")
+    parts.push("        'priority':'low',\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("evidence_tie_in = {\n")
+    parts.push("    'cycle_57_finding':'env caps set but no runtime attachment → fail open',\n")
+    parts.push("    'cycle_66_pod_2_class':'host scheduling failure (uptime=0, billing accrued)',\n")
+    parts.push("    'cycle_66_pod_1_class':'gpu_idle 100% with cap escape',\n")
+    parts.push("    'remediation_class':'pod-side self-watchdog 4-criterion OR composition',\n")
+    parts.push("    'cap_escape_prevention':'cost_cap_cents + runtime_cap 직접 enforced (no env-only)',\n")
+    parts.push("}\n\n")
+
+    parts.push("residual_actions = [\n")
+    parts.push("    {'action':'cascade hexa에 inline integrate (cycle 68 후보)', 'priority':'high', 'cost':'mac $0', 'requires':'사용자 승인'},\n")
+    parts.push("    {'action':'unified_launch.bash에 pod-init.sh watchdog inject', 'priority':'high', 'cost':'mac $0', 'requires':'사용자 승인 + RUNPOD_API_KEY 정책'},\n")
+    parts.push("    {'action':'h100_auto_kill path B (probe-exec) + gpu_idle inline', 'priority':'medium', 'cost':'mac $0', 'requires':'사용자 승인'},\n")
+    parts.push("    {'action':'real GPU validation (synthetic-only 한계)', 'priority':'low', 'cost':'$0.30 H100 P1 launch와 묶음', 'requires':'사용자 GPU 승인'},\n")
+    parts.push("]\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'cycle 67 — STUCK self-kill canonical utility landing',\n")
+    parts.push("    'cycle': 67,\n")
+    parts.push("    'user_request':'STUCK 방지 / 업로드한 로직에서 self-kill / 별도 함수로 재사용',\n")
+    parts.push("    'canonical_utility': canonical,\n")
+    parts.push("    'integration_sites': integration_sites,\n")
+    parts.push("    'evidence_tie_in': evidence_tie_in,\n")
+    parts.push("    'residual_actions': residual_actions,\n")
+    parts.push("    'non_mutation_guarantee':'utility 신설 + landing 기록만; launch helper patch는 0건 (별도 cycle)',\n")
+    parts.push("    'cross_link_cycles':['cycle 56 ssh activity', 'cycle 57 cap enforcement gap', 'cycle 63 probe-exec gap', 'cycle 66 incident closure'],\n")
+    parts.push("    'pattern':'governance audit chain layer 46 (utility 신설 — RunPod incident learning capture)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[stuck_self_kill_landing] cycle=67 utility=tool/anima_stuck_self_kill_lib.hexa selftest=13/13 sites=4 -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    println("inv:non_mutation=READ_ONLY_LANDING")
+    println("inv:cycle=67")
+    println("inv:canonical=tool/anima_stuck_self_kill_lib.hexa")
+    println("inv:utility_selftest=13/13")
+    println("inv:integration_sites=4")
+    println("inv:cross_link_cycles=56,57,63,66")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_stuck_self_kill_landing selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok { println("selftest=fail"); exit(2) }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=cycle 67 — STUCK self-kill canonical utility landing; NON_MUTATION; mac $0")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}

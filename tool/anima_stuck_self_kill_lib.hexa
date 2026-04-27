@@ -1,0 +1,265 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_stuck_self_kill_lib.hexa — canonical stuck-detect + self-kill utility
+//
+//  PURPOSE
+//    Single source of truth for STUCK 판정 + self-kill 호출.
+//    호출 site (h100_stage2_unified_launch.bash, h100_post_launch_cascade.hexa,
+//    h100_auto_kill.hexa, ...) 는 H42 inline 컨벤션으로 복사해서 사용.
+//
+//    Motivation (cycle 66 closure):
+//      cycle 1-66 RunPod incident chain에서 두 형태 stuck 발견:
+//        (a) Pod 1 anima-sae-steer-pilot — IDLE confirmed (gpu 0% for hours)
+//        (b) Pod 2 anima-gwt-deepseek-c2-long — host scheduling failure
+//                  (uptime=0 22.5h while billing accrued ~$66)
+//      Both forms cap escape (RUNTIME_CAP_MIN=12 → 22.5h, COST_CAP=$1 → ~$66).
+//      env-only caps without runtime attachment fail open (cycle 57 finding).
+//
+//    이 utility는 pod-side에서 self-watchdog으로 attach해서 cap escape를
+//    해결한다. Host-side guard (h100_auto_kill)는 별도 path B 패치 후 보강.
+//
+//  CONTRACT (4 detect + 1 dispatch + 1 watchdog = 6 함수)
+//
+//    detect 함수들 (모두 pure / read-only / bool 반환):
+//      _stuck_by_runtime_cap(uptime_sec, cap_min) -> bool
+//      _stuck_by_cost_cap(cost_so_far_usd, cap_usd) -> bool
+//      _stuck_by_gpu_idle_min(idle_min, threshold_min) -> bool
+//      _stuck_by_heartbeat_age(heartbeat_path, max_age_sec) -> bool
+//
+//    dispatch (self-kill 실행, dry-run default):
+//      _self_kill_dispatch(pod_id, reason, apply) -> int
+//        0 = noop or success / 1 = config error / 2 = exec error
+//        runpodctl 우선; 없으면 GraphQL (env RUNPOD_API_KEY 필요)
+//
+//    watchdog (poll loop, pod-side):
+//      _stuck_watchdog_poll_once(criteria, pod_id, apply) -> int
+//        한 번 평가해서 stuck 시 self-kill 호출. 호출자가 sleep + 루프 책임.
+//
+//  CALLER USAGE (pod-side, H42 inline 컨벤션)
+//    // INLINE_DEPRECATED[H42]: see tool/anima_stuck_self_kill_lib.hexa for canonical impl — kept inline (hexa stage0 loader)
+//    fn _stuck_by_runtime_cap(uptime_sec: int, cap_min: int) -> bool {
+//        return uptime_sec >= cap_min * 60
+//    }
+//    ...
+//    if _stuck_by_runtime_cap(my_uptime, RUNTIME_CAP_MIN) {
+//        _self_kill_dispatch(MY_POD_ID, "runtime_cap_exceeded", true)
+//    }
+//
+//  HARD CONSTRAINTS
+//    - Library-only file: top-level prints banner + exit(0).
+//    - `--selftest` argv triggers synthetic 7-scenario test + exit(0|1).
+//    - apply=false default; explicit apply=true required for real stop.
+//    - self_kill에서 pod_id가 비면 즉시 1 반환 (never silent fail).
+//    - stuck 검출 함수는 절대 panic 안 함 (missing input → false 반환).
+//
+//  RAW ALIGNMENT
+//    raw#9   hexa-only library
+//    raw#10  deterministic (pure detect; dispatch 1 side-effect via subprocess)
+//    raw#11  snake_case
+//    raw#15  no-hardcode (pod_id, paths, caps 모두 인자/env)
+//
+//  SECURITY
+//    - api key는 인자 아닌 env (RUNPOD_API_KEY) 로만; logs에 절대 출력 안 함.
+//    - reason 문자열은 _sh_quote로 안전 처리 (caller 책임 — example 참조).
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── inline minimal helpers (H42 self-contained library) ─────────────────────
+
+fn _sq(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _which_cmd(cmd: string) -> bool {
+    return exec_with_status("command -v " + _sq(cmd) + " >/dev/null 2>&1")[1] == 0
+}
+
+fn _getenv(k: string) -> string {
+    let r = exec_with_status("printf %s \"${" + k + "}\"")
+    return to_string(r[0])
+}
+
+// ─── detect functions (pure, bool) ───────────────────────────────────────────
+
+// True if pod uptime exceeded RUNTIME_CAP_MIN.
+// stuck case (cycle 66 Pod 2): uptime=0 inverts this; pair with heartbeat 검증.
+fn _stuck_by_runtime_cap(uptime_sec: int, cap_min: int) -> bool {
+    if cap_min <= 0 { return false }
+    return uptime_sec >= cap_min * 60
+}
+
+// True if cost so far exceeded COST_CAP.
+// note: hexa 1.0에서 float 지원이 부분적이라 cents (int) 단위 비교를 권장.
+// caller: _stuck_by_cost_cap_cents(cost_cents, cap_cents).
+fn _stuck_by_cost_cap_cents(cost_so_far_cents: int, cap_cents: int) -> bool {
+    if cap_cents <= 0 { return false }
+    return cost_so_far_cents >= cap_cents
+}
+
+// True if GPU idle minutes >= threshold (h100_auto_kill 설정과 동일 단위).
+fn _stuck_by_gpu_idle_min(idle_min: int, threshold_min: int) -> bool {
+    if idle_min < 0 { return false }   // unknown idle → not stuck
+    if threshold_min <= 0 { return false }
+    return idle_min >= threshold_min
+}
+
+// True if heartbeat file is missing OR mtime older than max_age_sec.
+// raw#9: training script가 /workspace/.heartbeat 같은 경로를 N초마다 touch.
+fn _stuck_by_heartbeat_age(heartbeat_path: string, max_age_sec: int) -> bool {
+    if heartbeat_path == "" { return false }   // unconfigured → not stuck
+    if max_age_sec <= 0 { return false }
+    let exist = exec_with_status("test -e " + _sq(heartbeat_path))
+    if exist[1] != 0 { return true }   // missing = stuck
+    // BSD/GNU stat 모두 시도 (mac BSD: -f %m / linux GNU: -c %Y)
+    let bsd = exec_with_status("stat -f %m " + _sq(heartbeat_path) + " 2>/dev/null")
+    let mtime_str = if bsd[1] == 0 {
+        to_string(bsd[0]).trim()
+    } else {
+        let gnu = exec_with_status("stat -c %Y " + _sq(heartbeat_path) + " 2>/dev/null")
+        if gnu[1] != 0 { return false }   // stat fail → unknown, not stuck
+        to_string(gnu[0]).trim()
+    }
+    if mtime_str == "" { return false }
+    let mtime = to_int(mtime_str)
+    let now_s = to_int(to_string(now()))
+    return (now_s - mtime) >= max_age_sec
+}
+
+// ─── self-kill dispatch ──────────────────────────────────────────────────────
+
+// Self-kill the pod via runpodctl (if on PATH) or GraphQL (if RUNPOD_API_KEY).
+// reason은 logs/JSON에 기록되되 RUNPOD_API_KEY는 절대 출력 안 함.
+// returns: 0 = success or noop dry-run / 1 = config error / 2 = exec error
+fn _self_kill_dispatch(pod_id: string, reason: string, apply: bool) -> int {
+    if pod_id == "" {
+        println("[stuck_self_kill] ERROR pod_id empty; aborting (no silent fail)")
+        return 1
+    }
+    let log = "[stuck_self_kill] pod=" + pod_id + " reason=" + reason +
+              " apply=" + (if apply { "yes" } else { "no" })
+    println(log)
+    if !apply { return 0 }   // dry-run
+
+    if _which_cmd("runpodctl") {
+        let cmd = "runpodctl pod stop " + _sq(pod_id)
+        let r = exec_with_status(cmd)
+        if r[1] != 0 {
+            println("[stuck_self_kill] runpodctl rc=" + to_string(r[1]) +
+                    " out=" + to_string(r[0]).trim())
+            return 2
+        }
+        println("[stuck_self_kill] runpodctl stop OK")
+        return 0
+    }
+
+    // GraphQL fallback (pod-side: api key must be inject by launcher into env).
+    let api = _getenv("RUNPOD_API_KEY")
+    if api == "" {
+        println("[stuck_self_kill] ERROR runpodctl absent and RUNPOD_API_KEY unset")
+        return 1
+    }
+    let q = "{\"query\":\"mutation { podStop(input:{podId:\\\"" + pod_id + "\\\"}){ id desiredStatus } }\"}"
+    let curl = "curl -fsS -X POST https://api.runpod.io/graphql " +
+               "-H 'Content-Type: application/json' " +
+               "-H \"Authorization: Bearer ${RUNPOD_API_KEY}\" " +
+               "-d " + _sq(q)
+    let r = exec_with_status(curl)
+    if r[1] != 0 {
+        println("[stuck_self_kill] graphql rc=" + to_string(r[1]) +
+                " out=" + to_string(r[0]).trim())
+        return 2
+    }
+    println("[stuck_self_kill] graphql podStop OK")
+    return 0
+}
+
+// ─── watchdog single-poll (caller owns sleep+loop) ───────────────────────────
+//
+//   any_stuck = caller가 4 detect 함수들을 OR 조합한 결과
+//   reason    = caller가 결정 (e.g., "runtime_cap_exceeded" | "heartbeat_stale" | ...)
+//
+//   poll loop는 caller에서 (sleep + while) 책임지는 게 hexa stage0 호환:
+//     while true {
+//         let stuck = _stuck_by_runtime_cap(...) || _stuck_by_heartbeat_age(...)
+//         if stuck { _self_kill_dispatch(MY_POD_ID, "stuck:" + tag, true); break }
+//         exec_with_status("sleep 60")
+//     }
+
+fn _stuck_watchdog_evaluate(any_stuck: bool, reason: string, pod_id: string, apply: bool) -> int {
+    if !any_stuck { return 0 }
+    return _self_kill_dispatch(pod_id, reason, apply)
+}
+
+// ─── selftest ────────────────────────────────────────────────────────────────
+
+fn _stuck_self_kill_selftest() -> int {
+    let mut fails = 0
+
+    // 1) runtime cap: uptime 800s vs cap 12min(720s) → STUCK
+    if !_stuck_by_runtime_cap(800, 12) { println("FAIL[1] runtime cap"); fails = fails + 1 }
+    // 2) runtime cap: uptime 600s vs cap 12min → not stuck
+    if _stuck_by_runtime_cap(600, 12) { println("FAIL[2] runtime cap"); fails = fails + 1 }
+    // 3) runtime cap: cap=0 → never stuck (disabled)
+    if _stuck_by_runtime_cap(99999, 0) { println("FAIL[3] runtime cap disabled"); fails = fails + 1 }
+
+    // 4) cost cap (cents): 200c vs 100c → STUCK
+    if !_stuck_by_cost_cap_cents(200, 100) { println("FAIL[4] cost cap"); fails = fails + 1 }
+    // 5) cost cap: 50c vs 100c → not stuck
+    if _stuck_by_cost_cap_cents(50, 100) { println("FAIL[5] cost cap"); fails = fails + 1 }
+
+    // 6) gpu idle: 10min vs threshold 5 → STUCK
+    if !_stuck_by_gpu_idle_min(10, 5) { println("FAIL[6] gpu idle"); fails = fails + 1 }
+    // 7) gpu idle: -1 (unknown) → not stuck (no false positive)
+    if _stuck_by_gpu_idle_min(-1, 5) { println("FAIL[7] gpu idle unknown"); fails = fails + 1 }
+
+    // 8) heartbeat: missing path → STUCK
+    let nonexistent = "/tmp/anima_stuck_self_kill_selftest_missing_" + to_string(now())
+    if !_stuck_by_heartbeat_age(nonexistent, 60) { println("FAIL[8] hb missing"); fails = fails + 1 }
+    // 9) heartbeat: empty config → not stuck
+    if _stuck_by_heartbeat_age("", 60) { println("FAIL[9] hb empty"); fails = fails + 1 }
+
+    // 10) self_kill: empty pod_id → 1 (config error)
+    if _self_kill_dispatch("", "test_empty_pod_id", false) != 1 {
+        println("FAIL[10] self_kill empty pod_id should return 1"); fails = fails + 1
+    }
+    // 11) self_kill: dry-run with valid pod_id → 0 (noop)
+    if _self_kill_dispatch("FAKE-POD-ID-SELFTEST", "test_dry_run", false) != 0 {
+        println("FAIL[11] self_kill dry-run should return 0"); fails = fails + 1
+    }
+
+    // 12) watchdog evaluate: any_stuck=false → 0 (no kill)
+    if _stuck_watchdog_evaluate(false, "test", "FAKE-POD", false) != 0 {
+        println("FAIL[12] watchdog not_stuck should return 0"); fails = fails + 1
+    }
+    // 13) watchdog evaluate: any_stuck=true + dry-run + valid pod → 0 (printed but no kill)
+    if _stuck_watchdog_evaluate(true, "test_stuck", "FAKE-POD", false) != 0 {
+        println("FAIL[13] watchdog stuck dry-run should return 0"); fails = fails + 1
+    }
+
+    return fails
+}
+
+// ─── library-mode entrypoint ─────────────────────────────────────────────────
+
+let _argv = args()
+let mut _is_selftest = false
+let mut _i = 0
+while _i < len(_argv) {
+    if to_string(_argv[_i]) == "--selftest" { _is_selftest = true }
+    _i = _i + 1
+}
+
+if _is_selftest {
+    let f = _stuck_self_kill_selftest()
+    if f == 0 {
+        println("tool/anima_stuck_self_kill_lib.hexa selftest OK (13/13)")
+        exit(0)
+    } else {
+        println("tool/anima_stuck_self_kill_lib.hexa selftest FAIL count=" + to_string(f))
+        exit(1)
+    }
+}
+
+println("tool/anima_stuck_self_kill_lib.hexa — library; no runtime side effects")
+exit(0)
