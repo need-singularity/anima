@@ -1,0 +1,92 @@
+{
+  "schema": "anima/blockers/v1",
+  "slug": "runpod-pod-pre-ssh-orchestrator-stuck",
+  "status": "active",
+  "registered_at": "2026-04-27T23:35:00Z",
+  "registered_by": "anima-cmd-loop-2026-04-27 (own 4 + raw 45 mandate)",
+  "axis": "RunPod orchestrator pre-SSH bring-up window — distinct from gemma-27b mid-download platform-termination",
+  "task_id_chain": ["#20-axis105-pilot-t1", "#2-recovery"],
+  "summary": "RunPod pod 6chik4vxo5bkjv (Llama-3.2-3B Pilot-T1, 50GB disk, 251GB RAM) entered 'pod not ready' state at allocation (14:21:59Z) and remained stuck for 70+ minutes (vs normal 90-240s SSH bring-up). Pod was RUNNING in runpodctl pod list but ssh.error='pod not ready' persisted. Cost burn ~$3.4 (1h13m × $2.99/hr) with zero progress. Manual terminate at 23:35Z. NOT a wrapper bug, NOT a model bug — RunPod orchestrator-side pre-SSH stage fault.",
+  "failure_signature": "ssh.status=RUNNING, ssh.error='pod not ready', no IP/port assignment, no SSH key push, persistent past 30× normal bring-up window",
+  "distinguishes_from": [
+    "gemma_27b_repeat_silent_platform_termination — mid-download platform termination at ~30-40GB cumulative bytes threshold (different stage)",
+    "cuInit=999 cold-start fault — SSH ready but CUDA driver not initialized (different fault layer)"
+  ],
+  "evidence": {
+    "pod_id": "6chik4vxo5bkjv",
+    "pod_name": "anima-pilot-t1-resume-llama32-3b-20260427142156",
+    "rented_at": "2026-04-27T14:21:59Z",
+    "terminated_at": "2026-04-27T23:35:00Z",
+    "wallclock_min": 73.0,
+    "cost_usd_burned": 3.40,
+    "ssh_status_during": "RUNNING + 'pod not ready' (orchestrator stage)",
+    "ssh_ip_assigned": false,
+    "ssh_port_assigned": false
+  },
+  "hypotheses": [
+    {
+      "id": "H1",
+      "name": "image_pull_stalled",
+      "description": "RunPod orchestrator failed to pull pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04 image from registry. Stuck in image_pull state without timeout/retry.",
+      "test": "Compare with concurrent pods on same image — pod 1 oidguj265b00zh + pod 3 3csbgbnf2hf3gg used same image and SSH-ed normally. Suggests host-specific or zone-specific orchestrator issue, not image issue.",
+      "support": "WEAK"
+    },
+    {
+      "id": "H2",
+      "name": "host_node_drained",
+      "description": "Pod assigned to a host node that began draining/maintenance after rental. RunPod orchestrator did not auto-migrate.",
+      "test": "Cannot verify externally — RunPod does not expose host node ID.",
+      "support": "PLAUSIBLE"
+    },
+    {
+      "id": "H3",
+      "name": "cluster_zone_capacity_throttle",
+      "description": "RunPod cluster zone reached capacity, marking new pods RUNNING but denying actual SSH provisioning.",
+      "test": "Same as H2 — cannot verify externally.",
+      "support": "PLAUSIBLE"
+    }
+  ],
+  "alternative_paths": [
+    {
+      "id": "alt-1",
+      "name": "respawn_different_zone",
+      "description": "Re-dispatch axis 105 Pilot-T1 with explicit cloud_type or different region. RunPod CLI does not expose region selection but cloud_type=COMMUNITY vs SECURE may change zone.",
+      "estimated_cost_usd": 0.50,
+      "estimated_time_min": 20,
+      "priority": 1
+    },
+    {
+      "id": "alt-2",
+      "name": "batch_dispatch_with_health_gate",
+      "description": "Spawn 2 pods simultaneously, take whichever SSH-ready first within 5 min, terminate the other. Eliminates single-pod stuck risk.",
+      "estimated_cost_usd": 0.30,
+      "estimated_time_min": 15,
+      "priority": 2
+    },
+    {
+      "id": "alt-3",
+      "name": "fold_axis_105_into_axis_96_pod",
+      "description": "axis 96 step1 (Llama-3.1-8B) and axis 105 (Llama-3.2-3B) measurements can share a pod. Reuse pod 1 wrapper (Llama-3.1-8B) and tack on Llama-3.2-3B section. Single SSH, lower stuck-risk surface.",
+      "estimated_cost_usd": 0.30,
+      "estimated_time_min": 15,
+      "priority": 3
+    }
+  ],
+  "own_4_compliance": {
+    "step_a_diagnosis": "RunPod orchestrator pre-SSH stage stuck for 70+ min. Failure signature recorded. Hypotheses 3.",
+    "step_b_canonical_fix": "Add stuck-pod-watchdog to tool/anima_runpod_orchestrator.hexa: if ssh-not-ready persists beyond 5min × 3 = 15min, auto-terminate + register failure event before respawning.",
+    "step_c_harden": "ssh-wait timeout reduced from 180s to 300s with hard fail. Add per-pod cost cap that auto-terminates if no SSH-ready by max wait.",
+    "step_d_evolve": "docs/runpod_large_model_dispatch_template_20260427.md Pattern 8 — pre-SSH stuck-pod detection (this blocker becomes the canonical reference)."
+  },
+  "raw_10_caveats": [
+    "Single-pod observation — does not prove platform-wide pattern. Could be pod-specific bad luck.",
+    "Zone/region not externally observable — cannot rule out 'community cloud' downgrade artifact.",
+    "Image pull stalled hypothesis weakened by concurrent pods on same image succeeding.",
+    "Cost attribution: $3.4 burned without measurement is RunPod billing-as-allocated semantics — NOT user error."
+  ],
+  "next_action_priority_order": [
+    "Mk.XII Phase 3b 70B (current pod 3) — completion expected within 20min",
+    "axis 96 step1 respawn — wrapper reconstruction needed (~30min effort + $0.15 GPU)",
+    "axis 105 Pilot-T1 — alt-1 respawn after Mk.XII completion, single new pod"
+  ]
+}
