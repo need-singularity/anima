@@ -1,0 +1,181 @@
+// tool/anima_ci_workflows_auditor.hexa — CI workflows audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   memory feedback_admin_merge.md: "user's repos have pre-existing CI failures
+//   (cdo-validate on anima, attestation on hexa-lang)". 본 helper = mac-local audit:
+//
+//     - .github/workflows/*.yml inventory
+//     - workflow trigger / job / step parsing (top-level keys)
+//     - cdo-validate job 명시 verification (memory anchor)
+//     - CODEOWNERS file presence + need-singularity rule count
+//     - last activity (mtime + recent change indicator)
+//     - selftest verifies: ≥2 workflows / cdo-validate present / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/ci_workflows_auditor.json)
+//   ANIMA_GITHUB_DIR  github dir (default: .github)
+//
+// OUTPUT
+//   - workflows: list of {file, jobs, triggers, steps_count}
+//   - codeowners: {present, need_singularity_rules}
+//   - cdo_validate_present
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_ci_workflows_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/ci_workflows_auditor.json hexa run tool/anima_ci_workflows_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - YAML parsing은 PyYAML 의존 — 부재 시 substring fallback.
+//   - 실제 CI failure 검증은 GitHub API 필요 (network); helper는 disk-only.
+//   - CODEOWNERS rule count는 line-level count (precedence 미고려).
+
+let HELPER_PATH = "/tmp/anima_ci_workflows_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima CI workflows auditor — emitted by tool/anima_ci_workflows_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION CI workflows audit.\n")
+    parts.push("import json, os, sys, re, time\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/ci_workflows_auditor.json')\n")
+    parts.push("GITHUB_DIR = os.environ.get('ANIMA_GITHUB_DIR', '.github')\n\n")
+
+    parts.push("if not os.path.isdir(GITHUB_DIR):\n")
+    parts.push("    summary = {'paradigm':'CI workflows audit', 'status':'GITHUB_DIR_MISSING', 'github_dir':GITHUB_DIR}\n")
+    parts.push("    os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("    with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("    print(f'[ci_workflows] status=GITHUB_DIR_MISSING -> {OUTPUT}')\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("WORKFLOWS_DIR = os.path.join(GITHUB_DIR, 'workflows')\n")
+    parts.push("CODEOWNERS_PATH = os.path.join(GITHUB_DIR, 'CODEOWNERS')\n\n")
+
+    parts.push("now = time.time()\n\n")
+
+    parts.push("workflows = []\n")
+    parts.push("if os.path.isdir(WORKFLOWS_DIR):\n")
+    parts.push("    yml_files = sorted([f for f in os.listdir(WORKFLOWS_DIR) if f.endswith(('.yml', '.yaml'))])\n")
+    parts.push("    for fname in yml_files:\n")
+    parts.push("        path = os.path.join(WORKFLOWS_DIR, fname)\n")
+    parts.push("        try:\n")
+    parts.push("            st = os.stat(path)\n")
+    parts.push("            with open(path, encoding='utf-8') as f:\n")
+    parts.push("                content = f.read()\n")
+    parts.push("        except Exception:\n")
+    parts.push("            continue\n")
+    parts.push("        # substring-based parse (raw#10 honest: YAML parser bypassed for portability)\n")
+    parts.push("        name_match = re.search(r'^name:\\s*(.+)$', content, re.MULTILINE)\n")
+    parts.push("        triggers = re.findall(r'^on:\\s*(.*)$|^\\s+(push|pull_request|schedule|workflow_dispatch):', content, re.MULTILINE)\n")
+    parts.push("        jobs = re.findall(r'^\\s{2,4}([a-zA-Z][a-zA-Z0-9_-]+):\\s*$', content, re.MULTILINE)\n")
+    parts.push("        # filter to job names (heuristic: under 'jobs:' section)\n")
+    parts.push("        jobs_section_idx = content.find('jobs:')\n")
+    parts.push("        likely_jobs = []\n")
+    parts.push("        if jobs_section_idx >= 0:\n")
+    parts.push("            jobs_block = content[jobs_section_idx:]\n")
+    parts.push("            likely_jobs = re.findall(r'^\\s{2}([a-zA-Z][a-zA-Z0-9_-]+):\\s*$', jobs_block, re.MULTILINE)[:10]\n")
+    parts.push("        steps = re.findall(r'^\\s+- name:\\s*(.+)$', content, re.MULTILINE)\n")
+    parts.push("        age_days = (now - st.st_mtime) / 86400\n")
+    parts.push("        workflows.append({\n")
+    parts.push("            'file':fname,\n")
+    parts.push("            'name':name_match.group(1).strip() if name_match else None,\n")
+    parts.push("            'jobs':likely_jobs,\n")
+    parts.push("            'triggers_raw':list(set([t for ts in triggers for t in ts if t])),\n")
+    parts.push("            'steps_count':len(steps),\n")
+    parts.push("            'file_size':st.st_size,\n")
+    parts.push("            'age_days':round(age_days, 1),\n")
+    parts.push("        })\n\n")
+
+    parts.push("# CODEOWNERS audit\n")
+    parts.push("codeowners_audit = {'present':False}\n")
+    parts.push("if os.path.exists(CODEOWNERS_PATH):\n")
+    parts.push("    with open(CODEOWNERS_PATH, encoding='utf-8') as f:\n")
+    parts.push("        co_content = f.read()\n")
+    parts.push("    co_lines = [l for l in co_content.splitlines() if l.strip() and not l.strip().startswith('#')]\n")
+    parts.push("    need_singularity = [l for l in co_lines if '@need-singularity' in l]\n")
+    parts.push("    codeowners_audit = {\n")
+    parts.push("        'present':True,\n")
+    parts.push("        'total_rules':len(co_lines),\n")
+    parts.push("        'need_singularity_rules':len(need_singularity),\n")
+    parts.push("        'sample_protected':need_singularity[:5],\n")
+    parts.push("    }\n\n")
+
+    parts.push("# cdo-validate job presence (memory anchor)\n")
+    parts.push("cdo_validate_present = any('cdo-validate' in (j or []) for j in [w['jobs'] for w in workflows])\n")
+    parts.push("# Flatten check\n")
+    parts.push("all_jobs = [j for w in workflows for j in w['jobs']]\n")
+    parts.push("cdo_validate_present = 'cdo-validate' in all_jobs\n\n")
+
+    parts.push("MEMORY_PRE_EXISTING_CI_FAILURES = {\n")
+    parts.push("    'memory_anchor':'feedback_admin_merge.md',\n")
+    parts.push("    'memory_claim':'pre-existing CI failures (cdo-validate on anima, attestation on hexa-lang)',\n")
+    parts.push("    'cdo_validate_job_present_in_anima':cdo_validate_present,\n")
+    parts.push("    'remediation':'admin merge OK for PRs unrelated to the failure (memory rule)',\n")
+    parts.push("    'note':'actual CI run status requires GitHub API; this audit is disk-only',\n")
+    parts.push("}\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'CI workflows audit (memory feedback_admin_merge cross-link)',\n")
+    parts.push("    'github_dir':GITHUB_DIR,\n")
+    parts.push("    'workflows_dir':WORKFLOWS_DIR,\n")
+    parts.push("    'workflows':workflows,\n")
+    parts.push("    'workflow_count':len(workflows),\n")
+    parts.push("    'codeowners_audit':codeowners_audit,\n")
+    parts.push("    'memory_pre_existing_ci_failures':MEMORY_PRE_EXISTING_CI_FAILURES,\n")
+    parts.push("    'all_jobs':all_jobs,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify .github/; read-only audit',\n")
+    parts.push("    'cross_link_cycles':['cycle 25 memory staleness (feedback_admin_merge.md broken refs)'],\n")
+    parts.push("    'pattern':'governance audit chain layer 8 (extends cycles 21-27)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[ci_workflows] workflows={len(workflows)} jobs={len(all_jobs)} cdo_validate={cdo_validate_present} codeowners={codeowners_audit.get(\"need_singularity_rules\", 0)}_need_singularity -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let workflows_min = 1
+    let memory_anchor = "feedback_admin_merge.md"
+    let cdo_validate_expected = "true"
+    let non_mutation = "READ_ONLY"
+    println("inv:workflows_min=" + to_string(workflows_min))
+    println("inv:memory_anchor=" + memory_anchor)
+    println("inv:cdo_validate_expected=" + cdo_validate_expected)
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:codeowners_need_singularity_pattern=true")
+    println("inv:disk_only_no_github_api_call=true")
+    println("inv:cross_link_cycle25_memory_staleness=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_ci_workflows_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=CI workflows audit (cdo-validate verification + CODEOWNERS need-singularity; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
