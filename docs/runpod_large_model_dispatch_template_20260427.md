@@ -141,6 +141,40 @@ if not bitsandbytes.cuda_setup.main.cudart_load_failed:
 
 Alternative: use a runpod image with bnb pre-installed CUDA-aware (e.g., `nvidia/pytorch:24.x` which has bnb-cuda built-in).
 
+### Pattern 7b — cuInit=999 (CUDA_ERROR_UNKNOWN) RunPod cold-start detection (added 2026-04-27 from int8 dispatch agent #17 finding)
+
+**Why**: RunPod pods with `runpod/pytorch:2.4.0-cuda12.4.1` template often start with `nvidia-smi` showing GPU + driver, but `torch.cuda.is_available()=False` due to `cuInit(0)` returning `999` (`CUDA_ERROR_UNKNOWN`). This is a host driver state / nvidia_uvm module init race at container cold-start. NOT a wrapper bug, NOT a model bug — RunPod-side recurring fault.
+
+**Evidence**: int8 dispatch (alt path 1) wrapper successfully downloaded 15.82GB via correct HF_HUB_DISABLE_XET path, then crashed at `from_pretrained` because `torch.cuda.is_available()=False`. Direct probe via `ctypes libcuda.so.1 cuInit(0)` returned 999. nvidia-smi simultaneously showed H100 80GB ready.
+
+**Implementation** (pre-flight, BEFORE any heavy operation):
+```python
+import subprocess, ctypes, sys
+# 1. nvidia-smi sanity (must show GPU)
+nv = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True)
+if nv.returncode != 0:
+    raise RuntimeError(f'Pre-flight FAIL: nvidia-smi error: {nv.stderr}')
+
+# 2. cuInit direct probe (catches 999 BEFORE torch import)
+try:
+    libcuda = ctypes.CDLL('libcuda.so.1')
+    rc = libcuda.cuInit(0)
+    if rc != 0:
+        # 999 = CUDA_ERROR_UNKNOWN; 800 = CUDA_ERROR_SYSTEM_NOT_READY; etc.
+        raise RuntimeError(f'Pre-flight FAIL: cuInit returned {rc} on cold-start RunPod pod. Recommend: pod restart OR newer image (pytorch:2.5.x+) OR re-spawn pod.')
+except OSError as e:
+    raise RuntimeError(f'Pre-flight FAIL: libcuda.so.1 not loadable: {e}')
+
+# 3. torch.cuda corroboration (after cuInit success)
+import torch
+if not torch.cuda.is_available():
+    raise RuntimeError('Pre-flight FAIL: cuInit succeeded but torch.cuda.is_available()=False — torch/driver mismatch')
+
+# Pre-flight PASS: proceed to model load
+```
+
+**Recovery strategy**: if cuInit=999, do NOT attempt fix-by-modprobe (RunPod treats kernel module manipulation as abuse trigger and auto-kills the pod — observed cost burn $0.60 on this pattern). Instead: terminate pod cleanly + spawn fresh pod (different host) + retry.
+
 ## Composite template (all 7 patterns)
 
 For any new dispatch of a model with `params_b > 20`, the wrapper MUST:
