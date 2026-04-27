@@ -1,5 +1,7 @@
 // tool/anima_vast_ai_orchestrator.hexa — Anima vast.ai pod lifecycle orchestrator (raw#9 + raw#37).
 //
+// @resolver-bypass(reason="python3 absolute-path detection requires darwin-native invocation, no docker PATH dependency")
+//
 // PURPOSE
 //   NEW tool (NOT extend tool/anima_runpod_orchestrator.hexa which hard-codes
 //   runpodctl path L75-76). Per Agent B + Agent 2 sub-agent kicks
@@ -50,6 +52,30 @@
 let HELPER_PATH = "/tmp/anima_vast_ai_orchestrator_helper.hexa_tmp"
 let SCHEMA      = "anima/anima_vast_ai_orchestrator/1"
 let SPEC_DOC    = "docs/runbooks/runpod_alt_vendor_vast_ai.md"
+
+// raw 82 darwin-native python3 invocation: hexa-exec docker container has no
+// python3 in PATH; we must use an absolute host path. Fallback chain:
+//   /opt/homebrew/bin/python3 -> /usr/local/bin/python3 -> /usr/bin/python3 -> which python3
+fn _detect_python3() -> string {
+    let candidates = [
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3"
+    ]
+    let mut i = 0
+    while i < len(candidates) {
+        let p = candidates[i]
+        let r = exec_with_status("test -x " + p + " && echo 1 || echo 0")
+        if to_string(r[0]).trim() == "1" { return p }
+        i = i + 1
+    }
+    // Final fallback: shell command -v / which (resolved by host shell, not docker)
+    let r = exec_with_status("command -v python3 2>/dev/null || which python3 2>/dev/null")
+    let resolved = to_string(r[0]).trim()
+    if resolved != "" { return resolved }
+    // Last resort: bare name (will fail loudly in caller)
+    return "python3"
+}
 
 fn _sh_quote(s: string) -> string {
     let mut o = "'"
@@ -445,11 +471,15 @@ fn _write_helper() {
 }
 
 fn _run_helper(args: string) -> list {
-    let cmd = "python3 " + HELPER_PATH + " " + args
+    // raw 82: use absolute python3 path detected at call time -- bare "python3"
+    // fails inside hexa-exec docker container which has no python3 in PATH.
+    let py = _detect_python3()
+    let cmd = py + " " + HELPER_PATH + " " + args
     let r = exec_with_status(cmd)
     return [to_string(r[0]).trim(), to_int(r[1])]
 }
 
+@manual_main
 fn main() {
     let av = argv()
     let mut selftest = false
