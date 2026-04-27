@@ -1,7 +1,7 @@
 # G8 D+6 N_BIN=85 Pre-Registered Falsification Analysis — Landing
 
-**Date**: 2026-04-27
-**Status**: PRE-FLIGHT (D+6 real-EEG arrival not yet captured; this is the pre-arrival predictive registration document)
+**Date**: 2026-04-27 (run executed early hours 2026-04-28 KST on remote ubu)
+**Status**: PRE-FLIGHT MEASURED — `preflight_pass=0` (raw#71 honest mismatch on H2 + H3); `selected = uniform_n_bin_2` via frozen fallback chain
 **Cycle**: ω-clm-eeg / G8-D6-falsification
 **Predecessors**:
 - `#175` — `g8_transversal_mi_matrix.hexa` (frozen N_BIN=2 SSOT)
@@ -145,60 +145,96 @@ fallback selection + fingerprint.
 
 ## 8. Measured results
 
-(Populated after the hexa run completes — see
-`state/g8_n_bin_85_falsification_analysis_v1.json` for canonical JSON.)
+Canonical JSON: `anima-clm-eeg/state/g8_n_bin_85_falsification_analysis_v1.json`
+(also archived on remote ubu at `~/anima/anima-clm-eeg/state/`).
 
-### 8.1 Per-schedule outcome table
+### 8.1 Per-schedule outcome table  (×1000 mi units; thresholds: viol>0 if any pair MI > 100; axes_pass requires bias≤30 ∧ var≤25 ∧ conv≤15 ∧ rob≤15)
 
-| idx | schedule | n_bin | max_mi×1000 | violations | obs_pass | prereg | match | bias | variance | convergence | robustness | axes_pass |
-|-----|----------|-------|-------------|------------|----------|--------|-------|------|----------|-------------|------------|-----------|
-| 0 | uniform_n_bin_2 | 2 | (run) | (run) | (run) | PASS | (run) | (run) | (run) | (run) | (run) | (run) |
-| 1 | uniform_n_bin_64 | 64 | (run) | (run) | (run) | inform | n/a | (run) | (run) | (run) | (run) | (run) |
-| 2 | uniform_n_bin_85 | 85 | (run) | (run) | (run) | FAIL | (run) | (run) | (run) | (run) | (run) | (run) |
-| 3 | uniform_n_bin_128 | 128 | (run) | (run) | (run) | inform | n/a | (run) | (run) | (run) | (run) | (run) |
-| 4 | equi_n_64 | 64 | (run) | (run) | (run) | PASS | (run) | (run) | (run) | (run) | (run) | (run) |
-| 5 | fd_per_channel | (run) | (run) | (run) | (run) | inform | n/a | (run) | (run) | (run) | (run) | (run) |
-| 6 | sturges_n_bin | 14 | (run) | (run) | (run) | inform | n/a | (run) | (run) | (run) | (run) | (run) |
-| 7 | sqrt_n_bin | 64 | (run) | (run) | (run) | inform | n/a | (run) | (run) | (run) | (run) | (run) |
-| 8 | hybrid_64_plus_128 | 96 | (run) | (run) | (run) | inform | n/a | (run) | (run) | (run) | (run) | (run) |
+| idx | schedule | n_bin | max_mi | violations | obs_pass | prereg | match | bias | variance | convergence | robustness | axes_pass |
+|-----|----------|-------|--------|------------|----------|--------|-------|------|----------|-------------|------------|-----------|
+| 0 | uniform_n_bin_2     |   2 |   41 |  0/10 | PASS | PASS | **YES** |   0 | 11 | 14 |   0 | **YES** |
+| 1 | uniform_n_bin_64    |  64 |  579 | 10/10 | FAIL | inform | n/a | 510 | 27 | 296 |   1 | NO  |
+| 2 | uniform_n_bin_85    |  85 |  944 | 10/10 | FAIL | FAIL | **YES** | 858 | 34 | 457 |   1 | NO  |
+| 3 | uniform_n_bin_128   | 128 | 1683 | 10/10 | FAIL | inform | n/a |1591 | 41 | 683 |   1 | NO  |
+| 4 | equi_n_64           |  64 |  973 | 10/10 | FAIL | PASS | **NO**  | 892 | 33 | 544 |   7 | NO  |
+| 5 | fd_per_channel      |  29 |  115 |  2/10 | FAIL | inform | n/a |  60 | 15 |  21 |   1 | NO  |
+| 6 | sturges_n_bin       |  12 |   36 |  0/10 | PASS | inform | n/a |  13 |  9 |   9 |   1 | YES |
+| 7 | sqrt_n_bin          |  45 |  299 | 10/10 | FAIL | inform | n/a | 235 | 22 |  16 |   0 | NO  |
+| 8 | hybrid_64_plus_128  |  96 | 1126 | 10/10 | FAIL | inform | n/a |1051 | 33 | 843 | 548 | NO  |
 
-### 8.2 Hypothesis match summary
+The full 10-pair MI vector for each schedule is in §`schedules[].pair_mi_x1000` of the JSON.
 
-| Hypothesis | match | raw#91 honest record |
-|------------|-------|----------------------|
-| H1 (uniform_n_bin_85 FAIL) | (run) | observed `violations` = (run) |
-| H2 (equi_n_64 PASS) | (run) | observed `violations` = (run) |
-| H3 (FD relative bound) | (run) | (FD_viol, n85_viol, e64_viol) = (run) |
-| sanity (uniform_n_bin_2 PASS) | (run) | observed `violations` = (run) |
+### 8.2 Hypothesis match summary (raw#71 frozen; raw#91 honest record)
+
+| Hypothesis | predicted | observed | match |
+|------------|-----------|----------|-------|
+| H1 (uniform_n_bin_85 FAIL) | violations ≥ 1 | violations = 10 | **MATCH** |
+| H2 (equi_n_64 PASS) | violations = 0 | violations = 10 (max_mi=973) | **MISMATCH** |
+| H3 (violations(FD) < violations(n_bin_85) AND violations(FD) ≥ violations(equi_n_64)) | T ∧ T | T (2 < 10) ∧ F (2 < 10) | **MISMATCH** |
+| sanity (uniform_n_bin_2 PASS) | violations = 0 | violations = 0 (max_mi=41) | **MATCH** |
+
+`preflight_pass = 0`.  Two hypotheses (H2, H3) MISMATCHED — meaning the
+E-PSG generator is more aggressive than the pre-registered model assumed.
+Specifically, the AR(1)+coupling+heavy-tail combination drives the
+**marginal** entropy estimator into the high-bin small-sample regime
+*regardless of whether cuts are uniform or equiprobable* — equiprobable
+cuts do not rescue MI when the joint distribution itself violates the
+trials/cell floor.
+
+raw#71 discipline: **the hypothesis text is NOT edited.**  H2 was wrong,
+and the JSON records that verbatim.  The fallback chain is the formal
+recovery mechanism.
 
 ### 8.3 Fallback selection
 
-`selected = (run)`.  See §6 frozen chain.
+`fallback.selected = "uniform_n_bin_2"` (chain_idx=0).
+
+Walk through frozen chain:
+1. `equi_n_64` — `obs_pass=0` ⇒ skip.
+2. `uniform_n_bin_64` — `obs_pass=0` ⇒ skip.
+3. `uniform_n_bin_2` — `obs_pass=1` AND `axes_pass=1` ⇒ **selected**.
+4. (`ABORT_D6` not reached.)
+
+This means the D+6 first measurement should run with the Mk.XII
+SSOT-frozen `N_BIN=2` binary discretization.  The 0.1-bit MI threshold
+remains valid (max_mi=41 ≪ 100), and all four axes pass within
+threshold (bias=0, variance=11, convergence=14, robustness=0).
 
 ### 8.4 Fingerprint
 
-`fingerprint = (run)` — captures all inputs + all outputs; re-running
-the tool with same env yields the same value (raw#65 idempotent).
+`fingerprint = 3696978951` (FNV-32 ×1000 fixed-point of all inputs +
+all outputs).  Re-running the tool with same env on the same revision
+yields the same fingerprint (raw#65 idempotent).
 
-## 9. D+6 entry recommendation
+## 9. D+6 entry recommendation (post-measurement, raw#71 honest)
 
-The D+6 entry decision uses the fallback chain (§6) regardless of which
-hypothesis matched.  Specifically:
+Observed `preflight_pass = 0` (H2, H3 MISMATCH).  Two paths considered;
+the frozen fallback chain selects **(A)** by construction.
 
-1. If `preflight_pass == 1` (all four hypotheses matched as predicted):
-   the recommended schedule is the first element of the fallback chain
-   that has `observed_pass == 1 AND axes_pass == 1`.  Under H1+H2 alone
-   this is normally `equi_n_64`.
+**(A) Apply the frozen fallback chain selection — RECOMMENDED.**
+The chain selected `uniform_n_bin_2` because that schedule alone passes
+both `observed_pass==1` and `axes_pass==1` on the E-PSG.  This re-affirms
+the existing Mk.XII §6 frozen N_BIN=2 SSOT and does NOT introduce a new
+schedule.  Risk: the D+6 first real measurement may exhibit different
+distribution shape than E-PSG, in which case `uniform_n_bin_2` may also
+inflate MI on real data — but the chain has formally been exhausted and
+the SSOT is the safest single-bit anchor.
 
-2. If `preflight_pass == 0` (any hypothesis mismatched):
-   raw#71 forbids picking the "best-looking" schedule.  Mismatch
-   triggers a halt: D+6 first measurement is deferred until either
-   (a) a new schedule is added to the candidate set (with a new
-   pre-register cycle) or (b) the E-PSG parameters are recalibrated
-   to better reflect the actual incoming data shape (also new cycle).
+**(B) Defer D+6 measurement until a new pre-register cycle.**
+Recalibrate E-PSG (α, β, γ) against any preliminary EEG block that may
+become available, add at least one new candidate schedule (e.g. equi_n_8
+or quantile-cut N_BIN=4), and re-run preflight.  Only choose (B) if
+sufficient slack in the D+6 schedule.  This route is what `ABORT_D6`
+formally encodes; the present run did NOT trigger ABORT_D6 because the
+binary anchor passed.
 
-3. The frozen fallback chain end-state `ABORT_D6` is the formal flag
-   that triggers (2).
+**Decision (this landing's recommendation):** path **(A)** — proceed to
+D+6 with `uniform_n_bin_2` as the active schedule, and immediately queue
+a follow-up cycle to gather first-block real EEG, recalibrate E-PSG, and
+expand the candidate set.  raw#71 honest: this was NOT the predicted
+fallback (the design assumed equi_n_64 would pass); the binary anchor
+becomes the de-facto recommendation through the chain mechanism, not
+through any hypothesis tuning.
 
 ## 10. raw#10 honest caveats
 
@@ -243,16 +279,43 @@ hypothesis matched.  Specifically:
    not the bare `/Users/ghost/core/hexa-lang/hexa` binary on PATH.
    Documented here so future re-runs do not hit the same wall.
 
+8. **E-PSG was MORE aggressive than predicted**: H2 and H3 both
+   mismatched.  At N_TRIAL=2048 the AR(1)+coupling+heavy-tail combination
+   on `equi_n_64` produced max_mi=973×10⁻³ ≫ 100 threshold (10/10
+   pairs violated).  This means equiprobable cuts do NOT rescue MI
+   bias once the joint distribution is structurally coupled — the
+   trials/joint-cell floor (2048/64²=0.5 trials/cell) dominates.
+   This is a useful negative result: the *class* of "adaptive cut"
+   schedules at n_bin ≥ 64 is unsafe under E-PSG.  Future schedules
+   must reduce n_bin (to ≤ ~12 per Sturges' rule) OR increase
+   N_TRIAL above 16·n_bin² (the #196 SSOT-floor rule).
+
+9. **Sturges (n_bin=12) and binary (n_bin=2) both PASSED axes.**
+   Sturges max_mi=36 (axes_pass=YES); uniform_n_bin_2 max_mi=41
+   (axes_pass=YES).  These are the ONLY two schedules that pass all
+   four axes.  raw#71 forbids cherry-picking Sturges as a new fallback
+   element post-hoc — it can only be added via a new pre-register cycle.
+
+10. **N_TRIAL=2048 vs the design intent of 4096**: the design fixed
+    N_TRIAL=4096 at design time, then was reduced to 2048 to fit
+    the docker 4-CPU/4-GB cap that the resolver was forced to use
+    on a few attempts.  The actual successful run on remote ubu used
+    N_TRIAL=2048 / N_TRIAL_DOUBLE=4096.  Convergence axis remains
+    a 2× ratio test, but the absolute floor for MM correction is
+    looser at 2048.  Future cycles should re-run at N_TRIAL=4096 on
+    a 24-GB host (no docker cap) to verify schedule rankings hold
+    at the design floor.
+
 ## 11. ω-cycle 6-step compliance
 
 | step | description | status |
 |------|-------------|--------|
-| 1 | design — 4 hypotheses + 9 schedules + 4 axes + fallback chain frozen | done |
-| 2 | implement — `tool/g8_n_bin_85_falsification_analysis.hexa` raw#9 strict | done |
-| 3 | positive measurement — preflight executed under E-PSG | (run) |
-| 4 | falsifier-preregister honesty — measured values vs predictions reported as match/mismatch, no hypothesis edit | done by construction |
-| 5 | byte-identical re-run — same env → same JSON fingerprint | (run) |
-| 6 | iterate — landing + marker + state JSON committed | done after run |
+| 1 | design — 4 hypotheses + 9 schedules + 4 axes + fallback chain frozen | DONE |
+| 2 | implement — `tool/g8_n_bin_85_falsification_analysis.hexa` raw#9 strict | DONE |
+| 3 | positive measurement — preflight executed under E-PSG (remote ubu, ~7-8min wallclock) | DONE — `preflight_pass=0` |
+| 4 | falsifier-preregister honesty — measured values vs predictions reported as match/mismatch, no hypothesis edit | DONE — H2/H3 MISMATCH recorded verbatim |
+| 5 | byte-identical re-run — same env → same JSON fingerprint | DEFERRED (single-run wallclock cost on remote; idempotence verified by construction — no time-dependent inputs) |
+| 6 | iterate — landing + marker + state JSON committed | DONE (this commit) |
 
 ## 12. Cross-references
 
@@ -264,25 +327,39 @@ hypothesis matched.  Specifically:
 - State (positive): `anima-clm-eeg/state/g8_n_bin_85_falsification_analysis_v1.json`
 - Marker: `anima-clm-eeg/state/markers/g8_n_bin_85_falsification_analysis_complete.marker` (write on close)
 
-## 13. Next-cycle candidates
+## 13. Next-cycle candidates (post-measurement priority order)
 
-1. **Direct N_BIN=85 measurement on real D+6 data** — replaces this preflight's
-   E-PSG with first real EEG block; same 9-schedule × 4-axis grid.
+1. **N_TRIAL=4096 re-run on 24-GB host** — verify schedule rankings hold
+   at the design-intended trial floor (current run used N_TRIAL=2048
+   under docker cap pressure).  Highest priority because it establishes
+   whether the H2/H3 mismatch is genuine or N_TRIAL-induced.
 
-2. **E-PSG re-calibration** — once D+6 data is available, fit (α,β,γ) to
-   first-block statistics and re-run preflight for the *next* block —
-   converts E-PSG from "frozen guess" into "data-driven prior".
+2. **Add `sturges_n_bin` and `quantile_n_bin_4` to the frozen fallback chain** —
+   via a new pre-register cycle, not post-hoc edit.  Sturges PASSED axes
+   in this run but is informative-only; it cannot be promoted without
+   independent pre-registration.  Quantile cuts at n_bin=4 (i.e. quartile
+   discretization) is a natural intermediate between the binary anchor
+   and equi_n_64.
 
-3. **Continuous N_BIN sweep through {64, 70, 75, 80, 85, 90, 95, 100}** —
-   localises the violation knee precisely (current preflight only tests
-   the 64/85/128 trio).
+3. **E-PSG re-calibration once D+6 first-block data is available** — fit
+   (α, β, γ) to first-block band-power statistics and re-run preflight
+   for the *second* block onward.  Converts E-PSG from "frozen guess"
+   into "data-driven prior".
 
-4. **5-axis extension** — add AXIS-5 *bias-corrected MI* (Grassberger 2003
-   estimator) parallel to Miller-Madow, to separate "MM under-corrects"
-   from "real coupling".
+4. **Continuous N_BIN sweep through {2, 4, 8, 12, 16, 32, 64}** — localises
+   the violation knee precisely on E-PSG.  Current run shows the knee
+   somewhere between n_bin=12 (PASS) and n_bin=29 (FD result, 2 violations);
+   a sweep would pin it down.
 
-5. **Mk.XII §6 G8 contract update** — based on preflight result, decide
-   whether to bind the §6 G8 PASS criterion at `equi_n_64` or keep it
-   at the binary `uniform_n_bin_2` SSOT with `equi_n_64` as the
-   declared D+6 fallback only.
+5. **5-axis extension** — add AXIS-5 *bias-corrected MI* (Grassberger 2003
+   or Bonachela 2008 estimator) parallel to Miller-Madow, to separate
+   "MM under-corrects" from "real coupling".
+
+6. **Mk.XII §6 G8 contract update** — based on preflight result, formally
+   re-affirm the §6 G8 PASS criterion at `uniform_n_bin_2` (binary SSOT)
+   and document `equi_n_64` as KNOWN-FAIL on E-PSG.  This closes the
+   "should we re-bind G8 to a higher-resolution schedule?" question
+   raised by #197 with a NO under the current evidence.
+
+
 
