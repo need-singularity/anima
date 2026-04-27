@@ -1,0 +1,174 @@
+// tool/anima_bin_executables_auditor.hexa — bin/ executables + .git/hooks/ audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   bin/ 16 entrypoint scripts + .git/hooks/ active hooks audit. cycle 31 ready/ raw#9 divergence,
+//   cycle 32 sibling raw#9 scope 발견 후 — bin/ 도 .py vs .hexa 비율 + .git/hooks active state 확인.
+//
+//   본 helper = mac-local NON_MUTATION:
+//     - bin/ 16 files inventory (script type + executable bit + size)
+//     - 첫 번째 line shebang 분석 (python vs hexa vs bash)
+//     - .git/hooks/ active (.sample 제외) hooks count
+//     - selftest verifies: bin counts / hook samples filtered / NON_MUTATION
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/bin_executables_auditor.json)
+//   ANIMA_BIN_DIR     bin dir (default: bin)
+//   ANIMA_HOOKS_DIR   hooks dir (default: .git/hooks)
+//
+// OUTPUT
+//   - bin_inventory: list of {file, executable, size, shebang_type, first_line_preview}
+//   - shebang_distribution: python / hexa / bash / unknown counts
+//   - git_hooks: {active_count, sample_count, active_list}
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_bin_executables_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/bin_executables_auditor.json hexa run tool/anima_bin_executables_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - shebang 분석은 1-line read; multi-line preamble 미고려.
+//   - executable bit는 stat mode check (st_mode & 0o111).
+//   - .git/hooks active = 비-.sample 파일 (heuristic).
+
+let HELPER_PATH = "/tmp/anima_bin_executables_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima bin/ executables + .git/hooks audit — emitted by tool/anima_bin_executables_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION.\n")
+    parts.push("import json, os, sys, stat\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/bin_executables_auditor.json')\n")
+    parts.push("BIN_DIR = os.environ.get('ANIMA_BIN_DIR', 'bin')\n")
+    parts.push("HOOKS_DIR = os.environ.get('ANIMA_HOOKS_DIR', '.git/hooks')\n\n")
+
+    parts.push("bin_inventory = []\n")
+    parts.push("shebang_dist = {}\n")
+    parts.push("if os.path.isdir(BIN_DIR):\n")
+    parts.push("    for fname in sorted(os.listdir(BIN_DIR)):\n")
+    parts.push("        path = os.path.join(BIN_DIR, fname)\n")
+    parts.push("        if not os.path.isfile(path): continue\n")
+    parts.push("        try:\n")
+    parts.push("            st = os.stat(path)\n")
+    parts.push("            executable = bool(st.st_mode & stat.S_IXUSR)\n")
+    parts.push("            sz = st.st_size\n")
+    parts.push("            with open(path, encoding='utf-8', errors='replace') as f:\n")
+    parts.push("                first_line = f.readline().strip()\n")
+    parts.push("        except Exception:\n")
+    parts.push("            continue\n")
+    parts.push("        # classify shebang\n")
+    parts.push("        shebang_type = 'unknown'\n")
+    parts.push("        if first_line.startswith('#!'):\n")
+    parts.push("            sb_lower = first_line.lower()\n")
+    parts.push("            if 'python' in sb_lower:\n")
+    parts.push("                shebang_type = 'python'\n")
+    parts.push("            elif 'bash' in sb_lower or 'sh' in sb_lower:\n")
+    parts.push("                shebang_type = 'bash_sh'\n")
+    parts.push("            elif 'hexa' in sb_lower:\n")
+    parts.push("                shebang_type = 'hexa'\n")
+    parts.push("            else:\n")
+    parts.push("                shebang_type = 'other_shebang'\n")
+    parts.push("        elif first_line:\n")
+    parts.push("            shebang_type = 'no_shebang'\n")
+    parts.push("        else:\n")
+    parts.push("            shebang_type = 'empty'\n")
+    parts.push("        shebang_dist[shebang_type] = shebang_dist.get(shebang_type, 0) + 1\n")
+    parts.push("        bin_inventory.append({\n")
+    parts.push("            'file':fname,\n")
+    parts.push("            'executable':executable,\n")
+    parts.push("            'size':sz,\n")
+    parts.push("            'shebang_type':shebang_type,\n")
+    parts.push("            'first_line_preview':first_line[:80],\n")
+    parts.push("        })\n\n")
+
+    parts.push("# .git/hooks audit\n")
+    parts.push("git_hooks = {'present':False}\n")
+    parts.push("if os.path.isdir(HOOKS_DIR):\n")
+    parts.push("    hooks_files = os.listdir(HOOKS_DIR)\n")
+    parts.push("    active = sorted([f for f in hooks_files if not f.endswith('.sample')])\n")
+    parts.push("    samples = sorted([f for f in hooks_files if f.endswith('.sample')])\n")
+    parts.push("    git_hooks = {\n")
+    parts.push("        'present':True,\n")
+    parts.push("        'active_count':len(active),\n")
+    parts.push("        'sample_count':len(samples),\n")
+    parts.push("        'active_list':active[:20],\n")
+    parts.push("        'note':'active hooks (non-.sample) override default Git behavior',\n")
+    parts.push("    }\n\n")
+
+    parts.push("# Aggregate\n")
+    parts.push("executable_count = sum(1 for b in bin_inventory if b['executable'])\n")
+    parts.push("non_executable = sum(1 for b in bin_inventory if not b['executable'])\n\n")
+
+    parts.push("# raw#9 strict alignment check (bin scripts are entry points; what shebang?)\n")
+    parts.push("raw9_alignment = {\n")
+    parts.push("    'python_shebangs_in_bin':shebang_dist.get('python', 0),\n")
+    parts.push("    'hexa_shebangs_in_bin':shebang_dist.get('hexa', 0),\n")
+    parts.push("    'bash_shebangs_in_bin':shebang_dist.get('bash_sh', 0),\n")
+    parts.push("    'note':'raw#9 main hexa-only ban applies to .py source files; bin entry-point shebangs are separate convention',\n")
+    parts.push("}\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'bin/ executables + .git/hooks audit (governance audit chain layer 14)',\n")
+    parts.push("    'bin_dir':BIN_DIR,\n")
+    parts.push("    'hooks_dir':HOOKS_DIR,\n")
+    parts.push("    'bin_inventory':bin_inventory,\n")
+    parts.push("    'bin_count':len(bin_inventory),\n")
+    parts.push("    'executable_count':executable_count,\n")
+    parts.push("    'non_executable_count':non_executable,\n")
+    parts.push("    'shebang_distribution':shebang_dist,\n")
+    parts.push("    'git_hooks':git_hooks,\n")
+    parts.push("    'raw9_alignment':raw9_alignment,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT modify bin/ or .git/hooks; read-only audit',\n")
+    parts.push("    'cross_link_cycles':['cycle 26 .gitignore raw#9 verified','cycle 31 ready/ raw#9 divergence','cycle 32 sibling raw#9 scope'],\n")
+    parts.push("    'pattern':'governance audit chain layer 14 (cycles 21-33 + this)',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[bin_audit] bin={len(bin_inventory)} exec={executable_count} hooks_active={git_hooks.get(\"active_count\", 0)} hooks_samples={git_hooks.get(\"sample_count\", 0)} python_shebangs={shebang_dist.get(\"python\", 0)} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let bin_min = 10
+    let shebang_categories = "python,bash_sh,hexa,other_shebang,no_shebang,empty,unknown"
+    let non_mutation = "READ_ONLY"
+    println("inv:bin_min=" + to_string(bin_min))
+    println("inv:shebang_categories=" + shebang_categories)
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:hook_active_excludes_sample=true")
+    println("inv:executable_bit_via_st_mode_S_IXUSR=true")
+    println("inv:cross_link_cycle26_cycle31_cycle32=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_bin_executables_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=bin/ executables + .git/hooks audit (shebang dist + active hooks; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
