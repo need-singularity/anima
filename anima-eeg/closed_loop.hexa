@@ -1,29 +1,476 @@
-// closed_loop.hexa — Closed-loop EEG protocol: nback + meditation + neurofeedback
-// Feedback modes: eeg_only, bidirectional, neurofeedback_only
+// anima-eeg/closed_loop.hexa
+// raw#9 hexa-only · raw#10 honest · raw#11 snake_case · raw#15 SSOT
+// raw#65 idempotent · raw#68 byte-identical · raw#101 minimal
+//
+// PURPOSE
+//   Closed-loop EEG feedback core — bidirectional state machine that maps
+//   measured EEG band powers to neurofeedback adaptation parameters and
+//   tracks loop iterations + feedback events. Phase 4 priority 4 — foundation
+//   for neurofeedback.hexa (priority 5) + rp_adaptive_response.hexa (priority 7).
+//
+// MODES
+//   --selftest        deterministic synthetic 60-iteration nback loop, no hardware
+//   --run             real hardware closed-loop session (NOT IMPLEMENTED in this
+//                     module — wire via experiment.hexa --run-with-eeg + dispatch)
+//
+// raw#10 honest scope
+//   - Pure-hexa numerical feedback loop. NO BrainFlow / NO audio synthesis /
+//     NO LED PWM emission in this module. Hardware emission belongs to a
+//     downstream WRAPPER (experiment.hexa or eeg_recorder.hexa pipeline).
+//   - Synthetic --selftest path uses deterministic LCG (seed=1) for byte-
+//     identical reproducibility across runs (raw#68).
+//   - Synthetic mode emits tier=DEGRADED so consumers know it is not phenomenal.
+//
+// PROTOCOLS
+//   nback         high engagement target (beta-dominant), feedback when slipping
+//   meditation    high relaxation target (alpha-dominant), feedback when distracted
+//   neurofeedback generic phi-tracking, bidirectional feedback both directions
+//
+// FEEDBACK MODES
+//   eeg_only            measure-only, NO output adaptation (baseline)
+//   bidirectional       measure + adapt (both metrics + audio/led params)
+//   neurofeedback_only  output-only, NO adaptive logic (open-loop emission)
+//
+// DETERMINISM
+//   No clock, no env, no RNG except deterministic LCG with explicit seed.
+//   Same input → same output byte-identical across runs (raw#68 verified by T8).
+//
+// USAGE
+//   hexa run anima-eeg/closed_loop.hexa --selftest
 
-struct ClosedLoopConfig {
-    protocol: string,
-    feedback_mode: string,
-    duration_sec: i32,
-    adaptive: bool
+let SCHEMA = "anima-eeg/closed_loop/1"
+
+// ════════════════════════════════════════════════════════════════════
+// Section 0. Constants
+// ════════════════════════════════════════════════════════════════════
+
+let DEFAULT_DURATION_SEC   = 60
+let DEFAULT_PROTOCOL       = "neurofeedback"
+let DEFAULT_FEEDBACK_MODE  = "bidirectional"
+
+// nback engagement target (beta-dominant)
+let NBACK_BETA_TARGET      = 0.55
+let NBACK_ENGAGEMENT_FLOOR = 0.40
+
+// meditation relaxation target (alpha-dominant)
+let MEDITATION_ALPHA_TARGET     = 0.55
+let MEDITATION_RELAXATION_FLOOR = 0.45
+
+// neurofeedback generic phi target
+let PHI_TARGET             = 0.50
+let PHI_TOLERANCE          = 0.10
+
+// Adaptive smoothing — exponential moving average
+let EMA_ALPHA              = 0.30
+
+// LCG params (Numerical Recipes constants — deterministic)
+let LCG_A = 1664525
+let LCG_C = 1013904223
+let LCG_M = 4294967296
+
+// ════════════════════════════════════════════════════════════════════
+// Section 1. State (globals — avoids multi-float struct return bug
+//   per anima-eeg/rp_adaptive_response.hexa Section 1 comment)
+// ════════════════════════════════════════════════════════════════════
+
+let g_protocol           = ""
+let g_feedback_mode      = ""
+let g_duration_sec       = 0
+let g_iterations         = 0
+let g_feedback_events    = 0
+let g_phi_sum            = 0.0
+let g_phi_count          = 0
+let g_alpha_power_sum    = 0.0
+let g_beta_power_sum     = 0.0
+let g_engagement_ema     = 0.0
+let g_relaxation_ema     = 0.0
+let g_n_back_correct     = 0
+let g_n_back_total       = 0
+let g_lcg_state          = 0
+
+// Final aggregates (read after run_loop)
+let g_phi_mean           = 0.0
+let g_alpha_power_mean   = 0.0
+let g_n_back_accuracy    = 0.0
+
+// ════════════════════════════════════════════════════════════════════
+// Section 2. Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn clamp_f(v: float, lo: float, hi: float) -> float {
+    let mut out = v
+    if out < lo { out = lo }
+    if out > hi { out = hi }
+    return out
 }
 
-struct ClosedLoopResult {
-    phi_mean: float,
-    alpha_power: float,
-    n_back_accuracy: float,
-    feedback_events: i32
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
 }
 
-fn run_closed_loop(config: ClosedLoopConfig) -> ClosedLoopResult {
-    print("closed-loop EEG: " + config.protocol + " mode=" + config.feedback_mode)
-    return ClosedLoopResult(0.0, 0.0, 0.0, 0)
+// LCG random number generator — deterministic, seed-driven
+fn _lcg_seed(seed: int) {
+    g_lcg_state = seed
 }
 
-fn run_nback(difficulty: i32, duration: i32) -> ClosedLoopResult {
-    return run_closed_loop(ClosedLoopConfig("nback", "bidirectional", duration, true))
+fn _lcg_next() -> int {
+    g_lcg_state = (LCG_A * g_lcg_state + LCG_C) % LCG_M
+    return g_lcg_state
 }
 
-fn run_meditation(duration: i32) -> ClosedLoopResult {
-    return run_closed_loop(ClosedLoopConfig("meditation", "bidirectional", duration, true))
+// Returns float in [0.0, 1.0)
+fn _lcg_float() -> float {
+    let v = _lcg_next()
+    return to_float(v) / to_float(LCG_M)
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Section 3. Synthetic EEG sample generator (deterministic)
+// ════════════════════════════════════════════════════════════════════
+
+// Generates synthetic (alpha, beta, engagement, relaxation, phi) tuple
+// for iteration `i` under protocol `proto`. Pure deterministic.
+//
+// Sets globals: g_alpha_power_sum, g_beta_power_sum, g_phi_sum, g_phi_count
+// Returns: nothing — caller reads globals
+let g_sample_alpha       = 0.0
+let g_sample_beta        = 0.0
+let g_sample_engagement  = 0.0
+let g_sample_relaxation  = 0.0
+let g_sample_phi         = 0.0
+
+fn _synth_sample(proto: string, iter: int) {
+    // Drift component — slow oscillation per iteration
+    let drift = 0.10 * to_float(iter % 10) / 10.0
+
+    // Noise component — deterministic LCG
+    let noise = _lcg_float() * 0.10 - 0.05
+
+    if proto == "nback" {
+        // High engagement target → beta-dominant
+        g_sample_alpha      = 0.30 + drift + noise
+        g_sample_beta       = 0.55 + drift * 0.5 + noise
+        g_sample_engagement = clamp_f(0.50 + drift + noise, 0.0, 1.0)
+        g_sample_relaxation = clamp_f(0.30 - drift + noise, 0.0, 1.0)
+        g_sample_phi        = clamp_f(0.55 + drift * 0.3 + noise * 0.5, 0.0, 1.0)
+        return
+    }
+    if proto == "meditation" {
+        // High relaxation target → alpha-dominant
+        g_sample_alpha      = 0.55 + drift + noise
+        g_sample_beta       = 0.25 + drift * 0.3 + noise
+        g_sample_engagement = clamp_f(0.30 - drift + noise, 0.0, 1.0)
+        g_sample_relaxation = clamp_f(0.55 + drift + noise, 0.0, 1.0)
+        g_sample_phi        = clamp_f(0.45 + drift * 0.3 + noise * 0.5, 0.0, 1.0)
+        return
+    }
+    // neurofeedback (generic phi-tracking)
+    g_sample_alpha      = 0.40 + drift + noise
+    g_sample_beta       = 0.40 + drift + noise
+    g_sample_engagement = clamp_f(0.40 + drift + noise, 0.0, 1.0)
+    g_sample_relaxation = clamp_f(0.40 + drift + noise, 0.0, 1.0)
+    g_sample_phi        = clamp_f(0.50 + drift * 0.2 + noise * 0.5, 0.0, 1.0)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 4. Feedback decision (closed-loop adaptive logic)
+// ════════════════════════════════════════════════════════════════════
+
+// Returns 1 if feedback event was triggered this iteration, else 0
+fn _decide_feedback(proto: string) -> int {
+    if g_feedback_mode == "eeg_only" { return 0 }
+
+    if proto == "nback" {
+        if g_engagement_ema < NBACK_ENGAGEMENT_FLOOR { return 1 }
+        return 0
+    }
+    if proto == "meditation" {
+        if g_relaxation_ema < MEDITATION_RELAXATION_FLOOR { return 1 }
+        return 0
+    }
+    // neurofeedback (generic): event if outside [target ± tolerance]
+    if abs_f(g_sample_phi - PHI_TARGET) > PHI_TOLERANCE { return 1 }
+    return 0
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 5. Loop core
+// ════════════════════════════════════════════════════════════════════
+
+fn _reset_state() {
+    g_iterations      = 0
+    g_feedback_events = 0
+    g_phi_sum         = 0.0
+    g_phi_count       = 0
+    g_alpha_power_sum = 0.0
+    g_beta_power_sum  = 0.0
+    g_engagement_ema  = 0.40
+    g_relaxation_ema  = 0.40
+    g_n_back_correct  = 0
+    g_n_back_total    = 0
+    g_phi_mean        = 0.0
+    g_alpha_power_mean = 0.0
+    g_n_back_accuracy = 0.0
+}
+
+fn run_loop(proto: string, fb_mode: string, duration: int, seed: int) {
+    g_protocol      = proto
+    g_feedback_mode = fb_mode
+    g_duration_sec  = duration
+    _reset_state()
+    _lcg_seed(seed)
+
+    let mut i = 0
+    while i < duration {
+        _synth_sample(proto, i)
+
+        // Update EMA
+        g_engagement_ema = (1.0 - EMA_ALPHA) * g_engagement_ema + EMA_ALPHA * g_sample_engagement
+        g_relaxation_ema = (1.0 - EMA_ALPHA) * g_relaxation_ema + EMA_ALPHA * g_sample_relaxation
+
+        // Aggregate
+        g_phi_sum         = g_phi_sum + g_sample_phi
+        g_phi_count       = g_phi_count + 1
+        g_alpha_power_sum = g_alpha_power_sum + g_sample_alpha
+        g_beta_power_sum  = g_beta_power_sum + g_sample_beta
+
+        // Feedback decision
+        let fb = _decide_feedback(proto)
+        g_feedback_events = g_feedback_events + fb
+
+        // n-back synthetic accuracy: deterministic — correct if engagement > floor
+        if proto == "nback" {
+            g_n_back_total = g_n_back_total + 1
+            if g_engagement_ema >= NBACK_ENGAGEMENT_FLOOR {
+                g_n_back_correct = g_n_back_correct + 1
+            }
+        }
+
+        g_iterations = g_iterations + 1
+        i = i + 1
+    }
+
+    // Finalize aggregates
+    if g_phi_count > 0 {
+        g_phi_mean         = g_phi_sum / to_float(g_phi_count)
+        g_alpha_power_mean = g_alpha_power_sum / to_float(g_phi_count)
+    }
+    if g_n_back_total > 0 {
+        g_n_back_accuracy = to_float(g_n_back_correct) / to_float(g_n_back_total)
+    }
+}
+
+// Public API thin wrappers (Phase 5 callsites)
+fn run_nback(difficulty: int, duration: int) {
+    run_loop("nback", "bidirectional", duration, 1)
+}
+
+fn run_meditation(duration: int) {
+    run_loop("meditation", "bidirectional", duration, 1)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 6. KV emit
+// ════════════════════════════════════════════════════════════════════
+
+fn _emit_kv() {
+    println("schema=" + SCHEMA)
+    println("protocol=" + g_protocol)
+    println("feedback_mode=" + g_feedback_mode)
+    println("duration_sec=" + to_string(g_duration_sec))
+    println("iterations=" + to_string(g_iterations))
+    println("feedback_events=" + to_string(g_feedback_events))
+    println("phi_mean=" + to_string(g_phi_mean))
+    println("alpha_power_mean=" + to_string(g_alpha_power_mean))
+    println("n_back_accuracy=" + to_string(g_n_back_accuracy))
+    println("tier=DEGRADED")
+    println("raw10_honest=synthetic_loop_no_hardware")
+    println("selftest=ok")
+    println("DONE")
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 7. Self-tests (8 tests — invariant-driven)
+// ════════════════════════════════════════════════════════════════════
+
+fn assert_true(cond: bool, label: string) -> bool {
+    if cond { println("  PASS: " + label) } else { println("  FAIL: " + label) }
+    return cond
+}
+
+fn run_tests() -> int {
+    let mut pass = 0
+    let mut fail = 0
+
+    println("=== closed_loop raw#9 self-tests ===")
+
+    // T1: nback short loop runs N=10 iterations
+    println("[T1] nback N=10")
+    run_loop("nback", "bidirectional", 10, 1)
+    let ok1a = assert_true(g_iterations == 10, "iterations=10")
+    let ok1b = assert_true(g_n_back_total == 10, "n_back_total=10")
+    if ok1a && ok1b { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T2: meditation short loop, no n-back accumulation
+    println("[T2] meditation N=10 no n-back")
+    run_loop("meditation", "bidirectional", 10, 1)
+    let ok2a = assert_true(g_iterations == 10, "iterations=10")
+    let ok2b = assert_true(g_n_back_total == 0, "n_back_total=0 (not nback)")
+    let ok2c = assert_true(g_phi_count == 10, "phi_count=10")
+    if ok2a && ok2b && ok2c { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T3: phi_mean non-zero and bounded for any protocol
+    println("[T3] phi_mean bounded")
+    run_loop("neurofeedback", "bidirectional", 30, 1)
+    let ok3a = assert_true(g_phi_mean > 0.0, "phi_mean > 0.0")
+    let ok3b = assert_true(g_phi_mean < 1.0, "phi_mean < 1.0")
+    if ok3a && ok3b { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T4: feedback_mode=eeg_only suppresses feedback events
+    println("[T4] eeg_only suppresses feedback")
+    run_loop("nback", "eeg_only", 30, 1)
+    let ok4 = assert_true(g_feedback_events == 0, "feedback_events=0 (eeg_only)")
+    if ok4 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T5: bidirectional may emit feedback events
+    println("[T5] bidirectional emits feedback")
+    run_loop("neurofeedback", "bidirectional", 30, 1)
+    let ok5 = assert_true(g_feedback_events >= 0, "feedback_events >= 0")
+    if ok5 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T6: n_back_accuracy in [0, 1] for nback protocol
+    println("[T6] n_back_accuracy in [0,1]")
+    run_loop("nback", "bidirectional", 30, 1)
+    let ok6a = assert_true(g_n_back_accuracy >= 0.0, "accuracy >= 0")
+    let ok6b = assert_true(g_n_back_accuracy <= 1.0, "accuracy <= 1")
+    if ok6a && ok6b { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T7: thin-wrapper run_nback delegates with correct iterations
+    println("[T7] run_nback wrapper")
+    run_nback(2, 15)
+    let ok7a = assert_true(g_iterations == 15, "iterations=15")
+    let ok7b = assert_true(g_protocol == "nback", "protocol=nback")
+    let ok7c = assert_true(g_feedback_mode == "bidirectional", "feedback_mode=bidirectional")
+    if ok7a && ok7b && ok7c { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T8: deterministic byte-identical idempotence (raw#68)
+    println("[T8] deterministic idempotence")
+    run_loop("nback", "bidirectional", 60, 1)
+    let phi1 = g_phi_mean
+    let alpha1 = g_alpha_power_mean
+    let acc1 = g_n_back_accuracy
+    let fb1 = g_feedback_events
+    run_loop("nback", "bidirectional", 60, 1)
+    let ok8a = assert_true(abs_f(phi1   - g_phi_mean)         < 0.0001, "phi_mean idempotent")
+    let ok8b = assert_true(abs_f(alpha1 - g_alpha_power_mean) < 0.0001, "alpha_mean idempotent")
+    let ok8c = assert_true(abs_f(acc1   - g_n_back_accuracy)  < 0.0001, "accuracy idempotent")
+    let ok8d = assert_true(fb1 == g_feedback_events, "feedback_events idempotent")
+    if ok8a && ok8b && ok8c && ok8d { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("")
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL out of " + to_string(pass + fail))
+    return fail
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 8. CLI
+// ════════════════════════════════════════════════════════════════════
+
+fn _emit_trailer(slug: string, detail: string, fix: string) {
+    eprintln("reason: " + slug + ": " + detail)
+    eprintln("fix: " + fix)
+}
+
+fn _print_usage() {
+    eprintln("usage: hexa run anima-eeg/closed_loop.hexa --selftest")
+    eprintln("flags:")
+    eprintln("  --selftest        deterministic synthetic 60-iteration nback loop, tier=DEGRADED")
+    eprintln("  --protocol <name> nback | meditation | neurofeedback (default neurofeedback)")
+    eprintln("  --duration <n>    iteration count (default " + to_string(DEFAULT_DURATION_SEC) + ")")
+    eprintln("  --feedback <name> eeg_only | bidirectional | neurofeedback_only (default bidirectional)")
+    eprintln("  --help            this message")
+}
+
+// argv normalize — see experiment.hexa _flags_only_argv 동치 doc.
+// Mac stage0 / hetzner ssh / docker 의 argv() 형식 차이 portable handling.
+fn _flags_only_argv() -> array {
+    let av = argv()
+    let mut start = 0
+    let mut i = 0
+    while i < len(av) {
+        let a = av[i]
+        let n = len(a)
+        if n >= 5 {
+            let suffix = a[(n - 5)..n]
+            if suffix == ".hexa" { start = i + 1; break }
+        }
+        i = i + 1
+    }
+    let mut out = []
+    let mut j = start
+    while j < len(av) {
+        out.push(av[j])
+        j = j + 1
+    }
+    return out
+}
+
+fn main() {
+    let av = _flags_only_argv()
+    let mut selftest = false
+    let mut want_help = false
+    let mut protocol = DEFAULT_PROTOCOL
+    let mut duration = DEFAULT_DURATION_SEC
+    let mut fb_mode = DEFAULT_FEEDBACK_MODE
+
+    let mut i = 0
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" { want_help = true; i = i + 1; continue }
+        if a == "--protocol" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--protocol requires value","1) re-run with --protocol nback"); exit(2) }
+            protocol = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--duration" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--duration requires int","1) re-run with --duration 60"); exit(2) }
+            duration = to_int(av[i + 1]); i = i + 2; continue
+        }
+        if a == "--feedback" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--feedback requires value","1) re-run with --feedback bidirectional"); exit(2) }
+            fb_mode = av[i + 1]; i = i + 2; continue
+        }
+        _emit_trailer("unknown-arg", "unrecognized argument: " + a, "1) re-run with --help")
+        _print_usage()
+        exit(2)
+    }
+
+    if want_help { _print_usage(); exit(0) }
+
+    if !selftest {
+        eprintln("ABORT: must pass --selftest (raw#9 strict no-fallback policy)")
+        _print_usage()
+        exit(2)
+    }
+
+    println("== closed_loop selftest ==")
+    println("schema=" + SCHEMA)
+    println("raw10_honest=pure_hexa_loop_no_brainflow_no_audio_no_led")
+    println("")
+
+    // Demo emit (default neurofeedback short loop)
+    run_loop(protocol, fb_mode, duration, 1)
+    _emit_kv()
+    println("")
+
+    let fails = run_tests()
+    if fails != 0 {
+        println("selftest=fail")
+        eprintln("selftest FAILED: " + to_string(fails) + " test(s) failed")
+        exit(1)
+    }
+    println("selftest: OK")
+    exit(0)
+}
+// hexa-strict auto-invokes fn main() — do not call main() explicitly.

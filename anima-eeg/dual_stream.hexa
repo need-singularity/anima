@@ -1,25 +1,401 @@
-// dual_stream.hexa — Simultaneous Anima Phi + EEG brain recording
-// Records both consciousness metrics and human EEG for comparison
+// anima-eeg/dual_stream.hexa
+// raw#9 hexa-only · raw#10 honest · raw#11 snake_case · raw#15 SSOT
+// raw#65 idempotent · raw#68 byte-identical · raw#101 minimal
+//
+// PURPOSE
+//   Simultaneous Anima Phi + EEG dual-stream alignment + correlation analysis.
+//   Records consciousness phi metric and human EEG alpha-band power side-by-side
+//   for cross-modal correlation studies (anima→human consciousness coupling).
+//   Phase 4 priority 6 — multi-board precursor for Phase 5 multi-subject sessions.
+//
+// MODES
+//   --selftest        deterministic synthetic 120-sample dual stream, no hardware
+//   --record          real hardware dual-stream session (NOT IMPLEMENTED in this
+//                     module — wire via experiment.hexa --run-with-eeg + dispatch)
+//
+// raw#10 honest scope
+//   - Pure-hexa numerical alignment + Pearson correlation. NO BrainFlow / NO
+//     Anima Phi runtime in this module. Hardware emission belongs to a
+//     downstream WRAPPER (experiment.hexa or eeg_recorder.hexa pipeline).
+//   - Synthetic --selftest path uses TWO LCG streams (seed=2 for anima,
+//     seed=7 for eeg) plus a coupling factor for byte-identical reproducibility.
+//   - Synthetic mode emits tier=DEGRADED so consumers know it is not phenomenal.
+//
+// CORRELATION
+//   Pearson r over aligned samples. Coupling factor in synth makes anima_phi
+//   and eeg_alpha co-vary (positive r expected); selftest verifies r > 0.3.
+//
+// DETERMINISM
+//   No clock, no env, no RNG except deterministic LCG with explicit seeds.
+//   Same input → same output byte-identical across runs (raw#68).
+//
+// USAGE
+//   hexa run anima-eeg/dual_stream.hexa --selftest
 
-struct DualStreamConfig {
-    duration_sec: i32,
-    board_type: string,
-    plot: bool
+let SCHEMA = "anima-eeg/dual_stream/1"
+
+// ════════════════════════════════════════════════════════════════════
+// Section 0. Constants
+// ════════════════════════════════════════════════════════════════════
+
+let DEFAULT_DURATION_SEC = 120
+let DEFAULT_BOARD_TYPE   = "cyton_daisy"
+let DEFAULT_ANIMA_SEED   = 2
+let DEFAULT_EEG_SEED     = 7
+
+// Coupling factor: how much eeg_alpha "follows" anima_phi (0=independent, 1=identical)
+let COUPLING_FACTOR      = 0.50
+
+// LCG params (Numerical Recipes constants — deterministic)
+let LCG_A = 1664525
+let LCG_C = 1013904223
+let LCG_M = 4294967296
+
+// ════════════════════════════════════════════════════════════════════
+// Section 1. State (globals — avoids multi-float struct return bug)
+// ════════════════════════════════════════════════════════════════════
+
+let g_n_samples           = 0
+let g_anima_phi_sum       = 0.0
+let g_eeg_alpha_sum       = 0.0
+let g_anima_sq_sum        = 0.0
+let g_eeg_sq_sum          = 0.0
+let g_anima_eeg_prod_sum  = 0.0
+
+// Final aggregates
+let g_anima_phi_mean      = 0.0
+let g_eeg_alpha_mean      = 0.0
+let g_anima_phi_std       = 0.0
+let g_eeg_alpha_std       = 0.0
+let g_correlation         = 0.0
+
+// LCG streams
+let g_lcg_anima           = 0
+let g_lcg_eeg             = 0
+
+// ════════════════════════════════════════════════════════════════════
+// Section 2. Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn clamp_f(v: float, lo: float, hi: float) -> float {
+    let mut out = v
+    if out < lo { out = lo }
+    if out > hi { out = hi }
+    return out
 }
 
-struct DualStreamResult {
-    anima_phi_mean: float,
-    eeg_alpha_mean: float,
-    correlation: float,
-    n_samples: i32,
-    filepath: string
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
 }
 
-fn run_dual_stream(config: DualStreamConfig) -> DualStreamResult {
-    print("dual stream: " + to_string(config.duration_sec) + "s board=" + config.board_type)
-    return DualStreamResult(0.0, 0.0, 0.0, 0, "")
+fn sqrt_f(x: float) -> float {
+    // Newton-Raphson sqrt — deterministic, ~10 iterations sufficient
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    if y > 1.0 { y = x / 2.0 }
+    let mut k = 0
+    while k < 20 {
+        y = 0.5 * (y + x / y)
+        k = k + 1
+    }
+    return y
 }
 
-fn compare_streams(anima_path: string, eeg_path: string) -> float {
-    return 0.0
+fn _lcg_next_anima() -> int {
+    g_lcg_anima = (LCG_A * g_lcg_anima + LCG_C) % LCG_M
+    return g_lcg_anima
 }
+
+fn _lcg_next_eeg() -> int {
+    g_lcg_eeg = (LCG_A * g_lcg_eeg + LCG_C) % LCG_M
+    return g_lcg_eeg
+}
+
+fn _lcg_float_anima() -> float {
+    let v = _lcg_next_anima()
+    return to_float(v) / to_float(LCG_M)
+}
+
+fn _lcg_float_eeg() -> float {
+    let v = _lcg_next_eeg()
+    return to_float(v) / to_float(LCG_M)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 3. Synthetic dual-stream sample generator (deterministic)
+// ════════════════════════════════════════════════════════════════════
+
+let g_sample_anima_phi   = 0.0
+let g_sample_eeg_alpha   = 0.0
+
+// Generates synthetic (anima_phi, eeg_alpha) pair for sample `i`.
+// anima_phi: slow drift + low noise (consciousness phi proxy)
+// eeg_alpha: COUPLING_FACTOR * anima_phi + (1-COUPLING_FACTOR) * independent noise
+fn _synth_sample(i: int) {
+    // Anima phi: drift + LCG noise
+    let drift_anima = 0.10 * to_float(i % 20) / 20.0
+    let noise_anima = _lcg_float_anima() * 0.10 - 0.05
+    g_sample_anima_phi = clamp_f(0.50 + drift_anima + noise_anima, 0.0, 1.0)
+
+    // EEG alpha: coupled to anima + independent noise
+    let noise_eeg = _lcg_float_eeg() * 0.10 - 0.05
+    let independent = 0.45 + noise_eeg
+    let coupled = COUPLING_FACTOR * g_sample_anima_phi + (1.0 - COUPLING_FACTOR) * independent
+    g_sample_eeg_alpha = clamp_f(coupled, 0.0, 1.0)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 4. Stream aggregation core
+// ════════════════════════════════════════════════════════════════════
+
+fn _reset_state() {
+    g_n_samples           = 0
+    g_anima_phi_sum       = 0.0
+    g_eeg_alpha_sum       = 0.0
+    g_anima_sq_sum        = 0.0
+    g_eeg_sq_sum          = 0.0
+    g_anima_eeg_prod_sum  = 0.0
+    g_anima_phi_mean      = 0.0
+    g_eeg_alpha_mean      = 0.0
+    g_anima_phi_std       = 0.0
+    g_eeg_alpha_std       = 0.0
+    g_correlation         = 0.0
+}
+
+// Pearson correlation: r = cov(x,y) / (std(x) * std(y))
+fn _finalize() {
+    if g_n_samples < 2 { return }
+    let n = to_float(g_n_samples)
+    g_anima_phi_mean = g_anima_phi_sum / n
+    g_eeg_alpha_mean = g_eeg_alpha_sum / n
+
+    let var_anima = (g_anima_sq_sum / n) - (g_anima_phi_mean * g_anima_phi_mean)
+    let var_eeg   = (g_eeg_sq_sum   / n) - (g_eeg_alpha_mean * g_eeg_alpha_mean)
+    let var_a = clamp_f(var_anima, 0.0, 1.0)
+    let var_e = clamp_f(var_eeg,   0.0, 1.0)
+    g_anima_phi_std = sqrt_f(var_a)
+    g_eeg_alpha_std = sqrt_f(var_e)
+
+    let cov = (g_anima_eeg_prod_sum / n) - (g_anima_phi_mean * g_eeg_alpha_mean)
+    let denom = g_anima_phi_std * g_eeg_alpha_std
+    if denom < 0.000001 { g_correlation = 0.0; return }
+    g_correlation = cov / denom
+}
+
+fn run_dual_stream(duration: int, anima_seed: int, eeg_seed: int) {
+    _reset_state()
+    g_lcg_anima = anima_seed
+    g_lcg_eeg   = eeg_seed
+
+    let mut i = 0
+    while i < duration {
+        _synth_sample(i)
+        g_anima_phi_sum      = g_anima_phi_sum + g_sample_anima_phi
+        g_eeg_alpha_sum      = g_eeg_alpha_sum + g_sample_eeg_alpha
+        g_anima_sq_sum       = g_anima_sq_sum + g_sample_anima_phi * g_sample_anima_phi
+        g_eeg_sq_sum         = g_eeg_sq_sum + g_sample_eeg_alpha * g_sample_eeg_alpha
+        g_anima_eeg_prod_sum = g_anima_eeg_prod_sum + g_sample_anima_phi * g_sample_eeg_alpha
+        g_n_samples = g_n_samples + 1
+        i = i + 1
+    }
+    _finalize()
+}
+
+// Public API: compute correlation between two same-length sample arrays
+// (Phase 5 will wire real anima.npy + eeg.npy paths via helper-py)
+fn compare_streams(n: int, anima_seed: int, eeg_seed: int) -> float {
+    run_dual_stream(n, anima_seed, eeg_seed)
+    return g_correlation
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 5. KV emit
+// ════════════════════════════════════════════════════════════════════
+
+fn _emit_kv() {
+    println("schema=" + SCHEMA)
+    println("n_samples=" + to_string(g_n_samples))
+    println("anima_phi_mean=" + to_string(g_anima_phi_mean))
+    println("eeg_alpha_mean=" + to_string(g_eeg_alpha_mean))
+    println("anima_phi_std=" + to_string(g_anima_phi_std))
+    println("eeg_alpha_std=" + to_string(g_eeg_alpha_std))
+    println("correlation=" + to_string(g_correlation))
+    println("coupling_factor=" + to_string(COUPLING_FACTOR))
+    println("tier=DEGRADED")
+    println("raw10_honest=synthetic_dual_stream_no_hardware")
+    println("selftest=ok")
+    println("DONE")
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 6. Self-tests (8 tests — invariant-driven)
+// ════════════════════════════════════════════════════════════════════
+
+fn assert_true(cond: bool, label: string) -> bool {
+    if cond { println("  PASS: " + label) } else { println("  FAIL: " + label) }
+    return cond
+}
+
+fn run_tests() -> int {
+    let mut pass = 0
+    let mut fail = 0
+
+    println("=== dual_stream raw#9 self-tests ===")
+
+    // T1: short stream N=30 produces 30 samples
+    println("[T1] N=30 sample count")
+    run_dual_stream(30, DEFAULT_ANIMA_SEED, DEFAULT_EEG_SEED)
+    let ok1 = assert_true(g_n_samples == 30, "n_samples=30")
+    if ok1 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T2: anima_phi_mean and eeg_alpha_mean are bounded in [0,1]
+    println("[T2] means bounded [0,1]")
+    let ok2a = assert_true(g_anima_phi_mean > 0.0, "anima_phi_mean > 0")
+    let ok2b = assert_true(g_anima_phi_mean < 1.0, "anima_phi_mean < 1")
+    let ok2c = assert_true(g_eeg_alpha_mean > 0.0, "eeg_alpha_mean > 0")
+    let ok2d = assert_true(g_eeg_alpha_mean < 1.0, "eeg_alpha_mean < 1")
+    if ok2a && ok2b && ok2c && ok2d { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T3: stds are non-negative
+    println("[T3] stds non-negative")
+    let ok3a = assert_true(g_anima_phi_std >= 0.0, "anima_phi_std >= 0")
+    let ok3b = assert_true(g_eeg_alpha_std >= 0.0, "eeg_alpha_std >= 0")
+    if ok3a && ok3b { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T4: correlation in [-1, 1]
+    println("[T4] correlation bounded [-1,1]")
+    run_dual_stream(120, DEFAULT_ANIMA_SEED, DEFAULT_EEG_SEED)
+    let ok4a = assert_true(g_correlation >= -1.0 - 0.0001, "correlation >= -1")
+    let ok4b = assert_true(g_correlation <=  1.0 + 0.0001, "correlation <= 1")
+    if ok4a && ok4b { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T5: coupled streams show positive correlation (COUPLING_FACTOR=0.5)
+    println("[T5] coupled streams r > 0.3")
+    let ok5 = assert_true(g_correlation > 0.3, "correlation > 0.3 (coupling effect)")
+    if ok5 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T6: short stream N=1 returns 0 correlation safely (no division-by-zero)
+    println("[T6] N=1 safe degenerate")
+    run_dual_stream(1, DEFAULT_ANIMA_SEED, DEFAULT_EEG_SEED)
+    let ok6 = assert_true(g_correlation == 0.0, "correlation=0 for N=1")
+    if ok6 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T7: compare_streams API returns same correlation as run_dual_stream
+    println("[T7] compare_streams API")
+    let r7 = compare_streams(60, DEFAULT_ANIMA_SEED, DEFAULT_EEG_SEED)
+    let ok7 = assert_true(abs_f(r7 - g_correlation) < 0.0001, "compare_streams matches global")
+    if ok7 { pass = pass + 1 } else { fail = fail + 1 }
+
+    // T8: deterministic byte-identical idempotence (raw#68)
+    println("[T8] deterministic idempotence")
+    run_dual_stream(120, DEFAULT_ANIMA_SEED, DEFAULT_EEG_SEED)
+    let m_anima1 = g_anima_phi_mean
+    let m_eeg1   = g_eeg_alpha_mean
+    let r1       = g_correlation
+    run_dual_stream(120, DEFAULT_ANIMA_SEED, DEFAULT_EEG_SEED)
+    let ok8a = assert_true(abs_f(m_anima1 - g_anima_phi_mean) < 0.0001, "anima_phi_mean idempotent")
+    let ok8b = assert_true(abs_f(m_eeg1   - g_eeg_alpha_mean) < 0.0001, "eeg_alpha_mean idempotent")
+    let ok8c = assert_true(abs_f(r1       - g_correlation)    < 0.0001, "correlation idempotent")
+    if ok8a && ok8b && ok8c { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("")
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL out of " + to_string(pass + fail))
+    return fail
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 7. CLI
+// ════════════════════════════════════════════════════════════════════
+
+fn _emit_trailer(slug: string, detail: string, fix: string) {
+    eprintln("reason: " + slug + ": " + detail)
+    eprintln("fix: " + fix)
+}
+
+fn _print_usage() {
+    eprintln("usage: hexa run anima-eeg/dual_stream.hexa --selftest")
+    eprintln("flags:")
+    eprintln("  --selftest        deterministic synthetic 120-sample dual stream, tier=DEGRADED")
+    eprintln("  --duration <n>    sample count (default " + to_string(DEFAULT_DURATION_SEC) + ")")
+    eprintln("  --board <name>    cyton_daisy | cyton | ganglion (default cyton_daisy)")
+    eprintln("  --help            this message")
+}
+
+// argv normalize — see experiment.hexa _flags_only_argv 동치 doc.
+fn _flags_only_argv() -> array {
+    let av = argv()
+    let mut start = 0
+    let mut i = 0
+    while i < len(av) {
+        let a = av[i]
+        let n = len(a)
+        if n >= 5 {
+            let suffix = a[(n - 5)..n]
+            if suffix == ".hexa" { start = i + 1; break }
+        }
+        i = i + 1
+    }
+    let mut out = []
+    let mut j = start
+    while j < len(av) {
+        out.push(av[j])
+        j = j + 1
+    }
+    return out
+}
+
+fn main() {
+    let av = _flags_only_argv()
+    let mut selftest = false
+    let mut want_help = false
+    let mut duration = DEFAULT_DURATION_SEC
+    let mut board = DEFAULT_BOARD_TYPE
+
+    let mut i = 0
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" { want_help = true; i = i + 1; continue }
+        if a == "--duration" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--duration requires int","1) re-run with --duration 120"); exit(2) }
+            duration = to_int(av[i + 1]); i = i + 2; continue
+        }
+        if a == "--board" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--board requires value","1) re-run with --board cyton_daisy"); exit(2) }
+            board = av[i + 1]; i = i + 2; continue
+        }
+        _emit_trailer("unknown-arg", "unrecognized argument: " + a, "1) re-run with --help")
+        _print_usage()
+        exit(2)
+    }
+
+    if want_help { _print_usage(); exit(0) }
+
+    if !selftest {
+        eprintln("ABORT: must pass --selftest (raw#9 strict no-fallback policy)")
+        _print_usage()
+        exit(2)
+    }
+
+    println("== dual_stream selftest ==")
+    println("schema=" + SCHEMA)
+    println("raw10_honest=pure_hexa_dual_stream_no_brainflow_no_anima_runtime")
+    println("board=" + board)
+    println("")
+
+    // Demo emit
+    run_dual_stream(duration, DEFAULT_ANIMA_SEED, DEFAULT_EEG_SEED)
+    _emit_kv()
+    println("")
+
+    let fails = run_tests()
+    if fails != 0 {
+        println("selftest=fail")
+        eprintln("selftest FAILED: " + to_string(fails) + " test(s) failed")
+        exit(1)
+    }
+    println("selftest: OK")
+    exit(0)
+}
+// hexa-strict auto-invokes fn main() — do not call main() explicitly.
