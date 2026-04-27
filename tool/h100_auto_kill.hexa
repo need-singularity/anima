@@ -135,6 +135,57 @@ fn _probe_plan(pod, cfg) -> string {
     return "ssh -o ConnectTimeout=" + to_string(tmo) + " -o BatchMode=yes -p " + to_string(port) + " " + user + "@" + host + " " + _sh_quote(cmd)
 }
 
+// ─── path B (cycle 72): real probe execution ──────────────────────────────
+// cycle 63 발견: 기존 _evaluate_pod는 probe_cmd 문자열만 생성 후 idle_minutes_mock
+// 부재 시 UNKNOWN으로 단락 → --apply에서도 STOP 도달 못함. 본 함수는 ssh probe를
+// 실제 exec하고 결과를 binary idle indicator로 해석:
+//
+//   nvidia_smi : 결과 == 0  → idle (gpu util 0%)         → return threshold (STOP)
+//                결과  > 0  → active                     → return 0 (KEEP)
+//   who/tmux   : 결과 == 0  → no users/sessions          → return threshold (STOP)
+//                결과  > 0  → users/sessions present     → return 0 (KEEP)
+//
+// raw#10 honest:
+//   - 본 path B는 binary indicator 단순화 (instant 측정). cycle 67 utility의
+//     _stuck_by_gpu_idle_min과 단위 다름 (이 helper는 minute 누적 추적 안 함).
+//   - probe exec 실패 (ssh 끊김 / parse fail) → -1 반환 (UNKNOWN 유지, no false STOP)
+//   - host 없음 또는 probe_cmd 없음 → -1 (UNKNOWN, 기존 동작 보존)
+fn _probe_exec(pod, cfg, threshold: int) -> int {
+    let probe = _probe_plan(pod, cfg)
+    if probe == "" { return -1 }
+    let host = _pod_field_str(pod, "ssh_host", "")
+    if host == "" { return -1 }   // can't ssh without host (cycle 63 Pod 2 class)
+    let r = exec_with_status(probe)
+    if r[1] != 0 { return -1 }   // ssh fail → UNKNOWN, no false STOP
+    let out = to_string(r[0]).trim()
+    if out == "" { return -1 }
+    // parse first integer from output (handles whitespace/decimals defensively)
+    let first_line = if out.contains("\n") {
+        let parts = out.split("\n")
+        to_string(parts[0]).trim()
+    } else {
+        out
+    }
+    // strip non-digit suffix (e.g., "0 %" from nvidia-smi)
+    let mut digits = ""
+    let mut i = 0
+    while i < len(first_line) {
+        let ch = first_line.substring(i, i + 1)
+        if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
+           ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" {
+            digits = digits + ch
+        } else {
+            if digits != "" { i = len(first_line) }   // stop at first non-digit after digits
+        }
+        i = i + 1
+    }
+    if digits == "" { return -1 }
+    let val = to_int(digits)
+    // binary indicator: 0 = idle (STOP), >0 = active (KEEP)
+    if val == 0 { return threshold }   // ≥ threshold triggers STOP in caller
+    return 0
+}
+
 // ─── verdict per pod ──────────────────────────────────────────────────────
 
 fn _evaluate_pod(pod, cfg, apply) {
@@ -162,7 +213,12 @@ fn _evaluate_pod(pod, cfg, apply) {
     v["probe_cmd"] = _probe_plan(pod, cfg)
 
     // Mock hook used by self-test (raw#9: deterministic injection).
-    let idle = _pod_field_int(pod, "idle_minutes_mock", -1)
+    let mut idle = _pod_field_int(pod, "idle_minutes_mock", -1)
+    // cycle 72 path B: if no mock and ssh probe is available, exec it for real.
+    // selftest는 mock 사용으로 그대로 PASS; 실 prod에서는 mock 없이 probe_exec 진입.
+    if idle < 0 {
+        idle = _probe_exec(pod, cfg, threshold)
+    }
     v["idle_minutes"] = idle
 
     if idle < 0 {
