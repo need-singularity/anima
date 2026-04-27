@@ -165,6 +165,46 @@ if expected > CUMULATIVE_CEILING_GB:
 
 **Cross-reference**: state/blockers/gemma_27b_repeat_silent_platform_termination.json status_history#3 (H2 CONFIRMED via Mk.XII Phase 3b 3rd reproduction).
 
+### Pattern 6c — Multi-pod relay architecture (4-component, added 2026-04-28 from Mk.XII alt-vendor kick)
+
+**Why**: Pattern 6 + 6b establish cumulative-bytes ceiling (~35-40GB per pod). For models exceeding this (e.g., 70B fp16 = 140GB), single-pod path is infeasible. Pattern 6c canonicalizes 4-component relay architecture for production-grade large-model measurement, with optional cross-vendor distribution (RunPod sustained fault → vast.ai/AWS/GCP).
+
+**Evidence**: Mk.XII Phase 3b 70B path BLOCKED via single-pod; alt-vendor strategy kick (witness `2026-04-27_mk-xii-phase3b-70b-alt-vendor-strategy-runpod-4-strike-bypas_omega_cycle.json`) decomposed measurement into 4 roles.
+
+**4-component pipeline**:
+| role | responsibility | lifetime | host options |
+|---|---|---|---|
+| R1 download_pod | long-running fetch model to persistent volume / local disk + integrity verify | minutes-hours, no SSH-strict deadline | vast.ai (cheap long-running) / RunPod persistent volume |
+| R2 measurement_pod | attach volume / scp from R1, run forward + tomography measurement, write results | minutes for measurement | AWS (reliable) / RunPod / vast.ai |
+| R3 verifier_pod | verify result JSON schema + checksum + raw 91 honesty triad post-emission | seconds, CPU-only | hetzner (CPU-only verification, $0 marginal) |
+| R4 orchestrator | Mac-local nexus_remote dispatch, lifecycle management, watchdog, audit ledger emission per raw 86 | wallclock duration | Mac (orchestration only per raw 40) |
+
+**Implementation pattern** (cross-vendor with persistent volume):
+```bash
+# R1: long-running download pod (vast.ai $1-2/hr H100 spot)
+vast_ai_pod_create --persistent-volume vol-anima-llama70b \
+  --command "huggingface-cli download meta-llama/Llama-3.1-70B \
+             --local-dir /weights/Llama-3.1-70B --resume-download"
+
+# R2: measurement pod (RunPod or AWS, attaches same volume)
+runpod_pod_create --volume vol-anima-llama70b --volume-mount-path /weights \
+  --command "python wrapper.py --local-path /weights/Llama-3.1-70B"
+
+# R3: verifier pod (hetzner CPU-only)
+ssh hetzner "python verify_witness.py /shared/output.json"
+
+# R4: orchestrator (Mac, this script)
+# - tracks R1/R2/R3 lifecycle
+# - emits raw 86 audit ledger rows (cost_center, task_id, cost_actual)
+# - per-pod watchdog per own 4 (15min stuck terminate)
+```
+
+**Cross-vendor distribution opportunity**: R1 + R2 can span vendors. Cheapest long-running on vast.ai, reliable measurement on AWS, verification on hetzner. R4 always Mac-local per raw 40.
+
+**raw#10 caveat**: persistent volume sharing across vendors requires the SAME vendor (RunPod volume to RunPod pod, AWS EBS to AWS EC2). Cross-vendor file transfer = scp/rsync = additional bandwidth cost. Pattern 6c provides architecture; concrete cross-vendor file plumbing per implementation.
+
+**Cross-reference**: state/blockers/runpod_pod_pre_ssh_orchestrator_stuck.json (4-strike sustained fault) + design/kick/2026-04-27_mk-xii-phase3b-70b-alt-vendor-strategy-runpod-4-strike-bypas_omega_cycle.json (alt-vendor strategy).
+
 ### Pattern 7 — bnb GPU wheel pre-flight check before launch
 
 **Why**: pip-installed `bitsandbytes` may be CPU-only wheel even on CUDA-capable systems. RuntimeError comes mid-load, wasting download time.
