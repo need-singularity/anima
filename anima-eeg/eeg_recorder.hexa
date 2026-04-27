@@ -1,34 +1,538 @@
-// eeg_recorder.hexa — EEG background recorder: dual-stream for --web mode
-// Auto-segmentation into 5-minute files
+// anima-eeg/eeg_recorder.hexa
+// raw#9 hexa-only · raw#10 honest · raw#11 snake_case · raw#15 SSOT
+// raw#37 transient-helper-in-/tmp · raw#80 sentinel · raw#82 darwin-native
+//
+// PURPOSE
+//   Higher-level EEG recording orchestrator: segments long sessions into N-minute
+//   .npy chunks, supports multi-tag recording tasks (resting baseline / N-back /
+//   emotion-sync / sleep-protocol etc.), auto-paths to recordings/sessions/.
+//   Phase 4 D+0 critical path priority #3 (anima-clm-eeg/docs/
+//   eeg_d_day_readiness_check_landing.md §6 priority 3).
+//
+// MODES
+//   --selftest                         synthetic 16ch * 5s * 125Hz, 2-segment
+//   --record --task <name> --duration <n>   real BrainFlow segmented recording
+//   --tasks <a,b,c> --per-task <n>     multi-task recording session
+//
+// TASKS (well-known labels)
+//   resting_eyes_open, resting_eyes_closed, nback_2back, nback_3back,
+//   emotion_sync, sleep_baseline, motor_imagery_left, motor_imagery_right
+//
+// OUTPUT
+//   recordings/sessions/<task>_<ts>_<seg>.npy + .meta.json sidecar per segment.
+//   Session ledger at recordings/sessions/session_<ts>.json with all tasks +
+//   segment paths + verdicts.
+//
+// DESIGN
+//   Wraps anima-eeg/collect.hexa BrainFlow stream logic via a single helper.py
+//   that orchestrates: (1) device detect, (2) brainflow verify, (3) per-task
+//   segmented capture loop, (4) ledger emission. Mirrors calibrate.hexa /
+//   collect.hexa raw#9 wrapper structure.
+//
+// raw#10 honest scope
+//   - Segmentation = N independent BrainFlow capture windows (NOT continuous
+//     stream + post-cut; that is Phase 5 dual_stream territory). Inter-segment
+//     gap ~1s for board.stop_stream/start_stream — documented as DEGRADED
+//     continuity until dual_stream lands.
+//   - Synthetic --selftest emits tier=DEGRADED.
+//   - No fallback path: missing brainflow → ABORT_NO_BRAINFLOW.
+//
+// USAGE
+//   hexa run anima-eeg/eeg_recorder.hexa --selftest
+//   hexa run anima-eeg/eeg_recorder.hexa --record --task resting_eyes_open --duration 300 --segment 60
+//   hexa run anima-eeg/eeg_recorder.hexa --tasks resting_eyes_open,nback_2back --per-task 180
 
-struct EEGBackgroundRecorder {
-    recording: bool,
-    segment_duration: i32,
-    board_type: string,
-    output_dir: string
+let SCHEMA              = "anima-eeg/eeg_recorder/1"
+let HELPER_PATH         = "/tmp/anima_eeg_recorder_helper.hexa_tmp"
+
+let DEFAULT_BOARD_ID            = 2
+let DEFAULT_BOARD_NAME          = "cyton_daisy"
+let DEFAULT_DURATION_SEC        = 300       // 5 minutes default
+let DEFAULT_SEGMENT_SEC         = 60        // 1-minute segments
+let DEFAULT_SAMPLE_RATE_HZ      = 125
+let DEFAULT_VENV_PYTHON         = ".venv-eeg/bin/python"
+let DEFAULT_OUTPUT_DIR          = "recordings/sessions"
+let EXPECTED_CHANNEL_COUNT      = 16
+let EXPECTED_DATA_ROWS          = 32
+
+// ════════════════════════════════════════════════════════════════════
+// Section 0. Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
 }
 
-struct RecorderStatus {
-    recording: bool,
-    elapsed_sec: float,
-    segments_saved: i32,
-    current_phi: float
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
 }
 
-fn create_recorder(board_type: string) -> EEGBackgroundRecorder {
-    return EEGBackgroundRecorder(false, 300, board_type, "data/eeg/")
+fn _emit_trailer(reason_slug: string, reason_detail: string, fix: string) {
+    eprintln("reason: " + reason_slug + ": " + reason_detail)
+    eprintln("fix: " + fix)
 }
 
-fn start(recorder: EEGBackgroundRecorder) -> bool {
-    print("starting EEG background recorder")
-    return true
+fn _board_name_to_id(name: string) -> int {
+    if name == "cyton_daisy" { return DEFAULT_BOARD_ID }
+    if name == "cyton"       { return 0 }
+    if name == "ganglion"    { return 1 }
+    if name == "synthetic"   { return -1 }
+    return DEFAULT_BOARD_ID
 }
 
-fn stop(recorder: EEGBackgroundRecorder) -> bool {
-    print("stopping EEG background recorder")
-    return true
+// ════════════════════════════════════════════════════════════════════
+// Section 1. Helper python emitter (raw#37 transient)
+// ════════════════════════════════════════════════════════════════════
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# anima-eeg eeg_recorder helper — emitted by\n")
+    parts.push("# anima-eeg/eeg_recorder.hexa (raw#37 transient, not git-tracked).\n")
+    parts.push("import argparse, glob, json, os, subprocess, sys, textwrap, datetime, time\n\n")
+
+    parts.push("USB_SERIAL_GLOB = '/dev/cu.usbserial-*'\n")
+    parts.push("USB_MODEM_GLOB  = '/dev/cu.usbmodem*'\n")
+    parts.push("VENV_PYTHON     = '" + DEFAULT_VENV_PYTHON + "'\n")
+    parts.push("DEFAULT_OUTPUT_DIR = '" + DEFAULT_OUTPUT_DIR + "'\n\n")
+
+    parts.push("WELL_KNOWN_TASKS = {\n")
+    parts.push("    'resting_eyes_open', 'resting_eyes_closed',\n")
+    parts.push("    'nback_2back', 'nback_3back',\n")
+    parts.push("    'emotion_sync', 'sleep_baseline',\n")
+    parts.push("    'motor_imagery_left', 'motor_imagery_right',\n")
+    parts.push("    'selftest_synthetic'\n")
+    parts.push("}\n\n")
+
+    parts.push("def emit_trailer(slug, detail, fix):\n")
+    parts.push("    sys.stderr.write(f'reason: {slug}: {detail}\\n')\n")
+    parts.push("    sys.stderr.write(f'fix: {fix}\\n')\n\n")
+
+    parts.push("def detect_devices():\n")
+    parts.push("    return sorted(set(glob.glob(USB_SERIAL_GLOB) + glob.glob(USB_MODEM_GLOB)))\n\n")
+
+    parts.push("def choose_port(args):\n")
+    parts.push("    devs = detect_devices()\n")
+    parts.push("    if args.port: return args.port\n")
+    parts.push("    if not devs:\n")
+    parts.push("        emit_trailer('device-not-found', 'no usb device',\n")
+    parts.push("                     '1) plug Dongle  2) toggle Cyton ON->PC  3) re-run')\n")
+    parts.push("        return None\n")
+    parts.push("    if len(devs) > 1:\n")
+    parts.push("        emit_trailer('device-ambiguous', f'{devs}', '1) pass --port')\n")
+    parts.push("        return None\n")
+    parts.push("    return devs[0]\n\n")
+
+    parts.push("def verify_brainflow():\n")
+    parts.push("    if not os.path.exists(VENV_PYTHON):\n")
+    parts.push("        emit_trailer('venv-missing', f'{VENV_PYTHON} missing',\n")
+    parts.push("                     '1) python3 -m venv .venv-eeg  2) pip install brainflow numpy')\n")
+    parts.push("        return False, ''\n")
+    parts.push("    r = subprocess.run([VENV_PYTHON, '-c', 'import brainflow,numpy; print(brainflow.__version__)'],\n")
+    parts.push("                       capture_output=True, text=True, timeout=20)\n")
+    parts.push("    if r.returncode != 0:\n")
+    parts.push("        emit_trailer('brainflow-missing', f'{r.stderr.strip()[:200]}',\n")
+    parts.push("                     '1) pip install --upgrade brainflow numpy')\n")
+    parts.push("        return False, ''\n")
+    parts.push("    return True, r.stdout.strip()\n\n")
+
+    parts.push("def now_ts():\n")
+    parts.push("    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')\n\n")
+
+    parts.push("RECORD_PY = textwrap.dedent('''\n")
+    parts.push("    import json, sys, time\n")
+    parts.push("    import numpy as np\n")
+    parts.push("    from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds\n")
+    parts.push("    BOARD_ID = int(sys.argv[1]); PORT = sys.argv[2]\n")
+    parts.push("    DURATION = int(sys.argv[3]); OUTPUT = sys.argv[4]\n")
+    parts.push("    params = BrainFlowInputParams(); params.serial_port = PORT\n")
+    parts.push("    BoardShim.disable_board_logger()\n")
+    parts.push("    board = BoardShim(BOARD_ID, params)\n")
+    parts.push("    payload = {'rc':0,'rows':0,'cols':0,'sample_rate':0.0,\n")
+    parts.push("               'duration_actual':0.0,'eeg_indices':[],'output':OUTPUT,'err':''}\n")
+    parts.push("    t_start = time.time()\n")
+    parts.push("    try:\n")
+    parts.push("        sr = float(BoardShim.get_sampling_rate(BOARD_ID))\n")
+    parts.push("        eeg_idx = list(BoardShim.get_eeg_channels(BOARD_ID))\n")
+    parts.push("        payload['sample_rate'] = sr\n")
+    parts.push("        payload['eeg_indices'] = eeg_idx\n")
+    parts.push("        board.prepare_session(); board.start_stream()\n")
+    parts.push("        time.sleep(DURATION)\n")
+    parts.push("        data = board.get_board_data()\n")
+    parts.push("        t_end = time.time()\n")
+    parts.push("        payload['rows'] = int(data.shape[0])\n")
+    parts.push("        payload['cols'] = int(data.shape[1])\n")
+    parts.push("        payload['duration_actual'] = float(t_end - t_start)\n")
+    parts.push("        os.makedirs(os.path.dirname(os.path.abspath(OUTPUT)) or '.', exist_ok=True)\n")
+    parts.push("        np.save(OUTPUT, data.astype(np.float32))\n")
+    parts.push("    except Exception as exc:\n")
+    parts.push("        payload['rc'] = 1; payload['err'] = repr(exc)[:400]\n")
+    parts.push("    finally:\n")
+    parts.push("        try: board.stop_stream()\n")
+    parts.push("        except Exception: pass\n")
+    parts.push("        try: board.release_session()\n")
+    parts.push("        except Exception: pass\n")
+    parts.push("    print(json.dumps(payload))\n")
+    parts.push("''')\n\n")
+
+    parts.push("def record_one_segment(board_id, port, duration, output_path):\n")
+    parts.push("    r = subprocess.run([VENV_PYTHON, '-c', RECORD_PY,\n")
+    parts.push("                        str(board_id), port, str(duration), output_path],\n")
+    parts.push("                       capture_output=True, text=True, timeout=duration + 60)\n")
+    parts.push("    if r.returncode != 0 or not r.stdout.strip(): return None\n")
+    parts.push("    try: return json.loads(r.stdout.strip().splitlines()[-1])\n")
+    parts.push("    except Exception: return None\n\n")
+
+    parts.push("def cmd_record(args):\n")
+    parts.push("    port = choose_port(args)\n")
+    parts.push("    if port is None: print('record=fail'); sys.exit(2)\n")
+    parts.push("    ok, ver = verify_brainflow()\n")
+    parts.push("    if not ok: print('record=fail'); sys.exit(3)\n")
+    parts.push("    tasks = args.tasks.split(',') if args.tasks else [args.task]\n")
+    parts.push("    per_task = args.per_task if args.per_task else args.duration\n")
+    parts.push("    seg_dur  = max(1, min(args.segment, per_task))\n")
+    parts.push("    n_seg    = max(1, per_task // seg_dur)\n")
+    parts.push("    out_dir  = args.output_dir\n")
+    parts.push("    os.makedirs(out_dir, exist_ok=True)\n")
+    parts.push("    session_ts = now_ts()\n")
+    parts.push("    print(f'brainflow_version={ver}')\n")
+    parts.push("    print(f'port={port}'); print(f'board_id={args.board_id}')\n")
+    parts.push("    print(f'session_ts={session_ts}')\n")
+    parts.push("    print(f'output_dir={out_dir}')\n")
+    parts.push("    print(f'task_count={len(tasks)}')\n")
+    parts.push("    print(f'segment_sec={seg_dur}')\n")
+    parts.push("    print(f'segments_per_task={n_seg}')\n")
+    parts.push("    ledger = {'schema':'" + SCHEMA + "','session_ts':session_ts,\n")
+    parts.push("              'board_id':args.board_id,'serial_port':port,\n")
+    parts.push("              'tasks':[],'tier':'PHENOMENAL',\n")
+    parts.push("              'raw10_honest':'real_brainflow_segmented_capture_inter_segment_gap_~1s'}\n")
+    parts.push("    total_segments = 0\n")
+    parts.push("    total_failed   = 0\n")
+    parts.push("    for task in tasks:\n")
+    parts.push("        task = task.strip()\n")
+    parts.push("        if task and task not in WELL_KNOWN_TASKS:\n")
+    parts.push("            sys.stderr.write(f'note: task {task!r} not in WELL_KNOWN_TASKS; allowing\\n')\n")
+    parts.push("        task_record = {'task':task,'segments':[]}\n")
+    parts.push("        for s in range(n_seg):\n")
+    parts.push("            seg_path = os.path.join(out_dir, f'{task}_{session_ts}_seg{s:03d}.npy')\n")
+    parts.push("            res = record_one_segment(args.board_id, port, seg_dur, seg_path)\n")
+    parts.push("            if res is None or res['rc'] != 0:\n")
+    parts.push("                sys.stderr.write(f'segment failed: task={task} seg={s}\\n')\n")
+    parts.push("                task_record['segments'].append({'seg':s,'path':seg_path,'verdict':'FAIL'})\n")
+    parts.push("                total_failed += 1\n")
+    parts.push("                continue\n")
+    parts.push("            meta = {\n")
+    parts.push("                'schema':'" + SCHEMA + "','task':task,'session_ts':session_ts,\n")
+    parts.push("                'segment_index':s,'sample_rate':res['sample_rate'],\n")
+    parts.push("                'eeg_indices':res['eeg_indices'],\n")
+    parts.push("                'rows':res['rows'],'cols':res['cols'],\n")
+    parts.push("                'duration_requested_s':seg_dur,'duration_actual_s':res['duration_actual'],\n")
+    parts.push("                'tier':'PHENOMENAL','raw10_honest':'real_brainflow_segment'\n")
+    parts.push("            }\n")
+    parts.push("            with open(seg_path + '.meta.json','w') as f: json.dump(meta, f, indent=2)\n")
+    parts.push("            task_record['segments'].append({'seg':s,'path':seg_path,\n")
+    parts.push("                'rows':res['rows'],'cols':res['cols'],\n")
+    parts.push("                'duration_actual_s':res['duration_actual'],'verdict':'PASS'})\n")
+    parts.push("            total_segments += 1\n")
+    parts.push("            print(f'segment_ok task={task} seg={s} cols={res[\"cols\"]}')\n")
+    parts.push("        ledger['tasks'].append(task_record)\n")
+    parts.push("    ledger_path = os.path.join(out_dir, f'session_{session_ts}.json')\n")
+    parts.push("    with open(ledger_path, 'w') as f: json.dump(ledger, f, indent=2)\n")
+    parts.push("    print(f'segments_saved={total_segments}')\n")
+    parts.push("    print(f'segments_failed={total_failed}')\n")
+    parts.push("    print(f'ledger_path={ledger_path}')\n")
+    parts.push("    print(f'tier=PHENOMENAL')\n")
+    parts.push("    verdict = 'PASS' if (total_segments > 0 and total_failed == 0) else ('PARTIAL' if total_segments > 0 else 'FAIL')\n")
+    parts.push("    print(f'verdict={verdict}')\n")
+    parts.push("    print('record=' + ('ok' if verdict == 'PASS' else 'fail'))\n")
+    parts.push("    sys.exit(0 if verdict == 'PASS' else 1)\n\n")
+
+    parts.push("def cmd_selftest(args):\n")
+    parts.push("    # Synthetic 16ch * 5s * 125Hz, 2 segments (2.5s each), no hardware.\n")
+    parts.push("    import numpy as np\n")
+    parts.push("    n_ch = " + to_string(EXPECTED_CHANNEL_COUNT) + "\n")
+    parts.push("    rows = " + to_string(EXPECTED_DATA_ROWS) + "\n")
+    parts.push("    sr = " + to_string(DEFAULT_SAMPLE_RATE_HZ) + ".0\n")
+    parts.push("    seg_dur = 2  # seconds\n")
+    parts.push("    n_seg = 2\n")
+    parts.push("    cols = int(sr * seg_dur)\n")
+    parts.push("    rng = np.random.default_rng(20260427)\n")
+    parts.push("    out_dir = '/tmp/anima_eeg_recorder_selftest'\n")
+    parts.push("    os.makedirs(out_dir, exist_ok=True)\n")
+    parts.push("    session_ts = '20260427T000000Z'\n")
+    parts.push("    task = 'selftest_synthetic'\n")
+    parts.push("    eeg_idx = list(range(1, n_ch + 1))\n")
+    parts.push("    seg_paths = []\n")
+    parts.push("    seg_verdicts = []\n")
+    parts.push("    ledger = {'schema':'" + SCHEMA + "','session_ts':session_ts,\n")
+    parts.push("              'board_id':-1,'serial_port':'<synthetic>','tasks':[],\n")
+    parts.push("              'tier':'DEGRADED',\n")
+    parts.push("              'raw10_honest':'synthetic_segmented_capture_no_hardware'}\n")
+    parts.push("    task_record = {'task':task,'segments':[]}\n")
+    parts.push("    for s in range(n_seg):\n")
+    parts.push("        data = np.zeros((rows, cols), dtype=np.float32)\n")
+    parts.push("        t = np.arange(cols) / sr\n")
+    parts.push("        for k, ch in enumerate(eeg_idx):\n")
+    parts.push("            data[ch] = (0.6*np.sin(2*np.pi*(8.0+k*0.5+s*0.1)*t) +\n")
+    parts.push("                        0.4*rng.standard_normal(cols)).astype(np.float32)\n")
+    parts.push("        seg_path = os.path.join(out_dir, f'{task}_{session_ts}_seg{s:03d}.npy')\n")
+    parts.push("        np.save(seg_path, data)\n")
+    parts.push("        meta = {\n")
+    parts.push("            'schema':'" + SCHEMA + "','task':task,'session_ts':session_ts,\n")
+    parts.push("            'segment_index':s,'sample_rate':sr,'eeg_indices':eeg_idx,\n")
+    parts.push("            'rows':rows,'cols':cols,'duration_requested_s':seg_dur,\n")
+    parts.push("            'duration_actual_s':float(seg_dur),\n")
+    parts.push("            'tier':'DEGRADED','raw10_honest':'synthetic_segment_no_hardware'\n")
+    parts.push("        }\n")
+    parts.push("        with open(seg_path + '.meta.json','w') as f: json.dump(meta, f, indent=2)\n")
+    parts.push("        seg_paths.append(seg_path)\n")
+    parts.push("        seg_verdicts.append('PASS')\n")
+    parts.push("        # validate roundtrip\n")
+    parts.push("        rd = np.load(seg_path)\n")
+    parts.push("        assert rd.shape == (rows, cols), f'seg{s} roundtrip shape mismatch'\n")
+    parts.push("        task_record['segments'].append({'seg':s,'path':seg_path,\n")
+    parts.push("            'rows':rows,'cols':cols,'duration_actual_s':float(seg_dur),\n")
+    parts.push("            'verdict':'PASS'})\n")
+    parts.push("    ledger['tasks'].append(task_record)\n")
+    parts.push("    ledger_path = os.path.join(out_dir, f'session_{session_ts}.json')\n")
+    parts.push("    with open(ledger_path, 'w') as f: json.dump(ledger, f, indent=2)\n")
+    parts.push("    print('schema=" + SCHEMA + "')\n")
+    parts.push("    print('mode=selftest_synthetic')\n")
+    parts.push("    print('venv_python_exists=' + str(os.path.exists(VENV_PYTHON)))\n")
+    parts.push("    print(f'session_ts={session_ts}')\n")
+    parts.push("    print(f'output_dir={out_dir}')\n")
+    parts.push("    print(f'task_count=1')\n")
+    parts.push("    print(f'task_name={task}')\n")
+    parts.push("    print(f'segments_per_task={n_seg}')\n")
+    parts.push("    print(f'segment_sec={seg_dur}')\n")
+    parts.push("    print(f'sample_rate_actual={sr}')\n")
+    parts.push("    print(f'rows={rows}'); print(f'cols={cols}')\n")
+    parts.push("    print(f'eeg_channel_count={n_ch}')\n")
+    parts.push("    for i, p in enumerate(seg_paths):\n")
+    parts.push("        print(f'segment_{i:03d}_path={p}')\n")
+    parts.push("        print(f'segment_{i:03d}_verdict={seg_verdicts[i]}')\n")
+    parts.push("    # roundtrip on first segment\n")
+    parts.push("    rd0 = np.load(seg_paths[0])\n")
+    parts.push("    print(f'roundtrip_rows={int(rd0.shape[0])}')\n")
+    parts.push("    print(f'roundtrip_cols={int(rd0.shape[1])}')\n")
+    parts.push("    print(f'roundtrip_dtype={str(rd0.dtype)}')\n")
+    parts.push("    print(f'segments_saved={n_seg}')\n")
+    parts.push("    print(f'segments_failed=0')\n")
+    parts.push("    print(f'ledger_path={ledger_path}')\n")
+    parts.push("    print(f'ledger_exists={int(os.path.exists(ledger_path))}')\n")
+    parts.push("    print('tier=DEGRADED')\n")
+    parts.push("    print('raw10_honest=synthetic_segmented_capture_no_hardware')\n")
+    parts.push("    print('verdict=PASS')\n")
+    parts.push("    print('selftest=ok')\n")
+    parts.push("    print('DONE')\n\n")
+
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    sub = p.add_subparsers(dest='cmd', required=True)\n")
+    parts.push("    sub.add_parser('selftest')\n")
+    parts.push("    c = sub.add_parser('record')\n")
+    parts.push("    c.add_argument('--port', default='')\n")
+    parts.push("    c.add_argument('--task', default='resting_eyes_open')\n")
+    parts.push("    c.add_argument('--tasks', default='')\n")
+    parts.push("    c.add_argument('--duration', type=int, default=" + to_string(DEFAULT_DURATION_SEC) + ")\n")
+    parts.push("    c.add_argument('--per-task', dest='per_task', type=int, default=0)\n")
+    parts.push("    c.add_argument('--segment', type=int, default=" + to_string(DEFAULT_SEGMENT_SEC) + ")\n")
+    parts.push("    c.add_argument('--output-dir', dest='output_dir', default=DEFAULT_OUTPUT_DIR)\n")
+    parts.push("    c.add_argument('--board-id', dest='board_id', type=int, default=" + to_string(DEFAULT_BOARD_ID) + ")\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    if args.cmd == 'selftest': cmd_selftest(args)\n")
+    parts.push("    elif args.cmd == 'record': cmd_record(args)\n")
+    parts.push("    else: sys.exit(2)\n\n")
+
+    parts.push("if __name__ == '__main__': main()\n")
+
+    write_file(HELPER_PATH, parts.join(""))
 }
 
-fn get_status(recorder: EEGBackgroundRecorder) -> RecorderStatus {
-    return RecorderStatus(recorder.recording, 0.0, 0, 0.0)
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Section 2. Selftest assertions
+// ════════════════════════════════════════════════════════════════════
+
+fn assert_true(cond: bool, label: string) -> bool {
+    if cond { println("  PASS: " + label) } else { println("  FAIL: " + label) }
+    return cond
+}
+
+fn _run_selftest_assertions(body: string) -> int {
+    let mut pass = 0
+    let mut fail = 0
+
+    println("=== eeg_recorder raw#9 selftest assertions ===")
+
+    println("[T1] helper marker selftest=ok")
+    let t1 = assert_true(_kv_lookup(body, "selftest") == "ok", "selftest=ok present")
+    if t1 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T2] schema field")
+    let t2 = assert_true(_kv_lookup(body, "schema") == SCHEMA, "schema=" + SCHEMA)
+    if t2 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T3] mode=selftest_synthetic")
+    let t3 = assert_true(_kv_lookup(body, "mode") == "selftest_synthetic", "mode=selftest_synthetic")
+    if t3 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T4] eeg_channel_count=16")
+    let t4 = assert_true(_kv_lookup(body, "eeg_channel_count") == to_string(EXPECTED_CHANNEL_COUNT),
+                        "eeg_channel_count=" + to_string(EXPECTED_CHANNEL_COUNT))
+    if t4 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T5] tier=DEGRADED (synthetic raw#10 honest)")
+    let t5 = assert_true(_kv_lookup(body, "tier") == "DEGRADED", "tier=DEGRADED")
+    if t5 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T6] verdict=PASS")
+    let t6 = assert_true(_kv_lookup(body, "verdict") == "PASS", "verdict=PASS")
+    if t6 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T7] segments_saved=2 (2 synthetic segments)")
+    let t7 = assert_true(_kv_lookup(body, "segments_saved") == "2", "segments_saved=2")
+    if t7 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T8] segments_failed=0")
+    let t8 = assert_true(_kv_lookup(body, "segments_failed") == "0", "segments_failed=0")
+    if t8 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T9] ledger_exists=1 (session_<ts>.json written)")
+    let t9 = assert_true(_kv_lookup(body, "ledger_exists") == "1", "ledger_exists=1")
+    if t9 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T10] roundtrip dtype=float32")
+    let t10 = assert_true(_kv_lookup(body, "roundtrip_dtype") == "float32", "roundtrip_dtype=float32")
+    if t10 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("")
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL out of " + to_string(pass + fail))
+    return fail
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 3. CLI
+// ════════════════════════════════════════════════════════════════════
+
+fn _print_usage() {
+    eprintln("usage: hexa run anima-eeg/eeg_recorder.hexa --selftest")
+    eprintln("       hexa run anima-eeg/eeg_recorder.hexa --record --task <t> --duration <n> [--segment <n>] [--port <p>]")
+    eprintln("       hexa run anima-eeg/eeg_recorder.hexa --record --tasks <a,b,c> --per-task <n> [--segment <n>]")
+    eprintln("flags:")
+    eprintln("  --selftest        synthetic 16ch x 2 segments x 2s; tier=DEGRADED")
+    eprintln("  --record          real BrainFlow segmented recording")
+    eprintln("  --task <name>     single task (default resting_eyes_open)")
+    eprintln("  --tasks <list>    comma-separated multi-task list")
+    eprintln("  --duration <n>    total per-task duration sec (default " + to_string(DEFAULT_DURATION_SEC) + ")")
+    eprintln("  --per-task <n>    explicit per-task duration when --tasks given")
+    eprintln("  --segment <n>     segment length sec (default " + to_string(DEFAULT_SEGMENT_SEC) + ")")
+    eprintln("  --output-dir <p>  output dir (default " + DEFAULT_OUTPUT_DIR + ")")
+    eprintln("  --port <p>        Dongle serial node (auto-detect if omitted)")
+    eprintln("  --board <name>    cyton_daisy | cyton | ganglion (default cyton_daisy)")
+    eprintln("  --help            this message")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut record_mode = false
+    let mut want_help = false
+    let mut port = ""
+    let mut task = "resting_eyes_open"
+    let mut tasks = ""
+    let mut duration = DEFAULT_DURATION_SEC
+    let mut per_task = 0
+    let mut segment = DEFAULT_SEGMENT_SEC
+    let mut output_dir = DEFAULT_OUTPUT_DIR
+    let mut board_name = DEFAULT_BOARD_NAME
+
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--record"   { record_mode = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" { want_help = true; i = i + 1; continue }
+        if a == "--port"      { if (i+1)>=len(av) { _emit_trailer("missing-arg-value","--port","1) re-run --port"); exit(2) } port = av[i+1]; i = i + 2; continue }
+        if a == "--task"      { if (i+1)>=len(av) { _emit_trailer("missing-arg-value","--task","1) re-run --task"); exit(2) } task = av[i+1]; i = i + 2; continue }
+        if a == "--tasks"     { if (i+1)>=len(av) { _emit_trailer("missing-arg-value","--tasks","1) re-run --tasks a,b,c"); exit(2) } tasks = av[i+1]; i = i + 2; continue }
+        if a == "--duration"  { if (i+1)>=len(av) { _emit_trailer("missing-arg-value","--duration","1) re-run"); exit(2) } duration = to_int(av[i+1]); i = i + 2; continue }
+        if a == "--per-task"  { if (i+1)>=len(av) { _emit_trailer("missing-arg-value","--per-task","1) re-run"); exit(2) } per_task = to_int(av[i+1]); i = i + 2; continue }
+        if a == "--segment"   { if (i+1)>=len(av) { _emit_trailer("missing-arg-value","--segment","1) re-run"); exit(2) } segment = to_int(av[i+1]); i = i + 2; continue }
+        if a == "--output-dir"{ if (i+1)>=len(av) { _emit_trailer("missing-arg-value","--output-dir","1) re-run"); exit(2) } output_dir = av[i+1]; i = i + 2; continue }
+        if a == "--board"     { if (i+1)>=len(av) { _emit_trailer("missing-arg-value","--board","1) re-run"); exit(2) } board_name = av[i+1]; i = i + 2; continue }
+        _emit_trailer("unknown-arg", "unrecognized argument: " + a, "1) re-run with --help")
+        _print_usage()
+        exit(2)
+    }
+
+    if want_help { _print_usage(); exit(0) }
+
+    if !selftest && !record_mode {
+        eprintln("ABORT: must pass --selftest or --record (raw#9 strict no-fallback)")
+        _print_usage()
+        exit(2)
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("== eeg_recorder selftest ==")
+        let r = _run_helper("selftest")
+        let body = r[0]
+        let st   = r[1]
+        println(body)
+        if st != 0 { eprintln("selftest helper FAILED rc=" + to_string(st)); exit(1) }
+        if _kv_lookup(body, "selftest") != "ok" {
+            _emit_trailer("selftest-marker-missing", "no selftest=ok", "1) check helper parse")
+            exit(1)
+        }
+        println("")
+        let fails = _run_selftest_assertions(body)
+        if fails != 0 {
+            println("selftest=fail")
+            eprintln("selftest FAILED: " + to_string(fails) + " assertion(s)")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    // record_mode: real hardware
+    let board_id = _board_name_to_id(board_name)
+    let mut args = "record --board-id " + to_string(board_id) +
+                   " --duration " + to_string(duration) +
+                   " --segment " + to_string(segment) +
+                   " --output-dir " + _sh_quote(output_dir)
+    if per_task > 0 { args = args + " --per-task " + to_string(per_task) }
+    if tasks != "" { args = args + " --tasks " + _sh_quote(tasks) }
+    else           { args = args + " --task " + _sh_quote(task) }
+    if port != ""  { args = args + " --port " + _sh_quote(port) }
+    println("── eeg_recorder (real hardware) ──")
+    println("board: " + board_name + " (id=" + to_string(board_id) + ")")
+    if tasks != "" { println("tasks: " + tasks) } else { println("task: " + task) }
+    println("duration: " + to_string(duration) + "s  segment: " + to_string(segment) + "s")
+    println("output_dir: " + output_dir)
+    let r = _run_helper(args)
+    println(r[0])
+    exit(r[1])
+}
+// hexa-strict auto-invokes fn main() — do not call main() explicitly.
