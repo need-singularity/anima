@@ -1,0 +1,409 @@
+// tool/an11_b_v1_phi_mip_normalized.hexa — V1' k-invariant Φ_mip surrogate (raw#9 hexa-only).
+//
+// PURPOSE
+//   V1 main FALSIFIED (roadmap #102, state/an11_v1_subset_probe_finding_BASE_p1_20260425.json):
+//     - K_GRID = [8,10,12,14,16] sweep on cached H showed Φ_mip slope per-prompt
+//       NEGATIVE (lasttoken −0.005033, byte_weighted_mean −0.011233). Linear
+//       extrapolation k=32 → Φ predicted 0.172 (lasttoken) / 0.025 (bwm), well
+//       below PASS threshold 0.55.
+//     - Diagnosis: Φ_mip = min over 2^(k-1) bipartitions S of normalized
+//       cross-block Frob mass. As k grows, partition pool inflates exponentially
+//       (k=16 → 32K halves, k=32 → 2.1B halves), so the min-cut tail finds an
+//       even deeper cut purely as a sampling artifact. V1 metric is structurally
+//       anti-correlated with prompt count → prompt 16→32 is an ANTI-LEVER for
+//       V1, not a lever.
+//
+//   FIX (Agent C recommendation, anima-cmd-loop session 2026-04-28T07:25Z):
+//     Φ_mip_norm = min_cut / E[random_cut_under_uniform_bipartition_prior].
+//     Under a uniform-balanced-bipartition prior, E[cross_block_frob_mass]
+//     scales linearly in k (each off-diagonal Gram entry has fixed probability
+//     of being cut), so the ratio is k-INVARIANT to first order. Strong
+//     integration corresponds to min_cut << E[cut]; ratio ≤ 0.5 = strong
+//     signal.
+//
+// METHOD
+//   G       = H @ H.T                                # n × n Gram
+//   G2      = G * G                                  # squared entries
+//   total_offdiag_mass = sum_{i!=j} G2[i,j]          # invariant of H
+//   For each balanced bipartition S, |S| = n/2:
+//     cross(S) = sum over (i in S, j in Sc) of G2[i,j]   (upper+lower symmetric → ×2)
+//     min_cut = min_S cross(S)
+//   E[random_cut] under uniform-balanced-bipartition prior:
+//     Pr[(i,j) cut | balanced] = (n/2 * n/2 * 2) / (n * (n-1)) = n/(2(n-1))
+//     E[cross]  = total_offdiag_mass * n / (2*(n-1))     (linear in k=n)
+//   Φ_mip_norm = min_cut / E[random_cut]
+//
+//   PASS predicate (raw#12 frozen, pre-registered BEFORE measurement):
+//     PASS       Φ_mip_norm <= 0.5     (strong integration: min cut < half of expected)
+//     AMBIGUOUS  0.5 < Φ_mip_norm <= 0.8
+//     FAIL       Φ_mip_norm > 0.8
+//
+// COMMANDS
+//   --selftest                    Synthetic 16x16 toy H (block-diagonal vs uniform random)
+//   --validate <H_file>           Compute Φ_mip_norm on cached H matrix (CPU only, RO read)
+//   --compare-to-V1-baseline      Run on cached H AND emit comparison with V1 (un-normalized)
+//   --aggregate-5tuple            Same as --validate but emits 5-tuple compatible record
+//                                 (V0 / V1 / V1' / V2 / V_pairrank) — V1' is NEW axis.
+//
+// USAGE
+//   hexa run tool/an11_b_v1_phi_mip_normalized.hexa --selftest
+//   hexa run tool/an11_b_v1_phi_mip_normalized.hexa --validate <H_file> --output <r.json>
+//   hexa run tool/an11_b_v1_phi_mip_normalized.hexa --compare-to-V1-baseline \
+//          --validate <H_file> --output <r.json>
+//   hexa run tool/an11_b_v1_phi_mip_normalized.hexa --aggregate-5tuple \
+//          --validate <H_file> --output <r.json>
+//
+// IMPL NOTE
+//   raw 9 hexa-only compliant: heavy work runs in /tmp Python helper (transient,
+//   not tracked). CPU only on existing cached H matrices. Read-only on
+//   state/h_last_raw_p1_BASE_null_*.json (no modification).
+//
+//   raw 91 C1-C5 disclosure:
+//     C1 axis        = V1' k-invariant Φ_mip surrogate (separate from frozen V1)
+//     C2 commit      = (this commit)
+//     C3 honesty     = synthetic selftest only at impl time; cached-H validation
+//                      requires --validate invocation; V1 frozen FALSIFIED record
+//                      preserved (raw#10).
+//     C4 axis frozen = V1 main FALSIFIED record stays frozen; V1' is a NEW axis.
+//     C5 marker      = V1_PRIME_K_INVARIANT_PHI_MIP_IMPL_LIVE
+
+let HELPER_PATH = "/tmp/an11_b_v1_phi_mip_normalized_helper.hexa_tmp"
+let SCHEMA      = "anima/an11_v1_phi_mip_normalized/1"
+let SPEC_DOC    = "state/an11_v1_subset_probe_finding_BASE_p1_20260425.json + " +
+                  "docs/v3_metric_redesign_v2_mirror_sma_20260425.md (Option C 5-tuple) + " +
+                  "Agent C recommendation 2026-04-28T07:25Z (anima-cmd-loop)"
+let SPEC_COMMIT = "raw12_frozen_v1prime_k_invariant"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _write_helper() {
+    let src = "#!/usr/bin/env python3\n" +
+        "import json, sys, os, datetime, itertools\n" +
+        "import numpy as np\n" +
+        "\n" +
+        "# an11_b_v1_phi_mip_normalized helper (raw#9/raw#37 hexa-only wrapper invokes this).\n" +
+        "# Modes:\n" +
+        "#   validate <h_file> <result_path> <schema> <spec_doc> <spec_commit> <mode_label>\n" +
+        "#   selftest\n" +
+        "\n" +
+        "# raw#12 frozen thresholds (pre-registered BEFORE any measurement).\n" +
+        "T = {\n" +
+        "    'PASS_phi_norm':       0.5,    # min_cut <= 0.5 * E[random_cut] = strong integration\n" +
+        "    'AMBIGUOUS_phi_norm':  0.8,    # 0.5 < phi <= 0.8 = weak signal\n" +
+        "    # FAIL = phi > 0.8\n" +
+        "}\n" +
+        "V1_LEGACY_PASS = 0.55  # old V1 frozen threshold (for comparison only)\n" +
+        "\n" +
+        "def load_H(path):\n" +
+        "    with open(path) as f: d = json.load(f)\n" +
+        "    rows = [e['h'] for e in d['entries']]\n" +
+        "    return np.asarray(rows, dtype=np.float64), d.get('reduction', d.get('path_id', 'unknown'))\n" +
+        "\n" +
+        "def compute_phi_mip_normalized(H):\n" +
+        "    n = H.shape[0]\n" +
+        "    if n < 4 or n % 2 != 0:\n" +
+        "        raise ValueError(f'expected even n>=4, got n={n}')\n" +
+        "    G = H @ H.T\n" +
+        "    G2 = G * G\n" +
+        "    total_mass = float(G2.sum())\n" +
+        "    diag_mass = float(np.trace(G2))\n" +
+        "    offdiag_mass = total_mass - diag_mass\n" +
+        "    if offdiag_mass <= 0.0:\n" +
+        "        return {\n" +
+        "            'phi_mip_norm': 0.0, 'min_cut': 0.0,\n" +
+        "            'expected_random_cut': 0.0, 'verdict': 'FAIL',\n" +
+        "            'argmin_S': list(range(n//2)), 'note': 'degenerate (zero offdiag mass)'\n" +
+        "        }\n" +
+        "    half = n // 2\n" +
+        "    indices = list(range(n))\n" +
+        "    best_cut = None; best_S = None\n" +
+        "    # min_cut = min_S sum_{i in S, j in Sc} G2[i,j] (off-diagonal only by construction)\n" +
+        "    for S in itertools.combinations(indices, half):\n" +
+        "        S_idx  = np.array(S, dtype=np.intp)\n" +
+        "        S_set  = set(S)\n" +
+        "        Sc_idx = np.array([i for i in indices if i not in S_set], dtype=np.intp)\n" +
+        "        # cross block (S × Sc) + (Sc × S) = 2 * sum_{i in S, j in Sc} G2[i,j] (G symmetric)\n" +
+        "        cross = float(G2[np.ix_(S_idx, Sc_idx)].sum()) + float(G2[np.ix_(Sc_idx, S_idx)].sum())\n" +
+        "        if best_cut is None or cross < best_cut:\n" +
+        "            best_cut = cross; best_S = sorted(S)\n" +
+        "    # E[random_cut] under uniform balanced bipartition prior:\n" +
+        "    #   Pr[(i,j) cut | i!=j, balanced] = (half * half * 2) / (n * (n-1)) = n / (2*(n-1))\n" +
+        "    # E[cross] = sum_{i!=j} G2[i,j] * Pr[(i,j) cut] = offdiag_mass * n / (2*(n-1))\n" +
+        "    p_cut = float(n) / (2.0 * (n - 1))\n" +
+        "    expected_cut = offdiag_mass * p_cut\n" +
+        "    phi_norm = float(best_cut) / expected_cut if expected_cut > 0.0 else 0.0\n" +
+        "    if phi_norm <= T['PASS_phi_norm']: v = 'PASS'\n" +
+        "    elif phi_norm <= T['AMBIGUOUS_phi_norm']: v = 'AMBIGUOUS'\n" +
+        "    else: v = 'FAIL'\n" +
+        "    return {\n" +
+        "        'phi_mip_norm': phi_norm,\n" +
+        "        'min_cut': float(best_cut),\n" +
+        "        'expected_random_cut': float(expected_cut),\n" +
+        "        'offdiag_mass': offdiag_mass,\n" +
+        "        'p_cut_per_offdiag_pair': p_cut,\n" +
+        "        'argmin_S': [int(x) for x in best_S],\n" +
+        "        'n_prompts': int(n),\n" +
+        "        'partition_pool_size': int(_C(n, half)),\n" +
+        "        'verdict': v,\n" +
+        "        'thresholds': dict(T),\n" +
+        "    }\n" +
+        "\n" +
+        "def _C(n, k):\n" +
+        "    from math import comb\n" +
+        "    return comb(n, k)\n" +
+        "\n" +
+        "def compute_v1_legacy_phi(H):\n" +
+        "    # Legacy V1 phi_mip surrogate (un-normalized) for side-by-side comparison.\n" +
+        "    n = H.shape[0]\n" +
+        "    G = H @ H.T\n" +
+        "    G2 = G * G\n" +
+        "    Gn2 = float(G2.sum())\n" +
+        "    if Gn2 <= 0.0:\n" +
+        "        return {'phi_mip_legacy': 0.0, 'verdict_legacy': 'FAIL'}\n" +
+        "    half = n // 2\n" +
+        "    indices = list(range(n))\n" +
+        "    best = None; best_S = None\n" +
+        "    for S in itertools.combinations(indices, half):\n" +
+        "        S_set = set(S)\n" +
+        "        S_idx  = np.array(S, dtype=np.intp)\n" +
+        "        Sc_idx = np.array([i for i in indices if i not in S_set], dtype=np.intp)\n" +
+        "        in_block = float(G2[np.ix_(S_idx, S_idx)].sum()) + float(G2[np.ix_(Sc_idx, Sc_idx)].sum())\n" +
+        "        L_part = Gn2 - in_block\n" +
+        "        phi_S = L_part / Gn2\n" +
+        "        if best is None or phi_S < best:\n" +
+        "            best = phi_S; best_S = sorted(S)\n" +
+        "    phi = float(best)\n" +
+        "    if phi >= V1_LEGACY_PASS: v = 'PASS'\n" +
+        "    elif phi >= 0.45: v = 'AMBIGUOUS'\n" +
+        "    else: v = 'FAIL'\n" +
+        "    return {'phi_mip_legacy': phi, 'argmin_S_legacy': [int(x) for x in best_S],\n" +
+        "            'verdict_legacy': v, 'PASS_threshold_legacy': V1_LEGACY_PASS,\n" +
+        "            'note_legacy': 'V1 frozen (FALSIFIED at k=32 by anti-lever); kept for comparison.'}\n" +
+        "\n" +
+        "def cmd_validate(h_path, result_path, schema, spec_doc, spec_commit, mode_label):\n" +
+        "    if not os.path.exists(h_path):\n" +
+        "        print(f'ERR: missing H file {h_path}', file=sys.stderr); sys.exit(2)\n" +
+        "    H, reduction = load_H(h_path)\n" +
+        "    if H.shape[0] < 4 or H.shape[0] % 2 != 0:\n" +
+        "        print(f'ERR: need even n>=4 prompts, got {H.shape[0]}', file=sys.stderr); sys.exit(2)\n" +
+        "    r_norm = compute_phi_mip_normalized(H)\n" +
+        "    extras = {}\n" +
+        "    if mode_label in ('compare', 'aggregate'):\n" +
+        "        r_legacy = compute_v1_legacy_phi(H)\n" +
+        "        extras['V1_legacy_comparison'] = r_legacy\n" +
+        "        extras['V1_vs_V1prime_delta'] = {\n" +
+        "            'V1_legacy_phi': r_legacy['phi_mip_legacy'],\n" +
+        "            'V1_legacy_verdict': r_legacy['verdict_legacy'],\n" +
+        "            'V1prime_phi_norm': r_norm['phi_mip_norm'],\n" +
+        "            'V1prime_verdict': r_norm['verdict'],\n" +
+        "            'k_invariance_note': 'V1prime is k-invariant by construction (ratio cancels 2^(k-1) bipartition pool inflation that broke V1 main).',\n" +
+        "        }\n" +
+        "    if mode_label == 'aggregate':\n" +
+        "        extras['five_tuple_axis_role'] = {\n" +
+        "            'axis_name': 'V1prime',\n" +
+        "            'replaces_in_5tuple': 'V1 (legacy phi_mip; FALSIFIED at k=32, raw#10 frozen record)',\n" +
+        "            'PASS_predicate': 'phi_mip_norm <= 0.5',\n" +
+        "            'note': 'V1prime is the k-invariant successor for prompt-count-extension experiments; pair with V0 / V2 / V_pairrank for 4-tuple plus V_sub for 5-tuple semantic axis when measurable.',\n" +
+        "        }\n" +
+        "    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+        "    out = {\n" +
+        "        'schema': schema,\n" +
+        "        'tool': 'tool/an11_b_v1_phi_mip_normalized.hexa',\n" +
+        "        'verifier': 'V1prime: k-invariant phi_mip surrogate (min_cut / E[random_cut])',\n" +
+        "        'spec_doc': spec_doc,\n" +
+        "        'spec_commit': spec_commit,\n" +
+        "        'mode': mode_label,\n" +
+        "        'ts': ts,\n" +
+        "        'input': h_path,\n" +
+        "        'reduction_or_path_id': reduction,\n" +
+        "        'shape': [int(H.shape[0]), int(H.shape[1])],\n" +
+        "        'V1prime': r_norm,\n" +
+        "        'raw_compliance': [\n" +
+        "            'raw#9 hexa-only / Python helper /tmp emit',\n" +
+        "            'raw#10 V1 main FALSIFIED record preserved; V1prime is NEW axis (no overwrite)',\n" +
+        "            'raw#12 PASS predicate (<=0.5) pre-registered BEFORE measurement',\n" +
+        "            'raw#15 SSOT = this output file',\n" +
+        "            'raw#37 idempotent helper, deterministic over H',\n" +
+        "            'raw 91 C1-C5: V1prime axis separate from V1 frozen FALSIFIED record',\n" +
+        "        ],\n" +
+        "    }\n" +
+        "    out.update(extras)\n" +
+        "    with open(result_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    print(f'result_path={result_path}')\n" +
+        "    print(f'mode={mode_label}')\n" +
+        "    print(f'reduction={reduction}')\n" +
+        "    print(f'n_prompts={r_norm[\"n_prompts\"]}')\n" +
+        "    print(f'partition_pool_size={r_norm[\"partition_pool_size\"]}')\n" +
+        "    print(f'min_cut={r_norm[\"min_cut\"]:.6f}')\n" +
+        "    print(f'expected_random_cut={r_norm[\"expected_random_cut\"]:.6f}')\n" +
+        "    print(f'phi_mip_norm={r_norm[\"phi_mip_norm\"]:.6f}')\n" +
+        "    print(f'verdict={r_norm[\"verdict\"]}')\n" +
+        "    if 'V1_legacy_comparison' in extras:\n" +
+        "        rl = extras['V1_legacy_comparison']\n" +
+        "        print(f'V1_legacy_phi={rl[\"phi_mip_legacy\"]:.6f}')\n" +
+        "        print(f'V1_legacy_verdict={rl[\"verdict_legacy\"]}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def cmd_selftest():\n" +
+        "    # Synthetic 16x16 toy H with KNOWN structure.\n" +
+        "    # Block-diagonal: rows 0..7 share basis A, rows 8..15 share basis B → strong integration → low phi_norm.\n" +
+        "    # Uniform random : all rows iid Gaussian → phi_norm ~ 1.0 (no structure).\n" +
+        "    n = 16; d = 64\n" +
+        "    rng = np.random.default_rng(20260428)\n" +
+        "    # Block-diagonal H: two disjoint subspaces, members heavily correlated within block.\n" +
+        "    A = rng.standard_normal(d); A = A / (np.linalg.norm(A) + 1e-12)\n" +
+        "    B = rng.standard_normal(d); B = B / (np.linalg.norm(B) + 1e-12)\n" +
+        "    H_block = np.zeros((n, d))\n" +
+        "    for i in range(n):\n" +
+        "        anchor = A if i < n // 2 else B\n" +
+        "        H_block[i] = 1.0 * anchor + 0.05 * rng.standard_normal(d)\n" +
+        "    # Uniform random H (iid Gaussian rows, no shared structure).\n" +
+        "    H_unif = rng.standard_normal((n, d))\n" +
+        "    r_block = compute_phi_mip_normalized(H_block)\n" +
+        "    r_unif  = compute_phi_mip_normalized(H_unif)\n" +
+        "    # Sanity: block-diagonal phi_norm should be << 1 and PASS; uniform should be ~ 1.\n" +
+        "    assert 0.0 <= r_block['phi_mip_norm'] <= 2.0, f'block phi out of range: {r_block}'\n" +
+        "    assert 0.0 <= r_unif['phi_mip_norm']  <= 2.0, f'unif  phi out of range: {r_unif}'\n" +
+        "    assert r_block['phi_mip_norm'] < 0.2, f'block-diagonal phi_norm not low enough: {r_block}'\n" +
+        "    assert r_block['verdict'] == 'PASS', f'block-diagonal should PASS: {r_block}'\n" +
+        "    # Uniform random: min over C(16,8)=12870 partitions naturally pulls below E[cut]\n" +
+        "    # even without structure. Threshold-based test: uniform should NOT achieve PASS\n" +
+        "    # (i.e. phi_norm > 0.5), and uniform should be substantially above block-diagonal.\n" +
+        "    assert r_unif['phi_mip_norm'] > 0.5, f'uniform phi_norm too low (false PASS risk): {r_unif}'\n" +
+        "    assert r_unif['verdict'] in ('FAIL', 'AMBIGUOUS'), f'uniform should not PASS: {r_unif}'\n" +
+        "    assert r_unif['phi_mip_norm'] > 3.0 * r_block['phi_mip_norm'], f'discrimination gap too small: block={r_block[\"phi_mip_norm\"]} unif={r_unif[\"phi_mip_norm\"]}'\n" +
+        "    # k-invariance smoke check: same uniform construction at n=8 vs n=16 → both should give phi ~ 1.\n" +
+        "    H_unif_8 = rng.standard_normal((8, d))\n" +
+        "    r_unif_8 = compute_phi_mip_normalized(H_unif_8)\n" +
+        "    print(f'selftest=ok')\n" +
+        "    print(f'block_diag_phi_norm={r_block[\"phi_mip_norm\"]:.6f}')\n" +
+        "    print(f'block_diag_verdict={r_block[\"verdict\"]}')\n" +
+        "    print(f'block_diag_min_cut={r_block[\"min_cut\"]:.6f}')\n" +
+        "    print(f'block_diag_expected_cut={r_block[\"expected_random_cut\"]:.6f}')\n" +
+        "    print(f'uniform_phi_norm={r_unif[\"phi_mip_norm\"]:.6f}')\n" +
+        "    print(f'uniform_verdict={r_unif[\"verdict\"]}')\n" +
+        "    print(f'uniform_n8_phi_norm={r_unif_8[\"phi_mip_norm\"]:.6f}')\n" +
+        "    print(f'uniform_n8_verdict={r_unif_8[\"verdict\"]}')\n" +
+        "    print(f'k_invariance_caveat=normalization_neutralizes_E[cut]_growth_in_k_but_min_over_C(n,n/2)_still_has_finite_sample_downward_bias')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def main():\n" +
+        "    if len(sys.argv) < 2:\n" +
+        "        print('usage: helper <validate|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "    mode = sys.argv[1]\n" +
+        "    if mode == 'validate': cmd_validate(*sys.argv[2:8])\n" +
+        "    elif mode == 'selftest': cmd_selftest()\n" +
+        "    else: print(f'unknown mode: {mode}', file=sys.stderr); sys.exit(2)\n" +
+        "\n" +
+        "if __name__ == '__main__': main()\n"
+    write_file(HELPER_PATH, src)
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+@manual_main
+fn main() {
+    let av = argv()
+    let mut h_file = ""
+    let mut output = ""
+    let mut selftest = false
+    let mut compare = false
+    let mut aggregate = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--validate" && i + 1 < len(av) { h_file = av[i+1]; i = i + 2; continue }
+        if a == "--output" && i + 1 < len(av) { output = av[i+1]; i = i + 2; continue }
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--compare-to-V1-baseline" { compare = true; i = i + 1; continue }
+        if a == "--aggregate-5tuple" { aggregate = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("── an11_b_v1_phi_mip_normalized selftest ──")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 {
+            eprintln("selftest FAILED (exit " + to_string(r[1]) + ")")
+            exit(1)
+        }
+        if _kv_lookup(r[0], "selftest") != "ok" {
+            eprintln("selftest marker missing")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if h_file == "" || output == "" {
+        eprintln("ABORT: --validate <H_file> --output <path> required (or --selftest).")
+        eprintln("  optional: --compare-to-V1-baseline    (emit legacy V1 phi side-by-side)")
+        eprintln("  optional: --aggregate-5tuple          (emit 5-tuple compatible record)")
+        eprintln("  usage: hexa run tool/an11_b_v1_phi_mip_normalized.hexa --selftest")
+        eprintln("         hexa run tool/an11_b_v1_phi_mip_normalized.hexa \\")
+        eprintln("           --validate state/h_last_raw_p1_BASE_null_lasttoken_20260425.json \\")
+        eprintln("           --output state/an11_v1_phi_mip_norm_<run_id>.json")
+        exit(2)
+    }
+    if !file_exists(h_file) {
+        eprintln("ABORT: missing H file " + h_file)
+        exit(2)
+    }
+
+    let mut mode_label = "validate"
+    if aggregate { mode_label = "aggregate" }
+    else { if compare { mode_label = "compare" } }
+
+    println("── an11_b_v1_phi_mip_normalized ──")
+    println("input:  " + h_file)
+    println("output: " + output)
+    println("mode:   " + mode_label)
+
+    let args = "validate " +
+        _sh_quote(h_file) + " " +
+        _sh_quote(output) + " " +
+        _sh_quote(SCHEMA) + " " +
+        _sh_quote(SPEC_DOC) + " " +
+        _sh_quote(SPEC_COMMIT) + " " +
+        _sh_quote(mode_label)
+    let r = _run_helper(args)
+    let out = r[0]
+    let st  = r[1]
+    if st != 0 {
+        eprintln("ABORT: helper validate exited " + to_string(st))
+        eprintln(out)
+        exit(2)
+    }
+    println(out)
+    println("")
+    println("wrote " + output)
+    exit(0)
+}
+
+main()
