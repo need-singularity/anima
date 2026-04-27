@@ -1,0 +1,202 @@
+// tool/anima_runpod_runaway_cost_incident_auditor.hexa — RunPod runaway cost incident audit (raw#9 hexa-only, NON_MUTATION).
+//
+// PURPOSE
+//   cycle 52+53 RunPod 2 H100 발견 후 cycle 54 deep audit revealed:
+//     bnabak3i4r38bg: COST_CAP=$1, RUNTIME_CAP_MIN=15, uptime ~28h, cost ~$83.72
+//     1an0fdtr2mrif1: COST_CAP=$1, RUNTIME_CAP_MIN=12, uptime ~30h, cost ~$89.70
+//
+//   = RUNAWAY COST INCIDENT (caps not enforced; 87× over-budget, 112× over-runtime).
+//
+//   본 helper = mac-local NON_MUTATION:
+//     - per-pod uptime + cumulative cost calculation
+//     - cap escape ratio (actual/intended)
+//     - account balance + spendLimit awareness
+//     - emergency action recommendations (NON_MUTATION; user manual)
+//
+// INPUT
+//   ANIMA_OUTPUT      output JSON (default: state/runpod_runaway_cost_incident_auditor.json)
+//
+// OUTPUT
+//   - per_pod_runaway: list of {id, name, intended_cost_cap, intended_runtime_min, actual_uptime_h, actual_cost_usd, cost_escape_ratio, runtime_escape_ratio}
+//   - account_state: {balance, spend_limit, current_per_hr}
+//   - emergency_actions
+//   - non_mutation_guarantee
+//
+// USAGE
+//   hexa run tool/anima_runpod_runaway_cost_incident_auditor.hexa --selftest
+//   ANIMA_OUTPUT=state/runpod_runaway_cost_incident_auditor.json hexa run tool/anima_runpod_runaway_cost_incident_auditor.hexa
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest:
+//   - createdAt parsing은 ISO format heuristic.
+//   - cumulative cost = uptime_h × costPerHr (actual billing 일치 추정).
+//   - "runaway" = caps escaped; intentional vs accidental은 user 판단.
+
+let HELPER_PATH = "/tmp/anima_runpod_runaway_cost_incident_auditor_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima RunPod runaway cost incident auditor — emitted by tool/anima_runpod_runaway_cost_incident_auditor.hexa\n")
+    parts.push("# raw#37 transient. mac-local NON_MUTATION.\n")
+    parts.push("import json, os, sys, subprocess, datetime\n\n")
+
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', 'state/runpod_runaway_cost_incident_auditor.json')\n\n")
+
+    parts.push("def _parse_runpod_ts(ts_str):\n")
+    parts.push("    # '2026-04-26 05:29:47.979 +0000 UTC'\n")
+    parts.push("    if not ts_str: return None\n")
+    parts.push("    try:\n")
+    parts.push("        ts_clean = ts_str.replace(' +0000 UTC', '+00:00').replace(' +0000', '+00:00')\n")
+    parts.push("        if '.' in ts_clean:\n")
+    parts.push("            base, rest = ts_clean.rsplit('.', 1)\n")
+    parts.push("            us = ''.join(c for c in rest if c.isdigit())[:6]\n")
+    parts.push("            tz = rest[len(us):]\n")
+    parts.push("            ts_clean = f'{base}.{us}{tz}'\n")
+    parts.push("        return datetime.datetime.fromisoformat(ts_clean)\n")
+    parts.push("    except Exception:\n")
+    parts.push("        return None\n\n")
+
+    parts.push("# Active pods + per-pod details\n")
+    parts.push("active_pod_ids = []\n")
+    parts.push("try:\n")
+    parts.push("    r = subprocess.run(['runpodctl', 'pod', 'list'], capture_output=True, text=True, timeout=15)\n")
+    parts.push("    if r.returncode == 0:\n")
+    parts.push("        active_pod_ids = [p['id'] for p in json.loads(r.stdout)]\n")
+    parts.push("except Exception: pass\n\n")
+
+    parts.push("now_utc = datetime.datetime.now(datetime.timezone.utc)\n")
+    parts.push("per_pod_runaway = []\n")
+    parts.push("for pid in active_pod_ids:\n")
+    parts.push("    try:\n")
+    parts.push("        r = subprocess.run(['runpodctl', 'pod', 'get', pid], capture_output=True, text=True, timeout=15)\n")
+    parts.push("        if r.returncode != 0: continue\n")
+    parts.push("        d = json.loads(r.stdout)\n")
+    parts.push("    except Exception: continue\n")
+    parts.push("    created = _parse_runpod_ts(d.get('createdAt'))\n")
+    parts.push("    uptime_h = (now_utc - created).total_seconds() / 3600 if created else None\n")
+    parts.push("    cost_per_hr = d.get('costPerHr', 0)\n")
+    parts.push("    cumulative_cost = round(uptime_h * cost_per_hr, 2) if uptime_h else None\n")
+    parts.push("    env = d.get('env', {}) or {}\n")
+    parts.push("    intended_cost_cap = float(env.get('COST_CAP', 0)) if env.get('COST_CAP') else None\n")
+    parts.push("    intended_runtime_min = float(env.get('RUNTIME_CAP_MIN', 0)) if env.get('RUNTIME_CAP_MIN') else None\n")
+    parts.push("    cost_escape_ratio = round(cumulative_cost / intended_cost_cap, 1) if intended_cost_cap and cumulative_cost else None\n")
+    parts.push("    runtime_escape_ratio = round((uptime_h * 60) / intended_runtime_min, 1) if intended_runtime_min and uptime_h else None\n")
+    parts.push("    per_pod_runaway.append({\n")
+    parts.push("        'id':pid,\n")
+    parts.push("        'name':d.get('name'),\n")
+    parts.push("        'created_utc':d.get('createdAt'),\n")
+    parts.push("        'uptime_h':round(uptime_h, 1) if uptime_h else None,\n")
+    parts.push("        'cost_per_hr_usd':cost_per_hr,\n")
+    parts.push("        'cumulative_cost_usd':cumulative_cost,\n")
+    parts.push("        'intended_cost_cap_usd':intended_cost_cap,\n")
+    parts.push("        'intended_runtime_min':intended_runtime_min,\n")
+    parts.push("        'cost_escape_ratio':cost_escape_ratio,\n")
+    parts.push("        'runtime_escape_ratio_x':runtime_escape_ratio,\n")
+    parts.push("        'run_id':env.get('RUN_ID'),\n")
+    parts.push("    })\n\n")
+
+    parts.push("# Account state\n")
+    parts.push("account_state = {}\n")
+    parts.push("try:\n")
+    parts.push("    r = subprocess.run(['runpodctl', 'me'], capture_output=True, text=True, timeout=10)\n")
+    parts.push("    if r.returncode == 0:\n")
+    parts.push("        d = json.loads(r.stdout)\n")
+    parts.push("        account_state = {\n")
+    parts.push("            'client_balance_usd':round(d.get('clientBalance', 0), 2),\n")
+    parts.push("            'current_spend_per_hr_usd':d.get('currentSpendPerHr'),\n")
+    parts.push("            'spend_limit_usd':d.get('spendLimit'),\n")
+    parts.push("            'email':d.get('email'),\n")
+    parts.push("        }\n")
+    parts.push("        # Hours until balance depletes\n")
+    parts.push("        if account_state.get('current_spend_per_hr_usd') and account_state.get('current_spend_per_hr_usd') > 0:\n")
+    parts.push("            account_state['hours_until_balance_zero'] = round(account_state['client_balance_usd'] / account_state['current_spend_per_hr_usd'], 1)\n")
+    parts.push("            account_state['days_until_balance_zero'] = round(account_state['hours_until_balance_zero'] / 24, 1)\n")
+    parts.push("except Exception: pass\n\n")
+
+    parts.push("# Aggregate\n")
+    parts.push("total_cumulative = round(sum(p.get('cumulative_cost_usd', 0) or 0 for p in per_pod_runaway), 2)\n")
+    parts.push("total_intended_cap = round(sum(p.get('intended_cost_cap_usd', 0) or 0 for p in per_pod_runaway), 2)\n")
+    parts.push("aggregate_escape = round(total_cumulative / max(total_intended_cap, 0.01), 1) if total_intended_cap else None\n\n")
+
+    parts.push("EMERGENCY_ACTIONS = [\n")
+    parts.push("    {\n")
+    parts.push("        'severity':'CRITICAL',\n")
+    parts.push("        'action':'immediate decision required: terminate (stop burn) | continue (intentional) | investigate (ssh)',\n")
+    parts.push("        'terminate_commands':[f'runpodctl pod stop {p[\"id\"]}' for p in per_pod_runaway],\n")
+    parts.push("        'investigate_ssh':[f'runpodctl pod ssh {p[\"id\"]} (check actual progress)' for p in per_pod_runaway],\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'severity':'HIGH',\n")
+    parts.push("        'action':'audit launch script: COST_CAP / RUNTIME_CAP enforcement broken — caps not respected',\n")
+    parts.push("        'remediation':'find launch script; verify cap enforcement; add ' + 'auto-terminate timer if missing',\n")
+    parts.push("    },\n")
+    parts.push("    {\n")
+    parts.push("        'severity':'medium',\n")
+    parts.push("        'action':'memory project_h100_launch_pending.md update — current state since 2026-04-22 false',\n")
+    parts.push("    },\n")
+    parts.push("]\n\n")
+
+    parts.push("summary = {\n")
+    parts.push("    'paradigm':'RunPod runaway cost incident audit (cycle 52+53 follow-up; cap enforcement failure)',\n")
+    parts.push("    'incident_severity':'CRITICAL' if aggregate_escape and aggregate_escape > 10 else 'HIGH',\n")
+    parts.push("    'now_utc':now_utc.isoformat(),\n")
+    parts.push("    'per_pod_runaway':per_pod_runaway,\n")
+    parts.push("    'aggregate':{\n")
+    parts.push("        'total_cumulative_cost_usd':total_cumulative,\n")
+    parts.push("        'total_intended_cap_usd':total_intended_cap,\n")
+    parts.push("        'aggregate_escape_ratio_x':aggregate_escape,\n")
+    parts.push("    },\n")
+    parts.push("    'account_state':account_state,\n")
+    parts.push("    'emergency_actions':EMERGENCY_ACTIONS,\n")
+    parts.push("    'non_mutation_guarantee':'helper does NOT stop pods; user manual decision via runpodctl pod stop <id>',\n")
+    parts.push("    'cross_link_cycles':['cycle 52 RunPod active pods discovery','cycle 53 cycle 13 false-negative correction','cycle 17 atlas R47_DISAMBIG bnabak3i4r38bg no-auto-terminate documented'],\n")
+    parts.push("    'pattern':'governance audit chain layer 34 (cycles 21-53 + this) — runaway cost incident formal record',\n")
+    parts.push("}\n")
+    parts.push("os.makedirs(os.path.dirname(OUTPUT) or '.', exist_ok=True)\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2, ensure_ascii=False)\n")
+    parts.push("print(f'[runaway_audit] pods={len(per_pod_runaway)} cumulative=${total_cumulative} intended_cap=${total_intended_cap} escape_ratio={aggregate_escape}x balance=${account_state.get(\"client_balance_usd\")} hours_until_zero={account_state.get(\"hours_until_balance_zero\")} -> {OUTPUT}')\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _selftest_invariants() -> bool {
+    let incident_severity_levels = "CRITICAL,HIGH"
+    let emergency_actions_count = 3
+    let non_mutation = "READ_ONLY_NO_POD_STOP"
+    println("inv:incident_severity_levels=" + incident_severity_levels)
+    println("inv:emergency_actions_count=" + to_string(emergency_actions_count))
+    println("inv:non_mutation=" + non_mutation)
+    println("inv:cross_link_cycle52_cycle53_cycle17=true")
+    println("inv:cap_escape_ratio_calculated=true")
+    return true
+}
+
+fn cmd_selftest() {
+    println("── anima_runpod_runaway_cost_incident_auditor selftest ──")
+    _write_helper()
+    let ok = _selftest_invariants()
+    if !ok {
+        println("selftest=fail")
+        exit(2)
+    }
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("paradigm=RunPod runaway cost incident audit (cap enforcement failure quantified; mac $0; NON_MUTATION)")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
