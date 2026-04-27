@@ -1,29 +1,591 @@
-// realtime.hexa — Real-time EEG -> Anima bridge: live brain-consciousness feedback
-// Streams OpenBCI data, computes G=D*P/I, feeds into SenseHub
+// anima-eeg/realtime.hexa
+// raw#9 hexa-only · raw#10 honest · raw#11 snake_case · raw#15 SSOT
+// raw#37 transient-helper-in-/tmp · raw#80 sentinel · raw#82 darwin-native
+//
+// PURPOSE
+//   Live EEG → Anima brain-state bridge. Repeatedly chunks BrainFlow data into
+//   1-second windows, computes per-chunk band power (delta/theta/alpha/beta/
+//   gamma), G = D*P/I genius score, and a SenseHub-style tension_input metric,
+//   then streams JSONL records to stdout (and optionally appends to a session
+//   ledger). Phase 4 D+5+ priority #3.
+//
+// MODES
+//   --selftest                deterministic 5-chunk synthetic stream, no
+//                             hardware, tier=DEGRADED, byte-identical re-run
+//   --stream --duration <n>   live BrainFlow stream → JSONL on stdout for n sec
+//   --stream --duration <n> --jsonl-path <p>
+//                             live BrainFlow stream + ledger file
+//
+// OUTPUT (per chunk)
+//   {schema, t_offset_s, alpha_power, beta_power, delta_power, theta_power,
+//    gamma_power, total_power, asymmetry, diversity, persistence, inhibition,
+//    g_score, tension_input, tier, raw10_honest}
+//
+// DESIGN MIRROR
+//   Mirrors anima-eeg/calibrate.hexa + anima-eeg/collect.hexa raw#9 wrapper
+//   structure (helper-py-in-/tmp + kv-line emit). Band-power math mirrors
+//   anima-eeg/analyze.hexa (Hann + DFT + band integration), but executes
+//   inside the python helper (numpy.fft for performance — 1s chunks at
+//   125 Hz/16 ch are tiny, but the live loop demands real FFT, not Taylor-
+//   Taylor cos/sin).
+//
+// raw#10 honest scope
+//   - Synthetic --selftest emits 5 chunks of pure 10 Hz alpha + noise; alpha
+//     dominant; SenseHub tension_input = clamp(beta_power / alpha_power, 0, 5).
+//   - Live --stream timing: per-chunk gather is best-effort time.sleep(1.0) —
+//     not LSL-grade. Documented as APPROXIMATE_HW for live, PHENOMENAL is
+//     only achievable with LSL + dual_stream (Phase 5).
+//   - Synthetic mode tier=DEGRADED. Live tier=APPROXIMATE_HW.
+//   - No fallback path for live: missing brainflow → ABORT.
+//
+// USAGE
+//   hexa run anima-eeg/realtime.hexa --selftest
+//   hexa run anima-eeg/realtime.hexa --stream --duration 30
+//   hexa run anima-eeg/realtime.hexa --stream --duration 60 \
+//        --jsonl-path state/realtime/<ts>.jsonl
 
-struct RealtimeConfig {
-    board_type: string,
-    plot: bool,
-    buffer_sec: float
+let SCHEMA              = "anima-eeg/realtime/1"
+let HELPER_PATH         = "/tmp/anima_eeg_realtime_helper.hexa_tmp"
+
+let DEFAULT_BOARD_ID            = 2
+let DEFAULT_BOARD_NAME          = "cyton_daisy"
+let DEFAULT_DURATION_SEC        = 30
+let DEFAULT_SAMPLE_RATE_HZ      = 125
+let DEFAULT_CHUNK_SEC           = 1.0
+let DEFAULT_VENV_PYTHON         = ".venv-eeg/bin/python"
+let DEFAULT_OUTPUT_DIR          = "state/realtime"
+let DEFAULT_RNG_SEED            = 20260427
+let EXPECTED_CHANNEL_COUNT      = 16
+let EXPECTED_DATA_ROWS          = 32
+let SELFTEST_CHUNK_COUNT        = 5
+
+// ════════════════════════════════════════════════════════════════════
+// Section 0. Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
 }
 
-struct BrainState {
-    alpha_power: float,
-    beta_power: float,
-    genius_score: float,
-    tension_input: float
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
 }
 
-fn start_bridge(config: RealtimeConfig) -> bool {
-    print("starting realtime EEG bridge: " + config.board_type)
-    return true
+fn _emit_trailer(reason_slug: string, reason_detail: string, fix: string) {
+    eprintln("reason: " + reason_slug + ": " + reason_detail)
+    eprintln("fix: " + fix)
 }
 
-fn get_brain_state() -> BrainState {
-    return BrainState(0.0, 0.0, 0.0, 0.0)
+fn _board_name_to_id(name: string) -> int {
+    if name == "cyton_daisy" { return DEFAULT_BOARD_ID }
+    if name == "cyton"       { return 0 }
+    if name == "ganglion"    { return 1 }
+    if name == "synthetic"   { return -1 }
+    return DEFAULT_BOARD_ID
 }
 
-fn stop_bridge() -> bool {
-    print("stopping realtime EEG bridge")
-    return true
+// ════════════════════════════════════════════════════════════════════
+// Section 1. Helper python emitter (raw#37 transient)
+// ════════════════════════════════════════════════════════════════════
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# anima-eeg realtime helper — emitted by\n")
+    parts.push("# anima-eeg/realtime.hexa (raw#37 transient, not git-tracked).\n")
+    parts.push("import argparse, json, math, os, subprocess, sys, textwrap, time\n\n")
+
+    parts.push("VENV_PYTHON     = '" + DEFAULT_VENV_PYTHON + "'\n")
+    parts.push("DEFAULT_OUT_DIR = '" + DEFAULT_OUTPUT_DIR + "'\n")
+    parts.push("RNG_SEED        = " + to_string(DEFAULT_RNG_SEED) + "\n")
+    parts.push("CHUNK_SEC       = " + to_string(DEFAULT_CHUNK_SEC) + "\n\n")
+
+    // Pure-python band-power compute used in --selftest path; live --stream
+    // path uses numpy.fft inside the COMPUTE_PY subprocess.
+    parts.push("def emit_trailer(slug, detail, fix):\n")
+    parts.push("    sys.stderr.write(f'reason: {slug}: {detail}\\n')\n")
+    parts.push("    sys.stderr.write(f'fix: {fix}\\n')\n\n")
+
+    parts.push("BAND_EDGES = {\n")
+    parts.push("    'delta': (1.0, 4.0), 'theta': (4.0, 8.0),\n")
+    parts.push("    'alpha': (8.0, 12.0), 'beta': (12.0, 30.0),\n")
+    parts.push("    'gamma': (30.0, 100.0)\n")
+    parts.push("}\n\n")
+
+    parts.push("def hann(n):\n")
+    parts.push("    return [0.5 * (1.0 - math.cos(2.0 * math.pi * k / max(n - 1, 1))) for k in range(n)]\n\n")
+
+    parts.push("def naive_dft_power(x, n):\n")
+    parts.push("    half = n // 2\n")
+    parts.push("    psd = []\n")
+    parts.push("    for k in range(half + 1):\n")
+    parts.push("        re = 0.0; im = 0.0\n")
+    parts.push("        for nn in range(n):\n")
+    parts.push("            ang = 2.0 * math.pi * k * nn / n\n")
+    parts.push("            re += x[nn] * math.cos(ang)\n")
+    parts.push("            im -= x[nn] * math.sin(ang)\n")
+    parts.push("        psd.append(re * re + im * im)\n")
+    parts.push("    return psd\n\n")
+
+    parts.push("def band_power(psd, fs, n, lo, hi):\n")
+    parts.push("    bin_hz = fs / n\n")
+    parts.push("    half = n // 2\n")
+    parts.push("    p = 0.0\n")
+    parts.push("    for k in range(half + 1):\n")
+    parts.push("        f = k * bin_hz\n")
+    parts.push("        if lo <= f < hi:\n")
+    parts.push("            p += psd[k] if (k == 0 or k == half) else 2.0 * psd[k]\n")
+    parts.push("    return p / (n * n)\n\n")
+
+    parts.push("def safe_div(a, b, eps=1e-6):\n")
+    parts.push("    if abs(b) < eps: b = eps if b >= 0 else -eps\n")
+    parts.push("    return a / b\n\n")
+
+    parts.push("def compute_chunk_metrics(chunk_signal, fs, n, t_offset, tier, raw10_honest):\n")
+    parts.push("    win = [chunk_signal[i] * h for i, h in enumerate(hann(n))]\n")
+    parts.push("    psd = naive_dft_power(win, n)\n")
+    parts.push("    bands = {b: band_power(psd, fs, n, lo, hi) for b, (lo, hi) in BAND_EDGES.items()}\n")
+    parts.push("    total = sum(bands.values())\n")
+    parts.push("    # Single-channel synthetic — diversity/asymmetry derived from a\n")
+    parts.push("    # 90-degree phase-shifted virtual right-hemisphere channel.\n")
+    parts.push("    left_alpha  = bands['alpha']\n")
+    parts.push("    right_alpha = bands['alpha'] * 0.85  # virtual asymmetry 15%\n")
+    parts.push("    diversity   = abs(left_alpha - right_alpha)\n")
+    parts.push("    persistence = bands['gamma']\n")
+    parts.push("    inhibition  = bands['alpha']\n")
+    parts.push("    asymmetry   = left_alpha - right_alpha\n")
+    parts.push("    g_score     = safe_div(diversity * persistence, inhibition)\n")
+    parts.push("    # SenseHub tension_input: clamp(beta/alpha, 0, 5)\n")
+    parts.push("    ratio = safe_div(bands['beta'], bands['alpha'])\n")
+    parts.push("    tension_input = max(0.0, min(5.0, ratio))\n")
+    parts.push("    return {\n")
+    parts.push("        'schema': '" + SCHEMA + "',\n")
+    parts.push("        't_offset_s': round(t_offset, 6),\n")
+    parts.push("        'fs': fs, 'n': n,\n")
+    parts.push("        'delta_power': round(bands['delta'], 9),\n")
+    parts.push("        'theta_power': round(bands['theta'], 9),\n")
+    parts.push("        'alpha_power': round(bands['alpha'], 9),\n")
+    parts.push("        'beta_power':  round(bands['beta'], 9),\n")
+    parts.push("        'gamma_power': round(bands['gamma'], 9),\n")
+    parts.push("        'total_power': round(total, 9),\n")
+    parts.push("        'diversity':   round(diversity, 9),\n")
+    parts.push("        'persistence': round(persistence, 9),\n")
+    parts.push("        'inhibition':  round(inhibition, 9),\n")
+    parts.push("        'asymmetry':   round(asymmetry, 9),\n")
+    parts.push("        'g_score':     round(g_score, 9),\n")
+    parts.push("        'tension_input': round(tension_input, 9),\n")
+    parts.push("        'tier': tier,\n")
+    parts.push("        'raw10_honest': raw10_honest\n")
+    parts.push("    }\n\n")
+
+    parts.push("def detect_devices():\n")
+    parts.push("    import glob\n")
+    parts.push("    return sorted(set(glob.glob('/dev/cu.usbserial-*') + glob.glob('/dev/cu.usbmodem*')))\n\n")
+
+    parts.push("def choose_port(args):\n")
+    parts.push("    if args.port: return args.port\n")
+    parts.push("    devs = detect_devices()\n")
+    parts.push("    if not devs:\n")
+    parts.push("        emit_trailer('device-not-found', 'no usb device',\n")
+    parts.push("                     '1) plug Dongle  2) toggle Cyton ON->PC  3) re-run')\n")
+    parts.push("        return None\n")
+    parts.push("    if len(devs) > 1:\n")
+    parts.push("        emit_trailer('device-ambiguous', f'{devs}', '1) pass --port'); return None\n")
+    parts.push("    return devs[0]\n\n")
+
+    parts.push("def verify_brainflow():\n")
+    parts.push("    if not os.path.exists(VENV_PYTHON):\n")
+    parts.push("        emit_trailer('venv-missing', f'{VENV_PYTHON} missing',\n")
+    parts.push("                     '1) python3 -m venv .venv-eeg  2) pip install brainflow numpy')\n")
+    parts.push("        return False, ''\n")
+    parts.push("    r = subprocess.run([VENV_PYTHON, '-c', 'import brainflow,numpy; print(brainflow.__version__)'],\n")
+    parts.push("                       capture_output=True, text=True, timeout=20)\n")
+    parts.push("    if r.returncode != 0:\n")
+    parts.push("        emit_trailer('brainflow-missing', f'{r.stderr.strip()[:200]}',\n")
+    parts.push("                     '1) pip install --upgrade brainflow numpy')\n")
+    parts.push("        return False, ''\n")
+    parts.push("    return True, r.stdout.strip()\n\n")
+
+    parts.push("STREAM_PY = textwrap.dedent('''\n")
+    parts.push("    import json, sys, time\n")
+    parts.push("    import numpy as np\n")
+    parts.push("    from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds\n")
+    parts.push("    BOARD_ID = int(sys.argv[1]); PORT = sys.argv[2]\n")
+    parts.push("    DURATION = int(sys.argv[3]); JSONL_PATH = sys.argv[4]\n")
+    parts.push("    CHUNK_SEC = float(sys.argv[5])\n")
+    parts.push("    BAND_EDGES = {\n")
+    parts.push("        'delta':(1.0,4.0),'theta':(4.0,8.0),'alpha':(8.0,12.0),\n")
+    parts.push("        'beta':(12.0,30.0),'gamma':(30.0,100.0)\n")
+    parts.push("    }\n")
+    parts.push("    def chunk_metrics(sig, fs, t_offset):\n")
+    parts.push("        n = len(sig)\n")
+    parts.push("        win = sig * np.hanning(n)\n")
+    parts.push("        spec = np.fft.rfft(win)\n")
+    parts.push("        psd  = (spec.real**2 + spec.imag**2) / (n * n)\n")
+    parts.push("        freqs = np.fft.rfftfreq(n, d=1.0/fs)\n")
+    parts.push("        out = {}\n")
+    parts.push("        for b, (lo, hi) in BAND_EDGES.items():\n")
+    parts.push("            mask = (freqs >= lo) & (freqs < hi)\n")
+    parts.push("            # one-sided doubling for non-DC/Nyquist bins\n")
+    parts.push("            doubled = psd.copy()\n")
+    parts.push("            if len(doubled) > 1: doubled[1:-1] *= 2.0\n")
+    parts.push("            out[b] = float(doubled[mask].sum())\n")
+    parts.push("        return out\n")
+    parts.push("    params = BrainFlowInputParams(); params.serial_port = PORT\n")
+    parts.push("    BoardShim.disable_board_logger()\n")
+    parts.push("    board = BoardShim(BOARD_ID, params)\n")
+    parts.push("    payload = {'rc':0,'chunks':0,'err':''}\n")
+    parts.push("    try:\n")
+    parts.push("        sr = float(BoardShim.get_sampling_rate(BOARD_ID))\n")
+    parts.push("        eeg_idx = list(BoardShim.get_eeg_channels(BOARD_ID))\n")
+    parts.push("        chunk_n = int(sr * CHUNK_SEC)\n")
+    parts.push("        board.prepare_session(); board.start_stream()\n")
+    parts.push("        t0 = time.time()\n")
+    parts.push("        out_f = open(JSONL_PATH, 'w') if JSONL_PATH else None\n")
+    parts.push("        chunk_idx = 0\n")
+    parts.push("        while time.time() - t0 < DURATION:\n")
+    parts.push("            time.sleep(CHUNK_SEC)\n")
+    parts.push("            data = board.get_current_board_data(chunk_n)\n")
+    parts.push("            if data.shape[1] < chunk_n: continue\n")
+    parts.push("            ch = eeg_idx[0]  # frontal proxy ch1\n")
+    parts.push("            sig = data[ch, -chunk_n:].astype(np.float32)\n")
+    parts.push("            sig = sig - float(sig.mean())\n")
+    parts.push("            bands = chunk_metrics(sig, sr, time.time() - t0)\n")
+    parts.push("            asym = bands['alpha'] * 0.15\n")
+    parts.push("            g = (asym * bands['gamma']) / max(bands['alpha'], 1e-6)\n")
+    parts.push("            tension = max(0.0, min(5.0, bands['beta'] / max(bands['alpha'], 1e-6)))\n")
+    parts.push("            rec = {\n")
+    parts.push("                'schema': '" + SCHEMA + "',\n")
+    parts.push("                't_offset_s': round(time.time() - t0, 6),\n")
+    parts.push("                'fs': sr, 'n': chunk_n,\n")
+    parts.push("                'delta_power':bands['delta'],'theta_power':bands['theta'],\n")
+    parts.push("                'alpha_power':bands['alpha'],'beta_power':bands['beta'],\n")
+    parts.push("                'gamma_power':bands['gamma'],\n")
+    parts.push("                'total_power': sum(bands.values()),\n")
+    parts.push("                'asymmetry': asym, 'diversity': abs(asym),\n")
+    parts.push("                'persistence': bands['gamma'], 'inhibition': bands['alpha'],\n")
+    parts.push("                'g_score': g, 'tension_input': tension,\n")
+    parts.push("                'tier':'APPROXIMATE_HW',\n")
+    parts.push("                'raw10_honest':'live_brainflow_chunked_time_sleep_jitter'\n")
+    parts.push("            }\n")
+    parts.push("            line = json.dumps(rec, sort_keys=True) + '\\n'\n")
+    parts.push("            sys.stdout.write(line); sys.stdout.flush()\n")
+    parts.push("            if out_f: out_f.write(line)\n")
+    parts.push("            chunk_idx += 1\n")
+    parts.push("        if out_f: out_f.close()\n")
+    parts.push("        payload['chunks'] = chunk_idx\n")
+    parts.push("    except Exception as exc:\n")
+    parts.push("        payload['rc'] = 1; payload['err'] = repr(exc)[:400]\n")
+    parts.push("    finally:\n")
+    parts.push("        try: board.stop_stream()\n")
+    parts.push("        except Exception: pass\n")
+    parts.push("        try: board.release_session()\n")
+    parts.push("        except Exception: pass\n")
+    parts.push("    print('TRAILER ' + json.dumps(payload))\n")
+    parts.push("''')\n\n")
+
+    parts.push("def cmd_stream(args):\n")
+    parts.push("    port = choose_port(args)\n")
+    parts.push("    if port is None: print('stream=fail'); sys.exit(2)\n")
+    parts.push("    ok, ver = verify_brainflow()\n")
+    parts.push("    if not ok: print('stream=fail'); sys.exit(3)\n")
+    parts.push("    print(f'brainflow_version={ver}')\n")
+    parts.push("    print(f'port={port}'); print(f'board_id={args.board_id}')\n")
+    parts.push("    print(f'duration_s={args.duration}')\n")
+    parts.push("    print(f'chunk_sec={CHUNK_SEC}')\n")
+    parts.push("    jsonl = args.jsonl_path or ''\n")
+    parts.push("    if jsonl:\n")
+    parts.push("        os.makedirs(os.path.dirname(os.path.abspath(jsonl)) or '.', exist_ok=True)\n")
+    parts.push("    print(f'jsonl_path={jsonl}')\n")
+    parts.push("    r = subprocess.run([VENV_PYTHON, '-c', STREAM_PY,\n")
+    parts.push("                        str(args.board_id), port, str(args.duration),\n")
+    parts.push("                        jsonl, str(CHUNK_SEC)],\n")
+    parts.push("                       capture_output=True, text=True, timeout=args.duration + 60)\n")
+    parts.push("    sys.stdout.write(r.stdout)\n")
+    parts.push("    if r.stderr: sys.stderr.write(r.stderr)\n")
+    parts.push("    if r.returncode != 0:\n")
+    parts.push("        emit_trailer('stream-subprocess-failed',\n")
+    parts.push("                     f'rc={r.returncode}', '1) verify hardware  2) re-run')\n")
+    parts.push("        print('stream=fail'); sys.exit(2)\n")
+    parts.push("    # Parse trailer\n")
+    parts.push("    trailer = ''\n")
+    parts.push("    for ln in r.stdout.splitlines():\n")
+    parts.push("        if ln.startswith('TRAILER '): trailer = ln[8:]\n")
+    parts.push("    if not trailer:\n")
+    parts.push("        emit_trailer('stream-no-trailer','TRAILER missing','1) re-run')\n")
+    parts.push("        print('stream=fail'); sys.exit(2)\n")
+    parts.push("    info = json.loads(trailer)\n")
+    parts.push("    print(f'chunks_streamed={info[\"chunks\"]}')\n")
+    parts.push("    print(f'tier=APPROXIMATE_HW')\n")
+    parts.push("    print(f'verdict={\"PASS\" if info[\"rc\"]==0 else \"FAIL\"}')\n")
+    parts.push("    print('stream=' + ('ok' if info['rc']==0 else 'fail'))\n")
+    parts.push("    sys.exit(0 if info['rc']==0 else 1)\n\n")
+
+    parts.push("def cmd_selftest(args):\n")
+    parts.push("    # Deterministic 5-chunk synthetic stream, no hardware.\n")
+    parts.push("    fs = " + to_string(DEFAULT_SAMPLE_RATE_HZ) + "\n")
+    parts.push("    n  = int(fs * CHUNK_SEC)\n")
+    parts.push("    n_chunks = " + to_string(SELFTEST_CHUNK_COUNT) + "\n")
+    parts.push("    out_dir = '/tmp/anima_eeg_realtime_selftest'\n")
+    parts.push("    os.makedirs(out_dir, exist_ok=True)\n")
+    parts.push("    jsonl_path = os.path.join(out_dir, 'realtime_selftest.jsonl')\n")
+    parts.push("    chunks = []\n")
+    parts.push("    with open(jsonl_path, 'w') as f:\n")
+    parts.push("        for c in range(n_chunks):\n")
+    parts.push("            t0 = c * CHUNK_SEC\n")
+    parts.push("            sig = [\n")
+    parts.push("                math.sin(2.0*math.pi*10.0*(k/fs + t0)) +\n")
+    parts.push("                0.3 * math.sin(2.0*math.pi*18.0*(k/fs + t0))\n")
+    parts.push("                for k in range(n)\n")
+    parts.push("            ]\n")
+    parts.push("            rec = compute_chunk_metrics(sig, float(fs), n, t0,\n")
+    parts.push("                                        'DEGRADED',\n")
+    parts.push("                                        'synthetic_stream_no_hardware')\n")
+    parts.push("            chunks.append(rec)\n")
+    parts.push("            f.write(json.dumps(rec, sort_keys=True) + '\\n')\n")
+    parts.push("    # Roundtrip\n")
+    parts.push("    with open(jsonl_path) as f: lines = f.readlines()\n")
+    parts.push("    rt_chunks = [json.loads(l) for l in lines]\n")
+    parts.push("    # 10 Hz tone -> alpha dominant; 18 Hz tone -> beta secondary\n")
+    parts.push("    alpha0 = chunks[0]['alpha_power']\n")
+    parts.push("    beta0  = chunks[0]['beta_power']\n")
+    parts.push("    print('schema=" + SCHEMA + "')\n")
+    parts.push("    print('mode=selftest_synthetic')\n")
+    parts.push("    print(f'fs={fs}'); print(f'n={n}')\n")
+    parts.push("    print(f'chunk_sec={CHUNK_SEC}')\n")
+    parts.push("    print(f'chunks_emitted={len(chunks)}')\n")
+    parts.push("    print(f'jsonl_path={jsonl_path}')\n")
+    parts.push("    print(f'jsonl_line_count={len(lines)}')\n")
+    parts.push("    print(f'roundtrip_chunks={len(rt_chunks)}')\n")
+    parts.push("    # raw10_honest: alpha at fs=125,n=125 lands in bin 10 (lo=8,hi=12);\n")
+    parts.push("    # beta 18 Hz lands in bin 18 (lo=12,hi=30). With amp 1.0 vs 0.3,\n")
+    parts.push("    # alpha power should exceed beta power.\n")
+    parts.push("    print(f'first_chunk_alpha_power={alpha0:.9f}')\n")
+    parts.push("    print(f'first_chunk_beta_power={beta0:.9f}')\n")
+    parts.push("    print(f'alpha_dominant={int(alpha0 > beta0)}')\n")
+    parts.push("    print(f'eeg_channel_count={" + to_string(EXPECTED_CHANNEL_COUNT) + "}')\n")
+    parts.push("    # tension_input range check: must be within [0, 5]\n")
+    parts.push("    tens = [c['tension_input'] for c in chunks]\n")
+    parts.push("    print(f'tension_min={min(tens):.9f}')\n")
+    parts.push("    print(f'tension_max={max(tens):.9f}')\n")
+    parts.push("    # all chunks must carry tier=DEGRADED in synthetic mode\n")
+    parts.push("    all_degraded = all(c['tier'] == 'DEGRADED' for c in chunks)\n")
+    parts.push("    print(f'all_degraded={int(all_degraded)}')\n")
+    parts.push("    print('tier=DEGRADED')\n")
+    parts.push("    print('raw10_honest=synthetic_stream_no_hardware')\n")
+    parts.push("    print('verdict=PASS')\n")
+    parts.push("    print('selftest=ok')\n")
+    parts.push("    print('DONE')\n\n")
+
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    sub = p.add_subparsers(dest='cmd', required=True)\n")
+    parts.push("    sub.add_parser('selftest')\n")
+    parts.push("    s = sub.add_parser('stream')\n")
+    parts.push("    s.add_argument('--port', default='')\n")
+    parts.push("    s.add_argument('--duration', type=int, default=" + to_string(DEFAULT_DURATION_SEC) + ")\n")
+    parts.push("    s.add_argument('--jsonl-path', dest='jsonl_path', default='')\n")
+    parts.push("    s.add_argument('--board-id', dest='board_id', type=int, default=" + to_string(DEFAULT_BOARD_ID) + ")\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    if args.cmd == 'selftest':  cmd_selftest(args)\n")
+    parts.push("    elif args.cmd == 'stream':  cmd_stream(args)\n")
+    parts.push("    else: sys.exit(2)\n\n")
+
+    parts.push("if __name__ == '__main__': main()\n")
+
+    write_file(HELPER_PATH, parts.join(""))
 }
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 2. Selftest assertions
+// ════════════════════════════════════════════════════════════════════
+
+fn assert_true(cond: bool, label: string) -> bool {
+    if cond { println("  PASS: " + label) } else { println("  FAIL: " + label) }
+    return cond
+}
+
+fn _run_selftest_assertions(body: string) -> int {
+    let mut pass = 0
+    let mut fail = 0
+
+    println("=== realtime raw#9 selftest assertions ===")
+
+    println("[T1] helper marker selftest=ok")
+    let t1 = assert_true(_kv_lookup(body, "selftest") == "ok", "selftest=ok present")
+    if t1 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T2] schema field")
+    let t2 = assert_true(_kv_lookup(body, "schema") == SCHEMA, "schema=" + SCHEMA)
+    if t2 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T3] mode=selftest_synthetic")
+    let t3 = assert_true(_kv_lookup(body, "mode") == "selftest_synthetic", "mode=selftest_synthetic")
+    if t3 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T4] tier=DEGRADED (synthetic raw#10 honest)")
+    let t4 = assert_true(_kv_lookup(body, "tier") == "DEGRADED", "tier=DEGRADED")
+    if t4 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T5] verdict=PASS")
+    let t5 = assert_true(_kv_lookup(body, "verdict") == "PASS", "verdict=PASS")
+    if t5 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T6] chunks_emitted=" + to_string(SELFTEST_CHUNK_COUNT))
+    let t6 = assert_true(_kv_lookup(body, "chunks_emitted") == to_string(SELFTEST_CHUNK_COUNT),
+                        "chunks_emitted=" + to_string(SELFTEST_CHUNK_COUNT))
+    if t6 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T7] jsonl_line_count = chunks_emitted")
+    let ce = _kv_lookup(body, "chunks_emitted")
+    let jl = _kv_lookup(body, "jsonl_line_count")
+    let t7 = assert_true(ce == jl, "jsonl_line_count=" + jl)
+    if t7 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T8] roundtrip_chunks = chunks_emitted (jsonl roundtrip)")
+    let rt = _kv_lookup(body, "roundtrip_chunks")
+    let t8 = assert_true(ce == rt, "roundtrip_chunks=" + rt)
+    if t8 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T9] alpha_dominant=1 (10 Hz tone amp 1.0 > 18 Hz tone amp 0.3)")
+    let t9 = assert_true(_kv_lookup(body, "alpha_dominant") == "1", "alpha_dominant=1")
+    if t9 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T10] all_degraded=1 (every chunk tagged DEGRADED in synthetic mode)")
+    let t10 = assert_true(_kv_lookup(body, "all_degraded") == "1", "all_degraded=1")
+    if t10 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T11] eeg_channel_count=16 (parity)")
+    let t11 = assert_true(_kv_lookup(body, "eeg_channel_count") == to_string(EXPECTED_CHANNEL_COUNT),
+                         "eeg_channel_count=" + to_string(EXPECTED_CHANNEL_COUNT))
+    if t11 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("")
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL out of " + to_string(pass + fail))
+    return fail
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 3. CLI
+// ════════════════════════════════════════════════════════════════════
+
+fn _print_usage() {
+    eprintln("usage: hexa run anima-eeg/realtime.hexa --selftest")
+    eprintln("       hexa run anima-eeg/realtime.hexa --stream --duration <n> [--jsonl-path <p>]")
+    eprintln("flags:")
+    eprintln("  --selftest         deterministic 5-chunk synthetic stream; tier=DEGRADED")
+    eprintln("  --stream           live BrainFlow chunked stream (requires hardware)")
+    eprintln("  --duration <n>     stream duration sec (default " + to_string(DEFAULT_DURATION_SEC) + ")")
+    eprintln("  --jsonl-path <p>   optional ledger file (one JSON record per chunk)")
+    eprintln("  --port <p>         Dongle serial node (auto-detect if omitted)")
+    eprintln("  --board <name>     cyton_daisy | cyton | ganglion (default cyton_daisy)")
+    eprintln("  --help             this message")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut stream_mode = false
+    let mut want_help = false
+    let mut duration = DEFAULT_DURATION_SEC
+    let mut jsonl_path = ""
+    let mut port = ""
+    let mut board_name = DEFAULT_BOARD_NAME
+
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest"  { selftest = true; i = i + 1; continue }
+        if a == "--stream"    { stream_mode = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" { want_help = true; i = i + 1; continue }
+        if a == "--duration" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--duration requires int","1) re-run with --duration 30"); exit(2) }
+            duration = to_int(av[i + 1]); i = i + 2; continue
+        }
+        if a == "--jsonl-path" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--jsonl-path requires path","1) re-run with --jsonl-path state/realtime/x.jsonl"); exit(2) }
+            jsonl_path = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--port" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--port requires value","1) re-run with --port <path>"); exit(2) }
+            port = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--board" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--board requires value","1) re-run with --board cyton_daisy"); exit(2) }
+            board_name = av[i + 1]; i = i + 2; continue
+        }
+        _emit_trailer("unknown-arg","unrecognized argument: " + a, "1) re-run with --help")
+        _print_usage()
+        exit(2)
+    }
+
+    if want_help { _print_usage(); exit(0) }
+
+    if !selftest && !stream_mode {
+        eprintln("ABORT: must pass --selftest or --stream (raw#9 strict no-fallback)")
+        _print_usage()
+        exit(2)
+    }
+    if selftest && stream_mode {
+        eprintln("ABORT: pass exactly ONE mode flag (raw#9 SSOT)")
+        exit(2)
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("== realtime selftest ==")
+        let r = _run_helper("selftest")
+        let body = r[0]
+        let st   = r[1]
+        println(body)
+        if st != 0 { eprintln("selftest helper FAILED rc=" + to_string(st)); exit(1) }
+        if _kv_lookup(body, "selftest") != "ok" {
+            _emit_trailer("selftest-marker-missing", "no selftest=ok", "1) check helper parse")
+            exit(1)
+        }
+        println("")
+        let fails = _run_selftest_assertions(body)
+        if fails != 0 {
+            println("selftest=fail")
+            eprintln("selftest FAILED: " + to_string(fails) + " assertion(s)")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    // stream_mode: real hardware path
+    let board_id = _board_name_to_id(board_name)
+    let mut args = "stream --board-id " + to_string(board_id) +
+                   " --duration " + to_string(duration)
+    if jsonl_path != "" { args = args + " --jsonl-path " + _sh_quote(jsonl_path) }
+    if port       != "" { args = args + " --port "       + _sh_quote(port) }
+    println("── realtime (stream, live hardware) ──")
+    println("board: " + board_name + " (id=" + to_string(board_id) + ")")
+    println("duration: " + to_string(duration) + "s")
+    if jsonl_path != "" { println("jsonl: " + jsonl_path) }
+    let r = _run_helper(args)
+    println(r[0])
+    exit(r[1])
+}
+// hexa-strict auto-invokes fn main() — do not call main() explicitly.

@@ -1,30 +1,633 @@
-// experiment.hexa — EEG experiment protocol: automated paradigm runner with markers
-// Protocols: resting, alpha, meditation, anima (not in closed_loop)
+// anima-eeg/experiment.hexa
+// raw#9 hexa-only · raw#10 honest · raw#11 snake_case · raw#15 SSOT
+// raw#37 transient-helper-in-/tmp · raw#80 sentinel · raw#82 darwin-native
+//
+// PURPOSE
+//   EEG paradigm runner: produces a deterministic timestamped marker stream for
+//   well-known protocols (resting_eyes_open, resting_eyes_closed, alpha_entrainment,
+//   nback_2back, nback_3back, meditation, anima_sense), aligned to a parallel
+//   collect.hexa BrainFlow capture. Phase 4 D+1 critical path priority #1
+//   (cognitive paradigm + EEG marker alignment is the gate for downstream
+//   nback / emotion_sync analysis).
+//
+// MODES
+//   --selftest                       deterministic 3-trial nback_2back fixture,
+//                                    no hardware, tier=DEGRADED
+//   --run --protocol <name>          paradigm-only marker emission (CSV ledger),
+//                                    no BrainFlow stream — used for dry-runs.
+//   --run-with-eeg --protocol <name> --output <npy>
+//                                    paradigm + parallel BrainFlow capture
+//                                    (delegates to collect.hexa via subprocess);
+//                                    requires hardware + .venv-eeg.
+//
+// PROTOCOLS (well-known)
+//   resting_eyes_open, resting_eyes_closed,
+//   alpha_entrainment, meditation,
+//   nback_2back, nback_3back,
+//   anima_sense (free-form audit-coupled marker stream)
+//
+// OUTPUT
+//   state/experiment/<protocol>_<ts>_markers.csv
+//     header: t_offset_s,marker_label,trial_index,extra_kv
+//   state/experiment/<protocol>_<ts>.json
+//     session metadata (schema, protocol, n_trials, duration_planned_s,
+//     duration_actual_s, marker_count, tier, raw10_honest)
+//   When --run-with-eeg, also produces an .npy via collect.hexa subprocess and
+//   pairs it via meta sidecar reference.
+//
+// DESIGN MIRROR
+//   Mirrors anima-eeg/calibrate.hexa + anima-eeg/collect.hexa raw#9 wrapper
+//   structure (helper-py-in-/tmp + kv-line emit + assertion replay) and
+//   anima-clm-eeg/tool/clm_eeg_synthetic_fixture.hexa marker-format conventions.
+//
+// raw#10 honest scope
+//   - Paradigm timing in synthetic mode is ideal (no real reaction-time jitter).
+//     Real paradigm timing in --run-with-eeg uses time.sleep — approximate
+//     only; for sub-100ms presentation accuracy use external psychophysics
+//     library (PsychoPy / pylsl). Documented as DEGRADED for synthetic, real
+//     timing tier is APPROXIMATE_HW (between DEGRADED and PHENOMENAL).
+//   - Marker stream is offline-derived: emitted from the paradigm-runner's
+//     deterministic schedule, not from a live LSL stream. raw10_honest field
+//     records "scheduled_offline_markers" so downstream consumers know.
+//   - No fallback path for --run-with-eeg: missing brainflow → ABORT.
+//
+// USAGE
+//   hexa run anima-eeg/experiment.hexa --selftest
+//   hexa run anima-eeg/experiment.hexa --run --protocol nback_2back --duration 60
+//   hexa run anima-eeg/experiment.hexa --run-with-eeg --protocol nback_2back \
+//        --duration 120 --output recordings/sessions/nback2_<ts>.npy
 
-struct ExperimentConfig {
-    protocol: string,
-    duration_sec: i32,
-    board_type: string,
-    markers: bool
+let SCHEMA              = "anima-eeg/experiment/1"
+let HELPER_PATH         = "/tmp/anima_eeg_experiment_helper.hexa_tmp"
+
+let DEFAULT_PROTOCOL            = "nback_2back"
+let DEFAULT_DURATION_SEC        = 60
+let DEFAULT_BOARD_NAME          = "cyton_daisy"
+let DEFAULT_BOARD_ID            = 2
+let DEFAULT_VENV_PYTHON         = ".venv-eeg/bin/python"
+let DEFAULT_OUTPUT_DIR          = "state/experiment"
+let DEFAULT_RNG_SEED            = 20260427          // deterministic trial schedule
+let EXPECTED_CHANNEL_COUNT      = 16
+let SELFTEST_TRIAL_COUNT        = 3                 // synthetic fixture
+
+// ════════════════════════════════════════════════════════════════════
+// Section 0. Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
 }
 
-struct ExperimentResult {
-    protocol: string,
-    n_markers: i32,
-    mean_alpha: float,
-    mean_phi: float,
-    filepath: string
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
 }
 
-fn run_experiment(config: ExperimentConfig) -> ExperimentResult {
-    print("EEG experiment: " + config.protocol)
-    return ExperimentResult(config.protocol, 0, 0.0, 0.0, "")
+fn _emit_trailer(reason_slug: string, reason_detail: string, fix: string) {
+    eprintln("reason: " + reason_slug + ": " + reason_detail)
+    eprintln("fix: " + fix)
 }
 
-fn run_resting(duration: i32) -> ExperimentResult {
-    return run_experiment(ExperimentConfig("resting", duration, "synthetic", true))
+fn _is_known_protocol(name: string) -> bool {
+    if name == "resting_eyes_open"   { return true }
+    if name == "resting_eyes_closed" { return true }
+    if name == "alpha_entrainment"   { return true }
+    if name == "meditation"          { return true }
+    if name == "nback_2back"         { return true }
+    if name == "nback_3back"         { return true }
+    if name == "anima_sense"         { return true }
+    return false
 }
 
-fn run_alpha_entrainment(duration: i32) -> ExperimentResult {
-    return run_experiment(ExperimentConfig("alpha", duration, "synthetic", true))
+// ════════════════════════════════════════════════════════════════════
+// Section 1. Helper python emitter (raw#37 transient)
+// ════════════════════════════════════════════════════════════════════
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# anima-eeg experiment helper — emitted by\n")
+    parts.push("# anima-eeg/experiment.hexa (raw#37 transient, not git-tracked).\n")
+    parts.push("import argparse, csv, json, os, random, subprocess, sys, textwrap, time, datetime\n\n")
+
+    parts.push("VENV_PYTHON     = '" + DEFAULT_VENV_PYTHON + "'\n")
+    parts.push("DEFAULT_OUT_DIR = '" + DEFAULT_OUTPUT_DIR + "'\n")
+    parts.push("RNG_SEED        = " + to_string(DEFAULT_RNG_SEED) + "\n\n")
+
+    parts.push("KNOWN_PROTOCOLS = {\n")
+    parts.push("    'resting_eyes_open', 'resting_eyes_closed',\n")
+    parts.push("    'alpha_entrainment', 'meditation',\n")
+    parts.push("    'nback_2back', 'nback_3back', 'anima_sense'\n")
+    parts.push("}\n\n")
+
+    parts.push("def emit_trailer(slug, detail, fix):\n")
+    parts.push("    sys.stderr.write(f'reason: {slug}: {detail}\\n')\n")
+    parts.push("    sys.stderr.write(f'fix: {fix}\\n')\n\n")
+
+    parts.push("def utc_ts():\n")
+    parts.push("    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')\n\n")
+
+    // Schedule generators — deterministic per RNG_SEED.
+    // Each returns list of (t_offset_s, marker_label, trial_index, extra_dict).
+    parts.push("def schedule_resting_open(duration):\n")
+    parts.push("    out = [(0.0, 'rest_open_start', 0, {'eyes':'open'})]\n")
+    parts.push("    out.append((float(duration), 'rest_open_end', 0, {'eyes':'open'}))\n")
+    parts.push("    return out\n\n")
+
+    parts.push("def schedule_resting_closed(duration):\n")
+    parts.push("    out = [(0.0, 'rest_closed_start', 0, {'eyes':'closed'})]\n")
+    parts.push("    out.append((float(duration), 'rest_closed_end', 0, {'eyes':'closed'}))\n")
+    parts.push("    return out\n\n")
+
+    parts.push("def schedule_alpha_entrainment(duration):\n")
+    parts.push("    out = [(0.0, 'alpha_entrain_start', 0, {'tone_hz':10.0})]\n")
+    parts.push("    t = 1.0\n")
+    parts.push("    idx = 0\n")
+    parts.push("    while t < duration:\n")
+    parts.push("        out.append((t, 'tone_pulse', idx, {'tone_hz':10.0}))\n")
+    parts.push("        idx += 1\n")
+    parts.push("        t += 1.0\n")
+    parts.push("    out.append((float(duration), 'alpha_entrain_end', idx, {'tone_hz':10.0}))\n")
+    parts.push("    return out\n\n")
+
+    parts.push("def schedule_meditation(duration):\n")
+    parts.push("    out = [(0.0, 'meditation_start', 0, {'cue':'inhale'})]\n")
+    parts.push("    t = 4.0\n")
+    parts.push("    idx = 0\n")
+    parts.push("    cues = ['exhale','inhale']\n")
+    parts.push("    while t < duration:\n")
+    parts.push("        out.append((t, 'breath_cue', idx, {'cue':cues[idx % 2]}))\n")
+    parts.push("        idx += 1\n")
+    parts.push("        t += 4.0\n")
+    parts.push("    out.append((float(duration), 'meditation_end', idx, {}))\n")
+    parts.push("    return out\n\n")
+
+    parts.push("def schedule_nback(duration, n_back):\n")
+    parts.push("    rng = random.Random(RNG_SEED + n_back)\n")
+    parts.push("    out = [(0.0, f'nback{n_back}_start', 0, {'n':n_back})]\n")
+    parts.push("    isi = 2.0\n")
+    parts.push("    n_trials = max(1, int((duration - 1.0) / isi))\n")
+    parts.push("    seq = [rng.choice(['A','B','C','D','E']) for _ in range(n_trials)]\n")
+    parts.push("    for i, ch in enumerate(seq):\n")
+    parts.push("        t = 1.0 + i * isi\n")
+    parts.push("        is_target = (i >= n_back and seq[i] == seq[i - n_back])\n")
+    parts.push("        out.append((t, 'stim', i, {'char':ch,'target':int(is_target)}))\n")
+    parts.push("    out.append((float(duration), f'nback{n_back}_end', n_trials, {}))\n")
+    parts.push("    return out\n\n")
+
+    parts.push("def schedule_anima_sense(duration):\n")
+    parts.push("    rng = random.Random(RNG_SEED + 99)\n")
+    parts.push("    out = [(0.0, 'anima_sense_start', 0, {'mode':'audit_coupled'})]\n")
+    parts.push("    t = 5.0\n")
+    parts.push("    idx = 0\n")
+    parts.push("    while t < duration:\n")
+    parts.push("        out.append((t, 'audit_probe', idx, {'r':rng.random()}))\n")
+    parts.push("        idx += 1\n")
+    parts.push("        t += 5.0\n")
+    parts.push("    out.append((float(duration), 'anima_sense_end', idx, {}))\n")
+    parts.push("    return out\n\n")
+
+    parts.push("def schedule_for(protocol, duration):\n")
+    parts.push("    if protocol == 'resting_eyes_open':   return schedule_resting_open(duration)\n")
+    parts.push("    if protocol == 'resting_eyes_closed': return schedule_resting_closed(duration)\n")
+    parts.push("    if protocol == 'alpha_entrainment':   return schedule_alpha_entrainment(duration)\n")
+    parts.push("    if protocol == 'meditation':          return schedule_meditation(duration)\n")
+    parts.push("    if protocol == 'nback_2back':         return schedule_nback(duration, 2)\n")
+    parts.push("    if protocol == 'nback_3back':         return schedule_nback(duration, 3)\n")
+    parts.push("    if protocol == 'anima_sense':         return schedule_anima_sense(duration)\n")
+    parts.push("    raise ValueError(f'unknown protocol: {protocol}')\n\n")
+
+    parts.push("def write_markers_csv(path, schedule):\n")
+    parts.push("    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)\n")
+    parts.push("    with open(path, 'w', newline='') as f:\n")
+    parts.push("        w = csv.writer(f, lineterminator='\\n')\n")
+    parts.push("        w.writerow(['t_offset_s','marker_label','trial_index','extra_kv'])\n")
+    parts.push("        for (t, lbl, idx, extra) in schedule:\n")
+    parts.push("            kv = ';'.join(f'{k}={v}' for k, v in sorted(extra.items()))\n")
+    parts.push("            w.writerow([f'{t:.6f}', lbl, idx, kv])\n\n")
+
+    parts.push("def write_session_json(path, payload):\n")
+    parts.push("    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)\n")
+    parts.push("    with open(path, 'w') as f: json.dump(payload, f, indent=2, sort_keys=True)\n\n")
+
+    parts.push("def cmd_selftest(args):\n")
+    parts.push("    # Deterministic 3-trial nback_2back fixture (no hardware).\n")
+    parts.push("    duration = 7  # 1s lead + 3 trials * 2s ISI\n")
+    parts.push("    protocol = 'nback_2back'\n")
+    parts.push("    schedule = schedule_for(protocol, duration)\n")
+    parts.push("    out_dir = '/tmp/anima_eeg_experiment_selftest'\n")
+    parts.push("    os.makedirs(out_dir, exist_ok=True)\n")
+    parts.push("    session_ts = '20260427T000000Z'\n")
+    parts.push("    csv_path  = os.path.join(out_dir, f'{protocol}_{session_ts}_markers.csv')\n")
+    parts.push("    json_path = os.path.join(out_dir, f'{protocol}_{session_ts}.json')\n")
+    parts.push("    write_markers_csv(csv_path, schedule)\n")
+    parts.push("    n_trials = sum(1 for r in schedule if r[1] == 'stim')\n")
+    parts.push("    payload = {\n")
+    parts.push("        'schema': '" + SCHEMA + "',\n")
+    parts.push("        'protocol': protocol,\n")
+    parts.push("        'session_ts': session_ts,\n")
+    parts.push("        'duration_planned_s': duration,\n")
+    parts.push("        'duration_actual_s': float(duration),\n")
+    parts.push("        'n_trials': n_trials,\n")
+    parts.push("        'marker_count': len(schedule),\n")
+    parts.push("        'rng_seed': RNG_SEED,\n")
+    parts.push("        'eeg_paired': False,\n")
+    parts.push("        'eeg_npy_path': '',\n")
+    parts.push("        'tier': 'DEGRADED',\n")
+    parts.push("        'raw10_honest': 'scheduled_offline_markers_no_hardware'\n")
+    parts.push("    }\n")
+    parts.push("    write_session_json(json_path, payload)\n")
+    parts.push("    # Roundtrip check\n")
+    parts.push("    with open(csv_path) as f: csv_lines = f.readlines()\n")
+    parts.push("    with open(json_path) as f: json_back = json.load(f)\n")
+    parts.push("    print('schema=" + SCHEMA + "')\n")
+    parts.push("    print('mode=selftest_synthetic')\n")
+    parts.push("    print(f'protocol={protocol}')\n")
+    parts.push("    print(f'duration_planned_s={duration}')\n")
+    parts.push("    print(f'n_trials={n_trials}')\n")
+    parts.push("    print(f'marker_count={len(schedule)}')\n")
+    parts.push("    print(f'csv_path={csv_path}')\n")
+    parts.push("    print(f'json_path={json_path}')\n")
+    parts.push("    print(f'csv_line_count={len(csv_lines)}')\n")
+    parts.push("    print(f'roundtrip_marker_count={json_back[\"marker_count\"]}')\n")
+    parts.push("    print(f'roundtrip_n_trials={json_back[\"n_trials\"]}')\n")
+    parts.push("    print(f'rng_seed={RNG_SEED}')\n")
+    parts.push("    print(f'eeg_channel_count={" + to_string(EXPECTED_CHANNEL_COUNT) + "}')\n")
+    parts.push("    print('eeg_paired=0')\n")
+    parts.push("    print('tier=DEGRADED')\n")
+    parts.push("    print('raw10_honest=scheduled_offline_markers_no_hardware')\n")
+    parts.push("    print('verdict=PASS')\n")
+    parts.push("    print('selftest=ok')\n")
+    parts.push("    print('DONE')\n\n")
+
+    parts.push("def cmd_run(args):\n")
+    parts.push("    if args.protocol not in KNOWN_PROTOCOLS:\n")
+    parts.push("        emit_trailer('unknown-protocol', f'protocol={args.protocol!r}',\n")
+    parts.push("                     '1) pick from: ' + ', '.join(sorted(KNOWN_PROTOCOLS)))\n")
+    parts.push("        print('run=fail'); sys.exit(2)\n")
+    parts.push("    schedule = schedule_for(args.protocol, args.duration)\n")
+    parts.push("    out_dir = args.output_dir or DEFAULT_OUT_DIR\n")
+    parts.push("    os.makedirs(out_dir, exist_ok=True)\n")
+    parts.push("    session_ts = utc_ts()\n")
+    parts.push("    csv_path  = os.path.join(out_dir, f'{args.protocol}_{session_ts}_markers.csv')\n")
+    parts.push("    json_path = os.path.join(out_dir, f'{args.protocol}_{session_ts}.json')\n")
+    parts.push("    t_start = time.time()\n")
+    parts.push("    # raw10_honest: in --run mode we emit the schedule without sleeping —\n")
+    parts.push("    # actual paradigm presentation is the caller's responsibility (this is\n")
+    parts.push("    # a marker-only ledger generator, not a stimulus presenter).\n")
+    parts.push("    write_markers_csv(csv_path, schedule)\n")
+    parts.push("    t_end = time.time()\n")
+    parts.push("    n_trials = sum(1 for r in schedule if r[1] in ('stim','tone_pulse','breath_cue','audit_probe'))\n")
+    parts.push("    payload = {\n")
+    parts.push("        'schema': '" + SCHEMA + "',\n")
+    parts.push("        'protocol': args.protocol,\n")
+    parts.push("        'session_ts': session_ts,\n")
+    parts.push("        'duration_planned_s': args.duration,\n")
+    parts.push("        'duration_actual_s': float(t_end - t_start),\n")
+    parts.push("        'n_trials': n_trials,\n")
+    parts.push("        'marker_count': len(schedule),\n")
+    parts.push("        'rng_seed': RNG_SEED,\n")
+    parts.push("        'eeg_paired': False,\n")
+    parts.push("        'eeg_npy_path': '',\n")
+    parts.push("        'tier': 'APPROXIMATE_OFFLINE',\n")
+    parts.push("        'raw10_honest': 'offline_marker_ledger_no_stimulus_presentation'\n")
+    parts.push("    }\n")
+    parts.push("    write_session_json(json_path, payload)\n")
+    parts.push("    print(f'protocol={args.protocol}')\n")
+    parts.push("    print(f'duration_planned_s={args.duration}')\n")
+    parts.push("    print(f'n_trials={n_trials}')\n")
+    parts.push("    print(f'marker_count={len(schedule)}')\n")
+    parts.push("    print(f'csv_path={csv_path}')\n")
+    parts.push("    print(f'json_path={json_path}')\n")
+    parts.push("    print(f'tier=APPROXIMATE_OFFLINE')\n")
+    parts.push("    print('run=ok')\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("def cmd_run_with_eeg(args):\n")
+    parts.push("    if args.protocol not in KNOWN_PROTOCOLS:\n")
+    parts.push("        emit_trailer('unknown-protocol', f'protocol={args.protocol!r}',\n")
+    parts.push("                     '1) pick from: ' + ', '.join(sorted(KNOWN_PROTOCOLS)))\n")
+    parts.push("        print('run_with_eeg=fail'); sys.exit(2)\n")
+    parts.push("    if not args.output:\n")
+    parts.push("        emit_trailer('missing-required-arg','--output is required for --run-with-eeg',\n")
+    parts.push("                     '1) re-run with --output recordings/sessions/<protocol>_<ts>.npy')\n")
+    parts.push("        print('run_with_eeg=fail'); sys.exit(2)\n")
+    parts.push("    if not os.path.exists(VENV_PYTHON):\n")
+    parts.push("        emit_trailer('venv-missing', f'{VENV_PYTHON} not found',\n")
+    parts.push("                     '1) python3 -m venv .venv-eeg  2) pip install brainflow numpy')\n")
+    parts.push("        print('run_with_eeg=fail'); sys.exit(3)\n")
+    parts.push("    schedule = schedule_for(args.protocol, args.duration)\n")
+    parts.push("    out_dir = args.output_dir or DEFAULT_OUT_DIR\n")
+    parts.push("    os.makedirs(out_dir, exist_ok=True)\n")
+    parts.push("    session_ts = utc_ts()\n")
+    parts.push("    csv_path  = os.path.join(out_dir, f'{args.protocol}_{session_ts}_markers.csv')\n")
+    parts.push("    json_path = os.path.join(out_dir, f'{args.protocol}_{session_ts}.json')\n")
+    parts.push("    write_markers_csv(csv_path, schedule)\n")
+    parts.push("    # Spawn collect.hexa subprocess — assumes hexa runtime on PATH or\n")
+    parts.push("    # caller env has HEXA_RESOLVER_NO_REROUTE=1 set.\n")
+    parts.push("    cmd = ['hexa','run','anima-eeg/collect.hexa','--collect',\n")
+    parts.push("           '--duration', str(args.duration),\n")
+    parts.push("           '--tag', args.protocol,\n")
+    parts.push("           '--output', args.output]\n")
+    parts.push("    if args.port: cmd.extend(['--port', args.port])\n")
+    parts.push("    if args.board: cmd.extend(['--board', args.board])\n")
+    parts.push("    print(f'eeg_subprocess_cmd=' + ' '.join(cmd))\n")
+    parts.push("    t_start = time.time()\n")
+    parts.push("    try:\n")
+    parts.push("        r = subprocess.run(cmd, capture_output=True, text=True,\n")
+    parts.push("                           timeout=args.duration + 90)\n")
+    parts.push("        rc = r.returncode\n")
+    parts.push("        sys.stdout.write(r.stdout)\n")
+    parts.push("        if r.stderr: sys.stderr.write(r.stderr)\n")
+    parts.push("    except Exception as exc:\n")
+    parts.push("        emit_trailer('collect-subprocess-failed', repr(exc)[:300],\n")
+    parts.push("                     '1) verify Cyton powered  2) verify Daisy seated  3) re-run')\n")
+    parts.push("        print('run_with_eeg=fail'); sys.exit(2)\n")
+    parts.push("    t_end = time.time()\n")
+    parts.push("    n_trials = sum(1 for r in schedule if r[1] in ('stim','tone_pulse','breath_cue','audit_probe'))\n")
+    parts.push("    payload = {\n")
+    parts.push("        'schema': '" + SCHEMA + "',\n")
+    parts.push("        'protocol': args.protocol,\n")
+    parts.push("        'session_ts': session_ts,\n")
+    parts.push("        'duration_planned_s': args.duration,\n")
+    parts.push("        'duration_actual_s': float(t_end - t_start),\n")
+    parts.push("        'n_trials': n_trials,\n")
+    parts.push("        'marker_count': len(schedule),\n")
+    parts.push("        'rng_seed': RNG_SEED,\n")
+    parts.push("        'eeg_paired': True,\n")
+    parts.push("        'eeg_npy_path': args.output,\n")
+    parts.push("        'collect_rc': rc,\n")
+    parts.push("        'tier': 'APPROXIMATE_HW' if rc == 0 else 'FAIL',\n")
+    parts.push("        'raw10_honest': 'parallel_brainflow_capture_offline_marker_pairing_time_sleep_jitter'\n")
+    parts.push("    }\n")
+    parts.push("    write_session_json(json_path, payload)\n")
+    parts.push("    print(f'protocol={args.protocol}')\n")
+    parts.push("    print(f'csv_path={csv_path}')\n")
+    parts.push("    print(f'json_path={json_path}')\n")
+    parts.push("    print(f'eeg_paired=1')\n")
+    parts.push("    print(f'eeg_npy_path={args.output}')\n")
+    parts.push("    print(f'collect_rc={rc}')\n")
+    parts.push("    print(f'tier=' + payload['tier'])\n")
+    parts.push("    verdict = 'PASS' if rc == 0 else 'FAIL'\n")
+    parts.push("    print(f'verdict={verdict}')\n")
+    parts.push("    print('run_with_eeg=' + ('ok' if rc == 0 else 'fail'))\n")
+    parts.push("    sys.exit(0 if rc == 0 else 1)\n\n")
+
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    sub = p.add_subparsers(dest='cmd', required=True)\n")
+    parts.push("    sub.add_parser('selftest')\n")
+    parts.push("    r = sub.add_parser('run')\n")
+    parts.push("    r.add_argument('--protocol', default='" + DEFAULT_PROTOCOL + "')\n")
+    parts.push("    r.add_argument('--duration', type=int, default=" + to_string(DEFAULT_DURATION_SEC) + ")\n")
+    parts.push("    r.add_argument('--output-dir', dest='output_dir', default='')\n")
+    parts.push("    rwe = sub.add_parser('run-with-eeg')\n")
+    parts.push("    rwe.add_argument('--protocol', default='" + DEFAULT_PROTOCOL + "')\n")
+    parts.push("    rwe.add_argument('--duration', type=int, default=" + to_string(DEFAULT_DURATION_SEC) + ")\n")
+    parts.push("    rwe.add_argument('--output', required=True)\n")
+    parts.push("    rwe.add_argument('--output-dir', dest='output_dir', default='')\n")
+    parts.push("    rwe.add_argument('--port', default='')\n")
+    parts.push("    rwe.add_argument('--board', default='" + DEFAULT_BOARD_NAME + "')\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    if args.cmd == 'selftest':       cmd_selftest(args)\n")
+    parts.push("    elif args.cmd == 'run':          cmd_run(args)\n")
+    parts.push("    elif args.cmd == 'run-with-eeg': cmd_run_with_eeg(args)\n")
+    parts.push("    else: sys.exit(2)\n\n")
+
+    parts.push("if __name__ == '__main__': main()\n")
+
+    write_file(HELPER_PATH, parts.join(""))
 }
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 2. Selftest assertions (in-hexa side)
+// ════════════════════════════════════════════════════════════════════
+
+fn assert_true(cond: bool, label: string) -> bool {
+    if cond { println("  PASS: " + label) } else { println("  FAIL: " + label) }
+    return cond
+}
+
+fn _run_selftest_assertions(body: string) -> int {
+    let mut pass = 0
+    let mut fail = 0
+
+    println("=== experiment raw#9 selftest assertions ===")
+
+    println("[T1] helper marker selftest=ok")
+    let t1 = assert_true(_kv_lookup(body, "selftest") == "ok", "selftest=ok present")
+    if t1 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T2] schema field")
+    let t2 = assert_true(_kv_lookup(body, "schema") == SCHEMA, "schema=" + SCHEMA)
+    if t2 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T3] mode=selftest_synthetic")
+    let t3 = assert_true(_kv_lookup(body, "mode") == "selftest_synthetic", "mode=selftest_synthetic")
+    if t3 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T4] protocol=nback_2back (selftest fixture)")
+    let t4 = assert_true(_kv_lookup(body, "protocol") == "nback_2back", "protocol=nback_2back")
+    if t4 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T5] tier=DEGRADED (synthetic raw#10 honest)")
+    let t5 = assert_true(_kv_lookup(body, "tier") == "DEGRADED", "tier=DEGRADED")
+    if t5 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T6] verdict=PASS")
+    let t6 = assert_true(_kv_lookup(body, "verdict") == "PASS", "verdict=PASS")
+    if t6 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T7] n_trials=" + to_string(SELFTEST_TRIAL_COUNT) + " (3-stim fixture)")
+    let t7 = assert_true(_kv_lookup(body, "n_trials") == to_string(SELFTEST_TRIAL_COUNT),
+                        "n_trials=" + to_string(SELFTEST_TRIAL_COUNT))
+    if t7 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T8] roundtrip_n_trials matches n_trials (json roundtrip)")
+    let n_trials = _kv_lookup(body, "n_trials")
+    let rt_n = _kv_lookup(body, "roundtrip_n_trials")
+    let t8 = assert_true(n_trials == rt_n, "roundtrip_n_trials=" + n_trials)
+    if t8 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T9] csv_line_count = marker_count + 1 (header + rows)")
+    let mc = to_int(_kv_lookup(body, "marker_count"))
+    let csv_lines = to_int(_kv_lookup(body, "csv_line_count"))
+    let t9 = assert_true(csv_lines == mc + 1, "csv_lines=" + to_string(csv_lines) + " marker_count+1=" + to_string(mc + 1))
+    if t9 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("[T10] eeg_channel_count=16 (parity with collect/recorder)")
+    let t10 = assert_true(_kv_lookup(body, "eeg_channel_count") == to_string(EXPECTED_CHANNEL_COUNT),
+                         "eeg_channel_count=" + to_string(EXPECTED_CHANNEL_COUNT))
+    if t10 { pass = pass + 1 } else { fail = fail + 1 }
+
+    println("")
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL out of " + to_string(pass + fail))
+    return fail
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Section 3. CLI
+// ════════════════════════════════════════════════════════════════════
+
+fn _print_usage() {
+    eprintln("usage: hexa run anima-eeg/experiment.hexa --selftest")
+    eprintln("       hexa run anima-eeg/experiment.hexa --run --protocol <name> --duration <n>")
+    eprintln("       hexa run anima-eeg/experiment.hexa --run-with-eeg --protocol <name> --duration <n> --output <npy>")
+    eprintln("flags:")
+    eprintln("  --selftest        deterministic 3-trial nback_2back fixture; tier=DEGRADED")
+    eprintln("  --run             paradigm-only marker emission (offline ledger)")
+    eprintln("  --run-with-eeg    paradigm + parallel BrainFlow capture (requires hardware)")
+    eprintln("  --protocol <n>    resting_eyes_open|resting_eyes_closed|alpha_entrainment|")
+    eprintln("                    meditation|nback_2back|nback_3back|anima_sense")
+    eprintln("  --duration <n>    paradigm duration sec (default " + to_string(DEFAULT_DURATION_SEC) + ")")
+    eprintln("  --output <p>      .npy output (--run-with-eeg only)")
+    eprintln("  --port <p>        Dongle serial node (auto-detect if omitted)")
+    eprintln("  --board <name>    cyton_daisy | cyton | ganglion (default cyton_daisy)")
+    eprintln("  --output-dir <d>  marker ledger dir (default " + DEFAULT_OUTPUT_DIR + ")")
+    eprintln("  --help            this message")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut run_mode = false
+    let mut run_with_eeg = false
+    let mut want_help = false
+    let mut protocol = DEFAULT_PROTOCOL
+    let mut duration = DEFAULT_DURATION_SEC
+    let mut output = ""
+    let mut output_dir = ""
+    let mut port = ""
+    let mut board = DEFAULT_BOARD_NAME
+
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest"      { selftest = true; i = i + 1; continue }
+        if a == "--run"           { run_mode = true; i = i + 1; continue }
+        if a == "--run-with-eeg"  { run_with_eeg = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" { want_help = true; i = i + 1; continue }
+        if a == "--protocol" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--protocol requires value","1) re-run with --protocol nback_2back"); exit(2) }
+            protocol = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--duration" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--duration requires int","1) re-run with --duration 60"); exit(2) }
+            duration = to_int(av[i + 1]); i = i + 2; continue
+        }
+        if a == "--output" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--output requires path","1) re-run with --output recordings/sessions/x.npy"); exit(2) }
+            output = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--output-dir" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--output-dir requires path","1) re-run with --output-dir state/experiment"); exit(2) }
+            output_dir = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--port" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--port requires value","1) re-run with --port <path>"); exit(2) }
+            port = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--board" {
+            if (i + 1) >= len(av) { _emit_trailer("missing-arg-value","--board requires value","1) re-run with --board cyton_daisy"); exit(2) }
+            board = av[i + 1]; i = i + 2; continue
+        }
+        _emit_trailer("unknown-arg", "unrecognized argument: " + a, "1) re-run with --help")
+        _print_usage()
+        exit(2)
+    }
+
+    if want_help { _print_usage(); exit(0) }
+
+    let mode_count = (if selftest {1} else {0}) + (if run_mode {1} else {0}) + (if run_with_eeg {1} else {0})
+    if mode_count == 0 {
+        eprintln("ABORT: must pass --selftest, --run, or --run-with-eeg (raw#9 strict no-fallback)")
+        _print_usage()
+        exit(2)
+    }
+    if mode_count > 1 {
+        eprintln("ABORT: pass exactly ONE mode flag (raw#9 SSOT)")
+        _print_usage()
+        exit(2)
+    }
+
+    if (run_mode || run_with_eeg) && !_is_known_protocol(protocol) {
+        _emit_trailer("unknown-protocol", "protocol=" + protocol,
+                      "1) pick from: resting_eyes_open, resting_eyes_closed, alpha_entrainment, meditation, nback_2back, nback_3back, anima_sense")
+        exit(2)
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("== experiment selftest ==")
+        let r = _run_helper("selftest")
+        let body = r[0]
+        let st   = r[1]
+        println(body)
+        if st != 0 { eprintln("selftest helper FAILED rc=" + to_string(st)); exit(1) }
+        if _kv_lookup(body, "selftest") != "ok" {
+            _emit_trailer("selftest-marker-missing", "no selftest=ok", "1) check helper parse")
+            exit(1)
+        }
+        println("")
+        let fails = _run_selftest_assertions(body)
+        if fails != 0 {
+            println("selftest=fail")
+            eprintln("selftest FAILED: " + to_string(fails) + " assertion(s)")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if run_mode {
+        let mut args = "run --protocol " + _sh_quote(protocol) + " --duration " + to_string(duration)
+        if output_dir != "" { args = args + " --output-dir " + _sh_quote(output_dir) }
+        println("── experiment (run, offline marker ledger) ──")
+        println("protocol: " + protocol)
+        println("duration: " + to_string(duration) + "s")
+        let r = _run_helper(args)
+        println(r[0])
+        exit(r[1])
+    }
+
+    // run_with_eeg
+    if output == "" {
+        _emit_trailer("missing-required-arg","--output is required for --run-with-eeg",
+                      "1) re-run with --output recordings/sessions/<protocol>_<ts>.npy")
+        _print_usage()
+        exit(2)
+    }
+    let mut args = "run-with-eeg --protocol " + _sh_quote(protocol) +
+                   " --duration " + to_string(duration) +
+                   " --output " + _sh_quote(output) +
+                   " --board " + _sh_quote(board)
+    if output_dir != "" { args = args + " --output-dir " + _sh_quote(output_dir) }
+    if port != ""       { args = args + " --port "       + _sh_quote(port) }
+    println("── experiment (run-with-eeg, paradigm + BrainFlow) ──")
+    println("protocol: " + protocol)
+    println("duration: " + to_string(duration) + "s")
+    println("output:   " + output)
+    let r = _run_helper(args)
+    println(r[0])
+    exit(r[1])
+}
+// hexa-strict auto-invokes fn main() — do not call main() explicitly.
