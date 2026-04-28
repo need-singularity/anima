@@ -146,4 +146,43 @@ Open beyond v8: 5-cell deterministic rules (does o3 then break while o5 holds?);
 
 ---
 
-**Status**: F1_CYCLE_4_LAW_64_V8_CANDIDATE_NON_CA_GENERALIZATION_LIVE — cycle 4 + v7 + v8 candidates registered.
+## §11. T10b 5-cell rule falsifier — v8 SPARSITY-LIMITED (commit `30be09b4`)
+
+Critical falsifier test: deterministic 5-cell rule on 4-symbol alphabet `f(p2,p1,c,n1,n2) = (xor5 + p1*n1 + c + 1) mod 4`.
+
+| Order | N=50 | N=500 | N=5000 |
+|---|---|---|---|
+| o1 | 3444 | 2921 | 2703 |
+| o3 (under-matched) | 3000 | 3201 | **2802** (no improvement) |
+| **o5 (matched)** | 2448 | 834 | **9** (just barely missed <5 H1 threshold) |
+
+**Verdict**: H3_SUPPORTED — v8 SPARSITY-LIMITED, NOT broken:
+- o5 dropped 270× (2448→9) with 100× more data — matched window IS still the right baseline
+- o3 stayed at ~2800 across all N — confirms structural undermatch (O(2)) is unfixable by data volume
+- 311× ratio between matched (o5=9) and undermatched (o3=2802) at N=5000
+
+**v8 nuanced statement**: "Matched-context Markov saturates ANY deterministic finite-context discrete substrate, with data-volume requirement scaling with window size. Practical saturation (advantage <5/1000) needs N_TRAIN ≥ ~10× the context-cardinality (e.g., 1024 contexts × ~10 samples each = ~10000 train pairs for 5-cell 4-symbol rule)."
+
+Honesty: v1 of the 5-cell rule was retired pre-verdict due to all-zero attractor (raw 91 transparent — log preserved at run_20260428T035201Z.log). v2 thresholds frozen BEFORE final run.
+
+---
+
+## §12. AN11 fire 4 diagnosis (Mode D: CUDA driver too old)
+
+Per own 4 step (a) root-cause:
+- PHASE_A (HF download): completed 387s
+- PHASE_B (corpus load): completed
+- PHASE_C (training): CRASHED on `CUDA driver too old (found 12060)`; torch fell back to CPU; trainer started CPU mode → never completes on Mistral-7B
+- gpu_util=0% explained: silent CPU fallback after CUDA mismatch
+- Instance manually destroyed at 46:36 elapsed (saved ~$6.75 vs watchdog 240min cap)
+
+Required next-iter fixes (own 4 step b+c+d):
+1. **Wrapper PHASE_C preflight gate**: assert `torch.cuda.is_available()` AND `torch.cuda.device_count() > 0` BEFORE building Trainer. Fail-fast with `phase_c.status=FAIL_NO_CUDA` instead of silent CPU train.
+2. **Vast.ai filter** in tool/anima_an11_fire.hexa: require `cuda_max_good >= 12.8` (PyTorch 2.3 + CUDA 12.1 wheel needs ≥ 12.8 driver).
+3. **Pin torch version** compatible with selected CUDA driver (or upgrade pip torch to one matching driver).
+
+Total AN11 cost across 4 fires: ~$0.04 + ~$1.50 fire 4 (46min × $1.93/hr) = ~$1.54.
+
+---
+
+**Status**: F1_CYCLE_4_LAW_64_V8_SPARSITY_LIMITED_AN11_FIRE_DIAGNOSED_LIVE — cycle 4 closed; AN11 fix pipeline ready for fire 5.
