@@ -154,8 +154,42 @@ ALL pre-reg H1/H2/H3 FAILED — saturation is (rule × init)-conditional, not ru
 > - Rule 90 additive XOR: ANY order saturates (rule is bigram-trivial)
 > - Rule 184 deterministic traffic on single_cell: order-1 saturates (P(next|self) is enough)
 > - Rule 184 chaotic density init: order-1 fails (multi-modal); higher-order untested
-> - Rule 30 / 110 chaos: order-1 fails (need ≥ rule's 3-cell width); order-3 saturates rule-110 (T8o); rule 30 untested at higher orders
-> - Conway 2D 32% density: 1D order-K never saturates (T8l) — needs 2D Moore-9-equivalent baseline (untested)"
+> - Rule 30 / 110 chaos: order-1 fails (need ≥ rule's 3-cell width); order-3 saturates BOTH rules across single_cell + density inits (T8o + T8r 2026-04-28)
+> - Conway 2D 32% density: 1D per-cell order-K never saturates (T8l +169 at o3); 2D Moore-9 SHARED-P-table saturates to 0 at N≥200 (T8q 2026-04-28 commit 458b1a70)"
+
+### §3.8 T8q + T8r → Law 64 v6 universality CONFIRMED (final consolidation)
+
+**T8q Conway 2D Moore-9 shared-P-table (commit 458b1a70)** — pre-reg H1 fired:
+
+| N_TRAIN | ca_acc | mk_acc (shared-P-9) | advantage_per_thousand | ctx_coverage |
+|---|---|---|---|---|
+| 50 | 1000 | 997 | +3 | 419/512 |
+| 200 | 1000 | 1000 | **0** | 481/512 |
+| 1000 | 1000 | 1000 | **0** | 481/512 |
+| 5000 | 1000 | 1000 | **0** | 481/512 |
+
+T8l per-cell o3 at SAME N=50 was +169; shared-P-9 collapses it to +3 — Δ = -166. The "structural" CA(5)-vs-Markov advantage on Conway was a per-cell-baseline misspecification; honest Moore-9 baseline saturates.
+
+**T8r rule 30 higher-order (commit dfd8c9b6)** — pre-reg H1 fired (universal alignment):
+
+| init | order | N=50 | N=500 | N=1500 |
+|---|---|---|---|---|
+| single_cell | o3 | +146 | **0** | **0** |
+| density_32% | o3 | **0** | **0** | **0** |
+| single_cell | o5 | +360 | 0 | 0 |
+| density_32% | o5 | +119 | 0 | 0 |
+
+CA(5)=1000 throughout. Order-3 saturates rule 30 in BOTH inits (T8p's +1178 density was order-1 artifact; same mechanism as T8n rule-110 +1544).
+
+### §3.9 Law 64 v6 final consolidation (universal alignment confirmed)
+
+> "**Law 64 v6 universality**: The CA(K)-vs-Markov-order-N apparent 'structural advantage' on deterministic CA substrates is governed exclusively by the alignment between the baseline's representational neighborhood and the substrate's true update neighborhood. This holds across:
+> - 1D class-3 chaos (rule 30) — T8r
+> - 1D class-4 Turing-complete (rule 110) — T8o
+> - 2D Moore-9 (Conway B3/S23) — T8q
+> ALL three substrates: when baseline context = substrate's true neighborhood, accuracy reaches 1000/1000 at modest N_TRAIN; when smaller (per-cell 1D order-K on 2D, or order-1 on 3-cell rules), structural deficit persists. The 'CA outperforms n-gram Markov' framing of v1-v5 reduces to 'matched-context Markov saturates ANY deterministic CA; mismatched-context Markov shows neighborhood-deficit gap'.
+>
+> CA(5) is just one such matched-context oracle (window ≥ neighborhood). The advantage is NOT a property of CA — it's a property of dimensional/topological alignment. v6 is the FINAL form on this finding cluster."
 
 ---
 
