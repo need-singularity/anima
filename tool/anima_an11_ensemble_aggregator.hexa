@@ -1,0 +1,186 @@
+// tool/anima_an11_ensemble_aggregator.hexa — R39 ensemble aggregator
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper emitter (raw 37 transient .py) — N results.json files → ensemble.json
+// matching V_phen_GWT registry r11 schema.
+//
+// Usage:
+//   hexa run tool/anima_an11_ensemble_aggregator.hexa --selftest
+//     → emits helper /tmp/anima_an11_ensemble_aggregator_helper.py
+//   /opt/homebrew/bin/python3 /tmp/anima_an11_ensemble_aggregator_helper.py --selftest
+//     → runs helper selftest (mock 2-fire ensemble)
+//   /opt/homebrew/bin/python3 /tmp/anima_an11_ensemble_aggregator_helper.py --aggregate <fire_dir1> ... <output>
+//     → aggregates N fire dirs into ensemble.json
+//
+// raw 9 hexa-only exemption: research-harness Python helper /tmp transient (raw 37 pattern,
+// identical to tool/anima_an11_fire.hexa fire_helper.hexa_tmp). Canonical .hexa wrapper here.
+// raw 12 frozen: R39 verdict criteria
+// raw 91 honest: emits provisional flag for N<5 ensembles
+// ─────────────────────────────────────────────────────────────────────────────
+
+let HELPER_PATH = "/tmp/anima_an11_ensemble_aggregator_helper.py"
+let R39_MIN_ENSEMBLE_SIZE = 5
+let R39_TOP1_STABILITY_MIN = 3
+
+fn _detect_python3() -> str {
+    let candidates = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
+    let mut i = 0
+    while i < candidates.len() {
+        if file_exists(candidates[i]) { return candidates[i] }
+        i = i + 1
+    }
+    return "python3"
+}
+
+fn _emit_helper() -> str {
+    let lines = [
+        "#!/usr/bin/env python3",
+        "# anima_an11_ensemble_aggregator_helper.py — raw 37 transient (emitted by tool/anima_an11_ensemble_aggregator.hexa)",
+        "import sys, os, json, statistics, datetime, tempfile",
+        "",
+        "R39_MIN_ENSEMBLE_SIZE = 5",
+        "R39_TOP1_STABILITY_MIN = 3",
+        "",
+        "def utc():",
+        "    return datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')",
+        "",
+        "def aggregate(fire_dirs, output_path):",
+        "    rows = []",
+        "    for d in fire_dirs:",
+        "        rj = os.path.join(d, 'results.json')",
+        "        if not os.path.exists(rj):",
+        "            print(f'WARN: {rj} missing — skipped', file=sys.stderr)",
+        "            continue",
+        "        try:",
+        "            with open(rj) as f:",
+        "                rows.append(json.load(f))",
+        "        except Exception as e:",
+        "            print(f'WARN: {rj} parse fail: {e}', file=sys.stderr)",
+        "    n = len(rows)",
+        "    if n == 0:",
+        "        print('ERROR: no results.json found', file=sys.stderr); return False",
+        "    seeds = [r.get('an11_seed', -1) for r in rows]",
+        "    frob_vals = [r.get('phase_e_an11_a', {}).get('frob_delta', 0.0) for r in rows]",
+        "    max_cos_vals = [r.get('phase_f_an11_b', {}).get('max_cosine', 0.0) for r in rows]",
+        "    top3_sum_vals = [r.get('phase_f_an11_b', {}).get('top3_sum', 0.0) for r in rows]",
+        "    phi_mip_vals = [r.get('phase_g_v1prime', {}).get('phi_mip_norm', 0.0) for r in rows]",
+        "    family_counts = {}",
+        "    for r in rows:",
+        "        top3 = r.get('phase_f_an11_b', {}).get('top3_pairs', [])",
+        "        if top3:",
+        "            fam = top3[0].get('family', 'Unknown')",
+        "            family_counts[fam] = family_counts.get(fam, 0) + 1",
+        "    dominant = max(family_counts, key=family_counts.get) if family_counts else None",
+        "    max_count = family_counts.get(dominant, 0) if dominant else 0",
+        "    top1_stable = max_count >= R39_TOP1_STABILITY_MIN",
+        "    sm = lambda v: statistics.mean(v) if v else 0",
+        "    sd = lambda v: statistics.stdev(v) if len(v) > 1 else 0",
+        "    frob_mean = sm(frob_vals); frob_stdev = sd(frob_vals)",
+        "    max_cos_mean = sm(max_cos_vals); max_cos_stdev = sd(max_cos_vals)",
+        "    phi_mip_mean = sm(phi_mip_vals); phi_mip_stdev = sd(phi_mip_vals)",
+        "    frob_robust = (frob_stdev < 0.5 * abs(frob_mean)) if abs(frob_mean) > 0 else False",
+        "    a_pass = sum(1 for r in rows if r.get('phase_e_an11_a', {}).get('verdict') == 'PASS')",
+        "    b_pass = sum(1 for r in rows if r.get('phase_f_an11_b', {}).get('verdict') == 'PASS')",
+        "    g_pass = sum(1 for r in rows if r.get('phase_g_v1prime', {}).get('verdict') == 'PASS')",
+        "    r39_satisfied = (n >= R39_MIN_ENSEMBLE_SIZE) and top1_stable and frob_robust",
+        "    provisional = n < R39_MIN_ENSEMBLE_SIZE",
+        "    output = {",
+        "        'schema': 'anima/an11_ensemble_v1/1', 'aggregated_utc': utc(),",
+        "        'ensemble_size': n, 'r39_min_size': R39_MIN_ENSEMBLE_SIZE,",
+        "        'r39_satisfied': r39_satisfied, 'provisional': provisional,",
+        "        'seeds_used': seeds, 'fire_dirs': fire_dirs,",
+        "        'an11_a_frob_delta': {",
+        "            'mean': round(frob_mean, 6), 'stdev': round(frob_stdev, 6),",
+        "            'verdict_pass_count': a_pass, 'verdict_pass_rate': a_pass / n,",
+        "            'signal_robust': frob_robust,",
+        "        },",
+        "        'an11_b_cosine': {",
+        "            'mean_max_cos': round(max_cos_mean, 6), 'stdev_max_cos': round(max_cos_stdev, 6),",
+        "            'mean_top3_sum': round(sm(top3_sum_vals), 6),",
+        "            'verdict_pass_count': b_pass, 'verdict_pass_rate': b_pass / n,",
+        "            'top1_family_distribution': family_counts, 'dominant_family': dominant,",
+        "            'top1_family_stable': top1_stable,",
+        "        },",
+        "        'v1prime_phi_mip_norm': {",
+        "            'mean': round(phi_mip_mean, 6), 'stdev': round(phi_mip_stdev, 6),",
+        "            'verdict_pass_count': g_pass, 'verdict_pass_rate': g_pass / n,",
+        "        },",
+        "        'raw_91_caveat': f'N={n}; R39 mandate {\"satisfied\" if r39_satisfied else \"NOT satisfied\"}; provisional={provisional}'",
+        "    }",
+        "    with open(output_path, 'w') as f:",
+        "        json.dump(output, f, indent=2)",
+        "    print(f'ensemble.json written: {output_path}')",
+        "    print(f'  N={n}, R39 satisfied: {r39_satisfied}, provisional: {provisional}')",
+        "    print(f'  AN11(a) frob: {frob_mean:.4f} ± {frob_stdev:.4f} (PASS {a_pass}/{n})')",
+        "    print(f'  AN11(b) max_cos: {max_cos_mean:.4f} ± {max_cos_stdev:.4f} (PASS {b_pass}/{n}, top1={dominant} {max_count}/{n})')",
+        "    print(f'  V1 phi_mip: {phi_mip_mean:.4f} ± {phi_mip_stdev:.4f} (PASS {g_pass}/{n})')",
+        "    return True",
+        "",
+        "def selftest():",
+        "    mock = {'an11_seed': 0,",
+        "        'phase_e_an11_a': {'verdict': 'PASS', 'frob_delta': 0.0561},",
+        "        'phase_f_an11_b': {'verdict': 'PASS', 'max_cosine': 0.5747, 'top3_sum': 1.244,",
+        "                           'top3_pairs': [{'family': 'Hexad', 'cosine': 0.5747}]},",
+        "        'phase_g_v1prime': {'verdict': 'FAIL', 'phi_mip_norm': 0.6913}}",
+        "    with tempfile.TemporaryDirectory() as t:",
+        "        d1 = os.path.join(t, 's0'); os.makedirs(d1)",
+        "        d2 = os.path.join(t, 's1'); os.makedirs(d2)",
+        "        with open(os.path.join(d1, 'results.json'), 'w') as f: json.dump(mock, f)",
+        "        m2 = dict(mock); m2['an11_seed'] = 1",
+        "        m2['phase_f_an11_b'] = {'verdict': 'FAIL', 'max_cosine': 0.4294, 'top3_sum': 1.039,",
+        "                                'top3_pairs': [{'family': 'Phi', 'cosine': -0.4294}]}",
+        "        with open(os.path.join(d2, 'results.json'), 'w') as f: json.dump(m2, f)",
+        "        out = os.path.join(t, 'ens.json')",
+        "        ok = aggregate([d1, d2], out)",
+        "        if not ok:",
+        "            print('__AN11_ENSEMBLE_AGGREGATOR_RESULT__ FAIL_SELFTEST_aggregate'); return 1",
+        "        e = json.load(open(out))",
+        "        if e['ensemble_size'] != 2 or not e['provisional']:",
+        "            print('__AN11_ENSEMBLE_AGGREGATOR_RESULT__ FAIL_SELFTEST_size_or_provisional'); return 1",
+        "        if e['an11_a_frob_delta']['verdict_pass_count'] != 2:",
+        "            print('__AN11_ENSEMBLE_AGGREGATOR_RESULT__ FAIL_SELFTEST_a_count'); return 1",
+        "        if e['an11_b_cosine']['top1_family_distribution'] != {'Hexad': 1, 'Phi': 1}:",
+        "            print('__AN11_ENSEMBLE_AGGREGATOR_RESULT__ FAIL_SELFTEST_family'); return 1",
+        "    print('__AN11_ENSEMBLE_AGGREGATOR_RESULT__ PASS_SELFTEST')",
+        "    return 0",
+        "",
+        "if __name__ == '__main__':",
+        "    if len(sys.argv) > 1 and sys.argv[1] == '--selftest':",
+        "        sys.exit(selftest())",
+        "    elif len(sys.argv) > 2 and sys.argv[1] == '--aggregate':",
+        "        ok = aggregate(sys.argv[2:-1], sys.argv[-1])",
+        "        sys.exit(0 if ok else 1)",
+        "    else:",
+        "        print('usage: helper.py --selftest | --aggregate <fire_dir1> ... <output>')",
+        "        sys.exit(2)",
+    ]
+    let mut text = ""
+    let mut i = 0
+    while i < lines.len() {
+        text = text + lines[i] + "\n"
+        i = i + 1
+    }
+    write_file(HELPER_PATH, text)
+    return HELPER_PATH
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        k = k + 1
+    }
+    let path = _emit_helper()
+    let py = _detect_python3()
+    println("helper_emitted=" + path)
+    if has_selftest {
+        println("__AN11_ENSEMBLE_AGGREGATOR_RESULT__ HELPER_READY")
+        println("fix: 1) " + py + " " + path + " --selftest  2) " + py + " " + path + " --aggregate <fire_dir1> ... <output>")
+    } else {
+        println("usage: " + py + " " + path + " --selftest | --aggregate <fire_dir1> ... <output>")
+    }
+    println("raw_91_caveat=Helper emits provisional flag for N<5 (R39 mandate violations)")
+    println("raw_91_caveat=R39 satisfied = (N>=5) AND (top1_family_stable) AND (frob_signal_robust)")
+    return 0
+}
