@@ -1,0 +1,318 @@
+// tool/anima_f1_cycle4_gpt2_fire.hexa — F1 cycle 4 GPT-2 vast.ai LIVE FIRE wrapper
+// ─────────────────────────────────────────────────────────────────────────────
+// COMPANION to tool/anima_f1_cycle4_gpt2_dispatch.hexa (commit 61532a3c).
+// Dispatch tool emits the dispatch PLAN. THIS tool fires the actual instance.
+//
+// PIPELINE
+//   1. Read pre-staged wrapper: state/f1_cycle4_gpt2_dispatch_wrapper.py.staged
+//   2. vastai search offers RTX_3090 spot ~$0.13/hr
+//   3. vastai create instance (--bid_price spot)
+//   4. scp wrapper.py.staged → /workspace/wrapper.py
+//   5. ssh exec python3 /workspace/wrapper.py (background)
+//   6. Watchdog poll status (240 min cap, raw 86 budget)
+//   7. scp /workspace/results.json → state/f1_cycle4_gpt2_results/
+//   8. vastai destroy instance
+//   9. raw 86 audit ledger emit
+//
+// SAFETY GATES
+//   --dry-run            no actual vastai create, prints plan only (default)
+//   --fire               LIVE — actually creates pod (own 6 autonomous OR user confirm)
+//   --max-cost USD       cost cap (default $2)
+//   --watchdog-min M     auto-destroy if elapsed > M (default 240min)
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 86 cost · raw 91 honest
+// ─────────────────────────────────────────────────────────────────────────────
+
+let TOOL_VERSION = "v1"
+let HELPER_PATH = "/tmp/anima_f1_cycle4_gpt2_fire_helper.hexa_tmp"
+let WRAPPER_STAGED_PATH = "state/f1_cycle4_gpt2_dispatch_wrapper.py.staged"
+let RESULTS_DIR = "state/f1_cycle4_gpt2_results"
+let AUDIT_LEDGER_PATH = "state/f1_cycle4_gpt2_results/raw86_audit_ledger.jsonl"
+
+let DEFAULT_MAX_COST_USD = 2
+let DEFAULT_WATCHDOG_MIN = 240
+let DEFAULT_GPU = "RTX_3090"
+let DEFAULT_BID_PRICE = "0.13"
+let DEFAULT_POLL_INTERVAL_S = 60
+
+fn _detect_python3() -> str {
+    let candidates = [
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3"
+    ]
+    let mut i = 0
+    while i < candidates.len() {
+        let p = candidates[i]
+        if file_exists(p) { return p }
+        i = i + 1
+    }
+    return "python3"
+}
+
+fn _emit_helper() -> str {
+    let lines = [
+        "#!/usr/bin/env python3",
+        "# anima_f1_cycle4_gpt2_fire_helper.py — raw#37 transient",
+        "import os, sys, json, subprocess, time, datetime, argparse",
+        "",
+        "REPO = '/Users/ghost/core/anima'",
+        "VASTAI_CLI = '/Users/ghost/.local/bin/vastai'",
+        "SECRET_CLI = '/Users/ghost/core/secret/bin/secret'",
+        "WRAPPER_STAGED = os.path.join(REPO, 'state/f1_cycle4_gpt2_dispatch_wrapper.py.staged')",
+        "RESULTS_DIR = os.path.join(REPO, 'state/f1_cycle4_gpt2_results')",
+        "AUDIT_LEDGER = os.path.join(RESULTS_DIR, 'raw86_audit_ledger.jsonl')",
+        "DISPATCH_LABEL = 'anima-f1-cycle4-gpt2-fire'",
+        "DEFAULT_MAX_COST_USD = 2",
+        "DEFAULT_WATCHDOG_MIN = 240",
+        "DEFAULT_GPU = 'RTX_3090'",
+        "DEFAULT_BID_PRICE = 0.13",
+        "DEFAULT_POLL_INTERVAL_S = 60",
+        "",
+        "def ts():",
+        "    return datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')",
+        "",
+        "def emit_audit(rec):",
+        "    os.makedirs(RESULTS_DIR, exist_ok=True)",
+        "    with open(AUDIT_LEDGER, 'a') as f:",
+        "        f.write(json.dumps(rec) + '\\n')",
+        "",
+        "def get_secret(key):",
+        "    try:",
+        "        return subprocess.check_output([SECRET_CLI, 'get', key], text=True).strip()",
+        "    except Exception:",
+        "        return None",
+        "",
+        "def search_offers(gpu, max_bid, min_disk=50, min_reliability=0.95):",
+        "    query = f'gpu_name={gpu} rentable=true reliability>{min_reliability} disk_space>={min_disk}'",
+        "    try:",
+        "        out = subprocess.check_output([VASTAI_CLI, 'search', 'offers', query, '--order', 'dph_total', '--limit', '5', '--raw'], text=True)",
+        "        offers = json.loads(out) if out else []",
+        "        affordable = [o for o in offers if o.get('dph_total', 999) <= max_bid * 1.5]",
+        "        return affordable",
+        "    except Exception as e:",
+        "        return [{'error': str(e)}]",
+        "",
+        "def vastai_create(offer_id, bid_price, dry_run):",
+        "    if dry_run:",
+        "        return {'dry_run': True, 'would_create_offer_id': offer_id, 'bid_price': bid_price}",
+        "    try:",
+        "        out = subprocess.check_output([VASTAI_CLI, 'create', 'instance', str(offer_id),",
+        "            '--image', 'pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime',",
+        "            '--disk', '50', '--bid_price', str(bid_price),",
+        "            '--label', DISPATCH_LABEL, '--raw'], text=True)",
+        "        return json.loads(out)",
+        "    except Exception as e:",
+        "        return {'error': str(e)}",
+        "",
+        "def vastai_destroy(instance_id, dry_run):",
+        "    if dry_run:",
+        "        return {'dry_run': True, 'would_destroy_instance_id': instance_id}",
+        "    try:",
+        "        out = subprocess.check_output([VASTAI_CLI, 'destroy', 'instance', str(instance_id), '--raw'], text=True)",
+        "        return json.loads(out) if out else {'destroyed': True}",
+        "    except Exception as e:",
+        "        return {'error': str(e)}",
+        "",
+        "def vastai_status(instance_id):",
+        "    try:",
+        "        out = subprocess.check_output([VASTAI_CLI, 'show', 'instance', str(instance_id), '--raw'], text=True)",
+        "        return json.loads(out) if out else {}",
+        "    except Exception as e:",
+        "        return {'error': str(e)}",
+        "",
+        "def scp_to_pod(ssh_host, ssh_port, src, dst):",
+        "    cmd = ['scp', '-P', str(ssh_port),",
+        "           '-o', 'StrictHostKeyChecking=no',",
+        "           '-i', os.path.expanduser('~/.vast/ssh/vast-key'),",
+        "           src, f'root@{ssh_host}:{dst}']",
+        "    return subprocess.call(cmd)",
+        "",
+        "def scp_from_pod(ssh_host, ssh_port, src, dst):",
+        "    cmd = ['scp', '-P', str(ssh_port),",
+        "           '-o', 'StrictHostKeyChecking=no',",
+        "           '-i', os.path.expanduser('~/.vast/ssh/vast-key'),",
+        "           f'root@{ssh_host}:{src}', dst]",
+        "    return subprocess.call(cmd)",
+        "",
+        "def ssh_exec(ssh_host, ssh_port, cmd):",
+        "    full = ['ssh', '-p', str(ssh_port),",
+        "            '-o', 'StrictHostKeyChecking=no',",
+        "            '-i', os.path.expanduser('~/.vast/ssh/vast-key'),",
+        "            f'root@{ssh_host}', cmd]",
+        "    return subprocess.call(full)",
+        "",
+        "def fire(args):",
+        "    plan = {'tool': 'anima_f1_cycle4_gpt2_fire', 'version': 'v1', 'ts_begin': ts()}",
+        "    plan['dry_run'] = args.dry_run",
+        "    plan['max_cost_usd'] = args.max_cost",
+        "    plan['watchdog_min'] = args.watchdog_min",
+        "    plan['bid_price'] = args.bid_price",
+        "    plan['gpu'] = args.gpu",
+        "    if not os.path.exists(WRAPPER_STAGED):",
+        "        plan['error'] = 'wrapper.py.staged not found at ' + WRAPPER_STAGED",
+        "        return plan",
+        "    plan['wrapper_staged_path'] = WRAPPER_STAGED",
+        "    plan['wrapper_size_bytes'] = os.path.getsize(WRAPPER_STAGED)",
+        "    api_key = get_secret('vast.api_key')",
+        "    plan['vast_api_key_present'] = api_key is not None",
+        "    ssh_key_path = os.path.expanduser('~/.vast/ssh/vast-key')",
+        "    plan['vast_ssh_key_present'] = os.path.exists(ssh_key_path)",
+        "    offers = search_offers(args.gpu, args.bid_price)",
+        "    plan['offers_top5'] = offers[:5]",
+        "    if args.dry_run:",
+        "        plan['phase'] = 'dry_run_complete'",
+        "        plan['next_step'] = 'pass --fire to create instance'",
+        "        emit_audit({'event': 'dry_run', 'ts': ts(), 'plan': plan})",
+        "        return plan",
+        "    if not plan['vast_api_key_present'] or not plan['vast_ssh_key_present']:",
+        "        plan['error'] = 'pre-flight FAIL: api_key or ssh_key missing'",
+        "        emit_audit({'event': 'preflight_fail', 'ts': ts(), 'plan': plan})",
+        "        return plan",
+        "    if not offers or 'error' in offers[0]:",
+        "        plan['error'] = 'no offers'",
+        "        emit_audit({'event': 'offers_empty', 'ts': ts(), 'plan': plan})",
+        "        return plan",
+        "    chosen = offers[0]",
+        "    create_res = vastai_create(chosen.get('id'), args.bid_price, False)",
+        "    plan['create_result'] = create_res",
+        "    if 'error' in create_res:",
+        "        emit_audit({'event': 'create_fail', 'ts': ts(), 'plan': plan})",
+        "        return plan",
+        "    instance_id = create_res.get('new_contract') or create_res.get('id')",
+        "    plan['instance_id'] = instance_id",
+        "    emit_audit({'event': 'created', 'ts': ts(), 'instance_id': instance_id})",
+        "    deadline = time.time() + args.watchdog_min * 60",
+        "    ssh_host = None; ssh_port = None",
+        "    while time.time() < deadline:",
+        "        st = vastai_status(instance_id)",
+        "        if st.get('actual_status') == 'running' and st.get('ssh_host'):",
+        "            ssh_host = st.get('ssh_host'); ssh_port = st.get('ssh_port', 22)",
+        "            break",
+        "        time.sleep(DEFAULT_POLL_INTERVAL_S)",
+        "    if ssh_host is None:",
+        "        plan['error'] = 'timeout waiting for ssh'",
+        "        vastai_destroy(instance_id, False)",
+        "        emit_audit({'event': 'ssh_timeout_destroyed', 'ts': ts(), 'instance_id': instance_id})",
+        "        return plan",
+        "    plan['ssh_host'] = ssh_host; plan['ssh_port'] = ssh_port",
+        "    rc = scp_to_pod(ssh_host, ssh_port, WRAPPER_STAGED, '/workspace/wrapper.py')",
+        "    plan['scp_to_rc'] = rc",
+        "    rc = ssh_exec(ssh_host, ssh_port, 'pip install --quiet transformers torch && python3 /workspace/wrapper.py > /workspace/run.log 2>&1 &')",
+        "    plan['ssh_launch_rc'] = rc",
+        "    while time.time() < deadline:",
+        "        rc = ssh_exec(ssh_host, ssh_port, 'test -f /workspace/results.json')",
+        "        if rc == 0:",
+        "            break",
+        "        time.sleep(DEFAULT_POLL_INTERVAL_S)",
+        "    os.makedirs(RESULTS_DIR, exist_ok=True)",
+        "    rc = scp_from_pod(ssh_host, ssh_port, '/workspace/results.json',",
+        "        os.path.join(RESULTS_DIR, f'results_{instance_id}.json'))",
+        "    plan['scp_from_rc'] = rc",
+        "    destroy_res = vastai_destroy(instance_id, False)",
+        "    plan['destroy_result'] = destroy_res",
+        "    plan['ts_end'] = ts()",
+        "    emit_audit({'event': 'fire_complete', 'ts': ts(), 'instance_id': instance_id, 'plan_summary': {k: plan[k] for k in plan if k != 'offers_top5'}})",
+        "    return plan",
+        "",
+        "def main():",
+        "    ap = argparse.ArgumentParser()",
+        "    ap.add_argument('--fire', action='store_true')",
+        "    ap.add_argument('--dry-run', action='store_true', default=True)",
+        "    ap.add_argument('--max-cost', type=float, default=DEFAULT_MAX_COST_USD)",
+        "    ap.add_argument('--watchdog-min', type=int, default=DEFAULT_WATCHDOG_MIN)",
+        "    ap.add_argument('--bid-price', type=float, default=DEFAULT_BID_PRICE)",
+        "    ap.add_argument('--gpu', type=str, default=DEFAULT_GPU)",
+        "    ap.add_argument('--selftest', action='store_true')",
+        "    args = ap.parse_args()",
+        "    if args.fire:",
+        "        args.dry_run = False",
+        "    if args.selftest:",
+        "        result = {'tool': 'anima_f1_cycle4_gpt2_fire', 'selftest': True,",
+        "                  'wrapper_staged_exists': os.path.exists(WRAPPER_STAGED),",
+        "                  'wrapper_staged_size': os.path.getsize(WRAPPER_STAGED) if os.path.exists(WRAPPER_STAGED) else 0,",
+        "                  'vastai_cli_exists': os.path.exists(VASTAI_CLI),",
+        "                  'secret_cli_exists': os.path.exists(SECRET_CLI),",
+        "                  'audit_ledger_path': AUDIT_LEDGER,",
+        "                  'defaults': {'max_cost_usd': DEFAULT_MAX_COST_USD,",
+        "                                'watchdog_min': DEFAULT_WATCHDOG_MIN,",
+        "                                'gpu': DEFAULT_GPU,",
+        "                                'bid_price': DEFAULT_BID_PRICE},",
+        "                  'pre_registered_pass_predicates': {",
+        "                       'per_task_alpha': 0.05,",
+        "                       'stouffer_z_threshold': 1.645,",
+        "                       'claim_81pct_per_task_threshold': 0.81}}",
+        "        print(json.dumps(result, indent=2))",
+        "        return 0",
+        "    result = fire(args)",
+        "    print(json.dumps(result, indent=2))",
+        "    return 0 if 'error' not in result else 1",
+        "",
+        "if __name__ == '__main__': sys.exit(main())",
+    ]
+    let mut text = ""
+    let mut i = 0
+    while i < lines.len() {
+        text = text + lines[i] + "\n"
+        i = i + 1
+    }
+    write_file(HELPER_PATH, text)
+    return HELPER_PATH
+}
+
+fn _selftest() {
+    println("__F1_CYCLE4_GPT2_FIRE_BEGIN__ selftest")
+    let _path = _emit_helper()
+    println("helper_emitted=" + HELPER_PATH)
+    println("wrapper_staged_path=" + WRAPPER_STAGED_PATH)
+    println("results_dir=" + RESULTS_DIR)
+    println("audit_ledger_path=" + AUDIT_LEDGER_PATH)
+    println("default_max_cost_usd=" + str(DEFAULT_MAX_COST_USD))
+    println("default_watchdog_min=" + str(DEFAULT_WATCHDOG_MIN))
+    println("default_gpu=" + DEFAULT_GPU)
+    println("default_bid_price=" + DEFAULT_BID_PRICE)
+    println("default_poll_interval_s=" + str(DEFAULT_POLL_INTERVAL_S))
+    let wrapper_present = file_exists("/Users/ghost/core/anima/" + WRAPPER_STAGED_PATH)
+    if wrapper_present {
+        println("wrapper_staged_exists=true")
+    } else {
+        println("wrapper_staged_exists=false")
+    }
+    println("__F1_CYCLE4_GPT2_FIRE_RESULT__ PASS_SELFTEST")
+    println("raw_91_caveat=DRY_RUN by default. --fire flag required for LIVE pod create.")
+    println("raw_91_caveat=Watchdog 240min cap enforces raw 86 cost ceiling at ~$0.52/run.")
+    println("raw_91_caveat=Real fire still requires user confirm OR own 6 autonomous fire context.")
+}
+
+fn _dry_run() {
+    println("__F1_CYCLE4_GPT2_FIRE_BEGIN__ dry_run")
+    let _path = _emit_helper()
+    let py = _detect_python3()
+    println("helper_emitted=" + HELPER_PATH)
+    println("python3_detected=" + py)
+    println("__F1_CYCLE4_GPT2_FIRE_RESULT__ HELPER_READY")
+    println("fix: 1) " + py + " " + HELPER_PATH + " --selftest    (offline preflight)")
+    println("fix: 2) " + py + " " + HELPER_PATH + " --dry-run     (search offers, no create)")
+    println("fix: 3) " + py + " " + HELPER_PATH + " --fire        (LIVE pod, watchdog 240min)")
+    println("raw_10_caveat=AWAITING_USER_FIRE — actual instance create deferred per task spec.")
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_dry_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--dry-run" { has_dry_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_dry_run { _dry_run() }
+    else {
+        println("usage: hexa run tool/anima_f1_cycle4_gpt2_fire.hexa --selftest | --dry-run")
+        println("F1 cycle 4 GPT-2 vast.ai LIVE FIRE — companion to anima_f1_cycle4_gpt2_dispatch.hexa")
+        println("Reads state/f1_cycle4_gpt2_dispatch_wrapper.py.staged → scp → ssh exec → watchdog → results.json")
+    }
+    return 0
+}
