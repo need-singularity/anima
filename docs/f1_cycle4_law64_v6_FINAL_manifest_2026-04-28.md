@@ -206,4 +206,31 @@ First REAL-DATA test of v8 (not synthetic): Pride and Prejudice 1045 chars, 28-a
 
 ---
 
-**Status**: F1_CYCLE_4_LAW_64_V8_NL_METHODOLOGICAL_LIMITS_LIVE — cycle 4 + 11 sub-tests + AN11 fire 5 in flight.
+## §14. AN11 fire 5 NEW failure mode discovered (Mode E — silent zero-training)
+
+Fire 5 (instance 35725130, ssh3.vast.ai:15130, $1.64/hr, alive 32:50, manually destroyed):
+- All prior fixes worked: TCP probe ✓ / boot detach ✓ / cuda_max_good=13.0 selection ✓ / wrapper preflight ✓
+- PHASE_A: HF download Mistral-7B 14.49GB in 153s ✓ OK
+- PHASE_B: corpus 10 rows × 5 categories ✓ OK
+- PHASE_C: LoRA train r=16 α=32 epochs=3 reported OK in **13.5 seconds** (suspiciously fast for 7B model 3 epochs)
+- **CRITICAL**: `_before_q_proj_l0_sha` (4d2ec422aefbb46b) == `_after_q_proj_l0_sha` (4d2ec422aefbb46b) → training was a no-op (zero gradient flow OR LoRA adapter not applied during forward OR train data empty)
+- PHASE_D: SVD eigen extraction → 25min silent CPU run on identical weights (99% CPU, 0% GPU, no progress)
+
+Per own 4 step (a) root-cause: fire 5 destroyed early to save ~$5.69 vs watchdog 240min cap.
+
+Required next-iter fixes (own 4 step b+c+d for fire 6):
+1. **Wrapper PHASE_C training assertion**: `assert sha256(adapter_weights_after) != sha256(adapter_weights_before)` — fail-fast if zero training
+2. **Gradient-norm logging**: emit grad_norm per epoch to PHASE_C results; fail-fast if all epochs grad_norm < 1e-6
+3. **PHASE_D timeout cap**: SVD per layer should take <2s; abort PHASE_D after 60s wallclock budget
+4. **Trainer device explicit set**: `model.to('cuda:0')` BEFORE Trainer construction; assert `next(model.parameters()).is_cuda` after
+
+Cumulative AN11 across 5 fires: ~$0.04 (fires 1-3) + $1.50 (fire 4) + $0.90 (fire 5) = $2.44 total. Five distinct root-cause iters per own 4 four-fold ladder:
+- Fire 1: SCP race (TCP probe d5956ad7)
+- Fire 2: SSH boot timeout (nohup detach c55fd840)
+- Fire 3: SCP race recurrence (same as 1, fix landed)
+- Fire 4: CUDA driver too old (cuda_max_good filter + wrapper preflight 6a3406f1)
+- Fire 5: Silent zero-training (4-fold fix needed for fire 6)
+
+---
+
+**Status**: F1_CYCLE_4_LAW_64_V8_CONFIRMED_T10E + AN11_FIRE_5_MODE_E_DIAGNOSED — cycle 4 closed; AN11 root-cause chain at 5 iters.
