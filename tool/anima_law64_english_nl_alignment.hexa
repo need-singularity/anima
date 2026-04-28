@@ -1,0 +1,501 @@
+// tool/anima_law64_english_nl_alignment.hexa — F1 cycle 4 T10c real-data NL test
+// ─────────────────────────────────────────────────────────────────────────────
+// QUESTION (raw 12 frozen, declared BEFORE running):
+//   Law 64 v8 candidate (commits 581fc1d8 + 30be09b4): "matched-context Markov
+//   saturates ANY DETERMINISTIC FINITE-CONTEXT discrete substrate, with
+//   data-volume scaling with window size". T8q (Conway 2D), T8r (rule 30),
+//   T10a (synthetic 4-symbol XOR codon), T10b (5-cell sparsity-limited) ALL
+//   confirm v8 on SYNTHETIC determinstic substrates. Open question (manifest
+//   §6 raw-real): does v8 generalize to REAL natural language — stochastic,
+//   non-stationary, plausibly non-finite-context (semantic/syntactic) data?
+//
+// SUBSTRATE: ~1100-char English prose excerpt (Pride and Prejudice opening,
+//   public domain). Normalized: a-z → 0..25, " " → 26, "." → 27. Other chars
+//   collapsed to space. Effective alphabet size = 28. NOT deterministic:
+//   same context "th" can be followed by "e","a","i","y", etc.
+//
+// ORACLE PROXY: order-7 Markov trained on FULL corpus (proxy ground-truth,
+//   since closed-form NL rule is impossible). NB: this is a PROXY, not a
+//   true oracle — its accuracy ceiling is itself bounded by NL stochasticity.
+//
+// THREE MARKOV BASELINES (parallel to T10a discipline):
+//   - Order-1: P(next | char-1)         — 28 ctx
+//   - Order-3: P(next | char-3..char-1) — 21,952 ctx (sparse)
+//   - Order-5: P(next | char-5..char-1) — 17,210,368 ctx (sparse, observed only)
+//   Each Markov uses sparse (ctx_id, counts[28]) parallel-array storage; lookup
+//   via linear scan over OBSERVED contexts (≤ N_train contexts in practice).
+//
+// PROTOCOL (real-data adapted):
+//   - Train on first 80% of corpus; test on last 20% (no toroidal init game).
+//   - Same train/test split fed to ALL orders + oracle proxy.
+//   - At each test position i, predict char[i] given prior k chars; compare to
+//     actual char[i]; aggregate accuracy per-thousand.
+//   - "Advantage_vs_oracle" = oracle_acc - markov_acc (signed; negative means
+//     Markov BEATS the proxy, possible if the proxy is over-fit on full corpus
+//     including test region — caveat, see raw 91 below).
+//   - N_TRAIN sweep: 200, 500, 800 (cap = 80% of 1100 ≈ 880; we cap at 800).
+//     Same TEST window used for all.
+//
+// PRE-REGISTERED HYPOTHESES (raw 12 frozen, declared BEFORE run):
+//   H1 (alignment universal on real data):
+//     order-5 advantage_vs_oracle approaches 0 at large N_TRAIN
+//     (|adv_o5_n800| < 50/1000); order-1 has persistent gap (>=80/1000).
+//     → Law 64 v8 EXTENDS TO REAL NL: matched-context Markov saturates
+//       NL within finite-context window (k=5 sufficient for char-level English
+//       prediction up to NL stochasticity floor).
+//
+//   H2 (NL breaks v8 — non-finite-context structure):
+//     even order-5 has gap > +50/1000 at large N_TRAIN — NL contains
+//     long-range syntactic/semantic dependencies that windowed Markov can't
+//     capture from local context alone. Higher-order proxy outperforms
+//     because LONGER context still helps.
+//     → Law 64 v8 IS SUBSTRATE-LIMITED: holds on finite-context substrates
+//       (CA, codon rules) but real NL has effectively unbounded context.
+//
+//   H3 (data-limited / proxy-noise):
+//     order-5 partial closure (10 ≤ |adv_o5_n800| < 50) — gap shrinks but
+//     doesn't vanish; or the order-7 proxy is itself a poor estimator on
+//     small corpora (overfits training, underperforms on test of last 20%).
+//     → Law 64 v8 NUANCE: data-volume scaling confirmed (T10b) holds
+//       SHARPER on real data; ~1000-char corpus is too small to fully
+//       saturate order-5 over 28-symbol alphabet.
+//
+// VERDICT MAPPING (frozen, no post-hoc tuning):
+//   adv_o1_n800 = oracle_acc - o1_acc per-thousand at N_TRAIN=800
+//   adv_o5_n800 = oracle_acc - o5_acc per-thousand at N_TRAIN=800
+//   abs_adv_o5  = abs(adv_o5_n800)
+//
+//   if abs_adv_o5 < 50 AND adv_o1_n800 >= 80:    H1_SUPPORTED  (alignment universal — v8 holds on real NL)
+//   elif adv_o5_n800 >= 50:                      H2_SUPPORTED  (NL breaks v8 — non-finite-context)
+//   else:                                         H3_SUPPORTED  (data-limited / proxy-noise)
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 91 honest finding
+// raw 42 caveat: 3 orders × 3 N_TRAIN + oracle proxy, ~3-5min budget Mac CPU.
+// raw 91 caveat: oracle PROXY (order-7 trained on full corpus) is NOT a true
+//   ground-truth oracle. Closed-form NL rule does not exist. Proxy accuracy
+//   has its own stochastic ceiling (~70-85% for char-level English at order 7
+//   based on Shannon's classic estimates — entropy ~1.3 bits/char).
+// raw 91 caveat: 1100-char corpus is SMALL relative to NL's true character
+//   distribution. Order-5 over 28-alphabet has 17M possible contexts; we'll
+//   observe at most ~800. Sparsity is severe — most test contexts will be
+//   UNSEEN at orders >= 3. We back off: unseen ctx → predict 'e' (most common
+//   English letter) as fallback. This is honest data-poverty, not a defect.
+// raw 91 caveat: train/test split by position (last 20% held out). NOT random
+//   shuffle — preserves NL's natural sequential structure but means test set
+//   may have different character distribution than train.
+// raw 91 caveat: oracle PROXY is trained on FULL corpus including test region.
+//   This gives it a structural advantage. If proxy accuracy is HIGHER than
+//   markov accuracy, it's mostly because it has SEEN the test contexts during
+//   its training. So adv_o5 small means o5 has captured most of what o7 (with
+//   peeking) captures = STRONG evidence for finite-context structure.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let SEED = 20260428
+let ALPHABET = 28           // a-z + space + period
+let SPACE_SYM = 26
+let PERIOD_SYM = 27
+
+let mut RNG_STATE = SEED
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rng_reset() { RNG_STATE = SEED }
+
+// ── Embedded English corpus (Pride & Prejudice opening, public domain) ──────
+fn _raw_corpus() -> string {
+    let s = "It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife. However little known the feelings or views of such a man may be on his first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding families, that he is considered the rightful property of some one or other of their daughters. My dear Mr. Bennet, said his lady to him one day, have you heard that Netherfield Park is let at last? Mr. Bennet replied that he had not. But it is, returned she, for Mrs. Long has just been here, and she told me all about it. Mr. Bennet made no answer. Do you not want to know who has taken it, cried his wife impatiently. You want to tell me, and I have no objection to hearing it. This was invitation enough. Why, my dear, you must know, Mrs. Long says that Netherfield is taken by a young man of large fortune from the north of England that he came down on Monday in a chaise and four to see the place and was so much delighted with it that he agreed with Mr. Morris immediately."
+    return s
+}
+
+// ── Normalization: a-z → 0..25, " " → 26, "." → 27, else → space ────────────
+fn _normalize(text: string) -> array {
+    let mut out = []
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let sub = text.substring(i, i + 1)
+        let c = char_code(sub, 0)
+        // ASCII a-z = 97..122
+        if c >= 97 && c <= 122 {
+            out.push(c - 97)
+        } else {
+            // ASCII A-Z = 65..90
+            if c >= 65 && c <= 90 {
+                out.push(c - 65)
+            } else {
+                if c == 46 {           // "."
+                    out.push(PERIOD_SYM)
+                } else {
+                    // collapse all other (space, comma, ?, digit, etc.) to space
+                    // collapse RUNS of non-alpha into single space
+                    let last = out.len() - 1
+                    if last < 0 {
+                        // skip leading non-alpha
+                    } else {
+                        if out[last] != SPACE_SYM { out.push(SPACE_SYM) }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Sparse storage: parallel arrays (ctx_ids, counts) ──────────────────────
+// counts is flat: ALPHABET slots per observed ctx, indexed [idx*ALPHABET + sym]
+// returns [ctx_ids, counts]
+//
+// _ctx_id(window: array) -> int: hashes a window of length k into a single
+// int. Uses radix-ALPHABET encoding. For k<=5 fits in int (28^5 = 17M);
+// for k=7 fits in int64 (28^7 ≈ 13.4B).
+
+fn _ctx_id(window: array) -> int {
+    let mut id = 0
+    let mut i = 0
+    while i < window.len() {
+        id = id * ALPHABET + window[i]
+        i = i + 1
+    }
+    return id
+}
+
+fn _find_ctx(ctx_ids: array, target: int) -> int {
+    let mut i = 0
+    let n = ctx_ids.len()
+    while i < n {
+        if ctx_ids[i] == target { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Train sparse Markov of order k on chars[0..end_excl).
+// Returns [ctx_ids, counts].
+fn _train_markov(chars: array, end_excl: int, k: int) -> array {
+    let mut ctx_ids = []
+    let mut counts = []
+    let mut i = k
+    while i < end_excl {
+        // window = chars[i-k..i]
+        let mut w = []
+        let mut j = i - k
+        while j < i { w.push(chars[j]); j = j + 1 }
+        let target = _ctx_id(w)
+        let idx = _find_ctx(ctx_ids, target)
+        let nxt = chars[i]
+        if idx >= 0 {
+            counts[idx * ALPHABET + nxt] = counts[idx * ALPHABET + nxt] + 1
+        } else {
+            ctx_ids.push(target)
+            let mut z = 0
+            while z < ALPHABET {
+                if z == nxt { counts.push(1) } else { counts.push(0) }
+                z = z + 1
+            }
+        }
+        i = i + 1
+    }
+    return [ctx_ids, counts]
+}
+
+// Argmax over ALPHABET slots; ties broken by lowest symbol index.
+fn _argmax_alpha(counts: array, base: int) -> int {
+    let mut best = 0
+    let mut bv = counts[base]
+    let mut s = 1
+    while s < ALPHABET {
+        if counts[base + s] > bv { bv = counts[base + s]; best = s }
+        s = s + 1
+    }
+    return best
+}
+
+// Predict char at position pos given chars and trained model of order k.
+// If context unseen, fall back to predicting "e" = char_code(101) - 97 = 4.
+fn _predict_at(model: array, chars: array, pos: int, k: int) -> int {
+    let ctx_ids = model[0]
+    let counts = model[1]
+    if pos < k { return 4 }  // "e" fallback for boundary
+    let mut w = []
+    let mut j = pos - k
+    while j < pos { w.push(chars[j]); j = j + 1 }
+    let target = _ctx_id(w)
+    let idx = _find_ctx(ctx_ids, target)
+    if idx < 0 { return 4 }  // unseen ctx → fallback "e"
+    return _argmax_alpha(counts, idx * ALPHABET)
+}
+
+// Evaluate accuracy: predict each char in [test_start, test_end) using model,
+// compare to actual chars. Returns acc per-thousand.
+fn _accuracy_at(model: array, chars: array, test_start: int, test_end: int, k: int) -> int {
+    let mut total = 0
+    let mut correct = 0
+    let mut p = test_start
+    while p < test_end {
+        let pred = _predict_at(model, chars, p, k)
+        let actual = chars[p]
+        if pred == actual { correct = correct + 1 }
+        total = total + 1
+        p = p + 1
+    }
+    if total == 0 { return 0 }
+    return (correct * 1000) / total
+}
+
+// ── single (order, n_train) evaluation ──────────────────────────────────────
+// Returns [order, n_train, oracle_acc, markov_acc, advantage]
+// (advantage = oracle_acc - markov_acc; signed)
+fn _eval(order: int, n_train: int, chars: array, oracle_model: array,
+         oracle_order: int, test_start: int, test_end: int) -> array {
+    // Cap n_train to test_start (don't leak test region into Markov training).
+    let cap = if n_train > test_start { test_start } else { n_train }
+    let model = _train_markov(chars, cap, order)
+    let mk_acc = _accuracy_at(model, chars, test_start, test_end, order)
+    let or_acc = _accuracy_at(oracle_model, chars, test_start, test_end, oracle_order)
+    let advantage = or_acc - mk_acc
+    let n_obs = (model[0]).len()
+    println("  order=" + str(order) + " n_train=" + str(n_train) + " observed_ctx=" + str(n_obs) + " oracle_acc=" + str(or_acc) + " markov_acc=" + str(mk_acc) + " advantage_per_thousand=" + str(advantage))
+    return [order, n_train, or_acc, mk_acc, advantage]
+}
+
+fn _run() {
+    println("__LAW_64_CYCLE_4_T10C_ENGLISH_NL_BEGIN__ real-data NL alignment test")
+    println("hypothesis H1 (alignment universal real-data): |adv_o5_n800|<50 AND adv_o1_n800>=80 — v8 holds on real NL")
+    println("hypothesis H2 (NL breaks v8): adv_o5_n800>=50 — NL has non-finite-context structure")
+    println("hypothesis H3 (data-limited): 10<=|adv_o5_n800|<50 — partial closure, ~1k corpus too small")
+    println("seed=" + str(SEED) + " alphabet=" + str(ALPHABET) + " corpus=Pride_and_Prejudice_opening")
+
+    _rng_reset()
+
+    // Load + normalize corpus
+    let raw = _raw_corpus()
+    let chars = _normalize(raw)
+    let total_chars = chars.len()
+    println("raw_corpus_len=" + str(len(raw)) + " normalized_chars=" + str(total_chars))
+
+    // Symbol frequency stats (for sanity)
+    let mut freqs = []
+    let mut z = 0
+    while z < ALPHABET { freqs.push(0); z = z + 1 }
+    let mut i = 0
+    while i < total_chars { freqs[chars[i]] = freqs[chars[i]] + 1; i = i + 1 }
+    println("freq_e=" + str(freqs[4]) + " freq_t=" + str(freqs[19]) + " freq_a=" + str(freqs[0]) + " freq_space=" + str(freqs[SPACE_SYM]) + " freq_period=" + str(freqs[PERIOD_SYM]))
+
+    // 80/20 train/test split by position
+    let test_start = (total_chars * 8) / 10
+    let test_end = total_chars
+    println("test_start=" + str(test_start) + " test_end=" + str(test_end) + " train_chars_avail=" + str(test_start) + " test_chars=" + str(test_end - test_start))
+
+    // Oracle proxy: order-7 trained on FULL corpus (peeks at test, by design)
+    let oracle_order = 7
+    println("training oracle proxy (order-7 on full corpus, peeks at test region by design)...")
+    let oracle_model = _train_markov(chars, total_chars, oracle_order)
+    let n_obs_oracle = (oracle_model[0]).len()
+    println("oracle_proxy_observed_ctx=" + str(n_obs_oracle) + " (max=" + str(total_chars - oracle_order) + ")")
+
+    // Sweep: 3 orders × 3 N_TRAIN
+    let n_a = 200; let n_b = 500; let n_c = 800
+
+    println("--- order=1 (P(next | char-1), 28 max-ctx) ---")
+    let o1_a = _eval(1, n_a, chars, oracle_model, oracle_order, test_start, test_end)
+    let o1_b = _eval(1, n_b, chars, oracle_model, oracle_order, test_start, test_end)
+    let o1_c = _eval(1, n_c, chars, oracle_model, oracle_order, test_start, test_end)
+
+    println("--- order=3 (P(next | char-3..char-1), 21952 max-ctx, sparse) ---")
+    let o3_a = _eval(3, n_a, chars, oracle_model, oracle_order, test_start, test_end)
+    let o3_b = _eval(3, n_b, chars, oracle_model, oracle_order, test_start, test_end)
+    let o3_c = _eval(3, n_c, chars, oracle_model, oracle_order, test_start, test_end)
+
+    println("--- order=5 (P(next | 5-char window), 17M max-ctx, sparse) ---")
+    let o5_a = _eval(5, n_a, chars, oracle_model, oracle_order, test_start, test_end)
+    let o5_b = _eval(5, n_b, chars, oracle_model, oracle_order, test_start, test_end)
+    let o5_c = _eval(5, n_c, chars, oracle_model, oracle_order, test_start, test_end)
+
+    let adv_o1_n200 = o1_a[4]; let adv_o1_n500 = o1_b[4]; let adv_o1_n800 = o1_c[4]
+    let adv_o3_n200 = o3_a[4]; let adv_o3_n500 = o3_b[4]; let adv_o3_n800 = o3_c[4]
+    let adv_o5_n200 = o5_a[4]; let adv_o5_n500 = o5_b[4]; let adv_o5_n800 = o5_c[4]
+
+    println("--- aggregate (advantage_per_thousand at key anchors) ---")
+    println("adv_o1: n200=" + str(adv_o1_n200) + " n500=" + str(adv_o1_n500) + " n800=" + str(adv_o1_n800))
+    println("adv_o3: n200=" + str(adv_o3_n200) + " n500=" + str(adv_o3_n500) + " n800=" + str(adv_o3_n800))
+    println("adv_o5: n200=" + str(adv_o5_n200) + " n500=" + str(adv_o5_n500) + " n800=" + str(adv_o5_n800))
+
+    let abs_o5_n800 = if adv_o5_n800 < 0 { 0 - adv_o5_n800 } else { adv_o5_n800 }
+
+    // Verdict mapping (pre-registered, frozen)
+    let mut verdict = "AMBIGUOUS"
+    let mut law_dir = "INCONCLUSIVE"
+    if abs_o5_n800 < 50 && adv_o1_n800 >= 80 {
+        verdict = "H1_SUPPORTED_alignment_principle_universal_on_real_NL_order5_saturates_against_order7_proxy"
+        law_dir = "LAW_64_v8_HOLDS_ON_REAL_NL_matched_context_markov_saturates_real_natural_language_within_finite_window_k5"
+    } else {
+        if adv_o5_n800 >= 50 {
+            verdict = "H2_SUPPORTED_NL_breaks_v8_non_finite_context_structure_present_in_real_NL"
+            law_dir = "LAW_64_v8_SUBSTRATE_LIMITED_holds_on_finite_context_synthetic_substrates_but_real_NL_has_unbounded_context"
+        } else {
+            verdict = "H3_SUPPORTED_data_limited_partial_closure_1k_corpus_too_small_for_full_o5_saturation_on_28_alphabet"
+            law_dir = "LAW_64_v8_NUANCE_data_volume_scaling_holds_sharper_on_real_data_corpus_size_insufficient_for_full_saturation"
+        }
+    }
+    println("--- verdict ---")
+    println("verdict=" + verdict)
+    println("law_64_direction=" + law_dir)
+    println("o5_closure_check_abs_adv_o5_n800=" + str(abs_o5_n800) + "_threshold_<50_for_H1")
+
+    println("__LAW_64_CYCLE_4_T10C_RESULT__ " + verdict)
+
+    // raw 91 honesty triad C1-C5
+    println("raw_91_C1_falsifiable=YES_pre_registered_thresholds_50_and_80_at_order5_n800_and_order1_n800_frozen")
+    println("raw_91_C2_replicable=YES_seed_" + str(SEED) + "_corpus_embedded_inline_pride_prejudice_opening_28symbol_normalization")
+    println("raw_91_C3_no_p_hacking=YES_thresholds_orders_anchors_split_frozen_in_header_before_run")
+    println("raw_91_C4_data_caveats=1100char_corpus_single_genre_19th_century_prose_28symbol_normalization_train80_test20_no_shuffle")
+    println("raw_91_C5_negative_result_published=YES_emit_regardless_of_outcome_per_raw_71")
+    println("raw_91_caveat=oracle_proxy_is_order7_trained_on_FULL_corpus_NOT_true_ground_truth_NL_has_no_closed_form_rule_proxy_has_structural_advantage_via_test_region_peek")
+    println("raw_91_caveat=order5_over_28_alphabet_has_17M_possible_contexts_observed_at_most_~800_severe_sparsity_unseen_ctx_falls_back_to_e_prediction")
+    println("raw_91_caveat=NL_is_stochastic_same_context_can_have_multiple_valid_continuations_so_perfect_acc_is_impossible_shannon_floor_~70_85_percent_on_char_level_english")
+    println("raw_91_caveat=if_adv_o5_negative_means_o5_BEATS_o7_proxy_likely_due_to_proxy_overfit_or_o7_data_starvation_at_smaller_train_sizes")
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T10C_ENGLISH_NL_BEGIN__ selftest")
+
+    // 1) Verify normalization
+    let test1 = _normalize("Hello, World!")
+    println("normalize_'Hello, World!'_len=" + str(test1.len()) + " expect=12_h-e-l-l-o-SP-w-o-r-l-d-SP")
+    let mut s = ""
+    let mut i = 0
+    while i < test1.len() {
+        s = s + str(test1[i]) + ","
+        i = i + 1
+    }
+    println("  syms=" + s)
+    // expect: 7,4,11,11,14,26,22,14,17,11,3,26 (h=7,e=4,l=11,l=11,o=14,sp=26,w=22,o=14,r=17,l=11,d=3,sp=26)
+    // trailing "!" is non-alpha → produces a space (the dedup only suppresses if last is already space)
+    let n_ok = test1.len() == 12
+        && test1[0] == 7 && test1[1] == 4 && test1[2] == 11 && test1[3] == 11 && test1[4] == 14
+        && test1[5] == 26 && test1[6] == 22 && test1[7] == 14 && test1[8] == 17 && test1[9] == 11 && test1[10] == 3
+        && test1[11] == 26
+
+    let test2 = _normalize("a.b")
+    println("normalize_'a.b'_len=" + str(test2.len()) + " expect=3 (a=0, period=27, b=1)")
+    let n2_ok = test2.len() == 3 && test2[0] == 0 && test2[1] == 27 && test2[2] == 1
+
+    let test3 = _normalize("  multi   space  ")  // leading skip, runs collapse
+    println("normalize_'  multi   space  '_len=" + str(test3.len()) + " expect=12 (multi-SP-space-SP)")
+    let n3_ok = test3.len() == 12
+
+    // 2) Verify ctx_id encoding
+    let id_a = _ctx_id([0])  // 0
+    let id_eth = _ctx_id([4, 19, 7])  // 4*28*28 + 19*28 + 7 = 3136 + 532 + 7 = 3675
+    println("ctx_id([0])=" + str(id_a) + " (expect 0)")
+    println("ctx_id([e=4,t=19,h=7])=" + str(id_eth) + " (expect 3675)")
+    let id_ok = id_a == 0 && id_eth == 3675
+
+    // 3) Verify find_ctx
+    let ids = [10, 20, 30, 40]
+    let f1 = _find_ctx(ids, 30)  // 2
+    let f2 = _find_ctx(ids, 999) // -1
+    println("find_ctx([10,20,30,40], 30)=" + str(f1) + " (expect 2)")
+    println("find_ctx([10,20,30,40], 999)=" + str(f2) + " (expect -1)")
+    let fc_ok = f1 == 2 && f2 == -1
+
+    // 4) Verify train_markov on tiny known sequence
+    // chars = [t=19, h=7, e=4, t=19, h=7, e=4, t=19, h=7] — order-1 train on first 8
+    let tiny = [19, 7, 4, 19, 7, 4, 19, 7]
+    let m1 = _train_markov(tiny, tiny.len(), 1)
+    let mids = m1[0]
+    let mcnt = m1[1]
+    println("train_markov_o1_observed_ctx_count=" + str(mids.len()) + " (expect 3 — t,h,e)")
+    // After training: ctx t -> h seen 3 times (positions 1,4,7); ctx h -> e seen 2 times (pos 2,5); ctx e -> t seen 2 times (pos 3,6)
+    // Find ctx for "t" (id=19)
+    let idx_t = _find_ctx(mids, 19)
+    let idx_h = _find_ctx(mids, 7)
+    let idx_e = _find_ctx(mids, 4)
+    println("idx_t=" + str(idx_t) + " idx_h=" + str(idx_h) + " idx_e=" + str(idx_e))
+    let cnt_t_to_h = if idx_t >= 0 { mcnt[idx_t * ALPHABET + 7] } else { -1 }
+    let cnt_h_to_e = if idx_h >= 0 { mcnt[idx_h * ALPHABET + 4] } else { -1 }
+    let cnt_e_to_t = if idx_e >= 0 { mcnt[idx_e * ALPHABET + 19] } else { -1 }
+    println("count(t->h)=" + str(cnt_t_to_h) + " (expect 3)")
+    println("count(h->e)=" + str(cnt_h_to_e) + " (expect 2)")
+    println("count(e->t)=" + str(cnt_e_to_t) + " (expect 2)")
+    let train_ok = mids.len() == 3 && cnt_t_to_h == 3 && cnt_h_to_e == 2 && cnt_e_to_t == 2
+
+    // 5) Verify predict on tiny: from "t" should predict "h"
+    let pred_after_t = _predict_at(m1, tiny, 1, 1)  // pos=1 means context = chars[0]=t, predict chars[1]; expected h
+    let pred_after_h = _predict_at(m1, tiny, 2, 1)  // ctx=h, predict e
+    let pred_after_e = _predict_at(m1, tiny, 3, 1)  // ctx=e, predict t
+    println("predict_after_t=" + str(pred_after_t) + " (expect 7=h)")
+    println("predict_after_h=" + str(pred_after_h) + " (expect 4=e)")
+    println("predict_after_e=" + str(pred_after_e) + " (expect 19=t)")
+    let pred_ok = pred_after_t == 7 && pred_after_h == 4 && pred_after_e == 19
+
+    // 6) Verify accuracy on perfect-prediction tiny corpus
+    // Train on positions 1..6 (i.e. cap=6); test on positions 6..8 (chars[6]=t,chars[7]=h)
+    let m1b = _train_markov(tiny, 6, 1)
+    let acc = _accuracy_at(m1b, tiny, 6, 8, 1)
+    println("acc_on_tiny_test=" + str(acc) + " (expect 1000=both predictions correct)")
+    let acc_ok = acc == 1000
+
+    // 7) Verify unseen-ctx fallback returns "e" (=4)
+    let unseen_pred = _predict_at(m1, [25, 25, 25], 1, 1)  // ctx=z=25 not seen
+    println("unseen_ctx_fallback_pred=" + str(unseen_pred) + " (expect 4=e)")
+    let fb_ok = unseen_pred == 4
+
+    // 8) Verify corpus loads, normalizes, has expected scale
+    let corp = _normalize(_raw_corpus())
+    println("corpus_normalized_len=" + str(corp.len()) + " (expect ~1000-1100)")
+    let corp_ok = corp.len() > 800 && corp.len() < 1200
+
+    // 9) Verify all chars in corpus are valid (0..27)
+    let mut all_valid = true
+    let mut k = 0
+    while k < corp.len() {
+        if corp[k] < 0 || corp[k] >= ALPHABET { all_valid = false }
+        k = k + 1
+    }
+    println("corpus_all_chars_valid=" + str(all_valid))
+
+    // 10) Verify argmax
+    let mut counts = []
+    let mut zz = 0
+    while zz < ALPHABET { counts.push(0); zz = zz + 1 }
+    counts[4] = 9
+    counts[19] = 5
+    counts[0] = 9  // tie with e=4; lowest-symbol tiebreak should win → 0
+    let am = _argmax_alpha(counts, 0)
+    println("argmax_tied_e_a_lowest_wins=" + str(am) + " (expect 0=a)")
+    let am_ok = am == 0
+
+    // 11) Verify ctx_id round-trip stability (encoding determinism)
+    let id_x1 = _ctx_id([4, 19, 7, 0, 13])
+    let id_x2 = _ctx_id([4, 19, 7, 0, 13])
+    println("ctx_id_determinism=" + str(id_x1) + "_vs_" + str(id_x2) + " (must match)")
+    let det_ok = id_x1 == id_x2
+
+    let ok = n_ok && n2_ok && n3_ok && id_ok && fc_ok && train_ok && pred_ok && acc_ok && fb_ok && corp_ok && all_valid && am_ok && det_ok
+    if ok {
+        println("__LAW_64_CYCLE_4_T10C_RESULT__ PASS_SELFTEST_normalize_ctx_id_find_ctx_train_markov_predict_accuracy_fallback_corpus_argmax_determinism_all_correct")
+    } else {
+        println("__LAW_64_CYCLE_4_T10C_RESULT__ FAIL_SELFTEST")
+        println("  n_ok=" + str(n_ok) + " n2_ok=" + str(n2_ok) + " n3_ok=" + str(n3_ok) + " id_ok=" + str(id_ok) + " fc_ok=" + str(fc_ok))
+        println("  train_ok=" + str(train_ok) + " pred_ok=" + str(pred_ok) + " acc_ok=" + str(acc_ok) + " fb_ok=" + str(fb_ok))
+        println("  corp_ok=" + str(corp_ok) + " all_valid=" + str(all_valid) + " am_ok=" + str(am_ok) + " det_ok=" + str(det_ok))
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_english_nl_alignment.hexa --selftest | --run")
+    }
+    return 0
+}
