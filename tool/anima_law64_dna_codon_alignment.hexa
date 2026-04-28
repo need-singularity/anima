@@ -1,0 +1,564 @@
+// tool/anima_law64_dna_codon_alignment.hexa — F1 cycle 4 T10a non-CA 4-symbol alignment
+// ─────────────────────────────────────────────────────────────────────────────
+// QUESTION (raw 12 frozen, declared BEFORE running):
+//   Law 64 v6 FINAL (commits 93239280 + 2bcfa18d): "matched-context Markov
+//   saturates ANY DETERMINISTIC CA". T9a extended to stochastic CA (5% noise).
+//   ALL prior tests used CA substrates (Conway 2D + 4 elementary 1D rules).
+//   Open question (manifest §5): does the alignment principle generalize to
+//   NON-CA discrete substrates (e.g., DNA-like 4-symbol alphabet, NL)?
+//   HYPOTHESIS: alignment principle is universal IF the substrate is markov
+//   over a finite-context window. CA satisfies this trivially. DNA-like 4-symbol
+//   determined-rule substrates also satisfy it. If matched-order Markov
+//   saturates, Law 64 generalizes BEYOND CA (universal alignment principle).
+//
+// SUBSTRATE: synthetic determined-DNA — 4-symbol alphabet {A=0, C=1, G=2, T=3}.
+//   Length=64 toroidal sequence. NOT a CA: CA = 2-symbol typically; here we
+//   have 4-symbol arithmetic on a non-binary alphabet, so n-gram statistics
+//   over 4-symbol contexts are FUNDAMENTALLY DIFFERENT (4^k contexts, not 2^k).
+//
+// "CODON RULE" (deterministic 3-cell function on 4-symbol alphabet):
+//   f(prev, curr, next) = (prev XOR curr XOR next) mod 4
+//   where XOR is bitwise on 2-bit values (each symbol ∈ {0,1,2,3} = 2 bits).
+//   Non-trivially periodic, deterministic, context-3 dependent.
+//
+// ORACLE: matched 3-cell window (CA(5)-equivalent for this substrate) — applies
+//   the true rule function. Perfect ceiling = 1000/1000.
+//
+// THREE MARKOV BASELINES (per-cell, parallel to T8o discipline):
+//   - Order-1: P(next | self)              — 4 contexts/cell
+//   - Order-3: P(next | prev, self, post)  — 64 contexts/cell  ← matches rule's 3-cell width
+//   - Order-5: P(next | 5-cell window)     — 1024 contexts/cell ← matches CA(5) window
+//   Each context tracks 4 output counts; predict via argmax.
+//
+// N_TRAIN ANCHORS: 50, 500, 1500
+// N_TEST: 15 (held constant, parallel to T8o)
+// INIT: single-symbol-A toroidal (deterministic spreading from one perturbation)
+//
+// PRE-REGISTERED HYPOTHESES (raw 12 frozen):
+//   H1 (alignment universal):
+//     order-3 saturates (advantage_vs_oracle < +5/1000) at N=500+ — alignment
+//     principle holds on non-CA 4-symbol substrate.
+//     → Law 64 v8 CANDIDATE: "matched-context Markov saturates ANY
+//       DETERMINISTIC FINITE-CONTEXT discrete substrate" (CA + 4-symbol rules
+//       + plausibly DNA/NL with sufficient context).
+//
+//   H2 (CA-specific):
+//     order-3 still has gap > +50/1000 at N=1500 — CA was special; alignment
+//     principle does NOT generalize. 4-symbol arithmetic creates true
+//     structural advantage.
+//     → Law 64 v6 STAYS NARROW: alignment principle is CA-specific; non-CA
+//       substrates retain genuine oracle advantage even with matched-width
+//       baselines.
+//
+//   H3 (data-sparsity):
+//     order-3 partial saturate (5 ≤ gap < 50 at N=1500) — gap shrinks with N
+//     but doesn't reach 0 due to 64-context × 4-output sparsity (4× more
+//     parameters per context vs binary CA).
+//     → Law 64 v6 NUANCE: principle holds asymptotically but data-volume
+//       requirement scales with alphabet size; finite-N behaviour shows gap.
+//
+// VERDICT MAPPING (frozen, no post-hoc tuning):
+//   adv_o3_n500  = oracle_advantage_per_thousand at order=3, N_TRAIN=500
+//   adv_o3_n1500 = oracle_advantage_per_thousand at order=3, N_TRAIN=1500
+//   if adv_o3_n500 < 5 AND adv_o3_n1500 < 5:                H1_SUPPORTED  (alignment universal)
+//   elif adv_o3_n1500 >= 50:                                H2_SUPPORTED  (CA-specific)
+//   else (5 <= adv_o3_n1500 < 50):                          H3_SUPPORTED  (data-sparsity)
+//   (order-5 closure check reported but not gating.)
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 91 honest finding
+// raw 42 caveat: 3 orders × 3 N_TRAIN, length-64 (vs 128 in T8o), ~2-4min budget on Mac CPU.
+// raw 91 caveat: single seed, single init (single_A). Random-density init NOT
+//   tested here (forward step if H1/H2 fires). Length-64 chosen to keep o5
+//   (1024 ctx/cell × 64 cells = 65536 params) tractable on CPU.
+// raw 91 caveat: bitwise XOR for 2-bit symbols is implemented via decomposition
+//   ((a/2)^(b/2))*2 + ((a%2)^(b%2)); hexa native ^ confirmed working (test=2).
+// ─────────────────────────────────────────────────────────────────────────────
+
+let LEN = 64
+let SEED = 20260428
+let N_TEST = 15
+
+let mut RNG_STATE = SEED
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rng_reset() { RNG_STATE = SEED }
+
+// ── 4-symbol bitwise XOR helper (each symbol in {0,1,2,3} = 2 bits) ─────────
+fn _xor4(a: int, b: int) -> int {
+    let hi = (a / 2) ^ (b / 2)
+    let lo = (a % 2) ^ (b % 2)
+    return hi * 2 + lo
+}
+
+// ── Codon rule: f(prev, curr, next) = (prev XOR curr XOR next) mod 4 ────────
+// Toroidal 1D, length=LEN, 4-symbol alphabet
+fn _codon_step(state: array) -> array {
+    let mut next = []
+    let mut i = 0
+    while i < LEN {
+        let li = (i + LEN - 1) % LEN
+        let ri = (i + 1) % LEN
+        let p = state[li]; let c = state[i]; let n = state[ri]
+        let v = _xor4(_xor4(p, c), n)
+        next.push(v % 4)
+        i = i + 1
+    }
+    return next
+}
+
+// Oracle: matches the rule exactly (3-cell window applied per cell)
+fn _oracle_predict(prev: array) -> array { return _codon_step(prev) }
+
+// Init: all-A (zero) with a 5-cell ACGTC perturbation at center.
+// We need ALL 4 symbols seeded because XOR over {0,1} is closed; if we only
+// inject {0,1} we never exercise contexts with symbols 2 or 3. Seeding
+// {1,2,3,2,1} = {C,G,T,G,C} forces full 4-symbol dynamics from step 1.
+// (parallel to T8o single_cell discipline but adapted to 4-symbol substrate.)
+fn _init_single_A() -> array {
+    let mut g = []
+    let mut i = 0
+    while i < LEN { g.push(0); i = i + 1 }
+    let cidx = LEN / 2
+    g[cidx - 2] = 1  // C
+    g[cidx - 1] = 2  // G
+    g[cidx] = 3      // T
+    g[cidx + 1] = 2  // G
+    g[cidx + 2] = 1  // C
+    return g
+}
+
+// ── neighbor index helpers (1D toroidal) ────────────────────────────────────
+fn _l1(c: int) -> int { return (c + LEN - 1) % LEN }
+fn _r1(c: int) -> int { return (c + 1) % LEN }
+fn _l2(c: int) -> int { return (c + LEN - 2) % LEN }
+fn _r2(c: int) -> int { return (c + 2) % LEN }
+
+// ── argmax over 4 output counts (returns symbol 0..3) ───────────────────────
+fn _argmax4(c0: int, c1: int, c2: int, c3: int) -> int {
+    let mut best = 0
+    let mut bv = c0
+    if c1 > bv { bv = c1; best = 1 }
+    if c2 > bv { bv = c2; best = 2 }
+    if c3 > bv { bv = c3; best = 3 }
+    return best
+}
+
+// ── Markov ORDER-1: P(next | self) — 4 ctx/cell, 4 outputs each ────────────
+// probs layout: 16 slots/cell, [c0_n0..n3, c1_n0..n3, c2_n0..n3, c3_n0..n3]
+fn _train_o1(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < LEN {
+        // 4 contexts × 4 outputs = 16 slots
+        let mut cnt = []
+        let mut z = 0
+        while z < 16 { cnt.push(0); z = z + 1 }
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev = pair[0]; let nxt = pair[1]
+            let ctx = prev[c]
+            let out = nxt[c]
+            cnt[ctx * 4 + out] = cnt[ctx * 4 + out] + 1
+            idx = idx + 1
+        }
+        let mut k = 0
+        while k < 16 { probs.push(cnt[k]); k = k + 1 }
+        c = c + 1
+    }
+    return probs
+}
+fn _predict_o1(probs: array, prev: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < LEN {
+        let ctx = prev[c]
+        let base = c * 16 + ctx * 4
+        let pred = _argmax4(probs[base], probs[base+1], probs[base+2], probs[base+3])
+        next.push(pred)
+        c = c + 1
+    }
+    return next
+}
+
+// ── Markov ORDER-3: P(next | prev, self, post) — 64 ctx/cell × 4 outputs ───
+// ctx = 16*prev + 4*self + post (matches codon rule's 3-cell neighborhood)
+// probs layout: 256 slots/cell (64 ctx × 4 outputs)
+fn _train_o3(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < LEN {
+        let mut cnt = []
+        let mut z = 0
+        while z < 256 { cnt.push(0); z = z + 1 }
+        let li = _l1(c); let ri = _r1(c)
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev = pair[0]; let nxt = pair[1]
+            let ctx = 16 * prev[li] + 4 * prev[c] + prev[ri]
+            let out = nxt[c]
+            cnt[ctx * 4 + out] = cnt[ctx * 4 + out] + 1
+            idx = idx + 1
+        }
+        let mut k = 0
+        while k < 256 { probs.push(cnt[k]); k = k + 1 }
+        c = c + 1
+    }
+    return probs
+}
+fn _predict_o3(probs: array, prev: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < LEN {
+        let li = _l1(c); let ri = _r1(c)
+        let ctx = 16 * prev[li] + 4 * prev[c] + prev[ri]
+        let base = c * 256 + ctx * 4
+        let pred = _argmax4(probs[base], probs[base+1], probs[base+2], probs[base+3])
+        next.push(pred)
+        c = c + 1
+    }
+    return next
+}
+
+// ── Markov ORDER-5: P(next | l2,l,self,r,r2) — 1024 ctx/cell × 4 outputs ──
+// ctx = 256*l2 + 64*l + 16*self + 4*r + r2 (5-cell window, supersumes 3-cell)
+// probs layout: 4096 slots/cell (1024 ctx × 4 outputs); LEN*4096 = 262144 total
+fn _train_o5(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < LEN {
+        let mut cnt = []
+        let mut z = 0
+        while z < 4096 { cnt.push(0); z = z + 1 }
+        let l2i = _l2(c); let li = _l1(c); let ri = _r1(c); let r2i = _r2(c)
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev = pair[0]; let nxt = pair[1]
+            let ctx = 256 * prev[l2i] + 64 * prev[li] + 16 * prev[c] + 4 * prev[ri] + prev[r2i]
+            let out = nxt[c]
+            cnt[ctx * 4 + out] = cnt[ctx * 4 + out] + 1
+            idx = idx + 1
+        }
+        let mut k = 0
+        while k < 4096 { probs.push(cnt[k]); k = k + 1 }
+        c = c + 1
+    }
+    return probs
+}
+fn _predict_o5(probs: array, prev: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < LEN {
+        let l2i = _l2(c); let li = _l1(c); let ri = _r1(c); let r2i = _r2(c)
+        let ctx = 256 * prev[l2i] + 64 * prev[li] + 16 * prev[c] + 4 * prev[ri] + prev[r2i]
+        let base = c * 4096 + ctx * 4
+        let pred = _argmax4(probs[base], probs[base+1], probs[base+2], probs[base+3])
+        next.push(pred)
+        c = c + 1
+    }
+    return next
+}
+
+// ── accuracy + corpus ───────────────────────────────────────────────────────
+fn _accuracy(pred: array, actual: array) -> int {
+    let mut total = 0; let mut match_count = 0
+    let mut s = 0
+    while s < pred.len() {
+        let p = pred[s]; let a = actual[s]
+        let mut c = 0
+        while c < LEN {
+            if p[c] == a[c] { match_count = match_count + 1 }
+            total = total + 1; c = c + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0 }
+    return (match_count * 1000) / total
+}
+
+fn _build_corpus(initial: array, n_steps: int) -> array {
+    let mut samples = []
+    let mut state = initial
+    let mut s = 0
+    while s < n_steps {
+        let nxt = _codon_step(state)
+        samples.push([state, nxt])
+        state = nxt
+        s = s + 1
+    }
+    return samples
+}
+
+// ── single (order, n_train) evaluation ──────────────────────────────────────
+fn _eval(order: int, n_train: int, max_train: int, init_state: array) -> array {
+    let total_steps = max_train + N_TEST
+    let full = _build_corpus(init_state, total_steps)
+    let mut train = []; let mut test = []
+    let mut k = 0
+    while k < full.len() {
+        if k < n_train { train.push(full[k]) }
+        if k >= max_train { test.push(full[k]) }
+        k = k + 1
+    }
+
+    let mut oracle_preds = []; let mut mk_preds = []; let mut actuals = []
+
+    if order == 1 {
+        let probs = _train_o1(train)
+        let mut i = 0
+        while i < test.len() {
+            let pair = test[i]; let ps = pair[0]; let an = pair[1]
+            oracle_preds.push(_oracle_predict(ps))
+            mk_preds.push(_predict_o1(probs, ps))
+            actuals.push(an)
+            i = i + 1
+        }
+    }
+    if order == 3 {
+        let probs = _train_o3(train)
+        let mut i = 0
+        while i < test.len() {
+            let pair = test[i]; let ps = pair[0]; let an = pair[1]
+            oracle_preds.push(_oracle_predict(ps))
+            mk_preds.push(_predict_o3(probs, ps))
+            actuals.push(an)
+            i = i + 1
+        }
+    }
+    if order == 5 {
+        let probs = _train_o5(train)
+        let mut i = 0
+        while i < test.len() {
+            let pair = test[i]; let ps = pair[0]; let an = pair[1]
+            oracle_preds.push(_oracle_predict(ps))
+            mk_preds.push(_predict_o5(probs, ps))
+            actuals.push(an)
+            i = i + 1
+        }
+    }
+
+    let oracle_acc = _accuracy(oracle_preds, actuals)
+    let mk_acc = _accuracy(mk_preds, actuals)
+    let advantage = if mk_acc > 0 { ((oracle_acc * 1000) / mk_acc) - 1000 } else { 999 }
+    println("  order=" + str(order) + " n_train=" + str(n_train) + " oracle_acc=" + str(oracle_acc) + " markov_acc=" + str(mk_acc) + " advantage_per_thousand=" + str(advantage))
+    return [order, n_train, oracle_acc, mk_acc, advantage]
+}
+
+fn _run() {
+    println("__LAW_64_CYCLE_4_T10A_DNA_CODON_BEGIN__ non-CA 4-symbol alignment test")
+    println("hypothesis H1 (alignment universal): order-3 saturates (<+5/1000) at N>=500 — Law 64 generalizes beyond CA")
+    println("hypothesis H2 (CA-specific): order-3 advantage >=+50 at N=1500 — alignment is CA-only")
+    println("hypothesis H3 (data-sparsity): 5 <= order-3 advantage < 50 at N=1500 — partial closure, alphabet-size scaling")
+    println("seed=" + str(SEED) + " len=" + str(LEN) + " alphabet=4 rule=xor3_codon N_TEST=" + str(N_TEST))
+
+    _rng_reset()
+    let init = _init_single_A()
+    let mut nonzero = 0
+    let mut ai = 0
+    while ai < LEN { if init[ai] != 0 { nonzero = nonzero + 1 } ai = ai + 1 }
+    println("init_single_A_nonzero=" + str(nonzero) + " (expect 5 — CGTGC seed)")
+
+    let max_train = 1500
+
+    println("--- order=1 (P(next|self), 4 ctx/cell × 4 outs = 16 params/cell) ---")
+    let o1_n50   = _eval(1, 50,   max_train, init)
+    let o1_n500  = _eval(1, 500,  max_train, init)
+    let o1_n1500 = _eval(1, 1500, max_train, init)
+
+    println("--- order=3 (P(next|prev,self,post), 64 ctx/cell × 4 outs = 256 params/cell — matches codon rule width) ---")
+    let o3_n50   = _eval(3, 50,   max_train, init)
+    let o3_n500  = _eval(3, 500,  max_train, init)
+    let o3_n1500 = _eval(3, 1500, max_train, init)
+
+    println("--- order=5 (P(next|5-cell window), 1024 ctx/cell × 4 outs = 4096 params/cell — supersumes codon width) ---")
+    let o5_n50   = _eval(5, 50,   max_train, init)
+    let o5_n500  = _eval(5, 500,  max_train, init)
+    let o5_n1500 = _eval(5, 1500, max_train, init)
+
+    let adv_o1_500  = o1_n500[4]
+    let adv_o1_1500 = o1_n1500[4]
+    let adv_o3_500  = o3_n500[4]
+    let adv_o3_1500 = o3_n1500[4]
+    let adv_o5_500  = o5_n500[4]
+    let adv_o5_1500 = o5_n1500[4]
+
+    println("--- aggregate (advantage_per_thousand at key anchors) ---")
+    println("adv_o1_n500="  + str(adv_o1_500)  + " adv_o1_n1500=" + str(adv_o1_1500))
+    println("adv_o3_n500="  + str(adv_o3_500)  + " adv_o3_n1500=" + str(adv_o3_1500))
+    println("adv_o5_n500="  + str(adv_o5_500)  + " adv_o5_n1500=" + str(adv_o5_1500))
+
+    // Verdict mapping (pre-registered, frozen)
+    let mut verdict = "AMBIGUOUS"
+    let mut law_dir = "INCONCLUSIVE"
+    if adv_o3_500 < 5 && adv_o3_1500 < 5 {
+        verdict = "H1_SUPPORTED_alignment_principle_universal_order3_saturates_on_non_CA_4_symbol_substrate"
+        law_dir = "LAW_64_v8_CANDIDATE_matched_context_markov_saturates_ANY_deterministic_finite_context_discrete_substrate_CA_plus_4symbol_codon_rules"
+    } else {
+        if adv_o3_1500 >= 50 {
+            verdict = "H2_SUPPORTED_CA_specific_alignment_principle_does_NOT_generalize_to_4_symbol_substrate"
+            law_dir = "LAW_64_v6_STAYS_NARROW_alignment_is_CA_specific_4_symbol_arithmetic_creates_genuine_oracle_advantage"
+        } else {
+            verdict = "H3_SUPPORTED_data_sparsity_partial_closure_alphabet_size_scaling_observed"
+            law_dir = "LAW_64_v6_NUANCE_principle_holds_asymptotically_data_volume_scales_with_alphabet_size"
+        }
+    }
+    println("--- verdict ---")
+    println("verdict=" + verdict)
+    println("law_64_direction=" + law_dir)
+    println("o5_closure_check_adv_o5_n1500=" + str(adv_o5_1500) + "_threshold_<5_for_full_closure_at_supersumed_window")
+
+    println("__LAW_64_CYCLE_4_T10A_RESULT__ " + verdict)
+
+    // raw 91 honesty triad C1-C5
+    println("raw_91_C1_falsifiable=YES_pre_registered_thresholds_5_and_50_at_order3_N500_and_N1500_frozen")
+    println("raw_91_C2_replicable=YES_seed_" + str(SEED) + "_deterministic_LCG_codon_rule_xor3_single_A_init")
+    println("raw_91_C3_no_p_hacking=YES_thresholds_orders_anchors_frozen_in_header_before_run")
+    println("raw_91_C4_data_caveats=length_64_toroidal_single_A_init_only_no_random_density_init_tested")
+    println("raw_91_C5_negative_result_published=YES_emit_regardless_of_outcome_per_raw_71")
+    println("raw_91_caveat=order-3_exactly_matches_codon_rule_3-cell_neighborhood_test_is_whether_data_volume_at_N=1500_is_sufficient_for_o3_to_learn_the_true_4-symbol_function")
+    println("raw_91_caveat=this_is_synthetic_determined_DNA_NOT_real_DNA_or_NL_real_substrates_have_longer_context_and_stochasticity_forward_step_if_H1_fires")
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T10A_DNA_CODON_BEGIN__ selftest")
+
+    // Verify 4-symbol bitwise XOR
+    let x_3_1 = _xor4(3, 1)  // 11 ^ 01 = 10 = 2
+    let x_2_3 = _xor4(2, 3)  // 10 ^ 11 = 01 = 1
+    let x_0_2 = _xor4(0, 2)  // 00 ^ 10 = 10 = 2
+    let x_1_1 = _xor4(1, 1)  // 01 ^ 01 = 00 = 0
+    println("xor4(3,1)=" + str(x_3_1) + " (expect 2)")
+    println("xor4(2,3)=" + str(x_2_3) + " (expect 1)")
+    println("xor4(0,2)=" + str(x_0_2) + " (expect 2)")
+    println("xor4(1,1)=" + str(x_1_1) + " (expect 0)")
+
+    // Verify codon rule on known pattern: g = [...,0,1,2,3,0,...]
+    // For cell at center idx=LEN/2, set neighborhood: l=1, c=2, r=3
+    // expected: 1 ^ 2 ^ 3 = 01^10^11 = 11^11 = 00 → wait: 1^2=3, 3^3=0. expect 0
+    let mut g = []
+    let mut i = 0
+    while i < LEN { g.push(0); i = i + 1 }
+    let cidx = LEN / 2
+    g[cidx - 1] = 1; g[cidx] = 2; g[cidx + 1] = 3
+    let nxt = _codon_step(g)
+    println("codon_test_input_at_[cidx-1,cidx,cidx+1]=[1,2,3]")
+    println("codon_test_next_at_cidx=" + str(nxt[cidx]) + " (expect 0 = 1^2^3 = 3^3 = 0)")
+    // cell at cidx-1: l=g[cidx-2]=0, c=g[cidx-1]=1, r=g[cidx]=2 → 0^1^2 = 3
+    println("codon_test_next_at_cidx-1=" + str(nxt[cidx-1]) + " (expect 3 = 0^1^2)")
+    // cell at cidx+1: l=g[cidx]=2, c=g[cidx+1]=3, r=g[cidx+2]=0 → 2^3^0 = 1
+    println("codon_test_next_at_cidx+1=" + str(nxt[cidx+1]) + " (expect 1 = 2^3^0)")
+
+    // Verify single_A init (CGTGC seed of 5 nonzero symbols at center)
+    let ic = _init_single_A()
+    let mut ic_nz = 0
+    let mut k = 0
+    while k < LEN { if ic[k] != 0 { ic_nz = ic_nz + 1 } k = k + 1 }
+    println("single_A_init_nonzero=" + str(ic_nz) + " (expect 5)")
+    println("single_A_init_at_idx_" + str(LEN/2) + "=" + str(ic[LEN/2]) + " (expect 3=T)")
+
+    // Verify rule shows non-trivial dynamics (NOT trivially periodic in first 8 steps)
+    // Track distinct symbols + active-cell count over 8 generations
+    let mini = _build_corpus(ic, 8)
+    let mut step = 0
+    let mut dynamics_ok = false
+    let mut max_active = 0
+    let mut max_distinct = 1
+    while step < mini.len() {
+        let pair = mini[step]
+        let stt = pair[1]
+        let mut active = 0
+        let mut seen0 = 0; let mut seen1 = 0; let mut seen2 = 0; let mut seen3 = 0
+        let mut s = 0
+        while s < LEN {
+            if stt[s] != 0 { active = active + 1 }
+            if stt[s] == 0 { seen0 = 1 }
+            if stt[s] == 1 { seen1 = 1 }
+            if stt[s] == 2 { seen2 = 1 }
+            if stt[s] == 3 { seen3 = 1 }
+            s = s + 1
+        }
+        let distinct = seen0 + seen1 + seen2 + seen3
+        if active > max_active { max_active = active }
+        if distinct > max_distinct { max_distinct = distinct }
+        println("  step=" + str(step+1) + " active=" + str(active) + " distinct_symbols=" + str(distinct))
+        step = step + 1
+    }
+    if max_active >= 3 { dynamics_ok = true }
+    println("dynamics_max_active=" + str(max_active) + " (expect >=3 for spreading)")
+    println("dynamics_max_distinct=" + str(max_distinct))
+
+    // Verify neighbor index helpers (LEN=64)
+    let l1_0 = _l1(0)   // expect 63
+    let r1_0 = _r1(0)   // expect 1
+    let l2_0 = _l2(0)   // expect 62
+    let r2_0 = _r2(0)   // expect 2
+    let l1_63 = _l1(63) // expect 62
+    let r1_63 = _r1(63) // expect 0
+    println("l1(0)=" + str(l1_0) + " r1(0)=" + str(r1_0) + " l2(0)=" + str(l2_0) + " r2(0)=" + str(r2_0))
+    println("l1(63)=" + str(l1_63) + " r1(63)=" + str(r1_63))
+
+    // Verify argmax4
+    let am0 = _argmax4(5, 2, 1, 0)  // 0
+    let am1 = _argmax4(0, 7, 3, 0)  // 1
+    let am2 = _argmax4(1, 1, 9, 4)  // 2
+    let am3 = _argmax4(0, 0, 0, 1)  // 3
+    println("argmax4(5,2,1,0)=" + str(am0) + " (expect 0)")
+    println("argmax4(0,7,3,0)=" + str(am1) + " (expect 1)")
+    println("argmax4(1,1,9,4)=" + str(am2) + " (expect 2)")
+    println("argmax4(0,0,0,1)=" + str(am3) + " (expect 3)")
+
+    // Verify train+predict pipelines on tiny corpus
+    let p1 = _train_o1(mini); let pred1 = _predict_o1(p1, ic)
+    let p3 = _train_o3(mini); let pred3 = _predict_o3(p3, ic)
+    let p5 = _train_o5(mini); let pred5 = _predict_o5(p5, ic)
+
+    println("p1_len=" + str(p1.len()) + " (expect " + str(16*LEN) + ")")
+    println("p3_len=" + str(p3.len()) + " (expect " + str(256*LEN) + ")")
+    println("p5_len=" + str(p5.len()) + " (expect " + str(4096*LEN) + ")")
+    println("pred1_len=" + str(pred1.len()) + " pred3_len=" + str(pred3.len()) + " pred5_len=" + str(pred5.len()))
+
+    // Verify oracle is perfect on codon corpus
+    let mut or_preds = []; let mut actuals = []
+    let mut mi = 0
+    while mi < mini.len() {
+        let pair = mini[mi]
+        let pst = pair[0]; let act = pair[1]
+        or_preds.push(_oracle_predict(pst)); actuals.push(act)
+        mi = mi + 1
+    }
+    let or_acc = _accuracy(or_preds, actuals)
+    println("oracle_acc_on_codon=" + str(or_acc) + " (expect 1000=100%)")
+
+    let xor_ok = x_3_1 == 2 && x_2_3 == 1 && x_0_2 == 2 && x_1_1 == 0
+    let codon_ok = nxt[cidx] == 0 && nxt[cidx-1] == 3 && nxt[cidx+1] == 1
+    let idx_ok = l1_0 == 63 && r1_0 == 1 && l2_0 == 62 && r2_0 == 2 && l1_63 == 62 && r1_63 == 0
+    let am_ok = am0 == 0 && am1 == 1 && am2 == 2 && am3 == 3
+    let ok = xor_ok && codon_ok && ic_nz == 5 && ic[LEN/2] == 3 && idx_ok && am_ok
+            && p1.len() == 16*LEN && p3.len() == 256*LEN && p5.len() == 4096*LEN
+            && pred1.len() == LEN && pred3.len() == LEN && pred5.len() == LEN
+            && or_acc == 1000 && dynamics_ok
+    if ok {
+        println("__LAW_64_CYCLE_4_T10A_RESULT__ PASS_SELFTEST_xor4_codon_step_indices_argmax4_markov_o1_o3_o5_oracle_dynamics_all_correct")
+    } else {
+        println("__LAW_64_CYCLE_4_T10A_RESULT__ FAIL_SELFTEST")
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_dna_codon_alignment.hexa --selftest | --run")
+    }
+    return 0
+}
