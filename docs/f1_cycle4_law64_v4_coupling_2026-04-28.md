@@ -89,10 +89,32 @@ Pre-registered hypotheses (raw 12 frozen):
 ### §3.3 Joint synthesis of Q1+Q2 → Law 64 v4 FINAL
 
 Both §3 open questions resolved in same session:
-- **Spatial-axis falsification (T8k)**: chaotic R-pent at 80x80 still descends to parity → train-volume axis is universal
+- **Spatial-axis falsification (T8k)**: chaotic R-pent at 80x80 still descends to parity → train-volume axis is universal on Conway
 - **Baseline-axis robustness (T8l)**: order-2/3 Markov does NOT close gap → CA(5) advantage is structural at short horizons
 
-Joint reading: CA(5) outperforms order-1/2/3 Markov at SHORT TRAIN HORIZONS (N_TRAIN ≤ ~50) regardless of grid size or pattern type — the structural-advantage finding is real. But Markov saturates given enough samples on Conway substrates because Conway is a deterministic finite-state system with limited entropy at every grid size. The "eternal advantage" claim is FALSE; the "structural advantage at short horizons" claim is TRUE.
+Joint reading: CA(5) outperforms order-1/2/3 Markov at SHORT TRAIN HORIZONS (N_TRAIN ≤ ~50) regardless of grid size or pattern type — the structural-advantage finding is real. But Markov saturates given enough samples on Conway substrates because Conway is a deterministic finite-state system with limited entropy at every grid size. The "eternal advantage" claim is FALSE on Conway; the "structural advantage at short horizons" claim is TRUE.
+
+### §3.4 T8n rule-110 generalization → Law 64 v5 (Conway-saturation is SUBSTRATE-SPECIFIC)
+
+Test (commits `53c711eb` + `1bd4b7e0`): rule-110 (Wolfram elementary 1D CA, Turing-complete class-4) length=128 toroidal, 5-cell window CA oracle, Markov o1 baseline. Pre-registered hypotheses H1/H2/H3 frozen.
+
+| init | N=15 | N=50 | N=150 | N=500 | N=1500 |
+|---|---|---|---|---|---|
+| single_cell | **+1544** | +1469 | +897 | +519 | **+501** |
+| density_32% | **+893** | +941 | +1049 | +1364 | **+686** |
+
+CA(5)=100% throughout (5-cell oracle subsumes 3-cell rule); Markov o1 stays 39-66% even at N=1500.
+
+**Verdict: H1_SUPPORTED + Conway-vs-rule110 ASYMMETRY DISCOVERED**:
+- Rule-110 advantage at N=15: 30x and 18x the +50/1000 threshold (vastly stronger than Conway's +63 to +69)
+- Rule-110 advantage at N=1500: STILL +501 / +686 — does NOT descend to parity
+- Conway: descends to parity by N=500 (10x10) / N=1500 (40x40, 80x80)
+
+**Why the asymmetry**: Conway 32%-density init has a small basin/attractor that Markov o1 can fully memorize given enough samples (10^2–10^3 transition pairs cover the orbit). Rule-110 is Turing-complete with chaotic class-4 dynamics → no bigram-saturable attractor; per-cell P(next|self) cannot capture the 3-cell pattern even at N=1500.
+
+### §3.5 Law 64 v5 statement (substrate-conditional)
+
+> "CA(N≥3)-vs-Markov-order-K advantage at low train-volume holds across multiple CA rules (Conway B3/S23 2D + rule-110 1D — class-3 chaotic class-4 Turing-complete). Markov-saturation behavior is SUBSTRATE-CONDITIONAL: on Conway 32%, Markov o1 saturates to parity by N≥500-1500 (small attractor); on rule-110, Markov o1 does NOT saturate within tested N=1500 (no bigram-saturable attractor in class-4 chaotic dynamics). The 'eternal advantage' hypothesis is FALSE on Conway 32% but appears APPROXIMATELY TRUE on rule-110."
 
 ---
 
