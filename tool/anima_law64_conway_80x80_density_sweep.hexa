@@ -1,0 +1,235 @@
+// tool/anima_law64_conway_80x80_density_sweep.hexa — F1 cycle 4 T8h 80x80 PHYSICAL-LIMIT probe
+// ─────────────────────────────────────────────────────────────────────────────
+// Per user directive 2026-04-28T11:15Z "물리,수학적 한계까지 kick + 수렴까지":
+//   80x80 = 6400 cells × 30 steps = 192K Conway ops/density level × 4 levels = 768K ops
+//   Each Conway step builds 6400-element array; Markov train builds 12800-element probs.
+//   HONEST estimate: HIGH PROBABILITY OF SIGKILL at hexa-interp 512MB watchdog (F5 finding).
+//   If SIGKILL fires → DOCUMENT AS PHYSICAL LIMIT REACHED (raw 37/38 valid omega-stop).
+//
+// Densities (skip 4% trivial-sparse to conserve memory budget):
+//   D1: 512 cells  (8%)
+//   D2: 1024 cells (16% — sweet spot of small grids)
+//   D3: 2048 cells (32% — 20x20 sweet spot)
+//   D4: 3200 cells (50% — saturated)
+//
+// raw 9 hexa-only · raw 91 honest finding · raw 37/38 omega-stop on physical limit
+// ─────────────────────────────────────────────────────────────────────────────
+
+let GRID_W = 80
+let GRID_H = 80
+let N_CELLS = 6400
+let SEED = 20260428
+let N_STEPS = 30  // train+test split: 15 train + 15 test
+
+let mut RNG_STATE = SEED
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rand_n(n: int) -> int { let x = _rand(); return x % n }
+
+fn _conway_step(state: array) -> array {
+    let mut next = []
+    let mut row = 0
+    while row < GRID_H {
+        let mut col = 0
+        while col < GRID_W {
+            let mut live_neighbors = 0
+            let mut dr = -1
+            while dr <= 1 {
+                let mut dc = -1
+                while dc <= 1 {
+                    if dr != 0 || dc != 0 {
+                        let nrow = (row + dr + GRID_H) % GRID_H
+                        let ncol = (col + dc + GRID_W) % GRID_W
+                        live_neighbors = live_neighbors + state[nrow * GRID_W + ncol]
+                    }
+                    dc = dc + 1
+                }
+                dr = dr + 1
+            }
+            let cur = state[row * GRID_W + col]
+            let mut new_val = 0
+            if cur == 1 && (live_neighbors == 2 || live_neighbors == 3) { new_val = 1 }
+            if cur == 0 && live_neighbors == 3 { new_val = 1 }
+            next.push(new_val)
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return next
+}
+
+fn _gen_density_init(k_live: int) -> array {
+    let mut g = []
+    let mut i = 0
+    while i < N_CELLS { g.push(0); i = i + 1 }
+    let mut placed = 0
+    let mut tries = 0
+    while placed < k_live && tries < 50000 {
+        let pos = _rand_n(N_CELLS)
+        if g[pos] == 0 {
+            g[pos] = 1
+            placed = placed + 1
+        }
+        tries = tries + 1
+    }
+    return g
+}
+
+fn _markov_train(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < N_CELLS {
+        let mut n00 = 0; let mut n01 = 0; let mut n10 = 0; let mut n11 = 0
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev_state = pair[0]; let next_state = pair[1]
+            let cur_bit = prev_state[c]; let nxt_bit = next_state[c]
+            if cur_bit == 0 && nxt_bit == 0 { n00 = n00 + 1 }
+            if cur_bit == 0 && nxt_bit == 1 { n01 = n01 + 1 }
+            if cur_bit == 1 && nxt_bit == 0 { n10 = n10 + 1 }
+            if cur_bit == 1 && nxt_bit == 1 { n11 = n11 + 1 }
+            idx = idx + 1
+        }
+        let p1g0 = if (n00+n01) > 0 { (n01*1000)/(n00+n01) } else { 500 }
+        let p1g1 = if (n10+n11) > 0 { (n11*1000)/(n10+n11) } else { 500 }
+        probs.push(p1g0); probs.push(p1g1)
+        c = c + 1
+    }
+    return probs
+}
+
+fn _markov_predict(probs: array, prev_state: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < N_CELLS {
+        let cur_bit = prev_state[c]
+        let p = if cur_bit == 0 { probs[2*c] } else { probs[2*c + 1] }
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+fn _accuracy(pred: array, actual: array) -> int {
+    let mut total = 0; let mut match_count = 0
+    let mut s = 0
+    while s < pred.len() {
+        let p = pred[s]; let a = actual[s]
+        let mut c = 0
+        while c < N_CELLS {
+            if p[c] == a[c] { match_count = match_count + 1 }
+            total = total + 1; c = c + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0 }
+    return (match_count * 1000) / total
+}
+
+fn _build_corpus(initial: array, n_steps: int) -> array {
+    let mut samples = []
+    let mut state = initial
+    let mut s = 0
+    while s < n_steps {
+        let nxt = _conway_step(state)
+        samples.push([state, nxt])
+        state = nxt
+        s = s + 1
+    }
+    return samples
+}
+
+fn _eval_density(name: str, k_live: int) -> array {
+    let initial = _gen_density_init(k_live)
+    let full = _build_corpus(initial, N_STEPS)
+    let train_size = N_STEPS / 2
+    let mut train = []; let mut test = []
+    let mut k = 0
+    while k < full.len() {
+        if k < train_size { train.push(full[k]) } else { test.push(full[k]) }
+        k = k + 1
+    }
+    let probs = _markov_train(train)
+    let mut ca_preds = []; let mut tf_preds = []; let mut actuals = []
+    let mut i = 0
+    while i < test.len() {
+        let pair = test[i]
+        let prev_st = pair[0]; let actual_next = pair[1]
+        let ca_next = _conway_step(prev_st)
+        let tf_next = _markov_predict(probs, prev_st)
+        ca_preds.push(ca_next); tf_preds.push(tf_next); actuals.push(actual_next)
+        i = i + 1
+    }
+    let ca_acc = _accuracy(ca_preds, actuals)
+    let tf_acc = _accuracy(tf_preds, actuals)
+    let advantage = if tf_acc > 0 { ((ca_acc * 1000) / tf_acc) - 1000 } else { 999 }
+    let density_pct = (k_live * 100) / N_CELLS
+    println("  " + name + " k=" + str(k_live) + " density=" + str(density_pct) + "% ca_acc=" + str(ca_acc) + " tf_acc=" + str(tf_acc) + " advantage=" + str(advantage))
+    return [k_live, density_pct, ca_acc, tf_acc, advantage]
+}
+
+fn _run() {
+    println("__LAW_64_CYCLE_4_T8H_DENSITY_BEGIN__ Conway 80x80 PHYSICAL-LIMIT probe")
+    println("hypothesis: does sweet spot continue shifting OR is hexa-interp memory the physical ceiling?")
+    println("seed=" + str(SEED) + " grid=80x80 N_CELLS=" + str(N_CELLS) + " N_STEPS=" + str(N_STEPS))
+    println("--- density sweep (skip 4% trivial-sparse) ---")
+    let r1 = _eval_density("D1_512live_8pct", 512)
+    let r2 = _eval_density("D2_1024live_16pct", 1024)
+    let r3 = _eval_density("D3_2048live_32pct", 2048)
+    let r4 = _eval_density("D4_3200live_50pct_random", 3200)
+    let mut max_adv = -9999; let mut peak_density = 0
+    let results = [r1, r2, r3, r4]
+    let mut k = 0
+    while k < results.len() {
+        let row = results[k]
+        if row[4] > max_adv { max_adv = row[4]; peak_density = row[1] }
+        k = k + 1
+    }
+    println("--- aggregate ---")
+    println("max_advantage_per_thousand=" + str(max_adv) + " at density=" + str(peak_density) + "%")
+    println("--- amplification trend (T8c-T8h) ---")
+    println("5x5   16% density: 4.7% advantage")
+    println("10x10 16% density: 8.7-30% advantage")
+    println("20x20 32-50% density: 22.8% advantage")
+    println("40x40 (T8g): see sibling verdict")
+    println("80x80 peak: " + str(max_adv) + "/1000 at " + str(peak_density) + "% density")
+    println("---")
+    if peak_density >= 1 && peak_density <= 99 {
+        println("__LAW_64_CYCLE_4_T8H_RESULT__ EIGHTYBYEIGHTY_PEAK_AT_" + str(peak_density) + "PCT_ADV_" + str(max_adv))
+    } else {
+        println("__LAW_64_CYCLE_4_T8H_RESULT__ EIGHTYBYEIGHTY_PEAK_DEGENERATE")
+    }
+    println("raw_91_honest=PHYSICAL_LIMIT_NOT_REACHED if line printed (no SIGKILL)")
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T8H_DENSITY_BEGIN__ selftest")
+    let g512 = _gen_density_init(512)
+    let mut count512 = 0
+    let mut i = 0
+    while i < N_CELLS { count512 = count512 + g512[i]; i = i + 1 }
+    println("density_512_actual_cells=" + str(count512))
+    if count512 == 512 {
+        println("__LAW_64_CYCLE_4_T8H_RESULT__ PASS_SELFTEST_density_init_correct")
+    } else {
+        println("__LAW_64_CYCLE_4_T8H_RESULT__ FAIL_SELFTEST")
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_conway_80x80_density_sweep.hexa --selftest | --run")
+    }
+    return 0
+}
