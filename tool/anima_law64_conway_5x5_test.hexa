@@ -1,0 +1,236 @@
+// tool/anima_law64_conway_5x5_test.hexa — F1 cycle 4 T8 Conway Game of Life 5x5 toroidal
+// ─────────────────────────────────────────────────────────────────────────────
+// Cycle 4 broader corpus T8 (Agent C original 8-task design — 2D structural).
+// Cycle 4 main tool deferred Conway as "structurally different" → standalone test here.
+//
+// Conway B3/S23 rules on 5x5 toroidal grid:
+//   - Birth: dead cell with exactly 3 live neighbors → born
+//   - Survival: live cell with 2 or 3 live neighbors → stays alive
+//   - Otherwise: dies
+//
+// 25 cells per state (vs cycle 4's 5 cells 1D). Ground-truth CA model.
+// Order-1 Markov surrogate per-cell baseline.
+//
+// FALSIFIER F1-T8: CA-Conway-true vs Markov-per-cell on Conway corpus.
+// Per Agent C design: CA(5) "ground truth" beats Transformer 81% claim — TEST ON CONWAY.
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 91 honest pre/post separation
+// ─────────────────────────────────────────────────────────────────────────────
+
+let GRID_W = 5
+let GRID_H = 5
+let N_CELLS = 25  // GRID_W * GRID_H
+let N_SAMPLES = 200
+let SEED = 20260428
+
+let mut RNG_STATE = SEED
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rand_bit() -> int { let x = _rand(); if x % 2 == 0 { return 0 } else { return 1 } }
+
+// ── Conway B3/S23 5x5 toroidal step ────────────────────────────────────────
+fn _conway_step(state: array) -> array {
+    let mut next = []
+    let mut row = 0
+    while row < GRID_H {
+        let mut col = 0
+        while col < GRID_W {
+            let mut live_neighbors = 0
+            // 8 toroidal neighbors
+            let mut dr = -1
+            while dr <= 1 {
+                let mut dc = -1
+                while dc <= 1 {
+                    if dr != 0 || dc != 0 {
+                        let nrow = (row + dr + GRID_H) % GRID_H
+                        let ncol = (col + dc + GRID_W) % GRID_W
+                        live_neighbors = live_neighbors + state[nrow * GRID_W + ncol]
+                    }
+                    dc = dc + 1
+                }
+                dr = dr + 1
+            }
+            let cur = state[row * GRID_W + col]
+            // B3/S23 rule
+            let mut new_val = 0
+            if cur == 1 && (live_neighbors == 2 || live_neighbors == 3) { new_val = 1 }
+            if cur == 0 && live_neighbors == 3 { new_val = 1 }
+            next.push(new_val)
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return next
+}
+
+// ── Order-1 Markov per-cell surrogate ──────────────────────────────────────
+fn _markov_train_25(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < N_CELLS {
+        let mut n00 = 0; let mut n01 = 0; let mut n10 = 0; let mut n11 = 0
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev_state = pair[0]; let next_state = pair[1]
+            let cur_bit = prev_state[c]; let nxt_bit = next_state[c]
+            if cur_bit == 0 && nxt_bit == 0 { n00 = n00 + 1 }
+            if cur_bit == 0 && nxt_bit == 1 { n01 = n01 + 1 }
+            if cur_bit == 1 && nxt_bit == 0 { n10 = n10 + 1 }
+            if cur_bit == 1 && nxt_bit == 1 { n11 = n11 + 1 }
+            idx = idx + 1
+        }
+        let p1g0 = if (n00+n01) > 0 { (n01*1000)/(n00+n01) } else { 500 }
+        let p1g1 = if (n10+n11) > 0 { (n11*1000)/(n10+n11) } else { 500 }
+        probs.push(p1g0); probs.push(p1g1)
+        c = c + 1
+    }
+    return probs
+}
+
+fn _markov_predict_25(probs: array, prev_state: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < N_CELLS {
+        let cur_bit = prev_state[c]
+        let p = if cur_bit == 0 { probs[2*c] } else { probs[2*c + 1] }
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+fn _accuracy_25(pred: array, actual: array) -> int {
+    let mut total = 0; let mut match_count = 0
+    let mut s = 0
+    while s < pred.len() {
+        let p = pred[s]; let a = actual[s]
+        let mut c = 0
+        while c < N_CELLS {
+            if p[c] == a[c] { match_count = match_count + 1 }
+            total = total + 1; c = c + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0 }
+    return (match_count * 1000) / total
+}
+
+// ── Corpus: 25 random bits → Conway B3/S23 next state ──────────────────────
+fn _gen_conway_corpus(n: int) -> array {
+    let mut samples = []
+    let mut i = 0
+    while i < n {
+        let mut state = []
+        let mut c = 0
+        while c < N_CELLS { state.push(_rand_bit()); c = c + 1 }
+        let nxt = _conway_step(state)
+        samples.push([state, nxt])
+        i = i + 1
+    }
+    return samples
+}
+
+fn _run() {
+    println("__LAW_64_CYCLE_4_T8_CONWAY_BEGIN__ Conway 5x5 toroidal B3/S23")
+    println("seed=" + str(SEED) + " n_samples=" + str(N_SAMPLES) + " grid=" + str(GRID_W) + "x" + str(GRID_H))
+    let train = _gen_conway_corpus(N_SAMPLES)
+    let test = _gen_conway_corpus(N_SAMPLES)
+    // CA-ground-truth: knows B3/S23 rule
+    let mut ca_preds = []; let mut tf_preds = []; let mut actuals = []
+    let probs = _markov_train_25(train)
+    let mut i = 0
+    while i < test.len() {
+        let pair = test[i]
+        let prev_st = pair[0]; let actual_next = pair[1]
+        let ca_next = _conway_step(prev_st)  // ground truth
+        let tf_next = _markov_predict_25(probs, prev_st)
+        ca_preds.push(ca_next); tf_preds.push(tf_next); actuals.push(actual_next)
+        i = i + 1
+    }
+    let ca_acc = _accuracy_25(ca_preds, actuals)
+    let tf_acc = _accuracy_25(tf_preds, actuals)
+    let advantage = if tf_acc > 0 { ((ca_acc * 1000) / tf_acc) - 1000 } else { 999 }
+    println("CA_ground_truth_acc_per_thousand=" + str(ca_acc) + " (" + str(ca_acc / 10) + "." + str(ca_acc % 10) + "%)")
+    println("Markov_TF_surrogate_acc_per_thousand=" + str(tf_acc) + " (" + str(tf_acc / 10) + "." + str(tf_acc % 10) + "%)")
+    println("advantage_per_thousand=" + str(advantage))
+    let claim_50 = 500
+    let claim_81 = 810
+    if advantage > claim_50 {
+        if advantage >= claim_81 {
+            println("__LAW_64_CYCLE_4_T8_RESULT__ PASS_AT_81PCT_CLAIM (advantage>=" + str(claim_81) + ")")
+        } else {
+            println("__LAW_64_CYCLE_4_T8_RESULT__ PARTIAL_PASS_above_50pct_below_81pct")
+        }
+    } else if advantage > 0 {
+        println("__LAW_64_CYCLE_4_T8_RESULT__ FAIL_below_50pct_threshold (advantage=" + str(advantage) + ")")
+    } else if advantage == 0 {
+        println("__LAW_64_CYCLE_4_T8_RESULT__ TIE_zero_advantage (both models same accuracy)")
+    } else {
+        println("__LAW_64_CYCLE_4_T8_RESULT__ FAIL_TF_BEATS_CA (advantage=" + str(advantage) + ")")
+    }
+    println("raw_10_caveat=CA-ground-truth knows-the-rule (B3/S23) — structural advantage built-in. Real Transformer rule-induction would require deep architecture (Conway sequences require ≥5-cell context per step, beyond order-1 Markov).")
+    println("raw_10_caveat=Markov surrogate is order-1 (no spatial context, no neighbor info). Real GPT-2/Transformer with 2D positional encoding would do MUCH better on Conway.")
+    println("raw_10_caveat=2D Conway is structurally harder than 1D Wolfram CAs — neighbor count requires 8-cell aggregation, not 3-cell.")
+    println("raw_12_frozen_pre_registration=thresholds 50pct + 81pct hardcoded BEFORE measurement (constants L186-187)")
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T8_CONWAY_BEGIN__ selftest")
+    // Known Conway pattern: blinker (3-cell horizontal line) oscillates with period 2
+    // 5x5 grid with blinker at row 2 (cells 10,11,12)
+    let mut blinker = []
+    let mut i = 0
+    while i < N_CELLS {
+        if i == 11 || i == 12 || i == 13 { blinker.push(1) } else { blinker.push(0) }
+        i = i + 1
+    }
+    let blinker_t1 = _conway_step(blinker)
+    // After 1 step, blinker should be vertical (cells 6, 11, 16) due to toroidal + B3/S23
+    println("blinker_initial_row1_horizontal=cells(11,12,13)=1")
+    println("blinker_after_1step:")
+    let mut row = 0
+    while row < GRID_H {
+        let mut line = "  "
+        let mut col = 0
+        while col < GRID_W {
+            let v = blinker_t1[row * GRID_W + col]
+            if v == 1 { line = line + "X " } else { line = line + ". " }
+            col = col + 1
+        }
+        println(line)
+        row = row + 1
+    }
+    // expected: vertical 3-cell at column 12 (cells 7, 12, 17) on 5x5 toroidal
+    let blinker_t2 = _conway_step(blinker_t1)
+    let mut t2_match_t0 = true
+    let mut k = 0
+    while k < N_CELLS {
+        if blinker_t2[k] != blinker[k] { t2_match_t0 = false }
+        k = k + 1
+    }
+    println("blinker_period_2_invariant_t2==t0=" + str(t2_match_t0))
+    if t2_match_t0 {
+        println("__LAW_64_CYCLE_4_T8_RESULT__ PASS_SELFTEST_blinker_period_2")
+    } else {
+        println("__LAW_64_CYCLE_4_T8_RESULT__ FAIL_SELFTEST_blinker_pattern_broken")
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_conway_5x5_test.hexa --selftest | --run")
+        println("F1 cycle 4 T8 Conway Game of Life 5x5 toroidal — closes 8-task corpus design")
+    }
+    return 0
+}
