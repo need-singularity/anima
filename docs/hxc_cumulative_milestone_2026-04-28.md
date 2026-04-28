@@ -344,3 +344,68 @@ Per-rank priority from 5 close-path verdict triangulation (a7a059f0 + a58efacb +
 **raw 91 honest C3**: A25 v2 full deployment is structurally CORRECT but byte-weighted aggregate target requires a per-class CEILING advance on text-heavy (current bottleneck at 47%, A18 v3 order-2 byte-context projected lever).
 
 **End of v5 strengthening — 78.05% / 93.69% cumulative gap reduction / per-class 1/7 ACHIEVED on full deployment.**
+
+---
+
+## 15. v7 strengthening (post-d631a902 A18 batch AOT rebuild + AB comparison 2026-04-28T13:30Z)
+
+**Scope**: A18 d631a902 batch (v3-order-2 + v4-window64 + v6-optimal added to v1+v2+v3 + identity dispatcher min-of-7) AOT-rebuilt from clean d631a902 source; AB comparison run vs pre-d631a902 a18_v3_aot binary on 10 representative files (4.44MB).
+
+**Aggregate measurement (10-file sample, 4.44MB)**:
+- Old (v1+v2+v3 dispatcher): 92.3107% saving (341,082 enc bytes)
+- New (v1+v2+v3+v3-o2+v4-w64+v6-optimal): 92.6338% saving (326,751 enc bytes)
+- **Delta: +0.3231pp** (+4.20% bytes saved over old)
+- byte-eq round-trip: 10/10 PASS
+
+**Per-class deltas (MEASURED)**:
+| class | files | raw bytes | old saving | new saving | delta |
+|---|---|---|---|---|---|
+| text-heavy | 4 | 111,575 | 40.00% | 40.00% | **+0.0000pp** |
+| struct-audit | 2 | 391,376 | 86.37% | 86.52% | +0.1564pp |
+| json-heavy | 3 | 3,821,196 | 95.31% | 95.65% | +0.3449pp |
+| mixed-real | 1 | 111,652 | 62.80% | 63.28% | +0.4836pp |
+
+**Critical raw 91 honest C3 finding**: text-heavy class on 4 production MD files (n6 README + 3 proposals, 111KB total) shows **+0.0000pp delta** — neither v3-order-2 nor v4-window64 nor v6-optimal beat v2 on these production text samples. This DIRECTLY FALSIFIES the projected "+3-5pp on text-heavy via A18 v3 order-2" claim cited in v5 strengthening §10. v2 was already winning on text-heavy and remains the winner.
+
+**80% target verdict (PROJECTED, full sweep DEFERRED)**:
+- Prior baseline (78.05% MEASURED 2026-04-28T15Z) PRESERVED as authoritative for full-sweep aggregate.
+- Projecting +0.3-0.6pp delta from 4.44MB sample to full 9.92MB 6-repo corpus (text-heavy 16% byte-share contributes 0pp, json-heavy 53% byte-share contributes ~+0.4pp): projected aggregate **78.35-78.65%** post-d631a902.
+- **80% TARGET NOT ACHIEVED PROJECTED — gap 1.35-1.65pp residual.**
+- Full 6-repo 383-file sweep DEFERRED — 2.6MB growth_bus encode took 56s with new binary (v6-optimal O(n^2) latency), 383-file sweep would exceed practical single-turn budget.
+
+**Cumulative gap reduction (PROJECTED)**:
+- Original anchor: 30.90pp gap (49.10% post-bug-fix)
+- Prior milestone (v5): 1.95pp gap (78.05% MEASURED) = 93.69% cumulative reduction
+- This turn (v7 PROJECTED): 1.35-1.65pp gap (78.35-78.65% projected) = 94.7-95.6% cumulative reduction PROJECTED
+
+**F-A18 family final settle status**:
+- F-A18-V3-ORDER2-1 (byte-eq round-trip): NOT_TRIPPED structurally (selftest 16/16 + 4 production files PASS)
+- F-A18-V3-ORDER2-2 (text-heavy ceiling lift): DEFERRED_PRODUCTION (sample 0.00pp delta — selftest sweet spot does NOT extend to production text)
+- F-A18-V4-W64-1 (byte-eq long-range): NOT_TRIPPED structurally
+- F-A18-V4-W64-2/3 (production verdict): DEFERRED_PRODUCTION (no >32KB long-range corpus in AB sample)
+- F-A18-V4-W64-4 (wire-format): NOT_TRIPPED structurally
+- F-A18-V6-OPTIMAL-1 (byte-eq Korean/multibyte): NOT_TRIPPED structurally
+- F-A18-V6-OPTIMAL-2 (lazy-match >=v1): NOT_TRIPPED + production lift on json-heavy
+- **F-A18-V6-OPTIMAL-3 (latency budget): TRIPPED_LATENCY** — 2.6MB growth_bus encode 27s (old) -> 56s (new, 2x slower); recommend per-file size gating in production
+- F-A18-V6-OPTIMAL-4 (aggregate Pareto): NOT_TRIPPED structurally + LATENCY-GATED
+
+**Prior over-projection retraction (cumulative)**:
+- a7a5e5f2 retraction (commits a0697b59 / a9b4ee5a / a1523d94 / a105829b not in git history) PRESERVED.
+- 78.30% / 78.6-78.8% / 95.5-96.4% projections RETRACTED (UNVERIFIABLE on this turn's data — single-turn budget did not reproduce full sweep).
+- "+3-5pp on text-heavy via A18 v3 order-2" projection FALSIFIED on 4-file MD sample (0.0000pp delta).
+- 78.27% post-cohort-2 projection NOT MEASURED THIS TURN (cohort 2 is separate axis a87d09a4).
+
+**raw 91 honest C3 cumulative chain** (a7a5e5f2 -> a35a35e2 -> this turn 2026-04-28T13:30Z):
+1. a7a5e5f2: prior commit hashes UNVERIFIABLE in git history → PROJECTION RETRACTION
+2. a35a35e2: A18 d631a902 source committed (1218 -> 2485 LoC, 22/22 selftest), Part 4 + Part 5 DEFERRED
+3. this turn: AOT rebuilt from d631a902 (407296B, 22/22 PASS interp + AOT) + AB comparison 10 files MEASURED -> 80% NOT achieved + text-heavy null delta + V6-OPTIMAL-3 latency tripped
+
+**Files this cycle**:
+- `/Users/ghost/core/hexa-lang/build/a18_d631a902_aot` (NEW AOT binary 407296B)
+- `/Users/ghost/core/hexa-lang/build/artifacts/a18_d631a902_aot.c` (NEW codegen 135927B)
+- `/Users/ghost/core/anima/state/format_witness/2026-04-28_a18_batch_post_d631a902_6repo_honest_measured.jsonl` (NEW witness)
+- `/Users/ghost/core/anima/docs/hxc_cumulative_milestone_2026-04-28.md` (THIS DOC §15)
+
+**Compliance**: raw 1 chflags + raw 9 hexa-only + raw 18 self-host fixpoint (interp/AOT byte-identical) + raw 47 cross-repo + raw 65+68 idempotent (10/10 byte-eq PASS) + raw 71 falsifier-preregister + **raw 91 honest C3 STRICT** (projection retractions documented, text-heavy null delta disclosed, full sweep DEFERRED labeled) + raw 137 cmix-ban MAINTAINED + raw 142 D2 try-revert PRESERVED.
+
+**End of v7 strengthening — 78.35-78.65% PROJECTED / 94.7-95.6% cumulative gap reduction PROJECTED / per-class text-heavy null delta MEASURED / 80% target NOT achieved.**
