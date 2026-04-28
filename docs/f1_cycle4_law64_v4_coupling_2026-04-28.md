@@ -53,7 +53,21 @@ Pre-registered hypotheses (raw 12 frozen):
 
 ### Open
 - 80x80 / N_TRAIN=1500 / aperiodic init (R-pentomino chaotic) regimes — does eternal advantage restore?
-- Markov order-2 / order-3 — does the gap survive higher-order n-gram baselines?
+- ~~Markov order-2 / order-3 — does the gap survive higher-order n-gram baselines?~~ **RESOLVED T8l 2026-04-28** — see §3.1.
+
+### §3.1 T8l higher-order Markov verdict — Law 64 v4 STRENGTHENS
+
+Test: 10x10 / 32% density / N_STEPS=100 (50 train + 50 test) / seed=20260428.
+Pre-registered hypotheses H1/H2/H3 frozen in tool header before run.
+
+| model | accuracy /1000 | CA(5) advantage /1000 |
+|---|---|---|
+| Markov order-1 (P(next|self)) | 862 | +160 |
+| Markov order-2 (P(next|self,left)) | 856 | +168 |
+| Markov order-3 (P(next|self,left,right)) | 855 | +169 |
+| CA(5) ground-truth | 1000 | — |
+
+**Verdict**: H2_SUPPORTED + partial H3 — CA(5) advantage is **ROBUST across n-gram orders**; higher-order Markov does NOT close the gap and actually slightly degrades from o1 (data-sparsity at 50 train pairs / 4-context o2 / 8-context o3 per cell). The +160 → +169 progression confirms Law 64 v4 is not an artifact of choosing the weakest baseline. v5-retraction-candidate H1 (advantage shrinks to <+5/1000) was REJECTED — gap GREW instead. Tool: `tool/anima_law64_conway_higher_order_markov.hexa`. Log: `state/law64_higher_order_markov/run_20260428T030754Z.log`.
 
 ---
 

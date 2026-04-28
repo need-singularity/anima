@@ -1,0 +1,405 @@
+// tool/anima_law64_conway_higher_order_markov.hexa — F1 cycle 4 T8l higher-order Markov baseline
+// ─────────────────────────────────────────────────────────────────────────────
+// Q2 of Law 64 v4 §3 open questions:
+//   Does CA(5) advantage survive HIGHER-ORDER MARKOV BASELINES (order-2 / order-3)?
+//
+// CONTEXT:
+//   - All prior T8a-T8j tests used Markov order-1: P(next_cell | current_cell)
+//   - Order-1 is the WEAKEST n-gram baseline; commit 8871288a saturated it on small substrates
+//   - Order-2: P(next_cell | current_cell, left_neighbor)
+//   - Order-3: P(next_cell | current_cell, left_neighbor, right_neighbor)
+//   - Higher-order is closer to transformer's local attention pattern
+//   - "left/right" here = spatial neighbors in the 2D grid (col-1, col+1, same row, toroidal wrap)
+//
+// SUBSTRATE: 10x10 / 32% density (32 live cells of 100) / N_STEPS=100 (50 train + 50 test)
+//   - density 32% chosen to push Markov harder than gliders (more transitions per cell)
+//   - N_STEPS=100 → 50 training pairs, 50 test pairs (moderate volume)
+//
+// PRE-REGISTERED HYPOTHESES (raw 12 frozen):
+//   H1: order-2/3 catches up — saturates faster than order-1 at smaller N → CA(5) advantage
+//       SHRINKS to <+5/1000 (Law 64 v4 needs WEAKENING / v5 retraction candidate).
+//   H2: order-2/3 STILL underperforms CA(5) by >+10/1000 — CA(5) structure remains
+//       advantageous beyond bigram models (Law 64 v4 STRENGTHENED — robust across orders).
+//   H3 (degraded): order-2/3 fails due to sparsity — P(B|A,C) sparse → underperforms
+//       order-1 (Law 64 v4 robust by accident; baseline choice didn't even matter).
+//
+// VERDICT MAPPING:
+//   if (ca5_adv_o2 < 5 && ca5_adv_o3 < 5):                      H1_SUPPORTED    (weakens)
+//   elif (ca5_adv_o2 > 10 && ca5_adv_o3 > 10):                  H2_SUPPORTED    (robust)
+//   elif (acc_o2 < acc_o1 || acc_o3 < acc_o1):                  H3_SUPPORTED    (degraded)
+//   else:                                                       AMBIGUOUS
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 91 honest finding
+// ─────────────────────────────────────────────────────────────────────────────
+
+let GRID_W = 10
+let GRID_H = 10
+let N_CELLS = 100
+let SEED = 20260428
+let N_STEPS = 100   // 50 train + 50 test
+let K_LIVE = 32     // 32% density
+
+let mut RNG_STATE = SEED
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rand_n(n: int) -> int { let x = _rand(); return x % n }
+
+// ── Conway 2D step (toroidal) ───────────────────────────────────────────────
+fn _conway_step(state: array) -> array {
+    let mut next = []
+    let mut row = 0
+    while row < GRID_H {
+        let mut col = 0
+        while col < GRID_W {
+            let mut live_neighbors = 0
+            let mut dr = -1
+            while dr <= 1 {
+                let mut dc = -1
+                while dc <= 1 {
+                    if dr != 0 || dc != 0 {
+                        let nrow = (row + dr + GRID_H) % GRID_H
+                        let ncol = (col + dc + GRID_W) % GRID_W
+                        live_neighbors = live_neighbors + state[nrow * GRID_W + ncol]
+                    }
+                    dc = dc + 1
+                }
+                dr = dr + 1
+            }
+            let cur = state[row * GRID_W + col]
+            let mut new_val = 0
+            if cur == 1 && (live_neighbors == 2 || live_neighbors == 3) { new_val = 1 }
+            if cur == 0 && live_neighbors == 3 { new_val = 1 }
+            next.push(new_val)
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return next
+}
+
+// ── density init: K live cells at random (deterministic seed) ───────────────
+fn _gen_density_init(k_live: int) -> array {
+    let mut g = []
+    let mut i = 0
+    while i < N_CELLS { g.push(0); i = i + 1 }
+    let mut placed = 0
+    let mut tries = 0
+    while placed < k_live && tries < 10000 {
+        let pos = _rand_n(N_CELLS)
+        if g[pos] == 0 { g[pos] = 1; placed = placed + 1 }
+        tries = tries + 1
+    }
+    return g
+}
+
+// ── helper: spatial left/right neighbor indices (same row, toroidal) ────────
+fn _left_idx(c: int) -> int {
+    let row = c / GRID_W; let col = c % GRID_W
+    let lcol = (col + GRID_W - 1) % GRID_W
+    return row * GRID_W + lcol
+}
+fn _right_idx(c: int) -> int {
+    let row = c / GRID_W; let col = c % GRID_W
+    let rcol = (col + 1) % GRID_W
+    return row * GRID_W + rcol
+}
+
+// ── Markov ORDER-1: P(next_cell_c | current_cell_c) ─────────────────────────
+// probs: per-cell array of [p1g0, p1g1] — index 2c, 2c+1
+fn _markov_train_o1(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < N_CELLS {
+        let mut n00 = 0; let mut n01 = 0; let mut n10 = 0; let mut n11 = 0
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev_state = pair[0]; let next_state = pair[1]
+            let cur_bit = prev_state[c]; let nxt_bit = next_state[c]
+            if cur_bit == 0 && nxt_bit == 0 { n00 = n00 + 1 }
+            if cur_bit == 0 && nxt_bit == 1 { n01 = n01 + 1 }
+            if cur_bit == 1 && nxt_bit == 0 { n10 = n10 + 1 }
+            if cur_bit == 1 && nxt_bit == 1 { n11 = n11 + 1 }
+            idx = idx + 1
+        }
+        let p1g0 = if (n00+n01) > 0 { (n01*1000)/(n00+n01) } else { 500 }
+        let p1g1 = if (n10+n11) > 0 { (n11*1000)/(n10+n11) } else { 500 }
+        probs.push(p1g0); probs.push(p1g1)
+        c = c + 1
+    }
+    return probs
+}
+fn _markov_predict_o1(probs: array, prev_state: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < N_CELLS {
+        let cur_bit = prev_state[c]
+        let p = if cur_bit == 0 { probs[2*c] } else { probs[2*c + 1] }
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+// ── Markov ORDER-2: P(next_cell_c | current_cell_c, left_neighbor) ─────────
+// 4 contexts per cell: (cur,left) ∈ {(0,0),(0,1),(1,0),(1,1)}
+// probs flat array length 8*N_CELLS: per cell 4 contexts × 2 (count_one, count_total)
+// We store p(next=1 | ctx) per thousand at offset 4*c + ctx_idx.
+// ctx_idx = 2*cur_bit + left_bit
+fn _markov_train_o2(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < N_CELLS {
+        let mut cnt1 = [0, 0, 0, 0]
+        let mut cntT = [0, 0, 0, 0]
+        let li = _left_idx(c)
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev_state = pair[0]; let next_state = pair[1]
+            let cur_bit = prev_state[c]
+            let lft_bit = prev_state[li]
+            let ctx = 2 * cur_bit + lft_bit
+            cntT[ctx] = cntT[ctx] + 1
+            if next_state[c] == 1 { cnt1[ctx] = cnt1[ctx] + 1 }
+            idx = idx + 1
+        }
+        let mut k = 0
+        while k < 4 {
+            let p = if cntT[k] > 0 { (cnt1[k]*1000) / cntT[k] } else { 500 }
+            probs.push(p)
+            k = k + 1
+        }
+        c = c + 1
+    }
+    return probs
+}
+fn _markov_predict_o2(probs: array, prev_state: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < N_CELLS {
+        let li = _left_idx(c)
+        let cur_bit = prev_state[c]
+        let lft_bit = prev_state[li]
+        let ctx = 2 * cur_bit + lft_bit
+        let p = probs[4*c + ctx]
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+// ── Markov ORDER-3: P(next | current, left, right) ──────────────────────────
+// 8 contexts per cell: 2*2*2. ctx_idx = 4*cur + 2*left + right
+// probs flat length 8*N_CELLS, p(next=1 | ctx) per thousand at 8*c + ctx
+fn _markov_train_o3(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < N_CELLS {
+        let mut cnt1 = [0, 0, 0, 0, 0, 0, 0, 0]
+        let mut cntT = [0, 0, 0, 0, 0, 0, 0, 0]
+        let li = _left_idx(c); let ri = _right_idx(c)
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev_state = pair[0]; let next_state = pair[1]
+            let cb = prev_state[c]; let lb = prev_state[li]; let rb = prev_state[ri]
+            let ctx = 4 * cb + 2 * lb + rb
+            cntT[ctx] = cntT[ctx] + 1
+            if next_state[c] == 1 { cnt1[ctx] = cnt1[ctx] + 1 }
+            idx = idx + 1
+        }
+        let mut k = 0
+        while k < 8 {
+            let p = if cntT[k] > 0 { (cnt1[k]*1000) / cntT[k] } else { 500 }
+            probs.push(p)
+            k = k + 1
+        }
+        c = c + 1
+    }
+    return probs
+}
+fn _markov_predict_o3(probs: array, prev_state: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < N_CELLS {
+        let li = _left_idx(c); let ri = _right_idx(c)
+        let cb = prev_state[c]; let lb = prev_state[li]; let rb = prev_state[ri]
+        let ctx = 4 * cb + 2 * lb + rb
+        let p = probs[8*c + ctx]
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+// ── accuracy + corpus ───────────────────────────────────────────────────────
+fn _accuracy(pred: array, actual: array) -> int {
+    let mut total = 0; let mut match_count = 0
+    let mut s = 0
+    while s < pred.len() {
+        let p = pred[s]; let a = actual[s]
+        let mut c = 0
+        while c < N_CELLS {
+            if p[c] == a[c] { match_count = match_count + 1 }
+            total = total + 1; c = c + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0 }
+    return (match_count * 1000) / total
+}
+
+fn _build_corpus(initial: array, n_steps: int) -> array {
+    let mut samples = []
+    let mut state = initial
+    let mut s = 0
+    while s < n_steps {
+        let nxt = _conway_step(state)
+        samples.push([state, nxt])
+        state = nxt
+        s = s + 1
+    }
+    return samples
+}
+
+// ── main run ────────────────────────────────────────────────────────────────
+fn _run() {
+    println("__LAW_64_CYCLE_4_T8L_HIGHER_ORDER_BEGIN__ Conway 10x10 32% density N=" + str(N_STEPS))
+    println("hypothesis: does CA(5) advantage survive higher-order Markov (order-2/3)?")
+    println("seed=" + str(SEED) + " grid=10x10 k_live=" + str(K_LIVE) + " (32%) N_STEPS=" + str(N_STEPS))
+    let initial = _gen_density_init(K_LIVE)
+    let full = _build_corpus(initial, N_STEPS)
+    let train_size = N_STEPS / 2
+    let mut train = []; let mut test = []
+    let mut k = 0
+    while k < full.len() {
+        if k < train_size { train.push(full[k]) } else { test.push(full[k]) }
+        k = k + 1
+    }
+    println("train_pairs=" + str(train.len()) + " test_pairs=" + str(test.len()))
+
+    // Train markov models
+    let probs_o1 = _markov_train_o1(train)
+    let probs_o2 = _markov_train_o2(train)
+    let probs_o3 = _markov_train_o3(train)
+
+    // Predict on test
+    let mut ca_preds = []; let mut o1_preds = []; let mut o2_preds = []; let mut o3_preds = []
+    let mut actuals = []
+    let mut i = 0
+    while i < test.len() {
+        let pair = test[i]
+        let prev_st = pair[0]; let actual_next = pair[1]
+        ca_preds.push(_conway_step(prev_st))
+        o1_preds.push(_markov_predict_o1(probs_o1, prev_st))
+        o2_preds.push(_markov_predict_o2(probs_o2, prev_st))
+        o3_preds.push(_markov_predict_o3(probs_o3, prev_st))
+        actuals.push(actual_next)
+        i = i + 1
+    }
+    let ca_acc = _accuracy(ca_preds, actuals)
+    let o1_acc = _accuracy(o1_preds, actuals)
+    let o2_acc = _accuracy(o2_preds, actuals)
+    let o3_acc = _accuracy(o3_preds, actuals)
+
+    let adv_o1 = if o1_acc > 0 { ((ca_acc * 1000) / o1_acc) - 1000 } else { 999 }
+    let adv_o2 = if o2_acc > 0 { ((ca_acc * 1000) / o2_acc) - 1000 } else { 999 }
+    let adv_o3 = if o3_acc > 0 { ((ca_acc * 1000) / o3_acc) - 1000 } else { 999 }
+
+    println("--- per-model accuracy (per_thousand correct cells) ---")
+    println("  ca5_acc=" + str(ca_acc))
+    println("  markov_o1_acc=" + str(o1_acc))
+    println("  markov_o2_acc=" + str(o2_acc))
+    println("  markov_o3_acc=" + str(o3_acc))
+    println("--- ca5 advantage per_thousand ---")
+    println("  adv_vs_o1=" + str(adv_o1))
+    println("  adv_vs_o2=" + str(adv_o2))
+    println("  adv_vs_o3=" + str(adv_o3))
+
+    // Verdict mapping (pre-registered)
+    let mut verdict = "AMBIGUOUS"
+    let mut law_dir = "INCONCLUSIVE"
+    if o2_acc < o1_acc || o3_acc < o1_acc {
+        verdict = "H3_SUPPORTED_higher_order_DEGRADED_data_sparsity"
+        law_dir = "ROBUST_BY_ACCIDENT_baseline_choice_inert"
+    }
+    if adv_o2 > 10 && adv_o3 > 10 {
+        verdict = "H2_SUPPORTED_ca5_advantage_ROBUST_across_orders"
+        law_dir = "STRENGTHENS"
+    }
+    if adv_o2 < 5 && adv_o3 < 5 {
+        verdict = "H1_SUPPORTED_ca5_advantage_SHRINKS_higher_order_catches_up"
+        law_dir = "WEAKENS_v5_retraction_candidate"
+    }
+    println("--- verdict ---")
+    println("  verdict=" + verdict)
+    println("  law_64_v4_direction=" + law_dir)
+    println("__LAW_64_CYCLE_4_T8L_RESULT__ " + verdict)
+
+    println("raw_91_C1_falsifiable=YES_pre_registered_thresholds_5_and_10_per_thousand")
+    println("raw_91_C2_replicable=YES_seed_" + str(SEED) + "_deterministic")
+    println("raw_91_C3_no_p_hacking=YES_thresholds_frozen_in_header_before_run")
+    println("raw_91_C4_data_caveats=10x10_32pct_density_random_init_NOT_glider_specific")
+    println("raw_91_C5_negative_result_published=YES_emit_regardless_of_outcome")
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T8L_HIGHER_ORDER_BEGIN__ selftest")
+    // Verify left/right index helpers on a known cell
+    let lc0 = _left_idx(0)   // row 0 col 0 → wraps to col 9 → idx 9
+    let rc0 = _right_idx(0)  // row 0 col 0 → col 1 → idx 1
+    let lc15 = _left_idx(15) // row 1 col 5 → col 4 → idx 14
+    let rc15 = _right_idx(15) // row 1 col 5 → col 6 → idx 16
+    println("left_idx(0)=" + str(lc0) + " (expect 9)")
+    println("right_idx(0)=" + str(rc0) + " (expect 1)")
+    println("left_idx(15)=" + str(lc15) + " (expect 14)")
+    println("right_idx(15)=" + str(rc15) + " (expect 16)")
+
+    // Verify density init
+    let g = _gen_density_init(K_LIVE)
+    let mut cnt = 0
+    let mut i = 0
+    while i < N_CELLS { cnt = cnt + g[i]; i = i + 1 }
+    println("density_init_live_cells=" + str(cnt) + " (expect " + str(K_LIVE) + ")")
+
+    // Verify a tiny train+predict roundtrip on 3 steps
+    let init2 = _gen_density_init(8)
+    let mini = _build_corpus(init2, 4)
+    let p1 = _markov_train_o1(mini)
+    let p2 = _markov_train_o2(mini)
+    let p3 = _markov_train_o3(mini)
+    let pred1 = _markov_predict_o1(p1, init2)
+    let pred2 = _markov_predict_o2(p2, init2)
+    let pred3 = _markov_predict_o3(p3, init2)
+    println("p1_len=" + str(p1.len()) + " (expect " + str(2*N_CELLS) + ")")
+    println("p2_len=" + str(p2.len()) + " (expect " + str(4*N_CELLS) + ")")
+    println("p3_len=" + str(p3.len()) + " (expect " + str(8*N_CELLS) + ")")
+    println("pred1_len=" + str(pred1.len()) + " pred2_len=" + str(pred2.len()) + " pred3_len=" + str(pred3.len()))
+
+    let ok = lc0 == 9 && rc0 == 1 && lc15 == 14 && rc15 == 16 && cnt == K_LIVE
+            && p1.len() == 2*N_CELLS && p2.len() == 4*N_CELLS && p3.len() == 8*N_CELLS
+            && pred1.len() == N_CELLS && pred2.len() == N_CELLS && pred3.len() == N_CELLS
+    if ok {
+        println("__LAW_64_CYCLE_4_T8L_RESULT__ PASS_SELFTEST_higher_order_markov_wired")
+    } else {
+        println("__LAW_64_CYCLE_4_T8L_RESULT__ FAIL_SELFTEST")
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_conway_higher_order_markov.hexa --selftest | --run")
+    }
+    return 0
+}
