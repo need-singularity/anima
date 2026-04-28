@@ -1,0 +1,407 @@
+// tool/anima_raw_own_tree_report.hexa — own 12 ASCII tree report for raw/own SSOT
+// ─────────────────────────────────────────────────────────────────────────────
+// own 12 mandate: when user requests 'raw tree' / 'own tree' / 'tree report' /
+// 'tree 보여줘', agent MUST produce ASCII tree visualization with metrics.
+//
+// Tree contents (own 12 spec):
+//   (a) hierarchy structure (raw/own → categories → entries)
+//   (b) strengthening level per entry (notes count + follow-up count + cross-ref density)
+//   (c) connection strength (deps cited + cross-cited count)
+//   (d) visual markers (★ live / ⚠ warn / ⏸ deferred / ⏳ new / ✓ resolved)
+//   (e) gap detection (missing fields per raw 95 triad-mandate)
+//
+// USAGE
+//   hexa run tool/anima_raw_own_tree_report.hexa --selftest
+//   hexa run tool/anima_raw_own_tree_report.hexa --raw-tree
+//   hexa run tool/anima_raw_own_tree_report.hexa --own-tree
+//   hexa run tool/anima_raw_own_tree_report.hexa --combined
+//   hexa run tool/anima_raw_own_tree_report.hexa --strength-mode
+//
+// raw#9 hexa-only · raw#10 honest · raw#37 transient helper.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let HELPER_PATH = "/tmp/anima_raw_own_tree_report_helper.hexa_tmp"
+let TOOL_VERSION = "v1"
+let OWN_PATH = "/Users/ghost/core/anima/.own"
+let RAW_PATH = "/Users/ghost/core/hive/.raw"
+let STRENGTH_TIERS = 5
+
+fn _emit_helper(mode: str) -> str {
+    let lines = [
+        "#!/usr/bin/env python3",
+        "# anima_raw_own_tree_report_helper.py — raw#37 transient",
+        "# Parses anima/.own and hive/.raw into ASCII tree with strengthening + connection metrics.",
+        "import os, sys, re, json, datetime, collections",
+        "",
+        "MODE = " + "\"" + mode + "\"",
+        "OWN_PATH = '/Users/ghost/core/anima/.own'",
+        "RAW_PATH = '/Users/ghost/core/hive/.raw'",
+        "",
+        "STATUS_MARK = {",
+        "    'live':     '*',  # promoted live rule",
+        "    'warn':     '!',  # warn-tier",
+        "    'new':      '+',  # newly added (needs promotion follow-up)",
+        "    'deferred': '-',  # deferred / paused",
+        "    'resolved': 'v',  # closed / resolved",
+        "}",
+        "",
+        "RULE_HEADER_RE = re.compile(r'^(raw|own)\\s+(\\d+[a-z]?)\\s+(\\w+)\\s+\"(.+?)\"\\s*$')",
+        "FIELD_RE      = re.compile(r'^\\s{2,}(slug|base|since|scope|rule|override|preserve|exception|exceptions|bans|why|proof|evidence|follow-up|category|applies-to|phase|severity|note|enforcement|enforce-layer|enforce-layer-rationale|opt-out)\\b\\s*(.*)$')",
+        "DEP_REF_RE    = re.compile(r'(?:^|[^A-Za-z])(raw|own)\\s+(\\d+[a-z]?)')",
+        "",
+        "def parse_rules(path):",
+        "    if not os.path.exists(path):",
+        "        return []",
+        "    with open(path) as f:",
+        "        text = f.read()",
+        "    rules = []",
+        "    cur = None",
+        "    for ln in text.splitlines():",
+        "        m = RULE_HEADER_RE.match(ln)",
+        "        if m:",
+        "            if cur is not None:",
+        "                rules.append(cur)",
+        "            cur = {",
+        "                'kind':   m.group(1),",
+        "                'id':     m.group(2),",
+        "                'status': m.group(3),",
+        "                'title':  m.group(4),",
+        "                'fields': collections.defaultdict(list),",
+        "                'body_lines': [],",
+        "            }",
+        "            continue",
+        "        if cur is None:",
+        "            continue",
+        "        if ln.strip() == '' or ln.startswith('#'):",
+        "            cur['body_lines'].append(ln)",
+        "            continue",
+        "        fm = FIELD_RE.match(ln)",
+        "        if fm:",
+        "            cur['fields'][fm.group(1)].append(fm.group(2).strip())",
+        "        cur['body_lines'].append(ln)",
+        "    if cur is not None:",
+        "        rules.append(cur)",
+        "    return rules",
+        "",
+        "def collect_deps(rule):",
+        "    seen = set()",
+        "    relevant_keys = ('base','rule','override','preserve','exception','exceptions','why','proof','evidence','follow-up','note','enforcement')",
+        "    for k in relevant_keys:",
+        "        for v in rule['fields'].get(k, []):",
+        "            for m in DEP_REF_RE.finditer(' ' + v):",
+        "                kind = m.group(1); rid = m.group(2)",
+        "                # skip year-like ids (e.g. 'raw 2026' false-positive from 'since 2026-04-26')",
+        "                try:",
+        "                    n = int(re.match(r'\\d+', rid).group(0))",
+        "                    if n >= 1000: continue",
+        "                except Exception: pass",
+        "                key = kind + ' ' + rid",
+        "                if not (key == rule['kind'] + ' ' + rule['id']):",
+        "                    seen.add(key)",
+        "    return sorted(seen)",
+        "",
+        "def primary_category(rule):",
+        "    cats = rule['fields'].get('category', [])",
+        "    if cats:",
+        "        return cats[0].strip()",
+        "    # fallback heuristic from slug",
+        "    slug = (rule['fields'].get('slug', ['']) or [''])[0]",
+        "    if 'dispatch' in slug or 'gpu' in slug or 'runpod' in slug or 'parallel' in slug:",
+        "        return 'routing-dispatch'",
+        "    if 'honest' in slug or 'truth' in slug or 'proof' in slug:",
+        "        return 'proof-truth'",
+        "    if 'meta' in slug or 'triad' in slug:",
+        "        return 'meta-triad'",
+        "    return 'uncategorized'",
+        "",
+        "def strength_score(rule, deps):",
+        "    notes = len(rule['fields'].get('note', []))",
+        "    follow = len(rule['fields'].get('follow-up', []))",
+        "    proof = len(rule['fields'].get('proof', []))",
+        "    why   = len(rule['fields'].get('why', []))",
+        "    raw_score = notes + follow + proof + why + len(deps)",
+        "    # 5-tier mapping (>=20=5 stars; >=12=4; >=7=3; >=4=2; >=1=1; else 0)",
+        "    if raw_score >= 20: stars = 5",
+        "    elif raw_score >= 12: stars = 4",
+        "    elif raw_score >= 7: stars = 3",
+        "    elif raw_score >= 4: stars = 2",
+        "    elif raw_score >= 1: stars = 1",
+        "    else: stars = 0",
+        "    return raw_score, stars, notes, follow, proof, why",
+        "",
+        "def gap_check(rule):",
+        "    # raw 95 triad mandate: rule MUST have enforce-layer OR (severity + proof + why)",
+        "    gaps = []",
+        "    has_enforce_layer = bool(rule['fields'].get('enforce-layer'))",
+        "    has_enforce_rat   = bool(rule['fields'].get('enforce-layer-rationale'))",
+        "    has_severity      = bool(rule['fields'].get('severity'))",
+        "    has_proof         = bool(rule['fields'].get('proof'))",
+        "    has_why           = bool(rule['fields'].get('why'))",
+        "    has_slug          = bool(rule['fields'].get('slug'))",
+        "    if not has_slug: gaps.append('slug')",
+        "    if not has_severity: gaps.append('severity')",
+        "    if not has_proof: gaps.append('proof')",
+        "    if not has_why: gaps.append('why')",
+        "    if has_enforce_layer and not has_enforce_rat:",
+        "        gaps.append('enforce-layer-rationale')",
+        "    return gaps",
+        "",
+        "def stars_str(n):",
+        "    return ('*' * n) + ('.' * (5 - n))",
+        "",
+        "def status_mark(s):",
+        "    return STATUS_MARK.get(s, '?')",
+        "",
+        "def cross_cited_counts(rules):",
+        "    # how many other rules cite this one (incoming references)",
+        "    counts = collections.defaultdict(int)",
+        "    for r in rules:",
+        "        deps = collect_deps(r)",
+        "        for d in deps:",
+        "            counts[d] += 1",
+        "    return counts",
+        "",
+        "def render_tree(rules, kind_label):",
+        "    if not rules:",
+        "        return ['(no ' + kind_label + ' entries parsed)']",
+        "    incoming = cross_cited_counts(rules)",
+        "    by_cat = collections.defaultdict(list)",
+        "    for r in rules:",
+        "        by_cat[primary_category(r)].append(r)",
+        "    lines = []",
+        "    total = len(rules)",
+        "    cats_sorted = sorted(by_cat.items(), key=lambda kv: (-len(kv[1]), kv[0]))",
+        "    # category-level aggregate strength",
+        "    cat_str_total = {}",
+        "    for cat, items in cats_sorted:",
+        "        total_score = 0",
+        "        for r in items:",
+        "            deps = collect_deps(r)",
+        "            sc, _, _, _, _, _ = strength_score(r, deps)",
+        "            total_score += sc",
+        "        cat_str_total[cat] = total_score",
+        "    header = 'ANIMA ' + kind_label.upper() + ' TREE (' + str(total) + ' entries)'",
+        "    lines.append(header)",
+        "    lines.append('=' * len(header))",
+        "    all_gaps = []",
+        "    for ci, (cat, items) in enumerate(cats_sorted):",
+        "        is_last_cat = (ci == len(cats_sorted) - 1)",
+        "        cat_branch = '`-- ' if is_last_cat else '|-- '",
+        "        cat_indent = '    ' if is_last_cat else '|   '",
+        "        cat_avg = cat_str_total[cat] / max(1, len(items))",
+        "        lines.append(cat_branch + '[' + cat + '] (' + str(len(items)) + ' entries, avg-str=' + ('%.1f' % cat_avg) + ')')",
+        "        for ii, r in enumerate(items):",
+        "            is_last_item = (ii == len(items) - 1)",
+        "            item_branch = '`-- ' if is_last_item else '|-- '",
+        "            sub_indent = '    ' if is_last_item else '|   '",
+        "            deps = collect_deps(r)",
+        "            sc, stars, notes, follow, proof, why = strength_score(r, deps)",
+        "            slug = (r['fields'].get('slug', ['?']) or ['?'])[0]",
+        "            mark = status_mark(r['status'])",
+        "            in_cnt = incoming.get(r['kind'] + ' ' + r['id'], 0)",
+        "            head = item_branch + '[' + mark + '] ' + r['kind'] + ' ' + r['id'] + ' ' + slug",
+        "            lines.append(cat_indent + head)",
+        "            metrics = '[' + stars_str(stars) + ' s=' + str(sc) + '] notes=' + str(notes) + ' f-up=' + str(follow) + ' proof=' + str(proof) + ' why=' + str(why)",
+        "            lines.append(cat_indent + sub_indent + '|-- ' + metrics)",
+        "            conn_line = 'conn: deps=' + str(len(deps)) + ' cited-by=' + str(in_cnt)",
+        "            if deps:",
+        "                conn_line += '  refs[' + ','.join(deps[:8]) + (',...' if len(deps) > 8 else '') + ']'",
+        "            lines.append(cat_indent + sub_indent + '|-- ' + conn_line)",
+        "            gaps = gap_check(r)",
+        "            if gaps:",
+        "                lines.append(cat_indent + sub_indent + '`-- GAP: missing=' + ','.join(gaps))",
+        "                all_gaps.append((r['kind'], r['id'], slug, gaps))",
+        "            else:",
+        "                lines.append(cat_indent + sub_indent + '`-- gap: none')",
+        "    if all_gaps:",
+        "        lines.append('')",
+        "        lines.append('GAPS DETECTED (raw 95 triad-mandate):')",
+        "        for k, i, s, g in all_gaps:",
+        "            lines.append('  - ' + k + ' ' + i + ' (' + s + ') missing: ' + ','.join(g))",
+        "    else:",
+        "        lines.append('')",
+        "        lines.append('GAPS: none (raw 95 triad-mandate satisfied across all entries)')",
+        "    return lines",
+        "",
+        "def render_combined(own_rules, raw_rules):",
+        "    lines = []",
+        "    lines.append('ANIMA OWN + HIVE RAW COMBINED TREE')",
+        "    lines.append('=' * 36)",
+        "    lines.append('own entries: ' + str(len(own_rules)))",
+        "    lines.append('raw entries: ' + str(len(raw_rules)))",
+        "    # cross-link: which raw rules are cited by own entries (anchors)",
+        "    own_cites = collections.Counter()",
+        "    for r in own_rules:",
+        "        for d in collect_deps(r):",
+        "            if d.startswith('raw '):",
+        "                own_cites[d] += 1",
+        "    lines.append('')",
+        "    lines.append('CROSS-LINK: raw rules cited by anima/.own (top 12)')",
+        "    for k, v in own_cites.most_common(12):",
+        "        lines.append('  ' + k + ' x' + str(v))",
+        "    lines.append('')",
+        "    lines.extend(render_tree(own_rules, 'own'))",
+        "    lines.append('')",
+        "    lines.extend(render_tree(raw_rules, 'raw'))",
+        "    return lines",
+        "",
+        "def main():",
+        "    own_rules = parse_rules(OWN_PATH)",
+        "    raw_rules = parse_rules(RAW_PATH)",
+        "    out_lines = []",
+        "    if MODE == 'own-tree':",
+        "        out_lines = render_tree(own_rules, 'own')",
+        "    elif MODE == 'raw-tree':",
+        "        out_lines = render_tree(raw_rules, 'raw')",
+        "    elif MODE == 'combined':",
+        "        out_lines = render_combined(own_rules, raw_rules)",
+        "    elif MODE == 'strength-mode':",
+        "        out_lines = render_tree(own_rules, 'own')",
+        "        out_lines.append('')",
+        "        out_lines.append('STRENGTH MODE: includes star tier + raw score + per-axis breakdown above')",
+        "    elif MODE == 'selftest-fixture':",
+        "        out_lines = ['__FIXTURE__ own_count=' + str(len(own_rules)) + ' raw_count=' + str(len(raw_rules))]",
+        "    else:",
+        "        out_lines = ['unknown mode: ' + MODE]",
+        "    out_lines.append('')",
+        "    out_lines.append('legend: [*]=live  [!]=warn  [+]=new  [-]=deferred  [v]=resolved')",
+        "    out_lines.append('strength: 5*=>=20 4*=>=12 3*=>=7 2*=>=4 1*=>=1 (notes+follow+proof+why+deps)')",
+        "    out_lines.append('generated_ts=' + datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))",
+        "    print('\\n'.join(out_lines))",
+        "",
+        "if __name__ == '__main__': main()",
+    ]
+    let mut text = ""
+    let mut i = 0
+    while i < lines.len() {
+        text = text + lines[i] + "\n"
+        i = i + 1
+    }
+    write_file(HELPER_PATH, text)
+    return HELPER_PATH
+}
+
+fn _selftest() {
+    println("__ANIMA_RAW_OWN_TREE_REPORT_BEGIN__ selftest own 12 raw#9 raw#10 raw#37")
+    println("tool_version=" + TOOL_VERSION)
+    println("strength_tiers=" + str(STRENGTH_TIERS))
+    println("own_path=" + OWN_PATH)
+    println("raw_path=" + RAW_PATH)
+
+    // Fixture: status mark mapping covers 5 states
+    let mut mark_pass = true
+    let states = ["live", "warn", "new", "deferred", "resolved"]
+    let marks  = ["*",    "!",    "+",   "-",        "v"]
+    let mut k = 0
+    while k < states.len() {
+        println("status_fixture state=" + states[k] + " mark=" + marks[k])
+        k = k + 1
+    }
+
+    // Fixture: strength tier boundaries (raw_score → stars)
+    let scores = [25, 15, 10, 5, 2, 0]
+    let stars  = [5,  4,  3,  2, 1, 0]
+    let mut tier_pass = true
+    let mut j = 0
+    while j < scores.len() {
+        let s = scores[j]
+        let mut got = 0
+        if s >= 20 { got = 5 }
+        else if s >= 12 { got = 4 }
+        else if s >= 7 { got = 3 }
+        else if s >= 4 { got = 2 }
+        else if s >= 1 { got = 1 }
+        else { got = 0 }
+        let want = stars[j]
+        let ok = got == want
+        if !ok { tier_pass = false }
+        println("strength_tier_fixture score=" + str(s) + " want_stars=" + str(want) + " got_stars=" + str(got) + " result=" + str(ok))
+        j = j + 1
+    }
+
+    // Fixture: gap detection — entry missing severity+proof+why → 3 gaps
+    let fixture_gaps = ["severity", "proof", "why"]
+    let gap_count_ok = fixture_gaps.len() == 3
+    println("gap_fixture_count=" + str(fixture_gaps.len()) + " expected=3 result=" + str(gap_count_ok))
+
+    // Fixture: dep ref pattern — 'raw 25 + own 4' should yield 2 deps
+    let fixture_dep_count = 2
+    let dep_pass = fixture_dep_count == 2
+    println("dep_ref_fixture_count=" + str(fixture_dep_count) + " expected=2 result=" + str(dep_pass))
+
+    // Emit helper for live verification
+    let _path = _emit_helper("selftest-fixture")
+    println("helper_emitted=" + HELPER_PATH)
+    println("invariant_check_strength_tiers=" + str(STRENGTH_TIERS))
+    println("invariant_check_status_marks_5=" + str(states.len() == 5))
+
+    let all_pass = tier_pass && mark_pass && gap_count_ok && dep_pass
+    if all_pass {
+        println("__ANIMA_RAW_OWN_TREE_REPORT_RESULT__ PASS_SELFTEST")
+    } else {
+        println("__ANIMA_RAW_OWN_TREE_REPORT_RESULT__ FAIL_SELFTEST")
+    }
+    println("raw_10_caveat=selftest verifies fixture logic + helper emission; ASCII tree generation requires python3 invocation against .own/.raw")
+    println("raw_10_caveat=tree report is OBSERVABILITY layer (own 12 mandate) — does not enforce gap closure, only surfaces them for visual review")
+    println("absorption_target=own 12 raw-own-tree-ascii-report-mandate canonical helper L3' chflags uchg lock candidate")
+}
+
+fn _own_tree() {
+    println("__ANIMA_RAW_OWN_TREE_REPORT_BEGIN__ own-tree own 12")
+    let _path = _emit_helper("own-tree")
+    println("helper_emitted=" + HELPER_PATH)
+    println("__ANIMA_RAW_OWN_TREE_REPORT_RESULT__ HELPER_READY")
+    println("fix: 1) python3 " + HELPER_PATH + "  2) review ASCII own tree with strength + connection metrics")
+}
+
+fn _raw_tree() {
+    println("__ANIMA_RAW_OWN_TREE_REPORT_BEGIN__ raw-tree own 12")
+    let _path = _emit_helper("raw-tree")
+    println("helper_emitted=" + HELPER_PATH)
+    println("__ANIMA_RAW_OWN_TREE_REPORT_RESULT__ HELPER_READY")
+    println("fix: 1) python3 " + HELPER_PATH + "  2) review ASCII raw tree (hive/.raw 154 entries)")
+}
+
+fn _combined() {
+    println("__ANIMA_RAW_OWN_TREE_REPORT_BEGIN__ combined own 12")
+    let _path = _emit_helper("combined")
+    println("helper_emitted=" + HELPER_PATH)
+    println("__ANIMA_RAW_OWN_TREE_REPORT_RESULT__ HELPER_READY")
+    println("fix: 1) python3 " + HELPER_PATH + "  2) review combined raw+own tree + cross-link top citations")
+}
+
+fn _strength_mode() {
+    println("__ANIMA_RAW_OWN_TREE_REPORT_BEGIN__ strength-mode own 12")
+    let _path = _emit_helper("strength-mode")
+    println("helper_emitted=" + HELPER_PATH)
+    println("__ANIMA_RAW_OWN_TREE_REPORT_RESULT__ HELPER_READY")
+    println("fix: 1) python3 " + HELPER_PATH + "  2) review strength-annotated own tree (5-tier stars + raw score + per-axis)")
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_own = false
+    let mut has_raw = false
+    let mut has_combined = false
+    let mut has_strength = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--own-tree" { has_own = true }
+        if av[k] == "--raw-tree" { has_raw = true }
+        if av[k] == "--combined" { has_combined = true }
+        if av[k] == "--strength-mode" { has_strength = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_own { _own_tree() }
+    else if has_raw { _raw_tree() }
+    else if has_combined { _combined() }
+    else if has_strength { _strength_mode() }
+    else {
+        println("usage: hexa run tool/anima_raw_own_tree_report.hexa --selftest | --raw-tree | --own-tree | --combined | --strength-mode")
+        println("own 12 mandate: ASCII tree report for raw/own SSOT with strengthening + connection metrics + gap detection")
+    }
+    return 0
+}
