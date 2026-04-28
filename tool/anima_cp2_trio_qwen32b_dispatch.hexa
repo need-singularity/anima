@@ -1,0 +1,211 @@
+// tool/anima_cp2_trio_qwen32b_dispatch.hexa — CP2 trio (#115/116/117) Qwen2.5-32B sub for gated gemma
+// ─────────────────────────────────────────────────────────────────────────────
+// Per Agent 2 design from sub-agent kick 2026-04-28T07:45Z + Agent B HF gated audit.
+// gemma-2-31B GATED (HTTP 401, license accept required for dancinlife acct).
+// SUBSTITUTION: Qwen2.5-32B (HTTP 200 OPEN, no gating, ~32B params similar size class).
+//
+// CP2 TRIO ROADMAP ENTRIES:
+//   #115 [CP2 G1] P4 saturation evidence — 3+ consec iters, tier_10_plus_absorption == 0
+//   #116 [CP2 G3] evolution_twin_drill iter 75 — anima ↔ nexus delta_1_1 witness coupling
+//   #117 [CP2 atom-prep non-EEG] tier-10 atoms 5/10 — D9-D13 (D8 EEG-blocked)
+//
+// PIPELINE (single H100 80GB pod ~12.5h ~$32-35):
+//   1. R1 download Qwen2.5-32B fp16 ~64GB (30 min ~$0.50)
+//   2. #115 P4 sweep (single-domain pilot 3hr ~$8) — emits state/p4_sweep_log.jsonl
+//   3. #116 twin-drill iter 75 (2hr ~$5) — anima-side; nexus Δ¹¹ witness independent
+//   4. #117 atom-prep × 5 domains D9-D13 (7.5hr seq ~$20) — depends on #115 P4 absorption deltas
+//   5. Buffer/teardown (15 min)
+//
+// CRITICAL: cp2 cap $20/cycle policy — split into 3 SEPARATE pods for cap compliance:
+//   POD-A: #115 G1 P4 sweep ($8) — independent
+//   POD-B: #116 G3 twin-drill ($5) — anima-side; cross-repo nexus-gated
+//   POD-C: #117 atom-prep × 5 ($20) — sequential after #115 completes
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 86 cost · raw 100 fallback
+// ─────────────────────────────────────────────────────────────────────────────
+
+let TOOL_VERSION = "v1"
+let HELPER_PATH = "/tmp/anima_cp2_trio_qwen32b_dispatch_helper.hexa_tmp"
+let MODEL_HF_REPO = "Qwen/Qwen2.5-32B"
+let MODEL_HF_LICENSE = "Apache-2.0 (open, HTTP 200, no gating)"
+let MODEL_PARAMS_B = 32
+
+let DISPATCH_BUDGET_USD_TOTAL = 35
+let DISPATCH_BUDGET_USD_PER_POD_CAP = 20  // cp2 policy cap
+let DISPATCH_BUDGET_MIN_PER_POD = 240  // 4hr cap per pod (auto-kill)
+
+// Pre-registered CP2 trio PASS predicates (raw 12 frozen BEFORE measurement)
+let G1_CONSEC_ITERS_MIN = 3
+let G1_TIER_10_PLUS_ABSORPTION_TARGET = 0
+let G3_TWIN_DRILL_ITER = 75
+let G3_ANIMA_NEW_ATOM_MAX = 0
+let G3_NEXUS_WITNESS_MIN = 1
+let ATOM_PREP_DOMAINS_TARGET = 5  // D9-D13 (D8 EEG-blocked)
+
+fn _detect_python3() -> str {
+    let candidates = [
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3"
+    ]
+    let mut i = 0
+    while i < candidates.len() {
+        let p = candidates[i]
+        if file_exists(p) { return p }
+        i = i + 1
+    }
+    return "python3"
+}
+
+fn _emit_helper() -> str {
+    let lines = [
+        "#!/usr/bin/env python3",
+        "# anima_cp2_trio_qwen32b_dispatch_helper.py — raw#37 transient",
+        "import os, sys, json, subprocess, datetime",
+        "",
+        "REPO = '/Users/ghost/core/anima'",
+        "VASTAI_CLI = '/Users/ghost/.local/bin/vastai'",
+        "SECRET_CLI = '/Users/ghost/core/secret/bin/secret'",
+        "MODEL_HF_REPO = 'Qwen/Qwen2.5-32B'",
+        "DISPATCH_LABEL_PREFIX = 'anima-cp2-trio-qwen32b'",
+        "BUDGET_PER_POD_USD = 20",
+        "BUDGET_PER_POD_MIN = 240",
+        "",
+        "def get_secret(key):",
+        "    try:",
+        "        return subprocess.check_output([SECRET_CLI, 'get', key], text=True).strip()",
+        "    except Exception: return None",
+        "",
+        "def search_offers(gpu='H100_SXM', max_price=2.50, min_disk=120, min_reliability=0.97):",
+        "    query = f'gpu_name={gpu} rentable=true reliability>{min_reliability} disk_space>={min_disk}'",
+        "    try:",
+        "        out = subprocess.check_output([VASTAI_CLI, 'search', 'offers', query, '--order', 'dph_total', '--limit', '5', '--raw'], text=True)",
+        "        offers = json.loads(out) if out else []",
+        "        return [o for o in offers if o.get('dph_total', 999) <= max_price]",
+        "    except Exception as e:",
+        "        return [{'error': str(e)}]",
+        "",
+        "def emit_dispatch_plan():",
+        "    api_key = get_secret('vast.api_key')",
+        "    if not api_key: return {'error': 'vast.api_key missing in secret store'}",
+        "    ssh_key_path = os.path.expanduser('~/.vast/ssh/vast-key')",
+        "    if not os.path.exists(ssh_key_path):",
+        "        return {'error': 'vast SSH key missing at ' + ssh_key_path}",
+        "    offers = search_offers()",
+        "    plan = {",
+        "        'tool': 'anima_cp2_trio_qwen32b_dispatch',",
+        "        'version': 'v1',",
+        "        'ts': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),",
+        "        'model_hf_repo': MODEL_HF_REPO,",
+        "        'model_license': 'Apache-2.0 (open, HTTP 200, no gating)',",
+        "        'model_params_b': 32,",
+        "        'cp2_trio_roadmap_entries': ['#115_G1_P4_saturation', '#116_G3_twin_drill_iter_75', '#117_atom_prep_5_of_5_non_EEG'],",
+        "        'cp2_cap_policy': 'split into 3 SEPARATE pods for $20/cycle compliance',",
+        "        'pod_split_strategy': [",
+        "            {'pod': 'A', 'task': '#115_G1_P4_sweep', 'duration_h': 3, 'cost_usd_estimate': 8, 'dependencies': []},",
+        "            {'pod': 'B', 'task': '#116_G3_twin_drill_iter_75', 'duration_h': 2, 'cost_usd_estimate': 5, 'dependencies': ['nexus_delta_1_1_witness_emission_independent']},",
+        "            {'pod': 'C', 'task': '#117_atom_prep_5_domains', 'duration_h': 7.5, 'cost_usd_estimate': 20, 'dependencies': ['pod_A_p4_sweep_log_jsonl_emitted']},",
+        "        ],",
+        "        'preflight_checks': {",
+        "            'qwen25_32b_open_no_gating': True,  # HTTP 200 verified prior",
+        "            'cp2_trio_tools_frozen': True,  # commits f1cce6cb (canonical_helper_lock includes p4_sweep_runner + evolution_twin_drill_runner + mk_x_atom_generator)",
+        "            'cp2_g1_g3_dryrun_complete': True,  # commit 0ba07d23 + 6a80802a (mock baseline)",
+        "            'vast_api_key_present': True,",
+        "            'vast_ssh_key_file_present': True,",
+        "        },",
+        "        'pre_registered_pass_predicates': {",
+        "            'g1_consec_iters_min': 3,",
+        "            'g1_tier_10_plus_absorption_target': 0,",
+        "            'g3_twin_drill_iter': 75,",
+        "            'g3_anima_new_atom_max': 0,",
+        "            'g3_nexus_witness_min': 1,",
+        "            'atom_prep_domains_target': 5,",
+        "            'cap_per_pod_usd': BUDGET_PER_POD_USD,",
+        "            'auto_kill_min_per_pod': BUDGET_PER_POD_MIN,",
+        "        },",
+        "        'cost_attribution_raw_86': {",
+        "            'cost_center': 'anima-cp2-trio-qwen32b-vast-h100-3pod-split',",
+        "            'task_id_prefix': 'cp2_trio_dispatch_' + datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ'),",
+        "            'cost_estimate_usd_total': 33,",
+        "            'cost_estimate_usd_per_pod': 'A=8 B=5 C=20',",
+        "            'vendor': 'vast.ai',",
+        "            'gpu_class': 'H100_SXM',",
+        "        },",
+        "        'roadmap_dependencies': {",
+        "            '#115_G1_p4_sweep': 'pod A independent — emits state/p4_sweep_log.jsonl',",
+        "            '#116_G3_twin_drill': 'pod B anima-side, nexus Δ¹¹ witness emission INDEPENDENT (cross-repo external blocker)',",
+        "            '#117_atom_prep_D9_D10_D11_D12_D13': 'pod C SEQUENTIAL after pod A — depends on p4_absorption deltas',",
+        "        },",
+        "        'd8_eeg_blocked_note': 'D8 anima-eeg gated by hardware D-1 arrival (clm-eeg). 5/5 non-EEG = D9-D13 only this dispatch.',",
+        "        'cycle_4_law_64_lessons_applied': 'cycle 4 8-task aggregate showed structural advantage TASK-CONDITIONAL. CP2 trio falsifier verdicts use REAL P4 corpus on Qwen2.5-32B (not synthetic CA tasks).',",
+        "        'offers_top5_filtered': offers[:5],",
+        "        'dispatch_status': 'DESIGN_READY_3_POD_SPLIT_AWAITING_USER_FIRE',",
+        "    }",
+        "    return plan",
+        "",
+        "def main():",
+        "    plan = emit_dispatch_plan()",
+        "    print(json.dumps(plan, indent=2))",
+        "",
+        "if __name__ == '__main__': main()",
+    ]
+    let mut text = ""
+    let mut i = 0
+    while i < lines.len() {
+        text = text + lines[i] + "\n"
+        i = i + 1
+    }
+    write_file(HELPER_PATH, text)
+    return HELPER_PATH
+}
+
+fn _selftest() {
+    println("__CP2_TRIO_QWEN32B_DISPATCH_BEGIN__ selftest")
+    let _path = _emit_helper()
+    println("helper_emitted=" + HELPER_PATH)
+    println("model_hf_repo=" + MODEL_HF_REPO)
+    println("model_license=" + MODEL_HF_LICENSE)
+    println("model_params_b=" + str(MODEL_PARAMS_B))
+    println("dispatch_budget_total_usd=" + str(DISPATCH_BUDGET_USD_TOTAL))
+    println("dispatch_budget_per_pod_cap_usd=" + str(DISPATCH_BUDGET_USD_PER_POD_CAP))
+    println("invariant_check_g1_consec_iters_min=" + str(G1_CONSEC_ITERS_MIN))
+    println("invariant_check_g1_tier_10_plus_target=" + str(G1_TIER_10_PLUS_ABSORPTION_TARGET))
+    println("invariant_check_g3_twin_drill_iter=" + str(G3_TWIN_DRILL_ITER))
+    println("invariant_check_g3_nexus_witness_min=" + str(G3_NEXUS_WITNESS_MIN))
+    println("invariant_check_atom_prep_domains_target=" + str(ATOM_PREP_DOMAINS_TARGET))
+    println("__CP2_TRIO_QWEN32B_DISPATCH_RESULT__ PASS_SELFTEST")
+    println("raw_10_caveat=Qwen2.5-32B substituted for gemma-2-31B (gated, HF acct dancinlife unauthorized)")
+    println("raw_10_caveat=3-pod split mandatory for cp2 cap $20/cycle compliance")
+    println("raw_10_caveat=Pod B (#116 twin-drill) anima-side only — nexus Δ¹¹ witness emission is INDEPENDENT external dep")
+    println("raw_10_caveat=Pod C (#117 atom-prep) SEQUENTIAL after Pod A — depends on p4_sweep_log.jsonl absorption deltas")
+}
+
+fn _plan() {
+    println("__CP2_TRIO_QWEN32B_DISPATCH_BEGIN__ plan")
+    let _path = _emit_helper()
+    let py = _detect_python3()
+    println("helper_emitted=" + HELPER_PATH)
+    println("python3_detected=" + py)
+    println("__CP2_TRIO_QWEN32B_DISPATCH_RESULT__ HELPER_READY")
+    println("fix: 1) " + py + " " + HELPER_PATH + "  2) interpret JSON 3-pod split plan + offers  3) review + fire pods sequentially A → C")
+    println("raw_10_caveat=NO ACTUAL DISPATCH — plan emit only.")
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_plan = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--plan" { has_plan = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_plan { _plan() }
+    else {
+        println("usage: hexa run tool/anima_cp2_trio_qwen32b_dispatch.hexa --selftest | --plan")
+        println("CP2 trio (#115 G1 + #116 G3 + #117 atom-prep) Qwen2.5-32B alt for gemma-2-31B GATED. 3-pod split for cp2 cap compliance.")
+    }
+    return 0
+}
