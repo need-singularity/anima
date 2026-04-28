@@ -112,9 +112,50 @@ CA(5)=100% throughout (5-cell oracle subsumes 3-cell rule); Markov o1 stays 39-6
 
 **Why the asymmetry**: Conway 32%-density init has a small basin/attractor that Markov o1 can fully memorize given enough samples (10^2–10^3 transition pairs cover the orbit). Rule-110 is Turing-complete with chaotic class-4 dynamics → no bigram-saturable attractor; per-cell P(next|self) cannot capture the 3-cell pattern even at N=1500.
 
-### §3.5 Law 64 v5 statement (substrate-conditional)
+### §3.5 Law 64 v5 statement (substrate-conditional) — CORRECTED to v6 below
 
-> "CA(N≥3)-vs-Markov-order-K advantage at low train-volume holds across multiple CA rules (Conway B3/S23 2D + rule-110 1D — class-3 chaotic class-4 Turing-complete). Markov-saturation behavior is SUBSTRATE-CONDITIONAL: on Conway 32%, Markov o1 saturates to parity by N≥500-1500 (small attractor); on rule-110, Markov o1 does NOT saturate within tested N=1500 (no bigram-saturable attractor in class-4 chaotic dynamics). The 'eternal advantage' hypothesis is FALSE on Conway 32% but appears APPROXIMATELY TRUE on rule-110."
+> [DEPRECATED v5] "CA(N≥3)-vs-Markov-order-K advantage at low train-volume holds across multiple CA rules. Markov-saturation behavior is SUBSTRATE-CONDITIONAL: on Conway 32%, Markov o1 saturates to parity; on rule-110, Markov o1 does NOT saturate."
+>
+> v5 was based on T8n single-baseline (order-1) only and conflated baseline-axis limitation with structural-advantage. Corrected by T8o + T8p (see §3.6).
+
+### §3.6 T8p Wolfram rule sweep + T8o rule-110 higher-order → Law 64 v6
+
+**T8p (commit e07397fa)** — Wolfram rule sweep (rules 30, 90, 110, 184), single_cell + density_32% inits, N=15/500/1500:
+
+| rule | class | init | N=15 | N=500 | N=1500 | behavior |
+|---|---|---|---|---|---|---|
+| 30 | 3-chaos | single | +941 | +937 | +953 | PERSIST |
+| 30 | 3-chaos | density | +1100 | +1079 | **+1178** | PERSIST (strongest) |
+| 90 | 3-additive | single | 0 | 0 | 0 | SATURATE |
+| 90 | 3-additive | density | +600 | 0 | 0 | SATURATE |
+| 110 | 4-universal | single | +1544 | +519 | +501 | PERSIST |
+| 110 | 4-universal | density | +893 | +1364 | +686 | PERSIST |
+| 184 | 2-traffic | single | +8 | +8 | +8 | SATURATE |
+| 184 | 2-traffic | density | +597 | +472 | +472 | PERSIST |
+
+ALL pre-reg H1/H2/H3 FAILED — saturation is (rule × init)-conditional, not rule-conditional. Rule 30 chaos > rule 110 universality > rule 90 additive XOR (Markov-trivial). Rule 184 split-pattern: deterministic single_cell saturates instantly; density chaotic init persists.
+
+**T8o (commit 3a5982f8)** — rule-110 + Markov order 1/2/3/5, single_cell init, len=128:
+
+| order | ctx/cell | N=50 | N=500 | N=1500 | behavior |
+|---|---|---|---|---|---|
+| 1 | 2 | +1469 | +519 | +501 | persist |
+| 2 | 4 | +1212 | +347 | +280 | partial |
+| 3 | 8 (= rule's neighborhood) | +795 | 0 | **0** | perfect saturation |
+| 5 | 32 (= CA(5) window) | +1197 | 0 | 0 | perfect saturation |
+
+**KEY CORRECTION**: rule-110 non-saturation in T8n was a per-cell-BIGRAM (order-1) artifact, NOT structural CA(5) advantage. Once n-gram order ≥ rule's neighborhood width (3 for rule-110), Markov saturates instantly. CONTRAST: Conway T8l (order-2/3 on 10x10/N=50) showed gap GROWING (+160→+169) because 1D higher-order Markov **cannot match 2D Moore-9 neighborhood**.
+
+### §3.7 Law 64 v6 statement (BASELINE-AXIS ALIGNMENT)
+
+> "CA(K)-vs-Markov-order-N advantage on a CA substrate is governed by **dimensional/topological alignment**: when n-gram context width ≥ rule's true neighborhood, Markov saturates to perfect accuracy (rule-110 / order-3, Conway / 2D-Moore-9-equivalent). When the baseline cannot represent the substrate's neighborhood (1D order-K on 2D Moore-9 Conway, OR per-cell-bigram on chaotic 1D rule with 3-cell rule), CA(K) maintains advantage. The 'CA outperforms Markov' framing of v1-v5 is incomplete — the precise claim is: **CA window ≥ substrate's neighborhood ⇒ perfect prediction; Markov context < substrate's neighborhood ⇒ structural deficit**.
+>
+> Saturation regime depends on (rule, init, baseline-order) triple:
+> - Rule 90 additive XOR: ANY order saturates (rule is bigram-trivial)
+> - Rule 184 deterministic traffic on single_cell: order-1 saturates (P(next|self) is enough)
+> - Rule 184 chaotic density init: order-1 fails (multi-modal); higher-order untested
+> - Rule 30 / 110 chaos: order-1 fails (need ≥ rule's 3-cell width); order-3 saturates rule-110 (T8o); rule 30 untested at higher orders
+> - Conway 2D 32% density: 1D order-K never saturates (T8l) — needs 2D Moore-9-equivalent baseline (untested)"
 
 ---
 
