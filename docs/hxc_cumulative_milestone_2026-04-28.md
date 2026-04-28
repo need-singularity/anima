@@ -20,6 +20,13 @@ This document consolidates ~8 hours of /loop autonomous cron output into a singl
 - Aggregate **75.77%** MEASURED (post-v2; +0.35pp delta from prior 75.42% best-of-N anchor).
 - Cumulative gap reduction: **30.90pp → 4.23pp = 86.3% closure** of original raw 137 80% target gap.
 
+**v5 strengthening (post-A25-v2 FULL DEPLOYMENT 6-repo LIVE FIRE 2026-04-28T15Z)**:
+- Aggregate **78.05%** MEASURED (post-A25-v2 full deployment; +1.98pp delta from 76.07% pre-v2 anchor).
+- Scope: 9,916,852 raw bytes / 383 files / 379/379 byte-eq PASS / 11/11 SHA256 sample PASS / 6 repos.
+- Cumulative gap reduction: **30.90pp → 1.95pp = 93.69% closure** of original raw 137 80% target gap (+7.39pp closure delta from prior 86.3%).
+- 80% TARGET NOT ACHIEVED MEASURED — gap 1.95pp residual.
+- raw 91 honest C3: 74dae9da projected 84.02% full-deployment was OVER-OPTIMISTIC; ACTUAL is +1.98pp not +7.95pp. Projection RETRACTED, structural finding (per-class wrapper overhead reclaim within 0.08-0.24pp on large classes) PRESERVED.
+
 What is true:
 - Aggregate climbed +61.29pp from Phase 5 (14.48%) to current (75.77%).
 - Per-class 2/4 ACHIEVED (text-heavy 83.83% + structured-audit 87.18%).
@@ -51,6 +58,8 @@ What is NOT true:
 | Phase 10 ade9d5eb | 62.59% | +25.32pp | A17 (PPM order-3) + A18 (LZ-PPM order-4) AOT binary deploy — gap **17.41pp** |
 | Phase 10/11 best-of-N (a6d36e1d) | 75.42% | +12.83pp | full-chain best-of-N {A1, A17, A18, A17→A18, A18→A17} per-file try-and-revert — gap **4.58pp** |
 | Phase 10/11 post-A18-v2 (ace91cf6) | **75.77%** | +0.35pp | A18 v2 inclusion full-chain best-of-N — gap **4.23pp** |
+| Phase 12 P3 A25 v2 slice (74dae9da) | 76.07% (anchor) → 76.52% (slice +0.45pp) | +0.45pp slice-only | A25 v2 wire fix on 4-class slice 231,901 B; full-deployment projected 84.02% (later RETRACTED) |
+| **Phase 12 P3 A25 v2 FULL DEPLOY (this milestone)** | **78.05%** | **+1.98pp** | **A25 v2 dispatcher applied 6-repo full corpus 9.92 MB / 383 files; gap 1.95pp** |
 
 \* anchor-change at Phase 10 P0+P3 is corpus-mix expansion, not algorithmic regression — measurement axis re-baselined.
 
@@ -63,9 +72,12 @@ What is NOT true:
 | Phase 8 post-bug-fix (a42b3f3e) | 49.10% | 30.90pp | 0% (anchor) |
 | Phase 10 ade9d5eb (AOT) | 62.59% | 17.41pp | 43.7% |
 | Phase 10/11 best-of-N (a6d36e1d) | 75.42% | 4.58pp | 85.2% |
-| Phase 10/11 post-A18-v2 (ace91cf6) | **75.77%** | **4.23pp** | **86.3%** |
+| Phase 10/11 post-A18-v2 (ace91cf6) | 75.77% | 4.23pp | 86.3% |
+| **Phase 12 P3 A25 v2 FULL DEPLOY** | **78.05%** | **1.95pp** | **93.69%** |
 
-**Cumulative gap reduction = (30.90 − 4.23) / 30.90 = 86.3% closure of original raw 137 80% target gap.**
+**Cumulative gap reduction = (30.90 − 1.95) / 30.90 = 93.69% closure of original raw 137 80% target gap.**
+
+(Prior milestone v4: 86.3%; current v5: 93.69%; +7.39pp closure delta on A25 v2 full deployment 9.92 MB / 383 files / 379 byte-eq PASS.)
 
 Pending paths (PROJECTED):
 - a87d09a4 AOT cohort 2 (A4+A12+A15) build-out → +2.5pp est = ~78.27% projected on land.
@@ -150,9 +162,9 @@ Six gates cleared in A22 tick 2 (commit `95f843b5`):
 
 ---
 
-## 6. Phase 12 P0 deploy LIVE — 2/4 classes (post-A18-v2 ace91cf6)
+## 6. Phase 12 P0 deploy LIVE — 2/4 classes (post-A18-v2 ace91cf6) + post-A25-v2 FULL DEPLOY (this milestone)
 
-Per-class achievement matrix (raw 91 C3 honest, post-A18-v2 inclusion delta +0.35pp):
+Per-class achievement matrix (raw 91 C3 honest, post-A18-v2 inclusion delta +0.35pp; for A25 v2 full deploy see §6.5 below):
 
 | class | constituents | saving% | verdict | P0 deploy |
 |---|---|---:|---|---|
@@ -160,6 +172,24 @@ Per-class achievement matrix (raw 91 C3 honest, post-A18-v2 inclusion delta +0.3
 | **structured-audit** | hive triad + hexa-lang aot_cache + airgenome rig_trend | **87.18%** | ACHIEVED (margin 7.18pp) | **LIVE** |
 | small-file | nexus state + nexus_proposals_small | 69.10% | BELOW (10.90pp gap) | GATED |
 | mixed-real | anima discovery + airgenome rig_trend mixed | 64.35% | BELOW (15.65pp gap) | GATED |
+
+### 6.5 A25 v2 FULL DEPLOYMENT 6-repo per-class (NEW v5 strengthening)
+
+Per-class breakdown via A25 v2 dispatcher across 6-repo full corpus (9.92 MB / 383 files):
+
+| class | files | raw bytes | enc bytes | saving% | gap to 80% | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| **json-heavy** | 108 | 5,260,287 | 457,054 | **91.31%** | -11.31pp | **ACHIEVED** |
+| mixed | 45 | 3,062,033 | 869,525 | 71.60% | 8.40pp | BELOW |
+| text-heavy | 117 | 1,559,008 | 825,101 | 47.08% | 32.92pp | BELOW |
+| struct-audit | 1 | 13,814 | 3,609 | 73.87% | 6.13pp | BELOW |
+| synthetic-repetitive | 1 | 1,282 | 1,188 | 7.33% | 72.67pp | BELOW |
+| small-file | 95 | 20,003 | 19,884 | 0.59% | 79.41pp | BELOW (try-revert preserved) |
+| passthrough | 12 | 425 | 425 | 0.00% | n/a | <64B raw 65+68 idempotent |
+
+**Per-class A25 v2 full-deploy verdict**: 1/7 ACHIEVED (json-heavy, the dominant 53% byte-share class). 5/7 BELOW. Aggregate 78.05%.
+
+raw 91 honest C3: prior P0 deploy table (text-heavy 83.83%, structured-audit 87.18%) was measured on a CURATED subset. Full-deployment A25 v2 dispatch with broader corpus mix yields lower per-class saving on text-heavy (47.08% across 1.56MB of mixed prose density) because the inclusion of less-compressible prose (anima atlas + n6 README + format_witness mixed) drags the byte-weighted class average. Both numbers are honest in their scope.
 
 **Per-class 2/4 ACHIEVED** + 2/4 잔여. Total per-class achievement matrix is the load-bearing partial-achievement evidence for the raw 137 v4 strengthening commit.
 
@@ -236,7 +266,9 @@ Cumulative position:
 
 ## 10. raw 91 honest C3 — what this milestone does NOT solve
 
-1. **Aggregate gap remains**: 75.77% < 80% target. **4.23pp away** (post-A18-v2 ace91cf6). Two GATED classes (small-file 69.10%, mixed-real 64.35%) need algorithmic lift.
+1. **Aggregate gap remains** (v5 strengthening update 2026-04-28T15Z): **78.05% < 80% target. 1.95pp away** (post-A25-v2 FULL DEPLOY 6-repo). Five BELOW classes (text-heavy 47%, mixed 72%, struct-audit 74%, small-file 0.6%, synthetic-repetitive 7%) need per-class CEILING advance — A18 v3 order-2 byte-context coder is the projected lever for text-heavy (currently 47%, projected +3-5pp). Prior v4 verdict (75.77% gap 4.23pp) PRESERVED as historical anchor.
+   - PRIOR (v4): 75.77% < 80% target. 4.23pp away (post-A18-v2 ace91cf6). Two GATED classes.
+1a. **A25 v2 full-deployment 84.02% projection RETRACTED**: 74dae9da event 8 projected +7.95pp on full deployment; ACTUAL is +1.98pp. raw 91 honest C3 retraction: byte-share decomposition assumed slice-tick per-class lift would extend to full-corpus byte distributions, but text-heavy class on broader corpus is 47% not 64% extrapolated, and small-file class on production scope is 0.59% not 5.06% slice. Structural finding (per-class wrapper overhead reclaim) PRESERVED on slice; aggregate projection RETRACTED.
 2. **F-A18-1 NOT RETIRED**: PARTIAL only; in-flight agent `a7b9417d` continues. A18 v2 inclusion delta +0.35pp is corpus-class-conditional (NOT promoted to RETIRED).
 3. **F-A19-6 NEW TRIPPED**: A19 federation 0pp net on broader nexus corpus; alternative path required.
 4. **F-A22-3 NOT_MEASURED**: A22 latency budget deferred to tick 3.
@@ -287,7 +319,8 @@ Per-rank priority from 5 close-path verdict triangulation (a7a059f0 + a58efacb +
 - **raw 95 triad**: L1 advisory (this v4 strengthening) + L2 lint (hxc_lint.hexa --measure) + L3 atlas (n6 + hive triad_audit + hexa-lang aot_cache anchor files).
 - **raw 99 hive cli**: hxc_lint.hexa --measure --class={text-heavy,structured-audit} reads deploy ledgers as authority.
 - **raw 102 STRENGTHEN-existing**: v4 strengthening = STRENGTHEN-existing path (raw 137 history+note 6 lines append + cumulative milestone doc strengthening + witness ledger land); no new raw or new doc creation.
-- **raw 137 80% Pareto + cmix-ban (v4 partial achievement formal)**: PARTIAL ACHIEVEMENT 2/4 per-class; aggregate 75.77% gap 4.23pp; **86.3% cumulative gap reduction MEASURED** (30.90pp anchor → 4.23pp); cmix-ban MAINTAINED.
+- **raw 137 80% Pareto + cmix-ban (v5 strengthening: A25 v2 FULL DEPLOYMENT 6-repo MEASURED)**: PARTIAL ACHIEVEMENT — aggregate **78.05% byte-weighted** (gap 1.95pp); 1/7 per-class ACHIEVED (json-heavy 91.31%, dominant 53% byte-share); 5/7 BELOW; **93.69% cumulative gap reduction MEASURED** (30.90pp anchor → 1.95pp; +7.39pp closure delta from v4 86.3%); 379/379 byte-eq PASS + 11/11 SHA256 sample PASS; cmix-ban MAINTAINED.
+   - PRIOR (v4): 86.3% cumulative gap reduction (75.77% / 4.23pp gap / 2-of-4 per-class).
 - **raw 142 D1-D5**: D2 (try-and-revert) + D3 (orthogonality) + D4 healthy-signal cumulative cadence 91.7% PRESERVED.
 - **raw 152 self-decoding**: VERIFIED at artifact level (raw 152 self-decoding-fixpoint VERIFIED).
 - **raw 156 algorithm-placement-orthogonality**: A20+A22 orthogonal; A23/A24/A25 forward-spec'd with placement axes.
@@ -296,3 +329,18 @@ Per-rank priority from 5 close-path verdict triangulation (a7a059f0 + a58efacb +
 ---
 
 **End of cumulative milestone 2026-04-28 (v4 strengthening — 75.77% / 86.3% cumulative gap reduction / per-class 2/4 ACHIEVED).**
+
+---
+
+## 14. v5 strengthening (post-A25-v2 FULL DEPLOYMENT 6-repo LIVE FIRE 2026-04-28T15Z)
+
+**Aggregate**: 78.05% byte-weighted MEASURED on 9,916,852 raw bytes / 383 files / 6 repos.
+**Cumulative gap reduction**: 30.90pp original anchor → 1.95pp current = **93.69% closure** (record).
+**80% target**: NOT ACHIEVED MEASURED — gap 1.95pp residual. Prior 84.02% full-deployment projection RETRACTED (raw 91 honest C3).
+**Byte-eq integrity**: 379/379 cmp byte-eq PASS + 11/11 SHA256 round-trip sample PASS (4 EMPTY files skipped).
+**Classification accuracy**: 100% — all 271 a18-routed (text/json/struct/mixed) + 95 a23-routed (small-file) + 12 passthrough + 1 a24 dispatched per dispatcher table.
+**Falsifier**: F-A25-WIRE-V2-3 NEW NOT_TRIPPED (full deployment 78.05% > 76.07% pre-v2 anchor; +1.98pp).
+**Witness**: `/Users/ghost/core/anima/state/format_witness/2026-04-28_a25_v2_full_deployment_6repo_80pct_measured.jsonl`
+**raw 91 honest C3**: A25 v2 full deployment is structurally CORRECT but byte-weighted aggregate target requires a per-class CEILING advance on text-heavy (current bottleneck at 47%, A18 v3 order-2 byte-context projected lever).
+
+**End of v5 strengthening — 78.05% / 93.69% cumulative gap reduction / per-class 1/7 ACHIEVED on full deployment.**
