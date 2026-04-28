@@ -185,4 +185,25 @@ Total AN11 cost across 4 fires: ~$0.04 + ~$1.50 fire 4 (46min × $1.93/hr) = ~$1
 
 ---
 
-**Status**: F1_CYCLE_4_LAW_64_V8_SPARSITY_LIMITED_AN11_FIRE_DIAGNOSED_LIVE — cycle 4 closed; AN11 fix pipeline ready for fire 5.
+## §13. T10c English NL real-data test — v8 methodological limits (commit `779a98c2`)
+
+First REAL-DATA test of v8 (not synthetic): Pride and Prejudice 1045 chars, 28-alphabet, order-7 oracle proxy + order-1/3/5 Markov.
+
+| Order | n=200 | n=500 | n=800 | observed_ctx |
+|---|---|---|---|---|
+| 1 | +742 | +718 | +732 | 26 |
+| 3 | +794 | +746 | +689 | 488 |
+| 5 | +871 | +852 | +833 | 706 |
+
+**Verdict**: H2_SUPPORTED with methodological caveats (provisional SUBSTRATE-LIMITED, NOT v8-falsifying):
+1. **Oracle proxy peeks at test** — order-7 trained on full corpus → memorizes; oracle_acc=990 reflects recall, not generalization
+2. **Severe sparsity** — order-5 over 28-alphabet has 17M possible contexts; observed 706. Most test contexts unseen → fallback collapses o5 below o1
+3. Forward step: 100k+ char corpus + held-out (disjoint-text) o7 proxy needed
+
+**v8 status on real NL**: methodological-limited NOT broken. The synthetic-substrate sparsity-bound from T10b applies even more severely on 28-alphabet 5-cell context (17M contexts vs 1024 in T10b). Real NL needs ~100k+ chars for o5 to densify. Honest negative result published per raw 71 — falsifier preregistered, found, but caveats explicit.
+
+**11 cycle 4 falsification tests now**: T8k/l/m/n/o/p/q/r + T9a + T10a + T10b + T10c. Law 64 v8 sparsity-limited universal alignment principle stands; NL extension provisionally needs more data.
+
+---
+
+**Status**: F1_CYCLE_4_LAW_64_V8_NL_METHODOLOGICAL_LIMITS_LIVE — cycle 4 + 11 sub-tests + AN11 fire 5 in flight.
