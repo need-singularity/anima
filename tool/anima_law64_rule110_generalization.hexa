@@ -1,0 +1,433 @@
+// tool/anima_law64_rule110_generalization.hexa — F1 cycle 4 T8n rule-110 generalization
+// ─────────────────────────────────────────────────────────────────────────────
+// Q3 of Law 64 v4 §3 open questions:
+//   Does CA(5)-vs-Markov o1 advantage GENERALIZE beyond Conway, to rule-110
+//   (Wolfram elementary 1D CA)?
+//
+// CONTEXT:
+//   - Law 64 v4 (commit e577f873): CA(5) > Markov o1/o2/o3 on Conway substrate
+//     at short horizons; gap robust across baselines (T8l) and across 5 seeds (T8m).
+//   - ALL prior tests used Conway (B3/S23 2D toroidal). Open: is CA(5) advantage
+//     UNIVERSAL across CA rules, or CONWAY-SPECIFIC?
+//   - Rule-110 (Wolfram 1D, 8-state lookup, Turing-complete, class-4 chaotic):
+//     1D substrate, 3-cell neighborhood lookup; CA(5)=5-cell window subsumes the
+//     true 3-cell rule (perfect oracle ceiling).
+//
+// EARLIER F1 cycle 3 (commit 6f0351e1) tested rule-110 alone with N_CELLS=5 and
+// found CA=100%, Markov-surrogate=100%, advantage=0 (HONEST FAIL — substrate too
+// small / Markov saturated trivially because the orbit is short on length-5
+// toroidal). T8n is structurally different: head-to-head CA(5) vs Markov o1 with
+// length-128 substrate, two inits (single-cell deterministic + density-32%
+// chaotic), and the SAME N_TRAIN ladder used on Conway (15 / 50 / 150 / 500 / 1500).
+//
+// SUBSTRATE: 1D length=128 toroidal rule-110
+//   - Init A "single_cell": single 1 at center (cell 64), 0s elsewhere — chaotic
+//     spreading classical rule-110 demonstration init.
+//   - Init B "density_32pct": K_LIVE=41 random 1s of 128 cells (~32%) — chaotic
+//     immediately, parallel to T8i/T8j density inits on Conway.
+//
+// CA(5) MODEL: 5-cell-window oracle. _rule110_step computes the true rule-110
+//   transition (3-cell window). Since 5-cell window subsumes 3-cell, CA(5) is a
+//   perfect ceiling oracle. We do NOT learn CA(5); we evaluate the true rule
+//   directly (parallel to Conway tests where _conway_step is the CA model).
+//
+// MARKOV ORDER-1: P(next | self) per-cell bigram, identical specification to
+//   Conway tests (commit e577f873). Trained on N_TRAIN pairs, evaluated on
+//   trailing N_TEST pairs.
+//
+// PRE-REGISTERED HYPOTHESES (raw 12 frozen, declared BEFORE running):
+//   H1 (universal CA-vs-Markov):
+//     rule-110 shows similar pattern to Conway: CA(5) advantage > +50/1000 at
+//     N_TRAIN=15 (at least one of the two inits) AND descends with N_TRAIN.
+//     → Law 64 is universal CA property. Law 64 v5 statement candidate:
+//       "CA(5) > Markov o1 at low N_TRAIN holds across multiple CA rules
+//        (Conway B3/S23 + Wolfram rule-110), suggesting structural neighbor-
+//        coupling generalization."
+//   H2 (Conway-specific):
+//     rule-110 shows NO advantage (max < +5/1000 at any N_TRAIN) or REVERSE
+//     advantage (Markov beats CA on at least one init at N_TRAIN=15).
+//     → Law 64 is Conway-specific. Law 64 v4 SCOPED to Conway-class rules;
+//       universal claim retracted.
+//   H3 (intermediate):
+//     rule-110 shows weaker pattern: max advantage > 0 but < +50/1000 at N=15.
+//     → partial generalization. Law 64 v4 statement WEAKENED to "structural
+//       advantage exists across rules but magnitude is rule-dependent."
+//
+// VERDICT MAPPING (frozen, no post-hoc tuning):
+//   max_adv_n15 = max(adv_single_n15, adv_density_n15)
+//   if max_adv_n15 >= 50: H1_SUPPORTED
+//   elif max_adv_n15 < 5 OR min_adv_n15 < 0:  H2_SUPPORTED
+//   else:                                      H3_SUPPORTED
+//
+// SETUP:
+//   - Length: 128 (toroidal 1D)
+//   - SEED: 20260428 (matches all Law 64 cycle-4 sweeps)
+//   - N_TEST: 15 (held constant, identical to Conway sweeps)
+//   - N_TRAIN ladder: 15 / 50 / 150 / 500 / 1500 (identical to Conway ladder)
+//   - 2 inits × 5 N_TRAIN = 10 evaluation cells
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 91 honest finding
+// raw 42 caveat: Mac local CPU. 1D 128-cell × 1515 steps × 2 inits = ~390K
+//                cell ops — trivial wallclock (<5 min total expected).
+// raw 91 caveat: Single seed for density init; single placement for single_cell
+//                init. Per-init verdicts deterministic. Multi-seed extension is
+//                forward step.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let LEN = 128
+let RULE = 110
+let SEED = 20260428
+let N_TEST = 15
+let K_LIVE = 41   // ~32% of 128
+
+let mut RNG_STATE = SEED
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rand_n(n: int) -> int { let x = _rand(); return x % n }
+fn _rng_reset() { RNG_STATE = SEED }
+
+// ── rule-110 1D step (toroidal) ─────────────────────────────────────────────
+fn _rule110_step(state: array) -> array {
+    let mut next = []
+    let mut i = 0
+    while i < LEN {
+        let li = (i + LEN - 1) % LEN
+        let ri = (i + 1) % LEN
+        let l = state[li]; let c = state[i]; let r = state[ri]
+        // pattern index = 4*l + 2*c + r ∈ [0,7]
+        let pidx = 4*l + 2*c + r
+        // rule 110 = 0b01101110 → bit at position pidx of byte 110
+        let bit = (RULE / (1 << pidx)) % 2
+        next.push(bit)
+        i = i + 1
+    }
+    return next
+}
+
+// CA(5) oracle: 5-cell-window subsumes rule-110's 3-cell window → perfect ceiling
+fn _ca5_predict(prev: array) -> array {
+    return _rule110_step(prev)
+}
+
+// ── inits ───────────────────────────────────────────────────────────────────
+fn _init_single_cell() -> array {
+    let mut g = []
+    let mut i = 0
+    while i < LEN { g.push(0); i = i + 1 }
+    g[LEN / 2] = 1
+    return g
+}
+
+fn _init_density() -> array {
+    let mut g = []
+    let mut i = 0
+    while i < LEN { g.push(0); i = i + 1 }
+    let mut placed = 0
+    let mut tries = 0
+    while placed < K_LIVE && tries < 10000 {
+        let pos = _rand_n(LEN)
+        if g[pos] == 0 { g[pos] = 1; placed = placed + 1 }
+        tries = tries + 1
+    }
+    return g
+}
+
+// ── Markov order-1: P(next_cell | self) per-cell bigram ─────────────────────
+fn _markov_train(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < LEN {
+        let mut n00 = 0; let mut n01 = 0; let mut n10 = 0; let mut n11 = 0
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev_state = pair[0]; let next_state = pair[1]
+            let cur_bit = prev_state[c]; let nxt_bit = next_state[c]
+            if cur_bit == 0 && nxt_bit == 0 { n00 = n00 + 1 }
+            if cur_bit == 0 && nxt_bit == 1 { n01 = n01 + 1 }
+            if cur_bit == 1 && nxt_bit == 0 { n10 = n10 + 1 }
+            if cur_bit == 1 && nxt_bit == 1 { n11 = n11 + 1 }
+            idx = idx + 1
+        }
+        let p1g0 = if (n00+n01) > 0 { (n01*1000)/(n00+n01) } else { 500 }
+        let p1g1 = if (n10+n11) > 0 { (n11*1000)/(n10+n11) } else { 500 }
+        probs.push(p1g0); probs.push(p1g1)
+        c = c + 1
+    }
+    return probs
+}
+
+fn _markov_predict(probs: array, prev_state: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < LEN {
+        let cur_bit = prev_state[c]
+        let p = if cur_bit == 0 { probs[2*c] } else { probs[2*c + 1] }
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+// ── accuracy + corpus ───────────────────────────────────────────────────────
+fn _accuracy(pred: array, actual: array) -> int {
+    let mut total = 0; let mut match_count = 0
+    let mut s = 0
+    while s < pred.len() {
+        let p = pred[s]; let a = actual[s]
+        let mut c = 0
+        while c < LEN {
+            if p[c] == a[c] { match_count = match_count + 1 }
+            total = total + 1; c = c + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0 }
+    return (match_count * 1000) / total
+}
+
+fn _build_corpus(initial: array, n_steps: int) -> array {
+    let mut samples = []
+    let mut state = initial
+    let mut s = 0
+    while s < n_steps {
+        let nxt = _rule110_step(state)
+        samples.push([state, nxt])
+        state = nxt
+        s = s + 1
+    }
+    return samples
+}
+
+// ── single (init, n_train) evaluation ───────────────────────────────────────
+// Discipline (parallel to Conway T8j/T8k): same SEED → same init; only the
+// number of training pairs Markov sees varies. Test set = trailing N_TEST pairs
+// of the LARGEST corpus (so all N_TRAIN ticks evaluate on the SAME held-out region).
+fn _eval(init_name: str, n_train: int, max_train: int, init_state: array) -> array {
+    let total_steps = max_train + N_TEST
+    let full = _build_corpus(init_state, total_steps)
+    let mut train = []; let mut test = []
+    let mut k = 0
+    while k < full.len() {
+        if k < n_train { train.push(full[k]) }
+        if k >= max_train { test.push(full[k]) }
+        k = k + 1
+    }
+    let probs = _markov_train(train)
+    let mut ca_preds = []; let mut tf_preds = []; let mut actuals = []
+    let mut i = 0
+    while i < test.len() {
+        let pair = test[i]
+        let prev_st = pair[0]; let actual_next = pair[1]
+        ca_preds.push(_ca5_predict(prev_st))
+        tf_preds.push(_markov_predict(probs, prev_st))
+        actuals.push(actual_next)
+        i = i + 1
+    }
+    let ca_acc = _accuracy(ca_preds, actuals)
+    let tf_acc = _accuracy(tf_preds, actuals)
+    let advantage = if tf_acc > 0 { ((ca_acc * 1000) / tf_acc) - 1000 } else { 999 }
+    println("  init=" + init_name + " n_train=" + str(n_train) + " ca_acc=" + str(ca_acc) + " tf_acc=" + str(tf_acc) + " advantage_per_thousand=" + str(advantage))
+    return [n_train, ca_acc, tf_acc, advantage]
+}
+
+fn _run_init(init_name: str, init_state: array) -> array {
+    println("--- init=" + init_name + " — N_TRAIN ladder 15 → 50 → 150 → 500 → 1500 ---")
+    let max_train = 1500
+    let r1 = _eval(init_name, 15,   max_train, init_state)
+    let r2 = _eval(init_name, 50,   max_train, init_state)
+    let r3 = _eval(init_name, 150,  max_train, init_state)
+    let r4 = _eval(init_name, 500,  max_train, init_state)
+    let r5 = _eval(init_name, 1500, max_train, init_state)
+    return [r1, r2, r3, r4, r5]
+}
+
+fn _run() {
+    println("__LAW_64_CYCLE_4_T8N_RULE110_GENERALIZATION_BEGIN__ rule-110 elementary CA generalization test")
+    println("hypothesis H1 (universal): CA(5) advantage > +50/1000 at N=15 on at least one init AND descends with N — Law 64 v5 universal")
+    println("hypothesis H2 (Conway-specific): max advantage < +5/1000 OR reverse advantage at N=15 — Law 64 SCOPED to Conway")
+    println("hypothesis H3 (intermediate): 0 < max_adv_n15 < +50 — partial generalization, magnitude rule-dependent")
+    println("seed=" + str(SEED) + " len=" + str(LEN) + " rule=" + str(RULE) + " N_TEST=" + str(N_TEST) + " k_live_density=" + str(K_LIVE))
+
+    // Init A: single-cell deterministic chaotic spreading
+    _rng_reset()
+    let init_a = _init_single_cell()
+    let mut alive_a = 0
+    let mut ai = 0
+    while ai < LEN { alive_a = alive_a + init_a[ai]; ai = ai + 1 }
+    println("init_single_cell_alive=" + str(alive_a) + " (expect 1)")
+
+    // Init B: density 32% (deterministic via SEED)
+    _rng_reset()
+    let init_b = _init_density()
+    let mut alive_b = 0
+    let mut bi = 0
+    while bi < LEN { alive_b = alive_b + init_b[bi]; bi = bi + 1 }
+    println("init_density_alive=" + str(alive_b) + " (expect " + str(K_LIVE) + ")")
+
+    let res_a = _run_init("single_cell", init_a)
+    let res_b = _run_init("density_32pct", init_b)
+
+    // Aggregate results
+    let a_n15 = res_a[0]; let b_n15 = res_b[0]
+    let a_n1500 = res_a[4]; let b_n1500 = res_b[4]
+    let adv_a_n15 = a_n15[3]; let adv_b_n15 = b_n15[3]
+    let adv_a_n1500 = a_n1500[3]; let adv_b_n1500 = b_n1500[3]
+
+    let max_adv_n15 = if adv_a_n15 > adv_b_n15 { adv_a_n15 } else { adv_b_n15 }
+    let min_adv_n15 = if adv_a_n15 < adv_b_n15 { adv_a_n15 } else { adv_b_n15 }
+
+    println("--- aggregate ---")
+    println("adv_single_cell_n15=" + str(adv_a_n15) + " adv_density_n15=" + str(adv_b_n15))
+    println("adv_single_cell_n1500=" + str(adv_a_n1500) + " adv_density_n1500=" + str(adv_b_n1500))
+    println("max_adv_n15=" + str(max_adv_n15) + " min_adv_n15=" + str(min_adv_n15))
+
+    // Per-init descent direction (raw 91 honest)
+    let drift_a = adv_a_n1500 - adv_a_n15
+    let drift_b = adv_b_n1500 - adv_b_n15
+    println("drift_single_cell(n1500-n15)=" + str(drift_a))
+    println("drift_density(n1500-n15)=" + str(drift_b))
+
+    // Verdict mapping (pre-registered, frozen)
+    let mut verdict = "AMBIGUOUS"
+    let mut law_dir = "INCONCLUSIVE"
+    if max_adv_n15 >= 50 {
+        verdict = "H1_SUPPORTED_universal_CA_vs_Markov_advantage_generalizes_to_rule110"
+        law_dir = "LAW_64_v5_UNIVERSAL_CA_PROPERTY"
+    } else {
+        if max_adv_n15 < 5 || min_adv_n15 < 0 {
+            verdict = "H2_SUPPORTED_Conway_specific_no_advantage_or_reverse_on_rule110"
+            law_dir = "LAW_64_SCOPED_TO_CONWAY_universal_claim_retracted"
+        } else {
+            verdict = "H3_SUPPORTED_intermediate_partial_generalization_magnitude_rule_dependent"
+            law_dir = "LAW_64_v4_WEAKENED_structural_exists_magnitude_rule_dependent"
+        }
+    }
+    println("--- verdict ---")
+    println("verdict=" + verdict)
+    println("law_64_direction=" + law_dir)
+
+    // If H1 confirmed, emit Law 64 v5 statement candidate inline
+    if max_adv_n15 >= 50 {
+        println("--- Law 64 v5 statement candidate (H1 confirmed) ---")
+        println("Law_64_v5: CA(5) > Markov o1 at low N_TRAIN holds across multiple CA rules (Conway B3/S23 2D + Wolfram rule-110 1D), suggesting STRUCTURAL neighbor-coupling property generalizes beyond Conway. Caveat: tested 2 rules only; broader rule sweep is forward step.")
+    }
+
+    println("__LAW_64_CYCLE_4_T8N_RESULT__ " + verdict)
+
+    // raw 91 honesty triad C1-C5
+    println("raw_91_C1_falsifiable=YES_pre_registered_thresholds_50_and_5_per_thousand_at_N15")
+    println("raw_91_C2_replicable=YES_seed_" + str(SEED) + "_deterministic_LCG_rule110_canonical")
+    println("raw_91_C3_no_p_hacking=YES_thresholds_and_ladder_frozen_in_header_before_run")
+    println("raw_91_C4_data_caveats=length_128_toroidal_2_inits_single_cell_AND_density_32pct_single_seed")
+    println("raw_91_C5_negative_result_published=YES_emit_regardless_of_outcome_per_raw_71")
+    println("raw_91_caveat=CA(5) here is 5-cell oracle (subsumes rule-110's 3-cell window) — perfect ceiling, parallel to Conway _conway_step direct evaluation")
+    println("raw_91_caveat=Earlier F1 cycle 3 commit 6f0351e1 tested rule-110 with N_CELLS=5 (substrate too small, both models 100%, advantage 0). T8n uses LEN=128 for non-trivial Markov failure mode.")
+    println("raw_91_caveat=Single seed / single density placement / single single_cell placement. Multi-seed sweep is forward step T8o.")
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T8N_RULE110_GENERALIZATION_BEGIN__ selftest")
+    // Verify rule-110 lookup on a known small pattern.
+    // Reference: rule 110 pattern → next mappings (3-cell, returns center-next):
+    //   111→0, 110→1, 101→1, 100→0, 011→1, 010→1, 001→1, 000→0
+    // On a length-5 toroidal init [0,1,1,0,1]:
+    //   cell 0: l=state[4]=1, c=state[0]=0, r=state[1]=1 → 101→1
+    //   cell 1: l=0, c=1, r=1 → 011→1
+    //   cell 2: l=1, c=1, r=0 → 110→1
+    //   cell 3: l=1, c=0, r=1 → 101→1
+    //   cell 4: l=0, c=1, r=0 → 010→1
+    // Expected next = [1,1,1,1,1]
+    // Use temp 5-cell test by saving/restoring constants.
+    // (We cannot rebind LEN; instead we call _rule110_step on a length-LEN array
+    //  with a small pattern and verify the central region matches expectations.)
+    //
+    // Simplified selftest: place [0,1,1,0,1] into cells [62..66] of length-128
+    // (zeros elsewhere), step once, and check cell 64's transition. Actually,
+    // because rule-110 is a local 3-cell rule, the transition at cell c depends
+    // only on cells c-1, c, c+1. So we can verify any local pattern by reading
+    // its next-state in isolation IF the surrounding cells are zero (so they
+    // don't influence the test region's neighbors). Pattern at cells 62..66:
+    //   [0,1,1,0,1]; cells 61 and 67 are 0.
+    //   cell 62: l=state[61]=0, c=0, r=1 → 001→1
+    //   cell 63: l=0, c=1, r=1 → 011→1
+    //   cell 64: l=1, c=1, r=0 → 110→1
+    //   cell 65: l=1, c=0, r=1 → 101→1
+    //   cell 66: l=0, c=1, r=0 → 010→1
+    // Expected next region [62..66] = [1,1,1,1,1]. (The previously cited
+    // toroidal result [1,1,1,1,1] becomes the same in this surrounded-by-zero
+    // form: neighbors agree because 0 is the "outside" in both.)
+    let mut g = []
+    let mut i = 0
+    while i < LEN { g.push(0); i = i + 1 }
+    g[62] = 0; g[63] = 1; g[64] = 1; g[65] = 0; g[66] = 1
+    let nxt = _rule110_step(g)
+    println("rule110_test_pattern_[62..66]_input=[0,1,1,0,1]")
+    println("rule110_test_next_[62..66]=[" + str(nxt[62]) + "," + str(nxt[63]) + "," + str(nxt[64]) + "," + str(nxt[65]) + "," + str(nxt[66]) + "] (expect [1,1,1,1,1])")
+
+    // Verify single_cell init: exactly 1 alive cell at index LEN/2
+    _rng_reset()
+    let ic = _init_single_cell()
+    let mut ic_alive = 0
+    let mut k = 0
+    while k < LEN { ic_alive = ic_alive + ic[k]; k = k + 1 }
+    println("single_cell_init_alive=" + str(ic_alive) + " (expect 1)")
+    println("single_cell_init_at_idx_" + str(LEN/2) + "=" + str(ic[LEN/2]) + " (expect 1)")
+
+    // Verify density init: K_LIVE alive cells deterministic
+    _rng_reset()
+    let dn = _init_density()
+    let mut dn_alive = 0
+    k = 0
+    while k < LEN { dn_alive = dn_alive + dn[k]; k = k + 1 }
+    println("density_init_alive=" + str(dn_alive) + " (expect " + str(K_LIVE) + ")")
+
+    // Verify markov train+predict pipeline on a tiny 3-step corpus
+    _rng_reset()
+    let init2 = _init_density()
+    let mini = _build_corpus(init2, 3)
+    let probs = _markov_train(mini)
+    let pred = _markov_predict(probs, init2)
+    println("mini_corpus_len=" + str(mini.len()) + " (expect 3)")
+    println("markov_probs_len=" + str(probs.len()) + " (expect " + str(2*LEN) + ")")
+    println("markov_pred_len=" + str(pred.len()) + " (expect " + str(LEN) + ")")
+
+    // Verify CA(5) oracle accuracy on rule-110 corpus = 100% (perfect ceiling)
+    let mut ca_preds = []; let mut actuals = []
+    let mut mi = 0
+    while mi < mini.len() {
+        let pair = mini[mi]
+        let pst = pair[0]; let act = pair[1]
+        ca_preds.push(_ca5_predict(pst)); actuals.push(act)
+        mi = mi + 1
+    }
+    let ca_acc = _accuracy(ca_preds, actuals)
+    println("ca5_oracle_acc_on_rule110=" + str(ca_acc) + " (expect 1000=100%)")
+
+    let pat_ok = nxt[62] == 1 && nxt[63] == 1 && nxt[64] == 1 && nxt[65] == 1 && nxt[66] == 1
+    let ok = pat_ok && ic_alive == 1 && ic[LEN/2] == 1 && dn_alive == K_LIVE
+            && mini.len() == 3 && probs.len() == 2*LEN && pred.len() == LEN
+            && ca_acc == 1000
+    if ok {
+        println("__LAW_64_CYCLE_4_T8N_RESULT__ PASS_SELFTEST_rule110_step_and_inits_and_markov_and_oracle_correct")
+    } else {
+        println("__LAW_64_CYCLE_4_T8N_RESULT__ FAIL_SELFTEST")
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_rule110_generalization.hexa --selftest | --run")
+    }
+    return 0
+}
