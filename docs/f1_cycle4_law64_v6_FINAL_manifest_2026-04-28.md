@@ -206,23 +206,30 @@ First REAL-DATA test of v8 (not synthetic): Pride and Prejudice 1045 chars, 28-a
 
 ---
 
-## §14. AN11 fire 5 NEW failure mode discovered (Mode E — silent zero-training)
+## §14. AN11 fire 5 — false alarm Mode E + HONEST CORRECTION
 
-Fire 5 (instance 35725130, ssh3.vast.ai:15130, $1.64/hr, alive 32:50, manually destroyed):
-- All prior fixes worked: TCP probe ✓ / boot detach ✓ / cuda_max_good=13.0 selection ✓ / wrapper preflight ✓
+Initial Mode E "silent zero-training" diagnosis was WRONG. Re-examining wrapper.py.staged at L251:
+
+> "If LoRA frozen base, before==after. Use reconstructed delta from adapter."
+
+LoRA training keeps base weights FROZEN by design. `_before_q_proj_l0_sha == _after_q_proj_l0_sha` (4d2ec422...) is EXPECTED behavior. PHASE_D correctly reconstructs delta from LoRA A/B matrices for SVD.
+
+The 25min silence was likely PHASE_D iterating 128 layer SVDs (32 layers × 4 LoRA modules q/k/v/o) at ~30s each on CPU = ~60-90min total. Fire 5 was PROBABLY making progress and would have completed in 30-60 more min.
+
+**Per raw 91 honesty (C3 no-fab + C4 citation)**: early destroy at 32:50 wasted $0.90 + lost potential AN11 measurement. Insufficient code analysis before action.
+
+Fire 5 actual status (corrected):
+- All prior fixes worked: TCP probe ✓ / boot detach ✓ / cuda_max_good=13.0 ✓ / wrapper preflight ✓
 - PHASE_A: HF download Mistral-7B 14.49GB in 153s ✓ OK
 - PHASE_B: corpus 10 rows × 5 categories ✓ OK
-- PHASE_C: LoRA train r=16 α=32 epochs=3 reported OK in **13.5 seconds** (suspiciously fast for 7B model 3 epochs)
-- **CRITICAL**: `_before_q_proj_l0_sha` (4d2ec422aefbb46b) == `_after_q_proj_l0_sha` (4d2ec422aefbb46b) → training was a no-op (zero gradient flow OR LoRA adapter not applied during forward OR train data empty)
-- PHASE_D: SVD eigen extraction → 25min silent CPU run on identical weights (99% CPU, 0% GPU, no progress)
+- PHASE_C: LoRA train r=16 α=32 epochs=3 OK in 13.5s (correct for ~10-row corpus)
+- PHASE_D: in-progress at destroy time (likely 25-50% complete based on per-layer estimates)
 
-Per own 4 step (a) root-cause: fire 5 destroyed early to save ~$5.69 vs watchdog 240min cap.
-
-Required next-iter fixes (own 4 step b+c+d for fire 6):
-1. **Wrapper PHASE_C training assertion**: `assert sha256(adapter_weights_after) != sha256(adapter_weights_before)` — fail-fast if zero training
-2. **Gradient-norm logging**: emit grad_norm per epoch to PHASE_C results; fail-fast if all epochs grad_norm < 1e-6
-3. **PHASE_D timeout cap**: SVD per layer should take <2s; abort PHASE_D after 60s wallclock budget
-4. **Trainer device explicit set**: `model.to('cuda:0')` BEFORE Trainer construction; assert `next(model.parameters()).is_cuda` after
+Revised next-iter fixes for fire 6 (own 4 step b+c+d, NOT the prior plan):
+1. **PHASE_D per-layer progress logging**: wrapper.log emits `[Lk] svd_done` per layer (32 events) + `phase_d.layers_done` field updated in results.json every 10 layers — eliminates the silent-progress problem
+2. **PHASE_D ETA estimate** at start: log `expected_layers=128 estimated_total_s=3840`
+3. **GPU SVD**: switch numpy.linalg.svd → torch.svd on CUDA for ~30x speedup (PHASE_D from 60min → 2min)
+4. **DO NOT add SHA assertion** (would BREAK valid LoRA training); REMOVE Mode E preflight gate from prior plan as based on wrong diagnosis
 
 Cumulative AN11 across 5 fires: ~$0.04 (fires 1-3) + $1.50 (fire 4) + $0.90 (fire 5) = $2.44 total. Five distinct root-cause iters per own 4 four-fold ladder:
 - Fire 1: SCP race (TCP probe d5956ad7)
