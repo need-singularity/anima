@@ -1,0 +1,313 @@
+// tool/anima_law64_conway_train_volume_sweep.hexa — F1 cycle 4 T8i train-volume axis
+// ─────────────────────────────────────────────────────────────────────────────
+// raw 12 frozen pre-registration (declared BEFORE running):
+//
+// HYPOTHESIS:
+//   Order-1 Markov per-cell bigram has FIXED representational capacity
+//   (4 transition counts per cell). As N_TRAIN → ∞, Markov saturates.
+//   CA(5) = exact Conway rule has UNBOUNDED capacity for this substrate.
+//   Therefore CA-vs-Markov advantage_per_thousand should either:
+//     (A) PLATEAU (Markov ceiling exposed) — CONVERGED finding
+//     (B) keep INCREASING monotonically — DIVERGENT finding (parallel to F3 Stouffer z)
+//     (C) DECREASE (Markov approaches CA on simple periodic patterns) — CONVERGED-DOWN
+//
+// SETUP (locked from commits 95b43ddb + 27e38a7a sweet-spot results):
+//   - Grid: 10x10 (sweet spot from T8e/T8f/T8g/T8h convergence axis)
+//   - Density: 32% (peak from 40x40+80x80 asymptote; 32 cells / 100)
+//   - Seed: 20260428 (deterministic, matches density-sweep tool)
+//   - Test split: trailing N_TEST=15 steps (held constant for fair comparison)
+//   - Vary N_TRAIN: 15 / 50 / 150 / 500 / 1500 (geometric ~3x ladder)
+//
+// CONVERGENCE CRITERION (frozen, no post-hoc tuning):
+//   |advantage_per_thousand[k] - advantage_per_thousand[k-1]| < 5
+//   for TWO consecutive ticks → declare CONVERGED at the smaller N_TRAIN.
+//   If criterion never met by N_TRAIN=1500 → declare DIVERGENT (raw 91 honest).
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 91 honest finding
+// raw 42 caveat: Mac local CPU execution (acceptable for short Conway sims;
+//                wallclock ≤ 10 min total; no GPU/witness ledger needed for axis sweep)
+// ─────────────────────────────────────────────────────────────────────────────
+
+let GRID_W = 10
+let GRID_H = 10
+let N_CELLS = 100
+let SEED = 20260428
+let N_TEST = 15           // held constant — fair test surface
+let DENSITY_K = 32        // 32 cells / 100 = 32% (sweet-spot from 40x40 / 80x80 asymptote)
+let CONV_DELTA = 5        // |Δadvantage| threshold (per-thousand units)
+
+let mut RNG_STATE = SEED
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rand_n(n: int) -> int { let x = _rand(); return x % n }
+fn _rng_reset() { RNG_STATE = SEED }
+
+fn _conway_step(state: array) -> array {
+    let mut next = []
+    let mut row = 0
+    while row < GRID_H {
+        let mut col = 0
+        while col < GRID_W {
+            let mut live_neighbors = 0
+            let mut dr = -1
+            while dr <= 1 {
+                let mut dc = -1
+                while dc <= 1 {
+                    if dr != 0 || dc != 0 {
+                        let nrow = (row + dr + GRID_H) % GRID_H
+                        let ncol = (col + dc + GRID_W) % GRID_W
+                        live_neighbors = live_neighbors + state[nrow * GRID_W + ncol]
+                    }
+                    dc = dc + 1
+                }
+                dr = dr + 1
+            }
+            let cur = state[row * GRID_W + col]
+            let mut new_val = 0
+            if cur == 1 && (live_neighbors == 2 || live_neighbors == 3) { new_val = 1 }
+            if cur == 0 && live_neighbors == 3 { new_val = 1 }
+            next.push(new_val)
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return next
+}
+
+// Generate init with exactly K live cells at random positions (deterministic seed)
+fn _gen_density_init(k_live: int) -> array {
+    let mut g = []
+    let mut i = 0
+    while i < N_CELLS { g.push(0); i = i + 1 }
+    let mut placed = 0
+    let mut tries = 0
+    while placed < k_live && tries < 10000 {
+        let pos = _rand_n(N_CELLS)
+        if g[pos] == 0 {
+            g[pos] = 1
+            placed = placed + 1
+        }
+        tries = tries + 1
+    }
+    return g
+}
+
+fn _markov_train(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < N_CELLS {
+        let mut n00 = 0; let mut n01 = 0; let mut n10 = 0; let mut n11 = 0
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev_state = pair[0]; let next_state = pair[1]
+            let cur_bit = prev_state[c]; let nxt_bit = next_state[c]
+            if cur_bit == 0 && nxt_bit == 0 { n00 = n00 + 1 }
+            if cur_bit == 0 && nxt_bit == 1 { n01 = n01 + 1 }
+            if cur_bit == 1 && nxt_bit == 0 { n10 = n10 + 1 }
+            if cur_bit == 1 && nxt_bit == 1 { n11 = n11 + 1 }
+            idx = idx + 1
+        }
+        let p1g0 = if (n00+n01) > 0 { (n01*1000)/(n00+n01) } else { 500 }
+        let p1g1 = if (n10+n11) > 0 { (n11*1000)/(n10+n11) } else { 500 }
+        probs.push(p1g0); probs.push(p1g1)
+        c = c + 1
+    }
+    return probs
+}
+
+fn _markov_predict(probs: array, prev_state: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < N_CELLS {
+        let cur_bit = prev_state[c]
+        let p = if cur_bit == 0 { probs[2*c] } else { probs[2*c + 1] }
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+fn _accuracy(pred: array, actual: array) -> int {
+    let mut total = 0; let mut match_count = 0
+    let mut s = 0
+    while s < pred.len() {
+        let p = pred[s]; let a = actual[s]
+        let mut c = 0
+        while c < N_CELLS {
+            if p[c] == a[c] { match_count = match_count + 1 }
+            total = total + 1; c = c + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0 }
+    return (match_count * 1000) / total
+}
+
+fn _build_corpus(initial: array, n_steps: int) -> array {
+    let mut samples = []
+    let mut state = initial
+    let mut s = 0
+    while s < n_steps {
+        let nxt = _conway_step(state)
+        samples.push([state, nxt])
+        state = nxt
+        s = s + 1
+    }
+    return samples
+}
+
+// Evaluate one N_TRAIN tick. Returns [n_train, ca_acc, tf_acc, advantage_per_thousand].
+// Discipline: same SEED → same initial pattern → same trajectory; only the
+// number of training pairs Markov sees varies. Test set = last N_TEST pairs of
+// the LARGEST corpus (so all N_TRAIN ticks evaluate on the SAME held-out region).
+fn _eval_train_volume(name: str, n_train: int, max_train: int) -> array {
+    _rng_reset()  // deterministic — every tick sees identical initial pattern
+    let initial = _gen_density_init(DENSITY_K)
+    let total_steps = max_train + N_TEST
+    let full = _build_corpus(initial, total_steps)
+    // Train: take the FIRST n_train pairs from full (chronological)
+    // Test: take the LAST N_TEST pairs (held out, identical across all ticks)
+    let mut train = []; let mut test = []
+    let mut k = 0
+    while k < full.len() {
+        if k < n_train { train.push(full[k]) }
+        if k >= max_train { test.push(full[k]) }
+        k = k + 1
+    }
+    let probs = _markov_train(train)
+    let mut ca_preds = []; let mut tf_preds = []; let mut actuals = []
+    let mut i = 0
+    while i < test.len() {
+        let pair = test[i]
+        let prev_st = pair[0]; let actual_next = pair[1]
+        let ca_next = _conway_step(prev_st)
+        let tf_next = _markov_predict(probs, prev_st)
+        ca_preds.push(ca_next); tf_preds.push(tf_next); actuals.push(actual_next)
+        i = i + 1
+    }
+    let ca_acc = _accuracy(ca_preds, actuals)
+    let tf_acc = _accuracy(tf_preds, actuals)
+    let advantage = if tf_acc > 0 { ((ca_acc * 1000) / tf_acc) - 1000 } else { 999 }
+    println("  " + name + " n_train=" + str(n_train) + " ca_acc=" + str(ca_acc) + " tf_acc=" + str(tf_acc) + " advantage_per_thousand=" + str(advantage))
+    return [n_train, ca_acc, tf_acc, advantage]
+}
+
+fn _abs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn _run() {
+    println("__LAW_64_CYCLE_4_T8I_TRAIN_VOLUME_BEGIN__ train-volume axis @ 10x10 / 32% density")
+    println("hypothesis: Markov order-1 per-cell bigram saturates, CA(5) advantage either PLATEAUS, DIVERGES, or CONVERGES-DOWN")
+    println("seed=" + str(SEED) + " grid=10x10 density_k=" + str(DENSITY_K) + " (32%) N_TEST=" + str(N_TEST) + " conv_delta=" + str(CONV_DELTA))
+    println("--- train-volume sweep (N_TRAIN: 15 → 50 → 150 → 500 → 1500) ---")
+    let max_train = 1500
+    let r1 = _eval_train_volume("V1_n15_baseline", 15, max_train)
+    let r2 = _eval_train_volume("V2_n50", 50, max_train)
+    let r3 = _eval_train_volume("V3_n150", 150, max_train)
+    let r4 = _eval_train_volume("V4_n500", 500, max_train)
+    let r5 = _eval_train_volume("V5_n1500", 1500, max_train)
+    let results = [r1, r2, r3, r4, r5]
+    println("--- convergence analysis ---")
+    let mut converged_at = -1
+    let mut prev_delta_ok = false
+    let mut k = 1
+    while k < results.len() {
+        let row = results[k]; let prev = results[k-1]
+        let d = _abs(row[3] - prev[3])
+        println("  Δadvantage(n=" + str(row[0]) + " vs n=" + str(prev[0]) + ") = " + str(d) + " (threshold " + str(CONV_DELTA) + ")")
+        if d < CONV_DELTA {
+            if prev_delta_ok && converged_at < 0 {
+                converged_at = prev[0]  // convergence at the FIRST N_TRAIN of the stable pair
+            }
+            prev_delta_ok = true
+        } else {
+            prev_delta_ok = false
+        }
+        k = k + 1
+    }
+    println("--- aggregate ---")
+    let mut max_adv = -9999; let mut peak_n = 0
+    let mut min_adv = 9999;  let mut min_n = 0
+    let mut j = 0
+    while j < results.len() {
+        let row = results[j]
+        if row[3] > max_adv { max_adv = row[3]; peak_n = row[0] }
+        if row[3] < min_adv { min_adv = row[3]; min_n = row[0] }
+        j = j + 1
+    }
+    println("max_advantage_per_thousand=" + str(max_adv) + " at n_train=" + str(peak_n))
+    println("min_advantage_per_thousand=" + str(min_adv) + " at n_train=" + str(min_n))
+    let last = results[results.len()-1]; let first = results[0]
+    let total_drift = last[3] - first[3]
+    println("total_drift(n=1500 vs n=15) = " + str(total_drift) + " per_thousand")
+    println("--- verdict ---")
+    let final_adv = last[3]
+    if converged_at > 0 {
+        if final_adv == 0 {
+            println("__LAW_64_CYCLE_4_T8I_RESULT__ CONVERGED_TO_PARITY_AT_N_TRAIN_" + str(converged_at) + "_final_advantage_0_per_thousand_markov_caught_up")
+        } else {
+            println("__LAW_64_CYCLE_4_T8I_RESULT__ CONVERGED_AT_N_TRAIN_" + str(converged_at) + "_final_advantage_" + str(final_adv) + "_per_thousand")
+        }
+    } else {
+        if total_drift > 0 {
+            println("__LAW_64_CYCLE_4_T8I_RESULT__ DIVERGENT_INCREASING_total_drift_" + str(total_drift) + "_per_thousand")
+        } else {
+            if total_drift < 0 {
+                println("__LAW_64_CYCLE_4_T8I_RESULT__ DIVERGENT_DECREASING_total_drift_" + str(total_drift) + "_per_thousand")
+            } else {
+                println("__LAW_64_CYCLE_4_T8I_RESULT__ NOISE_NO_DIRECTION")
+            }
+        }
+    }
+    println("--- comparison vs other Law 64 axes ---")
+    println("grid axis (commit 95b43ddb): CONVERGED 40x40≈80x80 at +22% advantage / 32% density")
+    println("density axis (commit 27e38a7a): CONVERGED peak at 32% density (10x10/20x20/40x40/80x80)")
+    println("train-volume axis (this tool, T8i): see verdict above")
+    println("raw_91_caveat=Mac local CPU execution per raw 42 — acceptable for axis sweep, no witness ledger needed")
+    println("raw_91_caveat=Held-out test set fixed at trailing N_TEST=15 of 1515 step trajectory — comparable across ticks")
+    println("raw_91_caveat=Conway is deterministic — Markov training pairs may saturate fast on a periodic orbit; long N_TRAIN may visit identical pairs repeatedly (no new info beyond cycle period)")
+    println("raw_91_caveat=Order-1 Markov per-cell bigram has fixed 4-count capacity — saturation is mathematically guaranteed (this experiment measures WHEN, not IF)")
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T8I_TRAIN_VOLUME_BEGIN__ selftest")
+    _rng_reset()
+    let g32 = _gen_density_init(DENSITY_K)
+    let mut count32 = 0
+    let mut i = 0
+    while i < N_CELLS { count32 = count32 + g32[i]; i = i + 1 }
+    println("density_32_actual_cells=" + str(count32))
+    // Single-step Conway sanity: the deterministic init must produce a deterministic next.
+    let nxt = _conway_step(g32)
+    let mut alive_next = 0
+    i = 0
+    while i < N_CELLS { alive_next = alive_next + nxt[i]; i = i + 1 }
+    println("next_step_alive_count=" + str(alive_next))
+    // Quick mini corpus check
+    _rng_reset()
+    let init2 = _gen_density_init(DENSITY_K)
+    let mini = _build_corpus(init2, 5)
+    println("mini_corpus_len=" + str(mini.len()))
+    if count32 == DENSITY_K && mini.len() == 5 {
+        println("__LAW_64_CYCLE_4_T8I_RESULT__ PASS_SELFTEST_density_init_and_corpus_correct")
+    } else {
+        println("__LAW_64_CYCLE_4_T8I_RESULT__ FAIL_SELFTEST")
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_conway_train_volume_sweep.hexa --selftest | --run")
+    }
+    return 0
+}
