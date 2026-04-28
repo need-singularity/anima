@@ -1,0 +1,376 @@
+// tool/anima_law64_conway_40x40_multi_seed_robustness.hexa — F1 cycle 4 T8m universality robustness
+// ─────────────────────────────────────────────────────────────────────────────
+// raw 12 frozen pre-registration (declared BEFORE running):
+//
+// CONTEXT — universality follow-up to T8j (commit 8871288a):
+//   T8j (40x40 / 32% / seed=20260428): N_TRAIN sweep 15→1500 → advantage
+//        69 → 29 → 23 → 21 → 4 per_thousand. DESCENT to ~parity at N_TRAIN=1500.
+//   Per raw 91 honesty: single-seed claims could be artifact of one seed's initial pattern.
+//   This tool tests whether the descent pattern is SEED-INDEPENDENT.
+//
+// THE UNIVERSALITY QUESTION (this tool answers):
+//   Does the 40x40/32% descent (high advantage at N=15, ~parity at N=1500) hold
+//   across MULTIPLE distinct seeds, or is it specific to seed=20260428's initial pattern?
+//
+// HYPOTHESES (frozen, no post-hoc tuning):
+//   H1 (UNIVERSALITY — descent is seed-independent):
+//      mean(advantage @ N=15) > +50/1000 across all 5 seeds
+//      AND mean(advantage @ N=1500) < +20/1000
+//      Interpretation: the descent is a property of the 40x40/32% Conway substrate,
+//      not the specific initial pattern. Law 64 v4 holds universally.
+//   H2 (SEED-SPECIFIC — high seed dependence):
+//      stdev(advantage @ N=15) > +50/1000 OR stdev(advantage @ N=1500) > +30/1000
+//      Interpretation: descent magnitude varies wildly across seeds; the T8j result
+//      may be partly artifact of seed=20260428's lucky/unlucky initial pattern.
+//      Law 64 v4 universality claim is weak.
+//   H3 (BOUNDARY — mixed): neither H1 nor H2 cleanly. Mean shows descent but
+//      stdev is moderate (between thresholds), or means do not span the
+//      threshold gap. Honest "more data needed" verdict.
+//
+// SETUP (locked from commits 95b43ddb 40x40 sweet-spot + 8871288a T8j):
+//   - Grid: 40x40 (1600 cells)
+//   - Density: 32% → 512 live cells
+//   - Test split: trailing N_TEST=15 steps (held constant — fair across seeds)
+//   - Seeds: {20260428, 12345, 99999, 7777, 31416} — 5 distinct values
+//             (20260428 is the T8j anchor; others are common test seeds)
+//   - N_TRAIN anchors: {15, 1500} — extremes of T8j's ladder (skip mid for compute)
+//   - Per seed × per N_TRAIN: compute advantage_per_thousand
+//   - Aggregate: mean ± stdev across 5 seeds at each N_TRAIN
+//
+// VERDICT MAPPING:
+//   - mean(N=15) > 50  AND mean(N=1500) < 20
+//     AND stdev(N=15) <= 50 AND stdev(N=1500) <= 30   → H1_SUPPORTED
+//   - stdev(N=15) > 50 OR stdev(N=1500) > 30          → H2_SUPPORTED
+//   - else                                            → H3_SUPPORTED
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 91 honest finding
+// raw 42 caveat: Mac local CPU. 5 seeds × 2 N_TRAIN ticks × ~30s each ≈ 5 min.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let GRID_W = 40
+let GRID_H = 40
+let N_CELLS = 1600
+let N_TEST = 15
+let DENSITY_K = 512
+
+let mut RNG_STATE = 20260428
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rand_n(n: int) -> int { let x = _rand(); return x % n }
+fn _rng_seed(s: int) { RNG_STATE = s }
+
+fn _conway_step(state: array) -> array {
+    let mut next = []
+    let mut row = 0
+    while row < GRID_H {
+        let mut col = 0
+        while col < GRID_W {
+            let mut live_neighbors = 0
+            let mut dr = -1
+            while dr <= 1 {
+                let mut dc = -1
+                while dc <= 1 {
+                    if dr != 0 || dc != 0 {
+                        let nrow = (row + dr + GRID_H) % GRID_H
+                        let ncol = (col + dc + GRID_W) % GRID_W
+                        live_neighbors = live_neighbors + state[nrow * GRID_W + ncol]
+                    }
+                    dc = dc + 1
+                }
+                dr = dr + 1
+            }
+            let cur = state[row * GRID_W + col]
+            let mut new_val = 0
+            if cur == 1 && (live_neighbors == 2 || live_neighbors == 3) { new_val = 1 }
+            if cur == 0 && live_neighbors == 3 { new_val = 1 }
+            next.push(new_val)
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return next
+}
+
+fn _gen_density_init(k_live: int) -> array {
+    let mut g = []
+    let mut i = 0
+    while i < N_CELLS { g.push(0); i = i + 1 }
+    let mut placed = 0
+    let mut tries = 0
+    while placed < k_live && tries < 1000000 {
+        let pos = _rand_n(N_CELLS)
+        if g[pos] == 0 {
+            g[pos] = 1
+            placed = placed + 1
+        }
+        tries = tries + 1
+    }
+    return g
+}
+
+fn _markov_train(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < N_CELLS {
+        let mut n00 = 0; let mut n01 = 0; let mut n10 = 0; let mut n11 = 0
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev_state = pair[0]; let next_state = pair[1]
+            let cur_bit = prev_state[c]; let nxt_bit = next_state[c]
+            if cur_bit == 0 && nxt_bit == 0 { n00 = n00 + 1 }
+            if cur_bit == 0 && nxt_bit == 1 { n01 = n01 + 1 }
+            if cur_bit == 1 && nxt_bit == 0 { n10 = n10 + 1 }
+            if cur_bit == 1 && nxt_bit == 1 { n11 = n11 + 1 }
+            idx = idx + 1
+        }
+        let p1g0 = if (n00+n01) > 0 { (n01*1000)/(n00+n01) } else { 500 }
+        let p1g1 = if (n10+n11) > 0 { (n11*1000)/(n10+n11) } else { 500 }
+        probs.push(p1g0); probs.push(p1g1)
+        c = c + 1
+    }
+    return probs
+}
+
+fn _markov_predict(probs: array, prev_state: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < N_CELLS {
+        let cur_bit = prev_state[c]
+        let p = if cur_bit == 0 { probs[2*c] } else { probs[2*c + 1] }
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+fn _accuracy(pred: array, actual: array) -> int {
+    let mut total = 0; let mut match_count = 0
+    let mut s = 0
+    while s < pred.len() {
+        let p = pred[s]; let a = actual[s]
+        let mut c = 0
+        while c < N_CELLS {
+            if p[c] == a[c] { match_count = match_count + 1 }
+            total = total + 1; c = c + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0 }
+    return (match_count * 1000) / total
+}
+
+fn _build_corpus(initial: array, n_steps: int) -> array {
+    let mut samples = []
+    let mut state = initial
+    let mut s = 0
+    while s < n_steps {
+        let nxt = _conway_step(state)
+        samples.push([state, nxt])
+        state = nxt
+        s = s + 1
+    }
+    return samples
+}
+
+// Evaluate one seed × one N_TRAIN. Returns advantage_per_thousand (int).
+// Discipline: seed determines initial pattern, N_TRAIN determines train slice
+// from common max-train trajectory. Test = trailing N_TEST pairs of max-train trajectory.
+fn _eval_seed_volume(seed: int, n_train: int, max_train: int) -> int {
+    _rng_seed(seed)
+    let initial = _gen_density_init(DENSITY_K)
+    let total_steps = max_train + N_TEST
+    let full = _build_corpus(initial, total_steps)
+    let mut train = []; let mut test = []
+    let mut k = 0
+    while k < full.len() {
+        if k < n_train { train.push(full[k]) }
+        if k >= max_train { test.push(full[k]) }
+        k = k + 1
+    }
+    let probs = _markov_train(train)
+    let mut ca_preds = []; let mut tf_preds = []; let mut actuals = []
+    let mut i = 0
+    while i < test.len() {
+        let pair = test[i]
+        let prev_st = pair[0]; let actual_next = pair[1]
+        let ca_next = _conway_step(prev_st)
+        let tf_next = _markov_predict(probs, prev_st)
+        ca_preds.push(ca_next); tf_preds.push(tf_next); actuals.push(actual_next)
+        i = i + 1
+    }
+    let ca_acc = _accuracy(ca_preds, actuals)
+    let tf_acc = _accuracy(tf_preds, actuals)
+    let advantage = if tf_acc > 0 { ((ca_acc * 1000) / tf_acc) - 1000 } else { 999 }
+    println("  seed=" + str(seed) + " n_train=" + str(n_train) + " ca_acc=" + str(ca_acc) + " tf_acc=" + str(tf_acc) + " advantage_per_thousand=" + str(advantage))
+    return advantage
+}
+
+fn _abs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+// Integer mean across an array (rounded toward zero).
+fn _mean(xs: array) -> int {
+    if xs.len() == 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < xs.len() { s = s + xs[i]; i = i + 1 }
+    return s / xs.len()
+}
+
+// Integer stdev (population) — sqrt approximated by Newton iteration on int.
+fn _isqrt(n: int) -> int {
+    if n <= 0 { return 0 }
+    let mut x = n
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+fn _stdev(xs: array, mean_val: int) -> int {
+    if xs.len() == 0 { return 0 }
+    let mut sum_sq = 0
+    let mut i = 0
+    while i < xs.len() {
+        let d = xs[i] - mean_val
+        sum_sq = sum_sq + d * d
+        i = i + 1
+    }
+    let var = sum_sq / xs.len()
+    return _isqrt(var)
+}
+
+fn _max(xs: array) -> int {
+    let mut m = xs[0]; let mut i = 1
+    while i < xs.len() { if xs[i] > m { m = xs[i] } i = i + 1 }
+    return m
+}
+
+fn _min(xs: array) -> int {
+    let mut m = xs[0]; let mut i = 1
+    while i < xs.len() { if xs[i] < m { m = xs[i] } i = i + 1 }
+    return m
+}
+
+fn _run() {
+    println("__LAW_64_CYCLE_4_T8M_40x40_MULTI_SEED_BEGIN__ universality robustness @ 40x40 / 32% density")
+    println("hypothesis H1 (UNIVERSALITY): mean(N=15)>50 AND mean(N=1500)<20 with bounded stdev")
+    println("hypothesis H2 (SEED-SPECIFIC): stdev(N=15)>50 OR stdev(N=1500)>30")
+    println("hypothesis H3 (BOUNDARY): mixed — neither H1 nor H2 cleanly")
+    println("seeds={20260428, 12345, 99999, 7777, 31416} N_TRAIN_anchors={15,1500} grid=40x40 density=512/1600")
+    let seeds = [20260428, 12345, 99999, 7777, 31416]
+    let max_train = 1500
+    let mut adv_n15 = []
+    let mut adv_n1500 = []
+    println("--- per-seed × per-N_TRAIN sweep ---")
+    let mut s = 0
+    while s < seeds.len() {
+        let sd = seeds[s]
+        println("seed " + str(sd) + ":")
+        let a15 = _eval_seed_volume(sd, 15, max_train)
+        let a1500 = _eval_seed_volume(sd, 1500, max_train)
+        adv_n15.push(a15)
+        adv_n1500.push(a1500)
+        s = s + 1
+    }
+    println("--- aggregate (across 5 seeds) ---")
+    let mean_n15 = _mean(adv_n15)
+    let mean_n1500 = _mean(adv_n1500)
+    let std_n15 = _stdev(adv_n15, mean_n15)
+    let std_n1500 = _stdev(adv_n1500, mean_n1500)
+    let max_n15 = _max(adv_n15);   let min_n15 = _min(adv_n15)
+    let max_n1500 = _max(adv_n1500); let min_n1500 = _min(adv_n1500)
+    println("N=15:   mean=" + str(mean_n15)   + " stdev=" + str(std_n15)   + " min=" + str(min_n15)   + " max=" + str(max_n15))
+    println("N=1500: mean=" + str(mean_n1500) + " stdev=" + str(std_n1500) + " min=" + str(min_n1500) + " max=" + str(max_n1500))
+    let descent = mean_n15 - mean_n1500
+    println("mean_descent(N=15 → N=1500) = " + str(descent) + " per_thousand")
+    println("--- H1 vs H2 vs H3 hypothesis verdict ---")
+    let h1_mean_ok = mean_n15 > 50 && mean_n1500 < 20
+    let h1_stdev_ok = std_n15 <= 50 && std_n1500 <= 30
+    let h2_trigger = std_n15 > 50 || std_n1500 > 30
+    if h1_mean_ok && h1_stdev_ok {
+        println("__LAW_64_CYCLE_4_T8M_RESULT__ H1_SUPPORTED_UNIVERSALITY_CONFIRMED_mean_n15_" + str(mean_n15) + "_mean_n1500_" + str(mean_n1500) + "_stdev_n15_" + str(std_n15) + "_stdev_n1500_" + str(std_n1500))
+    } else {
+        if h2_trigger {
+            println("__LAW_64_CYCLE_4_T8M_RESULT__ H2_SUPPORTED_SEED_SPECIFIC_stdev_n15_" + str(std_n15) + "_stdev_n1500_" + str(std_n1500) + "_mean_n15_" + str(mean_n15) + "_mean_n1500_" + str(mean_n1500))
+        } else {
+            println("__LAW_64_CYCLE_4_T8M_RESULT__ H3_SUPPORTED_BOUNDARY_mean_n15_" + str(mean_n15) + "_mean_n1500_" + str(mean_n1500) + "_stdev_n15_" + str(std_n15) + "_stdev_n1500_" + str(std_n1500) + "_descent_" + str(descent))
+        }
+    }
+    println("--- Law 64 v4 universality strength assessment ---")
+    if h1_mean_ok && h1_stdev_ok {
+        println("law_64_v4_universality_strength=STRONG_seed_independent_descent_pattern_holds")
+    } else {
+        if h2_trigger {
+            println("law_64_v4_universality_strength=WEAK_descent_magnitude_seed_dependent")
+        } else {
+            println("law_64_v4_universality_strength=MODERATE_directional_consistency_but_quantitative_variance")
+        }
+    }
+    println("--- comparison vs predecessor T8j (single seed) ---")
+    println("T8j seed=20260428 (commit 8871288a): advantage 69 → 29 → 23 → 21 → 4 (descent observed)")
+    println("T8m anchor on same seed (this run, N=15 then N=1500): see seed=20260428 row above")
+    println("raw_91_caveat=Single-seed T8j advantages might reflect that seed's initial pattern. T8m tests universality.")
+    println("raw_91_caveat=5 seeds is a small ensemble; n>=10 would tighten stdev estimate. Compute budget caps current sweep.")
+    println("raw_91_caveat=N_TRAIN anchors {15,1500} skip middle ladder rungs — tests endpoints only, not full descent shape.")
+    println("raw_91_caveat=Population stdev (not sample stdev) used; n=5 makes sample correction (n-1) modestly different.")
+    println("raw_91_caveat=Mac CPU local execution; 40x40 × 1515 steps × 5 seeds × 2 train slices ≈ 5-10 min wallclock.")
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T8M_40x40_MULTI_SEED_BEGIN__ selftest")
+    _rng_seed(20260428)
+    let g = _gen_density_init(DENSITY_K)
+    let mut count = 0
+    let mut i = 0
+    while i < N_CELLS { count = count + g[i]; i = i + 1 }
+    println("density_512_actual_cells=" + str(count))
+    // Verify two distinct seeds yield different initial patterns
+    _rng_seed(12345)
+    let g2 = _gen_density_init(DENSITY_K)
+    let mut count2 = 0
+    i = 0
+    while i < N_CELLS { count2 = count2 + g2[i]; i = i + 1 }
+    let mut diff = 0
+    i = 0
+    while i < N_CELLS { if g[i] != g2[i] { diff = diff + 1 } i = i + 1 }
+    println("seed_diff_cells_20260428_vs_12345=" + str(diff))
+    // Sanity: stdev / mean / isqrt
+    let t = [10, 20, 30, 40, 50]
+    let m = _mean(t)
+    let sd = _stdev(t, m)
+    println("stat_sanity_mean_10_20_30_40_50=" + str(m) + " stdev=" + str(sd))
+    // Quick mini corpus check (3 steps)
+    _rng_seed(20260428)
+    let init2 = _gen_density_init(DENSITY_K)
+    let mini = _build_corpus(init2, 3)
+    let probs = _markov_train(mini)
+    println("mini_corpus_len=" + str(mini.len()) + " markov_probs_len=" + str(probs.len()))
+    let expected_probs_len = 2 * N_CELLS
+    let isqrt100 = _isqrt(100)
+    println("isqrt_100=" + str(isqrt100))
+    if count == DENSITY_K && count2 == DENSITY_K && diff > 0 && mini.len() == 3 && probs.len() == expected_probs_len && m == 30 && isqrt100 == 10 {
+        println("__LAW_64_CYCLE_4_T8M_RESULT__ PASS_SELFTEST_density_seed_distinct_corpus_markov_stats_correct")
+    } else {
+        println("__LAW_64_CYCLE_4_T8M_RESULT__ FAIL_SELFTEST")
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_conway_40x40_multi_seed_robustness.hexa --selftest | --run")
+    }
+    return 0
+}
