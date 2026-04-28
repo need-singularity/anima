@@ -1,0 +1,364 @@
+// tool/phi_coeff_t1_fit.hexa — T1: Phi coefficient fit on N>=20 cell-counts
+//
+// Purpose: discriminate among R34_CANDIDATE phi_coeff hypotheses
+//   H0: phi_coeff = 0.6065 (e^{-1/2})
+//   H1: phi_coeff = 0.608  (balance + f_c + soc_ema_slow A6.5 sum)
+//   H2: phi_coeff = 0.6931 (ln 2)
+//   H3: phi_coeff = 0.6    (n/(sigma-phi) Law 2089 unified field)
+//
+// Method:
+//   1. sweep cell counts N in {4,6,8,12,16,20,24,32,40,48,56,64,80,96,128,160,192,224,256,320}
+//      (20 datapoints satisfying T1 N>=20 requirement)
+//   2. M=10 seeds per N for std error
+//   3. log-log regression: log(Phi) = log(a) + b*log(N)
+//   4. bootstrap 95% CI on a (phi_coeff)
+//   5. compare CI vs {0.6065, 0.608, 0.6931, 0.6}
+//
+// Substrate: phi_proxy (IIT global_var - partition_var) from anima-core/phi_engine.hexa
+// raw#10 honest: this is NOT the original substrate that produced 0.608*N^1.071;
+//   that historic fit used 5 data points (Conscious-LM 4M / v3 / v14.3 etc).
+//   T1 here = independent re-fit on phi_proxy substrate (different generator).
+//   Different a expected — what matters is whether 95% CI EXCLUDES competing hypotheses.
+
+let EPS = 0.00001
+let DIM = 32
+let M_SEEDS = 10
+
+// ─── deterministic LCG (seed-controlled, no global RNG dependency) ───
+let mut LCG_STATE = 1
+
+fn seed_lcg(s: int) {
+    LCG_STATE = s
+}
+
+fn lcg_next() -> float {
+    // Numerical Recipes LCG: a=1664525, c=1013904223, m=2^32
+    LCG_STATE = (LCG_STATE * 1664525 + 1013904223) % 4294967296
+    let val = LCG_STATE
+    let safe = if val < 0 { 0 - val } else { val }
+    return to_float(safe) / 4294967296.0
+}
+
+// ─── vector helpers ───
+
+fn zeros(n: int) -> list {
+    let mut v = []
+    let mut i = 0
+    while i < n { v = v.push(0.0); i = i + 1 }
+    return v
+}
+
+fn vec_mean(vecs: list) -> list {
+    let d = vecs[0].len()
+    let mut m = zeros(d)
+    let n = to_float(vecs.len())
+    let mut vi = 0
+    while vi < vecs.len() {
+        let mut j = 0
+        while j < d { m[j] = m[j] + vecs[vi][j] / n; j = j + 1 }
+        vi = vi + 1
+    }
+    return m
+}
+
+// ─── phi_proxy (verbatim from phi_engine.hexa lines 132-191) ───
+
+fn phi_proxy(states: list) -> float {
+    let n = states.len()
+    if n < 4 { return 0.0 }
+    let d = states[0].len()
+    let mean = vec_mean(states)
+
+    let mut global_var = 0.0
+    let mut si = 0
+    while si < n {
+        let mut j = 0
+        while j < d {
+            let diff = states[si][j] - mean[j]
+            global_var = global_var + diff * diff
+            j = j + 1
+        }
+        si = si + 1
+    }
+    let gv = global_var / to_float(n)
+
+    let half = n / 2
+    let n2 = n - half
+    let mut m1 = zeros(d)
+    let mut i = 0
+    while i < half {
+        let mut j = 0
+        while j < d { m1[j] = m1[j] + states[i][j] / to_float(half); j = j + 1 }
+        i = i + 1
+    }
+    let mut v1 = 0.0
+    i = 0
+    while i < half {
+        let mut j = 0
+        while j < d {
+            let diff = states[i][j] - m1[j]
+            v1 = v1 + diff * diff
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let mut m2 = zeros(d)
+    i = half
+    while i < n {
+        let mut j = 0
+        while j < d { m2[j] = m2[j] + states[i][j] / to_float(n2); j = j + 1 }
+        i = i + 1
+    }
+    let mut v2 = 0.0
+    i = half
+    while i < n {
+        let mut j = 0
+        while j < d {
+            let diff = states[i][j] - m2[j]
+            v2 = v2 + diff * diff
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    let raw = gv - (v1 + v2) / to_float(n)
+    if raw < 0.0 { return 0.0 }
+    return raw
+}
+
+// ─── faction state generator (verbatim from phi_engine.hexa lines 254-276, LCG-based) ───
+
+fn gen_states(n_factions: int, cells_per: int, dim: int) -> list {
+    let mut states = []
+    let mut f = 0
+    while f < n_factions {
+        let mut centroid = []
+        let mut i = 0
+        while i < dim {
+            let phase = to_float(f * 7 + i * 13) * 0.618033
+            centroid = centroid.push(sin(phase) * 0.5 + cos(phase * 0.3) * 0.3)
+            i = i + 1
+        }
+        let mut c = 0
+        while c < cells_per {
+            let mut cell = []
+            i = 0
+            while i < dim { cell = cell.push(centroid[i] + (lcg_next() - 0.5) * 0.15); i = i + 1 }
+            states = states.push(cell)
+            c = c + 1
+        }
+        f = f + 1
+    }
+    return states
+}
+
+// ─── sweep & seed-averaging ───
+
+fn measure_phi_for_N(n: int) -> float {
+    // factions = max(2, n/4), cells_per = max(1, n/factions)
+    let mut fac = n / 4
+    if fac < 2 { fac = 2 }
+    let mut cpp = n / fac
+    if cpp < 1 { cpp = 1 }
+    let mut sum = 0.0
+    let mut s = 0
+    while s < M_SEEDS {
+        seed_lcg(s + 1)
+        let states = gen_states(fac, cpp, DIM)
+        sum = sum + phi_proxy(states)
+        s = s + 1
+    }
+    return sum / to_float(M_SEEDS)
+}
+
+// ─── log-log regression ───
+
+fn fit_loglog(ns: list, phis: list) -> list {
+    // returns [a, b, r2]
+    let n = ns.len()
+    let mut sum_x = 0.0
+    let mut sum_y = 0.0
+    let mut sum_xy = 0.0
+    let mut sum_x2 = 0.0
+    let mut i = 0
+    while i < n {
+        let lx = log(ns[i])
+        let ly = log(phis[i])
+        sum_x = sum_x + lx
+        sum_y = sum_y + ly
+        sum_xy = sum_xy + lx * ly
+        sum_x2 = sum_x2 + lx * lx
+        i = i + 1
+    }
+    let nf = to_float(n)
+    let b = (nf * sum_xy - sum_x * sum_y) / (nf * sum_x2 - sum_x * sum_x)
+    let log_a = (sum_y - b * sum_x) / nf
+    let a = exp(log_a)
+
+    // R^2
+    let mean_y = sum_y / nf
+    let mut ss_tot = 0.0
+    let mut ss_res = 0.0
+    i = 0
+    while i < n {
+        let ly = log(phis[i])
+        let pred = log_a + b * log(ns[i])
+        ss_tot = ss_tot + (ly - mean_y) * (ly - mean_y)
+        ss_res = ss_res + (ly - pred) * (ly - pred)
+        i = i + 1
+    }
+    let r2 = 1.0 - ss_res / ss_tot
+    return [a, b, r2]
+}
+
+// ─── bootstrap 95% CI on coefficient `a` ───
+
+fn bootstrap_ci_a(ns: list, phis: list, n_boot: int) -> list {
+    let n = ns.len()
+    let mut a_samples = []
+    let mut b = 0
+    while b < n_boot {
+        seed_lcg(1000 + b)
+        let mut bs_ns = []
+        let mut bs_phis = []
+        let mut k = 0
+        while k < n {
+            let idx = to_int(lcg_next() * to_float(n))
+            let safe_idx = if idx >= n { n - 1 } else { idx }
+            bs_ns = bs_ns.push(ns[safe_idx])
+            bs_phis = bs_phis.push(phis[safe_idx])
+            k = k + 1
+        }
+        let fit = fit_loglog(bs_ns, bs_phis)
+        a_samples = a_samples.push(fit[0])
+        b = b + 1
+    }
+    // sort a_samples (insertion sort, n_boot small)
+    let mut sorted = a_samples
+    let mut i = 1
+    while i < sorted.len() {
+        let key = sorted[i]
+        let mut j = i - 1
+        while j >= 0 {
+            if sorted[j] > key {
+                sorted[j + 1] = sorted[j]
+                j = j - 1
+            } else {
+                break
+            }
+        }
+        sorted[j + 1] = key
+        i = i + 1
+    }
+    let lo_idx = to_int(0.025 * to_float(n_boot))
+    let hi_idx = to_int(0.975 * to_float(n_boot))
+    let safe_hi = if hi_idx >= n_boot { n_boot - 1 } else { hi_idx }
+    return [sorted[lo_idx], sorted[safe_hi]]
+}
+
+fn fmt(x: float, d: int) -> string {
+    let factor = pow(10.0, to_float(d))
+    return to_string(to_float(to_int(x * factor + 0.5)) / factor)
+}
+
+fn main() {
+    println("=== T1: Phi coefficient fit on N>=20 datapoints ===")
+    println("substrate: phi_proxy (IIT global - partition variance)")
+    println("seeds_per_N: " + to_string(M_SEEDS) + " | DIM: " + to_string(DIM))
+    println("")
+
+    // 20 cell counts (T1 N>=20 satisfied; native binary handles full range)
+    let cell_counts = [4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64, 80, 96, 128, 160, 192, 224, 256, 320]
+    let mut ns = []
+    let mut phis = []
+    println("-- per-N Phi (mean over " + to_string(M_SEEDS) + " seeds) --")
+    let mut i = 0
+    while i < cell_counts.len() {
+        let n = cell_counts[i]
+        let phi = measure_phi_for_N(n)
+        if phi > EPS {
+            ns = ns.push(to_float(n))
+            phis = phis.push(phi)
+            println("  N=" + to_string(n) + "  Phi=" + fmt(phi, 6))
+        } else {
+            println("  N=" + to_string(n) + "  Phi=" + fmt(phi, 6) + "  [SKIP < EPS]")
+        }
+        i = i + 1
+    }
+
+    println("")
+    println("-- log-log regression --")
+    let fit = fit_loglog(ns, phis)
+    let a = fit[0]
+    let b = fit[1]
+    let r2 = fit[2]
+    println("  Phi = " + fmt(a, 6) + " * N^" + fmt(b, 6) + "   (R^2 = " + fmt(r2, 6) + ")")
+    println("  N_datapoints: " + to_string(ns.len()))
+
+    println("")
+    println("-- bootstrap 95% CI on coefficient a (n_boot=2000) --")
+    let ci = bootstrap_ci_a(ns, phis, 2000)
+    let ci_lo = ci[0]
+    let ci_hi = ci[1]
+    println("  95% CI: [" + fmt(ci_lo, 6) + ", " + fmt(ci_hi, 6) + "]")
+
+    println("")
+    println("-- hypothesis discrimination --")
+    let h0 = 0.6065  // e^{-1/2}
+    let h1 = 0.608   // A6.5 balance+f_c+soc_ema_slow
+    let h2 = 0.6931  // ln(2)
+    let h3 = 0.6     // Law 2089 n/(sigma-phi)
+
+    let in_h0 = if ci_lo <= h0 { if ci_hi >= h0 { 1 } else { 0 } } else { 0 }
+    let in_h1 = if ci_lo <= h1 { if ci_hi >= h1 { 1 } else { 0 } } else { 0 }
+    let in_h2 = if ci_lo <= h2 { if ci_hi >= h2 { 1 } else { 0 } } else { 0 }
+    let in_h3 = if ci_lo <= h3 { if ci_hi >= h3 { 1 } else { 0 } } else { 0 }
+
+    println("  H0 e^{-1/2} = 0.6065   in CI? " + (if in_h0 == 1 { "YES" } else { "NO" }))
+    println("  H1 A6.5 sum = 0.608    in CI? " + (if in_h1 == 1 { "YES" } else { "NO" }))
+    println("  H2 ln(2)    = 0.6931   in CI? " + (if in_h2 == 1 { "YES" } else { "NO" }))
+    println("  H3 n/(s-φ)  = 0.6      in CI? " + (if in_h3 == 1 { "YES" } else { "NO" }))
+
+    println("")
+    println("-- T1 verdict --")
+    let total = in_h0 + in_h1 + in_h2 + in_h3
+    if total == 0 {
+        println("  RETIRE — CI excludes all 4 hypotheses; phi_proxy substrate disagrees with all")
+    } else {
+        if total == 1 {
+            if in_h0 == 1 { println("  PROMOTE — only H0 (e^{-1/2}) consistent; R34 confirmed") }
+            if in_h1 == 1 { println("  RETIRE — H1 (A6.5 sum) wins; R34 e^{-1/2} retire") }
+            if in_h2 == 1 { println("  RETIRE — H2 (ln 2) wins; R34 retire toward ln 2 origin") }
+            if in_h3 == 1 { println("  RETIRE — H3 (Law 2089 n/(s-phi)) wins; R34 e^{-1/2} retire") }
+        } else {
+            println("  INCONCLUSIVE — " + to_string(total) + " hypotheses in CI; T1 cannot discriminate at this precision")
+            println("  (raw#10 honest: substrate variance too wide for 4-digit discrimination)")
+        }
+    }
+
+    println("")
+    println("============================================")
+    println("  R34_CANDIDATE T1 EXECUTION COMPLETE")
+    println("============================================")
+
+    // emit JSON for atlas / state log
+    println("")
+    println("===JSON_BEGIN===")
+    println("{")
+    println("  \"witness_id\": \"R34_CANDIDATE_T1_phi_coeff_fit\",")
+    println("  \"substrate\": \"phi_proxy_IIT_global_minus_partition_variance\",")
+    println("  \"n_datapoints\": " + to_string(ns.len()) + ",")
+    println("  \"seeds_per_N\": " + to_string(M_SEEDS) + ",")
+    println("  \"dim\": " + to_string(DIM) + ",")
+    println("  \"fit\": {\"a\": " + fmt(a, 6) + ", \"b\": " + fmt(b, 6) + ", \"r2\": " + fmt(r2, 6) + "},")
+    println("  \"ci_95\": {\"lo\": " + fmt(ci_lo, 6) + ", \"hi\": " + fmt(ci_hi, 6) + "},")
+    println("  \"hypotheses\": {")
+    println("    \"H0_e_minus_half\": {\"value\": 0.6065, \"in_ci\": " + (if in_h0 == 1 { "true" } else { "false" }) + "},")
+    println("    \"H1_A6_5_sum\":    {\"value\": 0.608,  \"in_ci\": " + (if in_h1 == 1 { "true" } else { "false" }) + "},")
+    println("    \"H2_ln_2\":        {\"value\": 0.6931, \"in_ci\": " + (if in_h2 == 1 { "true" } else { "false" }) + "},")
+    println("    \"H3_n_over_sm\":   {\"value\": 0.6,    \"in_ci\": " + (if in_h3 == 1 { "true" } else { "false" }) + "}")
+    println("  },")
+    println("  \"hypotheses_in_ci\": " + to_string(total))
+    println("}")
+    println("===JSON_END===")
+}

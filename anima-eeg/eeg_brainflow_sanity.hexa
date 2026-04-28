@@ -1,0 +1,399 @@
+// anima-eeg/eeg_brainflow_sanity.hexa
+// raw#9 hexa-only · raw#10 honest · raw#11 snake_case · raw#12 silent-error-ban
+// raw#15 no-hardcode · raw#34 no-backup-files · raw#37 transient-helper-in-/tmp
+// raw#66 ai-native error trailer · raw#80 sentinel · raw#82 darwin-native marker
+//
+// PURPOSE
+//   5-second BrainFlow sanity capture for OpenBCI Cyton+Daisy 16ch on macOS.
+//   Auto-detects Dongle device node, verifies brainflow importable in
+//   .venv-eeg/, runs a short capture and validates expected (32, ~625) shape
+//   (32 channels × 5 s × 125 Hz; Cyton+Daisy 16ch native is 125 Hz/channel
+//   after Daisy interleaving — Cyton-only 8ch mode is 250 Hz).
+//
+// USAGE
+//   hexa run anima-eeg/eeg_brainflow_sanity.hexa
+//   hexa run anima-eeg/eeg_brainflow_sanity.hexa --port /dev/cu.usbserial-DM0258DD
+//   hexa run anima-eeg/eeg_brainflow_sanity.hexa --seconds 5 --board cyton_daisy
+//
+//   --selftest      parse helper, no hardware probe required
+//
+// SAFETY
+//   - read-only: never writes recordings
+//   - no sudo
+//
+//  @resolver-bypass(reason="darwin-native: globs /dev/cu.usbserial-* /
+//                   /dev/cu.usbmodem* via shell, invokes .venv-eeg/bin/python
+//                   which is a mac-local virtualenv. Hetzner / linux pods do
+//                   not expose host USB device nodes nor the local venv, so
+//                   external dispatch yields silent no-op. Local Darwin exec
+//                   is the only viable route.")
+
+let SCHEMA       = "anima-eeg/eeg_brainflow_sanity/1"
+let HELPER_PATH  = "/tmp/anima_eeg_brainflow_sanity_helper.hexa_tmp"
+
+// @const cyton_daisy_board_id : BrainFlow BoardIds.CYTON_DAISY_BOARD = 2
+let DEFAULT_BOARD_ID            = 2
+let DEFAULT_BOARD_NAME          = "cyton_daisy"
+let DEFAULT_SECONDS             = 5
+let DEFAULT_SAMPLE_RATE_HZ      = 125          // Cyton+Daisy 16ch effective (Daisy interleaving halves Cyton-8ch native 250Hz). Verify at runtime via BoardShim.get_sampling_rate(BoardIds.CYTON_DAISY_BOARD.value)
+let DEFAULT_VENV_PYTHON         = ".venv-eeg/bin/python"
+let DEFAULT_DEVICE_GLOB_USBSER  = "/dev/cu.usbserial-*"
+let DEFAULT_DEVICE_GLOB_USBMOD  = "/dev/cu.usbmodem*"
+let EXPECTED_ROWS               = 32
+let EXPECTED_COLS_MIN           = 550          // 125 * 5 - slack (~12% startup tolerance)
+let EXPECTED_COLS_MAX           = 700          // 125 * 5 + slack (~12% drift tolerance)
+
+// ════════════════════════════════════════════════════════════════════
+// Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _emit_trailer(reason_slug: string, reason_detail: string, fix: string) {
+    eprintln("reason: " + reason_slug + ": " + reason_detail)
+    eprintln("fix: " + fix)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Helper python emitter (raw#37 transient)
+// ════════════════════════════════════════════════════════════════════
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# anima-eeg eeg_brainflow_sanity helper — emitted by\n")
+    parts.push("# anima-eeg/eeg_brainflow_sanity.hexa (raw#37 transient).\n")
+    parts.push("import argparse, glob, json, os, subprocess, sys, textwrap\n\n")
+
+    parts.push("USB_SERIAL_GLOB = '/dev/cu.usbserial-*'\n")
+    parts.push("USB_MODEM_GLOB  = '/dev/cu.usbmodem*'\n")
+    parts.push("VENV_PYTHON     = '.venv-eeg/bin/python'\n\n")
+
+    parts.push("def emit_trailer(slug, detail, fix):\n")
+    parts.push("    sys.stderr.write(f'reason: {slug}: {detail}\\n')\n")
+    parts.push("    sys.stderr.write(f'fix: {fix}\\n')\n\n")
+
+    parts.push("def detect_devices():\n")
+    parts.push("    devs = sorted(set(glob.glob(USB_SERIAL_GLOB) + glob.glob(USB_MODEM_GLOB)))\n")
+    parts.push("    return devs\n\n")
+
+    parts.push("def cmd_detect(args):\n")
+    parts.push("    devs = detect_devices()\n")
+    parts.push("    print('detected_count=' + str(len(devs)))\n")
+    parts.push("    for d in devs: print('detected_device=' + d)\n")
+    parts.push("    if len(devs) == 0:\n")
+    parts.push("        emit_trailer('device-not-found',\n")
+    parts.push("                     f'no {USB_SERIAL_GLOB} or {USB_MODEM_GLOB} device present',\n")
+    parts.push("                     '1) plug Dongle into Mac, switch to GPIO 6  '\n")
+    parts.push("                     '2) toggle Cyton OFF->PC  '\n")
+    parts.push("                     '3) System Settings -> Privacy & Security -> allow blocked driver, reboot  '\n")
+    parts.push("                     '4) re-run')\n")
+    parts.push("        print('detect=fail')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    if len(devs) > 1 and not args.port:\n")
+    parts.push("        emit_trailer('device-ambiguous',\n")
+    parts.push("                     'multiple candidate device nodes detected; pass --port <path> to disambiguate',\n")
+    parts.push("                     '1) re-run with --port <one-of-detected-paths>')\n")
+    parts.push("        print('detect=ambiguous')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    chosen = args.port if args.port else devs[0]\n")
+    parts.push("    print('chosen_port=' + chosen)\n")
+    parts.push("    print('detect=ok')\n\n")
+
+    parts.push("def verify_brainflow():\n")
+    parts.push("    if not os.path.exists(VENV_PYTHON):\n")
+    parts.push("        emit_trailer('venv-missing',\n")
+    parts.push("                     f'{VENV_PYTHON} not found',\n")
+    parts.push("                     '1) python3 -m venv .venv-eeg  '\n")
+    parts.push("                     '2) source .venv-eeg/bin/activate  '\n")
+    parts.push("                     '3) pip install --upgrade brainflow numpy')\n")
+    parts.push("        return False, ''\n")
+    parts.push("    r = subprocess.run([VENV_PYTHON, '-c', 'import brainflow; print(brainflow.__version__)'],\n")
+    parts.push("                       capture_output=True, text=True, timeout=20)\n")
+    parts.push("    if r.returncode != 0:\n")
+    parts.push("        emit_trailer('brainflow-missing',\n")
+    parts.push("                     f'brainflow import failed: {r.stderr.strip()[:200]}',\n")
+    parts.push("                     '1) source .venv-eeg/bin/activate  '\n")
+    parts.push("                     '2) pip install --upgrade brainflow numpy')\n")
+    parts.push("        return False, ''\n")
+    parts.push("    return True, r.stdout.strip()\n\n")
+
+    parts.push("CAPTURE_PY = textwrap.dedent('''\n")
+    parts.push("    import json, sys, time\n")
+    parts.push("    from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds\n")
+    parts.push("    BOARD_ID = int(sys.argv[1])\n")
+    parts.push("    PORT     = sys.argv[2]\n")
+    parts.push("    SECONDS  = int(sys.argv[3])\n")
+    parts.push("    params = BrainFlowInputParams()\n")
+    parts.push("    params.serial_port = PORT\n")
+    parts.push("    BoardShim.disable_board_logger()\n")
+    parts.push("    board = BoardShim(BOARD_ID, params)\n")
+    parts.push("    rc = 0\n")
+    parts.push("    rows = 0\n")
+    parts.push("    cols = 0\n")
+    parts.push("    sample = \"\"\n")
+    parts.push("    err = \"\"\n")
+    parts.push("    try:\n")
+    parts.push("        board.prepare_session()\n")
+    parts.push("        board.start_stream()\n")
+    parts.push("        time.sleep(SECONDS)\n")
+    parts.push("        data = board.get_board_data()\n")
+    parts.push("        rows = int(data.shape[0])\n")
+    parts.push("        cols = int(data.shape[1])\n")
+    parts.push("        if cols > 0:\n")
+    parts.push("            sample = ','.join(f'{float(v):.6g}' for v in data[0, :min(8, cols)])\n")
+    parts.push("    except Exception as exc:\n")
+    parts.push("        rc = 1\n")
+    parts.push("        err = repr(exc)[:400]\n")
+    parts.push("    finally:\n")
+    parts.push("        try: board.stop_stream()\n")
+    parts.push("        except Exception: pass\n")
+    parts.push("        try: board.release_session()\n")
+    parts.push("        except Exception: pass\n")
+    parts.push("    print(json.dumps({'rc': rc, 'rows': rows, 'cols': cols, 'sample': sample, 'err': err}))\n")
+    parts.push("''')\n\n")
+
+    parts.push("def cmd_capture(args):\n")
+    parts.push("    devs = detect_devices()\n")
+    parts.push("    if len(devs) == 0:\n")
+    parts.push("        emit_trailer('device-not-found',\n")
+    parts.push("                     f'no {USB_SERIAL_GLOB} or {USB_MODEM_GLOB} device present',\n")
+    parts.push("                     '1) plug Dongle into Mac, switch to GPIO 6  '\n")
+    parts.push("                     '2) toggle Cyton OFF->PC  '\n")
+    parts.push("                     '3) System Settings -> Privacy & Security -> allow blocked driver, reboot  '\n")
+    parts.push("                     '4) re-run')\n")
+    parts.push("        print('__EEG_SANITY_RESULT__ FAIL shape=0x0 port=NONE')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    if args.port:\n")
+    parts.push("        if args.port not in devs:\n")
+    parts.push("            sys.stderr.write(f'note: --port {args.port} not in detected list {devs}; trying anyway\\n')\n")
+    parts.push("        port = args.port\n")
+    parts.push("    elif len(devs) > 1:\n")
+    parts.push("        emit_trailer('device-ambiguous',\n")
+    parts.push("                     f'multiple candidate device nodes: {devs}; pass --port <path>',\n")
+    parts.push("                     '1) re-run with --port <one-of-detected-paths>')\n")
+    parts.push("        print('__EEG_SANITY_RESULT__ FAIL shape=0x0 port=AMBIGUOUS')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    else:\n")
+    parts.push("        port = devs[0]\n")
+    parts.push("    ok, ver = verify_brainflow()\n")
+    parts.push("    if not ok:\n")
+    parts.push("        print(f'__EEG_SANITY_RESULT__ FAIL shape=0x0 port={port}')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    print(f'brainflow_version={ver}')\n")
+    parts.push("    print(f'port={port}')\n")
+    parts.push("    print(f'board_id={args.board_id}')\n")
+    parts.push("    print(f'seconds={args.seconds}')\n")
+    parts.push("    r = subprocess.run([VENV_PYTHON, '-c', CAPTURE_PY,\n")
+    parts.push("                        str(args.board_id), port, str(args.seconds)],\n")
+    parts.push("                       capture_output=True, text=True, timeout=args.seconds + 30)\n")
+    parts.push("    if r.returncode != 0 or not r.stdout.strip():\n")
+    parts.push("        emit_trailer('capture-subprocess-failed',\n")
+    parts.push("                     f'rc={r.returncode} stderr={r.stderr.strip()[:300]}',\n")
+    parts.push("                     '1) verify Cyton powered ON and toggled to PC  '\n")
+    parts.push("                     '2) verify Daisy stack seated  '\n")
+    parts.push("                     '3) re-run with --port <detected>')\n")
+    parts.push("        print(f'__EEG_SANITY_RESULT__ FAIL shape=0x0 port={port}')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    try:\n")
+    parts.push("        result = json.loads(r.stdout.strip().splitlines()[-1])\n")
+    parts.push("    except Exception as exc:\n")
+    parts.push("        emit_trailer('capture-parse-failed',\n")
+    parts.push("                     f'could not parse helper output: {exc!r}; raw={r.stdout[-200:]!r}',\n")
+    parts.push("                     '1) re-run; if persistent, check brainflow version compatibility')\n")
+    parts.push("        print(f'__EEG_SANITY_RESULT__ FAIL shape=0x0 port={port}')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    if result['rc'] != 0:\n")
+    parts.push("        emit_trailer('brainflow-capture-error',\n")
+    parts.push("                     result.get('err', '<no detail>'),\n")
+    parts.push("                     '1) toggle Cyton OFF then PC  '\n")
+    parts.push("                     '2) verify Daisy seated  '\n")
+    parts.push("                     '3) re-run')\n")
+    parts.push("        print(f'__EEG_SANITY_RESULT__ FAIL shape={result[\"rows\"]}x{result[\"cols\"]} port={port}')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    rows, cols = result['rows'], result['cols']\n")
+    parts.push("    print(f'shape_rows={rows}')\n")
+    parts.push("    print(f'shape_cols={cols}')\n")
+    parts.push("    print(f'channel0_first8={result[\"sample\"]}')\n")
+    parts.push("    expected_rows = " + to_string(EXPECTED_ROWS) + "\n")
+    parts.push("    cols_min = " + to_string(EXPECTED_COLS_MIN) + "\n")
+    parts.push("    cols_max = " + to_string(EXPECTED_COLS_MAX) + "\n")
+    parts.push("    ok_rows = (rows == expected_rows)\n")
+    parts.push("    ok_cols = (cols_min <= cols <= cols_max)\n")
+    parts.push("    verdict = 'PASS' if (ok_rows and ok_cols) else 'FAIL'\n")
+    parts.push("    if verdict == 'FAIL':\n")
+    parts.push("        emit_trailer('shape-mismatch',\n")
+    parts.push("                     f'rows={rows} (expected {expected_rows}) cols={cols} (expected {cols_min}..{cols_max})',\n")
+    parts.push("                     '1) verify Daisy module seated (else rows=8 not 32)  '\n")
+    parts.push("                     '2) verify sample rate 125Hz (Cyton+Daisy 16ch effective; 250Hz is Cyton-only 8ch)  '\n")
+    parts.push("                     '3) re-run')\n")
+    parts.push("    print(f'__EEG_SANITY_RESULT__ {verdict} shape={rows}x{cols} port={port}')\n")
+    parts.push("    sys.exit(0 if verdict == 'PASS' else 1)\n\n")
+
+    parts.push("def cmd_selftest(args):\n")
+    parts.push("    # parse-only style: do not touch hardware\n")
+    parts.push("    print('schema=anima-eeg/eeg_brainflow_sanity/1')\n")
+    parts.push("    print('venv_python_exists=' + str(os.path.exists(VENV_PYTHON)))\n")
+    parts.push("    print('selftest=ok')\n")
+    parts.push("    print('DONE')\n\n")
+
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    sub = p.add_subparsers(dest='cmd', required=True)\n")
+    parts.push("    sub.add_parser('selftest')\n")
+    parts.push("    d = sub.add_parser('detect')\n")
+    parts.push("    d.add_argument('--port', default='')\n")
+    parts.push("    c = sub.add_parser('capture')\n")
+    parts.push("    c.add_argument('--port', default='')\n")
+    parts.push("    c.add_argument('--seconds', type=int, default=" + to_string(DEFAULT_SECONDS) + ")\n")
+    parts.push("    c.add_argument('--board-id', dest='board_id', type=int, default=" + to_string(DEFAULT_BOARD_ID) + ")\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    if args.cmd == 'selftest': cmd_selftest(args)\n")
+    parts.push("    elif args.cmd == 'detect': cmd_detect(args)\n")
+    parts.push("    elif args.cmd == 'capture': cmd_capture(args)\n")
+    parts.push("    else: sys.exit(2)\n\n")
+
+    parts.push("if __name__ == '__main__': main()\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn _board_name_to_id(name: string) -> int {
+    if name == "cyton_daisy" { return DEFAULT_BOARD_ID }
+    if name == "cyton"       { return 0 }
+    if name == "ganglion"    { return 1 }
+    return DEFAULT_BOARD_ID
+}
+
+// ════════════════════════════════════════════════════════════════════
+// CLI
+// ════════════════════════════════════════════════════════════════════
+
+fn _print_usage() {
+    eprintln("usage: hexa run anima-eeg/eeg_brainflow_sanity.hexa [--port <path>] [--seconds <n>] [--board <name>]")
+    eprintln("       hexa run anima-eeg/eeg_brainflow_sanity.hexa --selftest")
+    eprintln("       hexa run anima-eeg/eeg_brainflow_sanity.hexa --detect")
+    eprintln("flags:")
+    eprintln("  --port <path>     Dongle serial node (auto-detect if omitted)")
+    eprintln("  --seconds <n>     capture duration (default 5)")
+    eprintln("  --board <name>    cyton_daisy | cyton | ganglion (default cyton_daisy)")
+    eprintln("  --detect          probe-only, do not capture")
+    eprintln("  --selftest        helper parse + venv presence check, no hardware")
+    eprintln("  --help            this message")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut detect_only = false
+    let mut want_help = false
+    let mut port = ""
+    let mut seconds = DEFAULT_SECONDS
+    let mut board_name = DEFAULT_BOARD_NAME
+
+    // argv layout under hexa-strict: av[0..1] are interp/exe path slots; user
+    // args begin at index 2 (mirrors tool/anima_runpod_orchestrator.hexa).
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--detect"   { detect_only = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" { want_help = true; i = i + 1; continue }
+        if a == "--port" {
+            if (i + 1) >= len(av) {
+                _emit_trailer("missing-arg-value",
+                              "--port requires a value (e.g. /dev/cu.usbserial-DM0258DD)",
+                              "1) re-run with --port <path>")
+                exit(2)
+            }
+            port = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--seconds" {
+            if (i + 1) >= len(av) {
+                _emit_trailer("missing-arg-value",
+                              "--seconds requires an integer value",
+                              "1) re-run with --seconds 5")
+                exit(2)
+            }
+            seconds = to_int(av[i + 1]); i = i + 2; continue
+        }
+        if a == "--board" {
+            if (i + 1) >= len(av) {
+                _emit_trailer("missing-arg-value",
+                              "--board requires a value",
+                              "1) re-run with --board cyton_daisy")
+                exit(2)
+            }
+            board_name = av[i + 1]; i = i + 2; continue
+        }
+        // unknown
+        _emit_trailer("unknown-arg",
+                      "unrecognized argument: " + a,
+                      "1) re-run with --help to see flags  2) drop the unknown arg")
+        _print_usage()
+        exit(2)
+    }
+
+    if want_help {
+        _print_usage()
+        exit(0)
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("== eeg_brainflow_sanity selftest ==")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("selftest FAILED rc=" + to_string(r[1])); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" {
+            _emit_trailer("selftest-marker-missing",
+                          "helper did not emit selftest=ok",
+                          "1) check /tmp/anima_eeg_brainflow_sanity_helper.hexa_tmp parse  2) re-run")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if detect_only {
+        let mut a = "detect"
+        if port != "" { a = a + " --port " + _sh_quote(port) }
+        let r = _run_helper(a)
+        println(r[0])
+        exit(r[1])
+    }
+
+    let board_id = _board_name_to_id(board_name)
+    let mut args = "capture --board-id " + to_string(board_id) + " --seconds " + to_string(seconds)
+    if port != "" { args = args + " --port " + _sh_quote(port) }
+    let r = _run_helper(args)
+    println(r[0])
+    exit(r[1])
+}
+// hexa-strict auto-invokes fn main() — do not call main() explicitly.

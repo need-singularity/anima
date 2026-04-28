@@ -1,0 +1,85 @@
+{
+  "cycle": "omega-network-6b",
+  "headline": "launchd plist scheduling daily PSI calibration cache refresh (unattended-safe)",
+  "parent_cycle": "omega-network-6",
+  "parent_commit": "7e309924",
+  "date_utc": "2026-04-26",
+  "repo": "/Users/ghost/core/nexus",
+  "head_before": "81f9e268eaefeb2024f7dfdef9fd9485ab98cde1",
+  "problem_statement": "ω-network-6 shipped tool/psi_calibration_cache.hexa with 24h TTL self-refresh — but it only refreshes when an operator sources it. Cron-driven hexa_remote calls bypass the source path, so the cache could remain stale indefinitely under unattended ops.",
+  "fix_summary": "Committed launchd plist that runs the existing tool with --refresh-force once per day at 04:20, ensuring state/psi_calibration_active.tsv stays inside the 24h TTL window without operator interaction.",
+  "deliverables": {
+    "plist": {
+      "path": "config/launchd/com.nexus.psi_calibration_refresh.plist",
+      "label": "com.nexus.psi_calibration_refresh",
+      "schedule": {"hour": 4, "minute": 20, "cadence": "daily"},
+      "program_arguments": [
+        "/Users/ghost/core/hexa-lang/hexa",
+        "run",
+        "/Users/ghost/core/nexus/tool/psi_calibration_cache.hexa",
+        "--refresh-force"
+      ],
+      "run_at_load": false,
+      "keep_alive": false,
+      "process_type": "Background",
+      "nice": 5,
+      "low_priority_io": true,
+      "working_directory": "/Users/ghost/core/nexus",
+      "stdout": "/Users/ghost/.hx/log/psi_calibration_refresh.log",
+      "stderr": "/Users/ghost/.hx/log/psi_calibration_refresh.err",
+      "env": {
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": "/Users/ghost",
+        "HEXA_LANG": "/Users/ghost/core/hexa-lang"
+      }
+    },
+    "install_help_tool": "tool/psi_calibration_install_help.hexa"
+  },
+  "design_decisions": [
+    "Hour=4 Minute=20 chosen to differ from com.nexus.bridge_pipeline's :15 cadence — avoids simultaneous I/O.",
+    "Nice=5 (vs bridge_pipeline's Nice=1) — housekeeping should yield to monitoring pipeline.",
+    "Direct hexa-binary invocation (not /bin/bash wrapper) since target is a .hexa tool — no shell intermediary needed; mirrors the spirit of bridge_pipeline (which uses /bin/bash because its target is a .sh).",
+    "RunAtLoad=false per requirement — operator bootstrap is decoupled from execution; first scheduled fire is at next 04:20.",
+    "Did not pass --quiet (psi_calibration_cache.hexa has no --quiet flag); --refresh-force is the only flag the tool consumes for forced-refresh semantics.",
+    "Separate install-help tool (psi_calibration_install_help.hexa) keeps concerns isolated from bridge_pipeline_install_help.hexa per ω-bridge-20 precedent."
+  ],
+  "constraints_honored": {
+    "hexa_only_suffix_raw9": "OK — only new files are .plist (system-defined) and .hexa.",
+    "no_parallel_session_collision": "OK — did not touch cli/run.hexa, state/atlas_health_timeline.jsonl, bisociation/spectra/g_atlas_composite_v3.json, tool/omega_cycle_atlas_ingest.hexa, n6/*, tool/kick_*.hexa, design/kick/*, .own.",
+    "state_read_only": "OK — no writes to state/* (the tool itself writes state/psi_calibration_active.tsv, but that's pre-existing ω-network-6 behavior and not a 6b mutation).",
+    "explicit_path_commit": "OK — git add by file paths only.",
+    "no_anima_commit": "OK — closure JSON is untracked at /Users/ghost/core/anima/state/.",
+    "history_ops_pin_sha": "N/A — no rewrites this cycle.",
+    "no_launchctl_load": "OK — only file commit; operator-initiated bootstrap."
+  },
+  "validation": {
+    "plutil_lint": "OK (config/launchd/com.nexus.psi_calibration_refresh.plist: OK)",
+    "hexa_binary_executable": true,
+    "target_tool_exists": true,
+    "log_dir_exists": true,
+    "underlying_command_smoke_run": {
+      "cmd": "/Users/ghost/core/hexa-lang/hexa run tool/psi_calibration_cache.hexa --refresh-force",
+      "exit_code": 0,
+      "sentinel": "__PSI_CALIBRATION__ REFRESHED hosts=4 cache_age_min=0",
+      "exports_emitted": [
+        "HEXA_REMOTE_PSI_THRESHOLD=80 (default)",
+        "HEXA_REMOTE_PSI_THRESHOLD_UBU1=64 (calibrated)",
+        "HEXA_REMOTE_PSI_THRESHOLD_UBU2=70 (calibrated)",
+        "HEXA_REMOTE_PSI_THRESHOLD_HETZNER=95 (calibrated)",
+        "HEXA_REMOTE_PSI_THRESHOLD_HTZ=95 (calibrated)"
+      ]
+    },
+    "install_help_smoke_run": "OK (full ritual printed, ec=0)"
+  },
+  "operator_install": [
+    "cp /Users/ghost/core/nexus/config/launchd/com.nexus.psi_calibration_refresh.plist ~/Library/LaunchAgents/",
+    "mkdir -p ~/.hx/log",
+    "launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.nexus.psi_calibration_refresh.plist",
+    "launchctl enable     gui/$UID/com.nexus.psi_calibration_refresh",
+    "launchctl kickstart -k gui/$UID/com.nexus.psi_calibration_refresh   # force first run"
+  ],
+  "follow_ups": [
+    "If parallel-session activity around hexa_remote stabilizes, consider re-pointing hexa_remote to source state/psi_calibration_active.tsv directly, removing the 'eval source-on-every-shell' operator burden.",
+    "Optional: extend bridge_anomaly to surface __PSI_CALIBRATION__ FALLBACK sentinel from the daily log, escalating on 2+ consecutive fallback days."
+  ]
+}

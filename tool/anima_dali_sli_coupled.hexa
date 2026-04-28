@@ -1,0 +1,548 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_dali_sli_coupled.hexa
+//
+//  PURPOSE  (Mk.XII candidate SUBSTRATE — DALI(S1) × SLI(S3) coupled architecture)
+//    omega_cycle_mk_xii_substrate_axis_20260426.md S1 (DALI, conf 0.86)
+//    + S3 (SLI, conf 0.74→0.76) joint composite metric.
+//
+//    s7_cusp_depth_projection_landing.md §10:
+//      "Mk.XII candidate 권고 update: 1. DALI(S1) + SLI(S3) coupled —
+//       cusp_depth = family_loc evidence (3/4)"
+//
+//    이 도구는 두 metric 을 single composite gate 로 통합한다.
+//    DALI = backbone-pair ΔL_loc invariance  (S1, layer locus invariance)
+//    SLI  = cross-bb cusp_depth std/mean      (S3, substrate-local irreversibility
+//                                              의 layer projection coherence)
+//
+//    JOINT DESIGN  (Step 1 frozen):
+//      DALI(b1,b2)   = SCALE - |L_loc(b1) - L_loc(b2)|       /SCALE
+//      DALI_min      = min over all 6 pairs (worst pair governs)
+//      SLI           = SCALE - (std(cusp_depth)*SCALE / mean(cusp_depth))
+//                       clamped 0..SCALE   (= 1 - CV)
+//      COUPLED       = isqrt(DALI_min * SLI)                 /SCALE  (geometric mean)
+//
+//      Hard PASS gate (Mk.XII chain integration 자격):
+//          (DALI_min  >= DALI_MIN_PASS  = 700)   AND
+//          (SLI       >= SLI_PASS       = 500)   AND
+//          (COUPLED   >= COUPLED_PASS   = 600)
+//
+//      위 3 gate 모두 만족 ⇒ "MK_XII_HARD_PASS_QUALIFIED"
+//      어느 하나라도 fail ⇒ verdict 분류:
+//          - DALI fail  → "DALI_INVARIANCE_FAIL"   (S1 layer-locus 깨짐)
+//          - SLI  fail  → "SLI_COHERENCE_FAIL"     (S3 cusp 위치 random)
+//          - both fail  → "JOINT_FAIL"
+//          - DALI/SLI pass but COUPLED < 600 → "MARGINAL_AMBIGUOUS"
+//
+//  RAW#9
+//    pure hexa · deterministic · cmt.json read-only · no Python
+//    integer fixed-point ×1000 · byte-identical re-run
+//
+//  POSITIVE SELFTEST
+//    4 backbone real cmt.json (Mistral / Qwen3 / Llama / gemma) →
+//    cusp_depth + family_loc + DALI + SLI + COUPLED.
+//    S7 측정값과 byte-identical inputs 재현 (cusp_depth = [875,111,125,857],
+//    family_loc = [875,111,625,857]) 에서 verdict 산출.
+//
+//  NEGATIVE FALSIFY
+//    cusp_depth 를 hash-seed scramble (N=64) → SLI std 폭증 → COUPLED FAIL.
+//    scramble 이 systematic Hard PASS 을 발생시키지 않음을 검증.
+//    detect = (random scrambles 중 PASS rate < 5%).
+//
+//  OUTPUT
+//    state/dali_sli_coupled_v1.json (deterministic, byte-identical mod timestamp)
+// ════════════════════════════════════════════════════════════════════════════
+
+let SCALE = 1000           // integer fixed-point
+let M32 = 4294967296
+let POLY_PRIME = 2654435761
+
+// Joint gate thresholds (×1000 scale)
+let DALI_MIN_PASS = 700    // worst-pair DALI >= 0.70 (locus diff <= 300‰)
+let SLI_PASS = 500         // SLI >= 0.50 (CV <= 0.5)
+let COUPLED_PASS = 600     // geometric mean >= 0.60
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+fn now_stamp() -> string { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+
+fn str_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + xs[i] + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+fn int_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + str(xs[i])
+        i = i + 1
+    }
+    return s + "]"
+}
+
+// float → int ×1000 (cmt.json abs is float)
+fn f1000(x) -> int {
+    let scaled = x * SCALE
+    let t = int(scaled)
+    if t < 0 { return 0 }
+    return t
+}
+
+// integer sqrt (Newton, ×1 input → ×1 output, must scale externally)
+fn isqrt(v: int) -> int {
+    if v <= 0 { return 0 }
+    let mut x = v
+    let mut prev = 0
+    let mut iter = 0
+    while iter < 32 {
+        prev = x
+        x = (x + v / x) / 2
+        if x == prev { iter = 32 }
+        iter = iter + 1
+    }
+    return x
+}
+
+fn abs_int(v: int) -> int {
+    if v < 0 { return -v }
+    return v
+}
+
+// ─── parse cmt.json: full layer × family L2 (mirrors cusp_depth_projector) ──
+fn read_cusp_depth(cmt_path: string) -> list {
+    // returns [n_layers, peak_layer, cusp_depth_x1000]
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let tomo = cmt["tomography"]
+    let layer_keys = keys(tomo)
+
+    let mut layer_ints = []
+    let mut i = 0
+    while i < len(layer_keys) {
+        layer_ints = layer_ints.push(int(layer_keys[i]))
+        i = i + 1
+    }
+    // sort ascending (insertion)
+    let mut sorted = []
+    let mut a = 0
+    while a < len(layer_ints) {
+        let v = layer_ints[a]
+        let mut placed = false
+        let mut new_sorted = []
+        let mut b = 0
+        while b < len(sorted) {
+            if !placed && v < sorted[b] {
+                new_sorted = new_sorted.push(v)
+                placed = true
+            }
+            new_sorted = new_sorted.push(sorted[b])
+            b = b + 1
+        }
+        if !placed { new_sorted = new_sorted.push(v) }
+        sorted = new_sorted
+        a = a + 1
+    }
+
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut best_layer = sorted[0]
+    let mut best_l2 = -1
+    let mut s = 0
+    while s < len(sorted) {
+        let layer_key = str(sorted[s])
+        let layer_obj = tomo[layer_key]
+        let mut sum_sq = 0
+        let mut f = 0
+        while f < 4 {
+            let fam_obj = layer_obj[families[f]]
+            let abs_v = fam_obj["abs"]
+            let av = f1000(abs_v)
+            sum_sq = sum_sq + av * av
+            f = f + 1
+        }
+        let l2 = isqrt(sum_sq)
+        if l2 > best_l2 {
+            best_l2 = l2
+            best_layer = sorted[s]
+        }
+        s = s + 1
+    }
+    let cusp_x1000 = (best_layer * SCALE) / n_layers
+    let mut out = []
+    out = out.push(n_layers)
+    out = out.push(best_layer)
+    out = out.push(cusp_x1000)
+    return out
+}
+
+// dominant family loc (matches F5 path / cusp_depth_projector family_loc_norm)
+fn family_loc_norm(cmt_path: string) -> int {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let dom = cmt["dominant_layer_per_family"]
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut best = 0
+    let mut i = 0
+    while i < 4 {
+        let entry = dom[families[i]]
+        let lay = entry["layer"]
+        let norm = (lay * SCALE) / n_layers
+        if norm > best { best = norm }
+        i = i + 1
+    }
+    return best
+}
+
+// ─── DALI: pair-wise invariance ──────────────────────────────────────────
+//   DALI(b1,b2) = SCALE - |L_loc(b1) - L_loc(b2)|
+//   returns list of pair DALI values (length C(n,2)) and pair labels
+fn dali_pairs(family_locs: list, names: list) -> list {
+    let n = len(family_locs)
+    let mut pair_vals = []
+    let mut pair_labels = []
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            let d = abs_int(family_locs[i] - family_locs[j])
+            let dali = SCALE - d
+            pair_vals = pair_vals.push(dali)
+            pair_labels = pair_labels.push(names[i] + "-" + names[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(pair_vals)
+    out = out.push(pair_labels)
+    return out
+}
+
+fn list_min(xs: list) -> int {
+    if len(xs) == 0 { return 0 }
+    let mut m = xs[0]
+    let mut i = 1
+    while i < len(xs) {
+        if xs[i] < m { m = xs[i] }
+        i = i + 1
+    }
+    return m
+}
+fn list_max(xs: list) -> int {
+    if len(xs) == 0 { return 0 }
+    let mut m = xs[0]
+    let mut i = 1
+    while i < len(xs) {
+        if xs[i] > m { m = xs[i] }
+        i = i + 1
+    }
+    return m
+}
+fn list_mean(xs: list) -> int {
+    let n = len(xs)
+    if n == 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < n { s = s + xs[i]; i = i + 1 }
+    return s / n
+}
+
+// ─── SLI: 1 - CV(cusp_depth)  (×1000) ──────────────────────────────────
+//   CV = std / mean. SLI = SCALE - CV*SCALE = SCALE - (std*SCALE)/mean
+//   std² = mean(x²) - mean(x)²  ; integer arithmetic, std then SCALE-recovered.
+fn sli_metric(cusp_depths: list) -> list {
+    // returns [mean, std_x1000, cv_x1000, sli_x1000]
+    let n = len(cusp_depths)
+    if n == 0 {
+        let mut out0 = []
+        out0 = out0.push(0); out0 = out0.push(0); out0 = out0.push(0); out0 = out0.push(0)
+        return out0
+    }
+    let m = list_mean(cusp_depths)
+    let mut sum_sq_dev = 0
+    let mut i = 0
+    while i < n {
+        let dv = cusp_depths[i] - m
+        sum_sq_dev = sum_sq_dev + dv * dv
+        i = i + 1
+    }
+    // var = sum_sq_dev / n  (integer)  → std = isqrt(var)
+    //   inputs already ×1000, so std is also ×1000.
+    let var = sum_sq_dev / n
+    let std = isqrt(var)
+    // cv ×1000 = std * SCALE / mean
+    let mut cv_x1000 = 0
+    if m > 0 { cv_x1000 = (std * SCALE) / m }
+    let mut sli = SCALE - cv_x1000
+    if sli < 0 { sli = 0 }
+    if sli > SCALE { sli = SCALE }
+    let mut out = []
+    out = out.push(m)
+    out = out.push(std)
+    out = out.push(cv_x1000)
+    out = out.push(sli)
+    return out
+}
+
+// ─── COUPLED: geometric mean of DALI_min × SLI ──────────────────────────
+fn coupled_metric(dali_min: int, sli: int) -> int {
+    if dali_min <= 0 || sli <= 0 { return 0 }
+    let prod = dali_min * sli   // up to SCALE² = 1e6
+    let gm = isqrt(prod)        // ×1 since both inputs ×1000 and isqrt of x² returns x
+    return gm                   // already ×1000
+}
+
+// ─── verdict classifier ─────────────────────────────────────────────────
+fn classify(dali_min: int, sli: int, coupled: int) -> string {
+    let d_pass = dali_min >= DALI_MIN_PASS
+    let s_pass = sli >= SLI_PASS
+    let c_pass = coupled >= COUPLED_PASS
+    if d_pass && s_pass && c_pass { return "MK_XII_HARD_PASS_QUALIFIED" }
+    if !d_pass && !s_pass         { return "JOINT_FAIL" }
+    if !d_pass                    { return "DALI_INVARIANCE_FAIL" }
+    if !s_pass                    { return "SLI_COHERENCE_FAIL" }
+    return "MARGINAL_AMBIGUOUS"
+}
+
+// ─── synthesize scrambled cusp for negative trial ───────────────────────
+fn scrambled_cusp(n_layers: int, seed: int) -> int {
+    let mut h = seed * POLY_PRIME
+    h = h % M32
+    if h < 0 { h = h + M32 }
+    let peak_layer = h % n_layers
+    return (peak_layer * SCALE) / n_layers
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    println("[anima_dali_sli_coupled] Mk.XII SUBSTRATE — DALI(S1) × SLI(S3) joint composite")
+    println("  DALI_pair(b1,b2) = SCALE - |L_loc(b1) - L_loc(b2)|")
+    println("  SLI = SCALE - (std(cusp_depth)*SCALE / mean(cusp_depth))")
+    println("  COUPLED = isqrt(DALI_min * SLI)")
+    println("  Hard PASS gate: DALI_min>=" + str(DALI_MIN_PASS) + " AND SLI>=" + str(SLI_PASS) + " AND COUPLED>=" + str(COUPLED_PASS))
+    println("")
+
+    let backbone_names = ["Mistral", "Qwen3", "Llama", "gemma"]
+    let cmt_paths = [
+        "state/v10_benchmark_v4/mistral/cmt.json",
+        "state/v10_benchmark_v4/qwen3/cmt.json",
+        "state/v10_benchmark_v4/llama/cmt.json",
+        "state/v10_benchmark_v4/gemma/cmt.json"
+    ]
+
+    // ─── 1. ingest cusp_depth + family_loc ────────────────────────────────
+    let mut cusp_depths = []
+    let mut family_locs = []
+    let mut n_layers_list = []
+    let mut peak_layers = []
+    let mut n = 0
+    while n < 4 {
+        let cd = read_cusp_depth(cmt_paths[n])
+        n_layers_list = n_layers_list.push(cd[0])
+        peak_layers = peak_layers.push(cd[1])
+        cusp_depths = cusp_depths.push(cd[2])
+        family_locs = family_locs.push(family_loc_norm(cmt_paths[n]))
+        n = n + 1
+    }
+
+    println("=== positive (4 real cmt.json) ===")
+    let mut k = 0
+    while k < 4 {
+        let line = "  " + backbone_names[k]
+                 + ": n_layers=" + str(n_layers_list[k])
+                 + " peak_layer=" + str(peak_layers[k])
+                 + " cusp_depth=" + str(cusp_depths[k])
+                 + " family_loc=" + str(family_locs[k])
+        println(line)
+        k = k + 1
+    }
+    println("")
+
+    // ─── 2. DALI pairs ────────────────────────────────────────────────────
+    let dali_res = dali_pairs(family_locs, backbone_names)
+    let dali_vals = dali_res[0]
+    let dali_labels = dali_res[1]
+    let dali_min = list_min(dali_vals)
+    let dali_max = list_max(dali_vals)
+    let dali_mean = list_mean(dali_vals)
+
+    println("=== DALI (S1, layer-locus pair invariance, 6 pairs) ===")
+    let mut p = 0
+    while p < len(dali_vals) {
+        println("  " + dali_labels[p] + ": DALI=" + str(dali_vals[p]))
+        p = p + 1
+    }
+    println("  DALI_min=" + str(dali_min) + " DALI_mean=" + str(dali_mean) + " DALI_max=" + str(dali_max))
+    println("  DALI gate (>=" + str(DALI_MIN_PASS) + ")? " + bool_s(dali_min >= DALI_MIN_PASS))
+    println("")
+
+    // ─── 3. SLI ────────────────────────────────────────────────────────────
+    let sli_res = sli_metric(cusp_depths)
+    let cusp_mean = sli_res[0]
+    let cusp_std = sli_res[1]
+    let cusp_cv = sli_res[2]
+    let sli = sli_res[3]
+    println("=== SLI (S3, cross-bb cusp_depth coherence) ===")
+    println("  mean(cusp_depth)=" + str(cusp_mean) + " std=" + str(cusp_std))
+    println("  CV=std/mean=" + str(cusp_cv) + " /1000")
+    println("  SLI = SCALE - CV = " + str(sli) + " /1000")
+    println("  SLI gate (>=" + str(SLI_PASS) + ")? " + bool_s(sli >= SLI_PASS))
+    println("")
+
+    // ─── 4. COUPLED composite ─────────────────────────────────────────────
+    let coupled = coupled_metric(dali_min, sli)
+    let pos_verdict = classify(dali_min, sli, coupled)
+    println("=== COUPLED (geometric mean) ===")
+    println("  COUPLED = isqrt(DALI_min * SLI) = isqrt(" + str(dali_min) + " * " + str(sli) + ") = " + str(coupled))
+    println("  COUPLED gate (>=" + str(COUPLED_PASS) + ")? " + bool_s(coupled >= COUPLED_PASS))
+    println("  positive verdict = " + pos_verdict)
+    println("")
+
+    // ─── 5. negative falsify (cusp_depth scramble × N trials) ────────────
+    //   DALI is family_loc-only (held fixed). Scrambling cusp_depth → SLI
+    //   typically inflates std (pushing CV up, SLI down) → COUPLED < gate.
+    //   Hard PASS rate among scrambled trials should be << 5 %.
+    let n_trials = 64
+    let mut neg_pass_count = 0
+    let mut neg_dali_pass_count = 0
+    let mut neg_sli_pass_count = 0
+    let mut neg_coupled_pass_count = 0
+    let mut neg_first_cusp = []
+    let mut neg_first_sli = 0
+    let mut neg_first_coupled = 0
+    let mut neg_first_verdict = ""
+    let mut neg_coupled_max = 0
+    let mut neg_sli_max = 0
+    let mut t = 0
+    while t < n_trials {
+        let mut neg_cusp = []
+        let mut nn = 0
+        while nn < 4 {
+            let seed_val = (t + 1) * 1009 + (nn + 1) * 31
+            let c = scrambled_cusp(n_layers_list[nn], seed_val)
+            neg_cusp = neg_cusp.push(c)
+            nn = nn + 1
+        }
+        if t == 0 { neg_first_cusp = neg_cusp }
+        // family_loc fixed → DALI fixed → only SLI/COUPLED change
+        let neg_sli_res = sli_metric(neg_cusp)
+        let neg_sli = neg_sli_res[3]
+        let neg_coupled = coupled_metric(dali_min, neg_sli)
+        let neg_verdict = classify(dali_min, neg_sli, neg_coupled)
+        if t == 0 {
+            neg_first_sli = neg_sli
+            neg_first_coupled = neg_coupled
+            neg_first_verdict = neg_verdict
+        }
+        if neg_sli > neg_sli_max { neg_sli_max = neg_sli }
+        if neg_coupled > neg_coupled_max { neg_coupled_max = neg_coupled }
+        if dali_min >= DALI_MIN_PASS { neg_dali_pass_count = neg_dali_pass_count + 1 }
+        if neg_sli >= SLI_PASS { neg_sli_pass_count = neg_sli_pass_count + 1 }
+        if neg_coupled >= COUPLED_PASS { neg_coupled_pass_count = neg_coupled_pass_count + 1 }
+        if neg_verdict == "MK_XII_HARD_PASS_QUALIFIED" { neg_pass_count = neg_pass_count + 1 }
+        t = t + 1
+    }
+    let neg_pass_rate_x1000 = (neg_pass_count * SCALE) / n_trials
+    let neg_detects = neg_pass_rate_x1000 <= 50   // <= 5%
+
+    println("=== negative falsify (" + str(n_trials) + " scrambled cusp trials) ===")
+    let mut nk = 0
+    while nk < 4 {
+        println("  " + backbone_names[nk] + " (trial 1) neg_cusp_depth=" + str(neg_first_cusp[nk]))
+        nk = nk + 1
+    }
+    println("  trial 1: SLI=" + str(neg_first_sli) + " COUPLED=" + str(neg_first_coupled) + " verdict=" + neg_first_verdict)
+    println("  Hard PASS trials: " + str(neg_pass_count) + "/" + str(n_trials)
+            + " (rate=" + str(neg_pass_rate_x1000) + " /1000)")
+    println("  SLI pass trials: " + str(neg_sli_pass_count) + "/" + str(n_trials))
+    println("  COUPLED pass trials: " + str(neg_coupled_pass_count) + "/" + str(n_trials))
+    println("  max(SLI)=" + str(neg_sli_max) + " max(COUPLED)=" + str(neg_coupled_max))
+    println("  random scrambling fails systematic Hard PASS? " + bool_s(neg_detects))
+    println("")
+
+    // ─── 6. Mk.XII Hard PASS chain integration eligibility ────────────────
+    let positive_hard_pass = pos_verdict == "MK_XII_HARD_PASS_QUALIFIED"
+    let mk_xii_eligible = positive_hard_pass && neg_detects
+    println("=== Mk.XII Hard PASS chain integration ===")
+    println("  positive Hard PASS: " + bool_s(positive_hard_pass))
+    println("  negative falsifier discriminates: " + bool_s(neg_detects))
+    println("  ELIGIBLE for Mk.XII chain integration: " + bool_s(mk_xii_eligible))
+    println("")
+
+    // ─── 7. JSON emit ─────────────────────────────────────────────────────
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima/dali_sli_coupled/1\",\n"
+    out = out + "  \"schema_version\": 1,\n"
+    out = out + "  \"verifier_type\": \"dali_sli_coupled\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"source\": \"tool/anima_dali_sli_coupled.hexa\",\n"
+    out = out + "  \"design\": {\n"
+    out = out + "    \"dali_formula\": \"DALI_pair(b1,b2) = SCALE - |L_loc(b1) - L_loc(b2)|\",\n"
+    out = out + "    \"sli_formula\": \"SLI = SCALE - (std(cusp_depth)*SCALE / mean(cusp_depth))\",\n"
+    out = out + "    \"coupled_formula\": \"COUPLED = isqrt(DALI_min * SLI)\",\n"
+    out = out + "    \"hard_pass_gate\": \"DALI_min>=" + str(DALI_MIN_PASS) + " AND SLI>=" + str(SLI_PASS) + " AND COUPLED>=" + str(COUPLED_PASS) + "\"\n"
+    out = out + "  },\n"
+    out = out + "  \"thresholds\": {\n"
+    out = out + "    \"dali_min_pass\": " + str(DALI_MIN_PASS) + ",\n"
+    out = out + "    \"sli_pass\": " + str(SLI_PASS) + ",\n"
+    out = out + "    \"coupled_pass\": " + str(COUPLED_PASS) + ",\n"
+    out = out + "    \"scale\": " + str(SCALE) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"backbones\": " + str_list_json(backbone_names) + ",\n"
+    out = out + "  \"cmt_sources\": " + str_list_json(cmt_paths) + ",\n"
+    out = out + "  \"positive\": {\n"
+    out = out + "    \"n_layers\": " + int_list_json(n_layers_list) + ",\n"
+    out = out + "    \"peak_layers\": " + int_list_json(peak_layers) + ",\n"
+    out = out + "    \"cusp_depth_x1000\": " + int_list_json(cusp_depths) + ",\n"
+    out = out + "    \"family_loc_x1000\": " + int_list_json(family_locs) + ",\n"
+    out = out + "    \"dali_pair_labels\": " + str_list_json(dali_labels) + ",\n"
+    out = out + "    \"dali_pair_x1000\": " + int_list_json(dali_vals) + ",\n"
+    out = out + "    \"dali_min_x1000\": " + str(dali_min) + ",\n"
+    out = out + "    \"dali_mean_x1000\": " + str(dali_mean) + ",\n"
+    out = out + "    \"dali_max_x1000\": " + str(dali_max) + ",\n"
+    out = out + "    \"cusp_mean_x1000\": " + str(cusp_mean) + ",\n"
+    out = out + "    \"cusp_std_x1000\": " + str(cusp_std) + ",\n"
+    out = out + "    \"cusp_cv_x1000\": " + str(cusp_cv) + ",\n"
+    out = out + "    \"sli_x1000\": " + str(sli) + ",\n"
+    out = out + "    \"coupled_x1000\": " + str(coupled) + ",\n"
+    out = out + "    \"verdict\": \"" + pos_verdict + "\",\n"
+    out = out + "    \"dali_pass\": " + bool_s(dali_min >= DALI_MIN_PASS) + ",\n"
+    out = out + "    \"sli_pass\": " + bool_s(sli >= SLI_PASS) + ",\n"
+    out = out + "    \"coupled_pass\": " + bool_s(coupled >= COUPLED_PASS) + ",\n"
+    out = out + "    \"hard_pass\": " + bool_s(positive_hard_pass) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"negative\": {\n"
+    out = out + "    \"n_trials\": " + str(n_trials) + ",\n"
+    out = out + "    \"scrambled_cusp_trial_1\": " + int_list_json(neg_first_cusp) + ",\n"
+    out = out + "    \"trial_1_sli_x1000\": " + str(neg_first_sli) + ",\n"
+    out = out + "    \"trial_1_coupled_x1000\": " + str(neg_first_coupled) + ",\n"
+    out = out + "    \"trial_1_verdict\": \"" + neg_first_verdict + "\",\n"
+    out = out + "    \"hard_pass_count\": " + str(neg_pass_count) + ",\n"
+    out = out + "    \"hard_pass_rate_x1000\": " + str(neg_pass_rate_x1000) + ",\n"
+    out = out + "    \"sli_pass_count\": " + str(neg_sli_pass_count) + ",\n"
+    out = out + "    \"coupled_pass_count\": " + str(neg_coupled_pass_count) + ",\n"
+    out = out + "    \"max_sli_x1000\": " + str(neg_sli_max) + ",\n"
+    out = out + "    \"max_coupled_x1000\": " + str(neg_coupled_max) + ",\n"
+    out = out + "    \"detects_failure\": " + bool_s(neg_detects) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"mk_xii_eligibility\": {\n"
+    out = out + "    \"positive_hard_pass\": " + bool_s(positive_hard_pass) + ",\n"
+    out = out + "    \"negative_falsifier_discriminates\": " + bool_s(neg_detects) + ",\n"
+    out = out + "    \"eligible_for_chain_integration\": " + bool_s(mk_xii_eligible) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"cross_validate\": \"omega_cycle_mk_xii_substrate_axis_20260426.md S1+S3 / s7_cusp_depth_projection_landing.md\"\n"
+    out = out + "}\n"
+    write_file("state/dali_sli_coupled_v1.json", out)
+    println("  wrote: state/dali_sli_coupled_v1.json")
+
+    // exit code: 0 if positive hard pass + negative discriminates, 1 otherwise
+    if mk_xii_eligible { exit(0) }
+    exit(1)
+}

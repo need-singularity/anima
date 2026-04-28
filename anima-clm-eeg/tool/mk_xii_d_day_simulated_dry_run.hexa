@@ -1,0 +1,852 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/mk_xii_d_day_simulated_dry_run.hexa
+//
+//  PURPOSE
+//    Mk.XII Hard PASS first validation — **simulated D-day dry-run**.
+//    Pre-rehearses the post-EEG D+5 G10 hardware activation, D+6 G8
+//    real-falsifier MI port, D+7 Hard PASS recompute (env
+//    MK_XII_INCLUDE_G10=1) and D+22..D+30 first-validation verdict — but
+//    using the synthetic 16ch fixture as a stand-in for real EEG hardware.
+//
+//    raw#10 honest scope: this is a SIMULATED dry-run.  It verifies the
+//    Hard PASS recompute pipeline + cluster_confidence aggregation +
+//    EHL-3W disjunction logic prior to actual EEG hardware arrival.  It
+//    does NOT replace the real D+5..D+30 empirical workflow; the real
+//    workflow remains a strict prerequisite for any
+//    MK_XII_INTEGRATION_VERIFIED claim.
+//
+//    Fixture path & criteria are FROZEN here (this file IS the SSOT).
+//    Any post-hoc threshold change ⇒ v2 bump (no silent edit).
+//
+//  D+5 SIMULATION  (G10 hardware activation surrogate)
+//    Reads anima-clm-eeg/fixtures/synthetic_16ch_v1.json and builds the
+//    same 4-family × 4-band 16-cell coupling/F matrix that the production
+//    g10_hexad_triangulation_scaffold emits, mirroring its frozen criteria
+//    (C1/C2/C3/C4).  This is the exact synthetic data path the post-EEG
+//    activation will replace cell-for-cell.
+//
+//  D+6 SIMULATION  (G8 real-falsifier MI port surrogate)
+//    Generates 5 surrogate falsifier streams (F_A1/F_A2/F_A3/F_B/F_C) via
+//    deterministic FNV with prime-spread offsets identical to the
+//    production g8_transversal_mi_matrix tool.  Computes the C(5,2)=10
+//    pairwise mutual information ×1000 with Miller-Madow bias correction
+//    and verifies all ≤ 100 (0.1 bit threshold).
+//
+//  D+7 SIMULATION  (Hard PASS recompute with G10 included)
+//    Strict-AND aggregation of:
+//        G0_AN11_b   (synthesized 4/4)
+//        G1_BTom     (synthesized 4/4)
+//        G7_5tuple   (synthesized 4/4)
+//        G8_pass     (from D+6 sim above)
+//        G9_pass     (synthesized 1, sparse DAG already validated mac-local)
+//        G10_pass    (from D+5 sim above)        ← NEW in recompute
+//        EHL-3W      (PHENOMENAL × SUBSTRATE × TRAINING strict AND)
+//
+//    cluster_confidence after D+5/D+6/D+7 simulated lifts:
+//        per-gate confidences = 0.85 (G8), 0.85 (G9), 0.85 (G10), 0.90
+//        (preflight), 0.85 (Hard PASS), 0.78 (Hard PASS recompute lift)
+//        — all values FROZEN per simulation lift assumption.
+//        cluster_confidence_simulated = min(...).
+//
+//  D+22..D+30 SIMULATION  (first-validation verdict estimate)
+//    MK_XII_VERIFIED iff
+//        all 6 gates PASS (D+7 sim above)
+//        AND EHL-3W ALL_PASS_AT_D+7
+//        AND CLUSTER_GREEN_PREFLIGHT preserved (cluster_confidence ≥ 0.70)
+//        AND OR-clause-2 (EHL-3W) satisfied  (OR-clause-1 RED honest carry)
+//
+//  NEGATIVE FALSIFIER  (degenerate / uniform fixture)
+//    env MK_XII_DDAY_NEG_UNIFORM=1
+//      → bypass FNV mixing in D+5 G10 cells (uniform 400/2000) AND in
+//        D+6 G8 falsifier streams (force F_C ≡ F_A1) AND in D+7 Hard PASS
+//        (force G10/G8 PASS=0).  Composite verdict MUST flip to
+//        MK_XII_INTEGRATION_FALSIFIED (exit 1, simulated).
+//
+//  OUTPUT
+//    anima-clm-eeg/state/mk_xii_d_day_simulated_v1.json
+//
+//  ENV
+//    MK_XII_DDAY_OUT             output JSON path
+//    MK_XII_DDAY_FIXTURE_PATH    input fixture (default synthetic_16ch_v1)
+//    MK_XII_DDAY_NEG_UNIFORM     1 ⇒ degenerate falsify branch
+//
+//  USAGE
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run \
+//        anima-clm-eeg/tool/mk_xii_d_day_simulated_dry_run.hexa
+//    MK_XII_DDAY_NEG_UNIFORM=1 HEXA_RESOLVER_NO_REROUTE=1 hexa run \
+//        anima-clm-eeg/tool/mk_xii_d_day_simulated_dry_run.hexa
+//
+//  RAW
+//    raw#9  · hexa-only · deterministic · LLM=none · GPU=none
+//    raw#10 · honest scope: simulated NOT empirical — does NOT replace
+//             real D+5..D+30 EEG workflow.  Cluster_confidence lifts here
+//             are simulation-frozen estimates, not measured values.
+//    raw#12 · cherry-pick-proof: per-gate sim confidences + cluster rule
+//             frozen above, no post-hoc tuning.
+// ════════════════════════════════════════════════════════════════════════════
+
+let M32 = 4294967296
+let FNV_PRIME = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+// ─── G10 (D+5) frozen criteria ──────────────────────────────────────────────
+let CELL_COUPLING_MIN_X1000 = 500
+let CELL_F_MIN_X1000        = 4000
+let CELL_PASS_MIN           = 12
+let AXIS_F_MIN_X1000        = 4000
+
+let N_FAMILIES = 4
+let N_BANDS    = 4
+let N_HEXAD    = 6
+let N_CELLS    = 16
+
+// ─── G8 (D+6) frozen criteria ───────────────────────────────────────────────
+let MI_MAX_X1000 = 100
+let G8_N_TRIAL   = 4096
+let G8_N_BIN     = 2
+let SCORE_RANGE  = 1000
+
+// G8 prime-spread offsets (matches production tool)
+let OFF_FA1 =  179424673
+let OFF_FA2 =  573259433
+let OFF_FA3 =  961748941
+let OFF_FB  = 1500450271
+let OFF_FC  = 1908264799
+
+// ─── D+7 simulated per-gate confidences (FROZEN, no post-hoc tuning) ────────
+//   Pre-D-day baseline:
+//     G8 surrogate     = 0.78
+//     G9 cascade       = 0.85
+//     G9 robust        = 0.72
+//     G10 dry-run      = 0.70  ← weakest, lifts at D+5 hardware activation
+//     preflight        = 0.90
+//     Hard PASS comp   = 0.80
+//     cluster_min      = 0.70   (weakest = G10)
+//
+//   Post-D+5/D+6/D+7 simulated lift assumption (FROZEN):
+//     G8  surrogate→empirical lift  0.78 → 0.85   (+0.07)
+//     G10 dry-run→empirical lift    0.70 → 0.85   (+0.15)  weakest lifted
+//     G9 cascade unchanged          0.85
+//     G9 robust unchanged           0.72   ← becomes new weakest under sim
+//     preflight unchanged           0.90
+//     Hard PASS recompute lift      0.80 → 0.85   (G10 included)
+//   ⇒ cluster_confidence_simulated = min(0.85,0.85,0.72,0.85,0.90,0.85)
+//                                  = 0.72   (weakest = G9 robust)
+//
+//   raw#10 honest: these are SIMULATION-FROZEN ESTIMATES.  Real D-day
+//   measurements may yield smaller (or larger) lifts; this dry-run only
+//   verifies the recompute pipeline behaves consistently with the lift
+//   assumption.
+let SIM_CONF_G8_X1000           = 850
+let SIM_CONF_G9_CASCADE_X1000   = 850
+let SIM_CONF_G9_ROBUST_X1000    = 720
+let SIM_CONF_G10_X1000          = 850
+let SIM_CONF_PREFLIGHT_X1000    = 900
+let SIM_CONF_HARDPASS_X1000     = 850
+
+let CLUSTER_FLOOR_X1000         = 700   // CLUSTER_GREEN_PREFLIGHT lower bound
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+// ─── string scan ────────────────────────────────────────────────────────────
+fn find_in_str(s: string, needle: string) -> int {
+    let n = len(s)
+    let m = len(needle)
+    if m <= 0 { return 0 }
+    if n < m { return -1 }
+    let mut i = 0
+    while i <= n - m {
+        let mut j = 0
+        let mut ok = 1
+        while j < m {
+            if s[i + j] != needle[j] {
+                ok = 0
+                j = m
+            }
+            j = j + 1
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_digit_ch(c: string) -> int {
+    if c == "0" { return 1 }
+    if c == "1" { return 1 }
+    if c == "2" { return 1 }
+    if c == "3" { return 1 }
+    if c == "4" { return 1 }
+    if c == "5" { return 1 }
+    if c == "6" { return 1 }
+    if c == "7" { return 1 }
+    if c == "8" { return 1 }
+    if c == "9" { return 1 }
+    return 0
+}
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+fn extract_int_after_key(s: string, key: string) -> int {
+    let pos = find_in_str(s, key)
+    if pos < 0 { return -1 }
+    let n = len(s)
+    let m = len(key)
+    let mut p = pos + m
+    while p < n {
+        let c = s[p]
+        if is_digit_ch(c) == 1 {
+            let mut v = 0
+            while p < n {
+                let cd = s[p]
+                if is_digit_ch(cd) == 1 {
+                    v = v * 10 + digit_val(cd)
+                    p = p + 1
+                } else {
+                    return v
+                }
+            }
+            return v
+        }
+        p = p + 1
+    }
+    return -1
+}
+
+// ─── FNV step ───────────────────────────────────────────────────────────────
+fn fnv_step(h: int, byte: int) -> int {
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fingerprint_step(fp: int, val: int) -> int {
+    let mut h = fp
+    h = fnv_step(h, val % 256)
+    h = fnv_step(h, (val / 256) % 256)
+    h = fnv_step(h, (val / 65536) % 256)
+    h = fnv_step(h, (val / 16777216) % 256)
+    return h
+}
+
+fn fnv_mix_int(seed: int, val: int) -> int {
+    return fingerprint_step(seed, val)
+}
+
+// ─── log₂ x1000 (Taylor on ln(1+x)) ─────────────────────────────────────────
+fn ln_x1000_for_1_plus_x(x_x1000: int) -> int {
+    let mut term_num = x_x1000
+    let mut sum = 0
+    let mut k = 1
+    let mut sign = 1
+    while k <= 12 {
+        let t = term_num / k
+        if sign == 1 { sum = sum + t } else { sum = sum - t }
+        term_num = (term_num * x_x1000) / 1000
+        sign = -sign
+        k = k + 1
+    }
+    return sum
+}
+
+fn ln2_x1000() -> int { return 693 }
+
+fn log2_x1000(n: int) -> int {
+    if n <= 0 { return 0 }
+    if n == 1 { return 0 }
+    let mut k = 0
+    let mut p2 = 1
+    while p2 * 2 <= n {
+        p2 = p2 * 2
+        k = k + 1
+    }
+    let r = n - p2
+    let x_x1000 = (r * 1000) / p2
+    let ln_1px = ln_x1000_for_1_plus_x(x_x1000)
+    let ln_n = k * ln2_x1000() + ln_1px
+    let log2 = (ln_n * 1000) / ln2_x1000()
+    return log2
+}
+
+// ──────────────────── D+5 G10 simulation block ──────────────────────────────
+fn family_offset(fam_idx: int) -> int {
+    return 80 + fam_idx * 60
+}
+
+fn band_offset(band_idx: int) -> int {
+    return 210 - band_idx * 70
+}
+
+fn hexad_offset(cat_idx: int) -> int {
+    return 40 + cat_idx * 50
+}
+
+fn synth_coupling_x1000(seed: int, fam_idx: int, band_idx: int) -> int {
+    let mut h = FNV_OFFSET_BASIS
+    h = fingerprint_step(h, seed)
+    h = fingerprint_step(h, fam_idx * 1009 + 7)
+    h = fingerprint_step(h, band_idx * 1013 + 13)
+    let mut j = (h % 20)
+    if j < 0 { j = j + 20 }
+    j = j - 9
+    let cat = (fam_idx * 2 + band_idx) % N_HEXAD
+    let base = 400
+    return base + family_offset(fam_idx) + band_offset(band_idx) + hexad_offset(cat) + j
+}
+
+fn synth_f_x1000(seed: int, fam_idx: int, band_idx: int) -> int {
+    let mut h = FNV_OFFSET_BASIS
+    h = fingerprint_step(h, seed * 31 + 17)
+    h = fingerprint_step(h, fam_idx * 2017 + 23)
+    h = fingerprint_step(h, band_idx * 2027 + 29)
+    let span = 5000
+    let mut v = (h % span)
+    if v < 0 { v = v + span }
+    return 4500 + v
+}
+
+let ANOVA_RESIDUAL_X1000_SQ = 1000
+
+fn axis_f_x1000(group_means: list, ng: int) -> int {
+    if ng < 2 { return 0 }
+    let mut sum = 0
+    let mut i = 0
+    while i < ng {
+        sum = sum + group_means[i]
+        i = i + 1
+    }
+    let grand = sum / ng
+    let mut ss_between = 0
+    let mut k = 0
+    while k < ng {
+        let d = group_means[k] - grand
+        ss_between = ss_between + d * d
+        k = k + 1
+    }
+    let df1 = ng - 1
+    let ms_between = ss_between / df1
+    let f_x1000 = (ms_between * 1000) / ANOVA_RESIDUAL_X1000_SQ
+    return f_x1000
+}
+
+// ──────────────────── D+6 G8 simulation block ───────────────────────────────
+fn surrogate_score(offset: int, t: int, k: int) -> int {
+    let mut h = FNV_OFFSET_BASIS
+    let golden = 2654435761
+    h = fnv_mix_int(h, offset)
+    h = fnv_mix_int(h, t * golden)
+    h = fnv_mix_int(h, offset * 31)
+    h = fnv_mix_int(h, t)
+    h = fnv_mix_int(h, h)
+    h = fnv_mix_int(h, offset + t * 7919)
+    h = fnv_mix_int(h, t * golden + offset)
+    h = fnv_mix_int(h, k)
+    h = fnv_mix_int(h, h * golden)
+    let r = h % SCORE_RANGE
+    if r < 0 { return r + SCORE_RANGE }
+    return r
+}
+
+fn score_to_bin(score: int) -> int {
+    let mut b = (score * G8_N_BIN) / SCORE_RANGE
+    if b < 0 { b = 0 }
+    if b >= G8_N_BIN { b = G8_N_BIN - 1 }
+    return b
+}
+
+fn build_hist_1d(offset: int, k_couple: int) -> list {
+    let mut h = []
+    let mut i = 0
+    while i < G8_N_BIN {
+        h.push(0)
+        i = i + 1
+    }
+    let mut t = 0
+    while t < G8_N_TRIAL {
+        let s = surrogate_score(offset, t, k_couple)
+        let b = score_to_bin(s)
+        h[b] = h[b] + 1
+        t = t + 1
+    }
+    return h
+}
+
+fn build_hist_2d(offset_x: int, offset_y: int, k_couple_x: int, k_couple_y: int) -> list {
+    let mut h = []
+    let mut i = 0
+    let total_cells = G8_N_BIN * G8_N_BIN
+    while i < total_cells {
+        h.push(0)
+        i = i + 1
+    }
+    let mut t = 0
+    while t < G8_N_TRIAL {
+        let sx = surrogate_score(offset_x, t, k_couple_x)
+        let sy = surrogate_score(offset_y, t, k_couple_y)
+        let bx = score_to_bin(sx)
+        let by = score_to_bin(sy)
+        let idx = bx * G8_N_BIN + by
+        h[idx] = h[idx] + 1
+        t = t + 1
+    }
+    return h
+}
+
+fn entropy_x1000_from_hist(hist: list, total: int) -> int {
+    if total <= 0 { return 0 }
+    let logN = log2_x1000(total)
+    let mut acc = 0
+    let mut k_nonempty = 0
+    let n = len(hist)
+    let mut i = 0
+    while i < n {
+        let c = hist[i]
+        if c > 0 {
+            let logc = log2_x1000(c)
+            acc = acc + c * (logN - logc)
+            k_nonempty = k_nonempty + 1
+        }
+        i = i + 1
+    }
+    let h_naive = acc / total
+    let mm_correction = ((k_nonempty - 1) * 721) / total
+    return h_naive + mm_correction
+}
+
+fn falsifier_offset(idx: int, mode_negative: int) -> int {
+    if idx == 0 { return OFF_FA1 }
+    if idx == 1 { return OFF_FA2 }
+    if idx == 2 { return OFF_FA3 }
+    if idx == 3 { return OFF_FB }
+    if mode_negative == 1 { return OFF_FA1 }
+    return OFF_FC
+}
+
+fn falsifier_couple(idx: int, mode_negative: int) -> int {
+    return 0
+}
+
+fn falsifier_name(idx: int) -> string {
+    if idx == 0 { return "F_A1_P1_LZ" }
+    if idx == 1 { return "F_A2_P2_TLR" }
+    if idx == 2 { return "F_A3_P3_GCG" }
+    if idx == 3 { return "F_B_HCI_5FALS" }
+    return "F_C_CPGD_G"
+}
+
+// ─── min over 6 confidences ─────────────────────────────────────────────────
+fn min2(a: int, b: int) -> int {
+    if a <= b { return a }
+    return b
+}
+
+fn cluster_min(confs: list) -> int {
+    let n = len(confs)
+    if n <= 0 { return 0 }
+    let mut m = confs[0]
+    let mut i = 1
+    while i < n {
+        m = min2(m, confs[i])
+        i = i + 1
+    }
+    return m
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    let fixture_path = env_str("MK_XII_DDAY_FIXTURE_PATH",
+                               "anima-clm-eeg/fixtures/synthetic_16ch_v1.json")
+    let out_path = env_str("MK_XII_DDAY_OUT",
+                           "anima-clm-eeg/state/mk_xii_d_day_simulated_v1.json")
+    let neg_uniform = env_str("MK_XII_DDAY_NEG_UNIFORM", "0")
+    let neg_mode = if neg_uniform == "1" { 1 } else { 0 }
+
+    let fixture = read_file(fixture_path)
+    let fixture_len = len(fixture)
+    let fp_extracted = extract_int_after_key(fixture, "\"fingerprint\":")
+    let dry_seed = if fp_extracted >= 0 { fp_extracted } else { fixture_len }
+
+    // ─────────────────────── D+5 G10 simulated activation ──────────────────
+    let mut couplings = []
+    let mut fstats    = []
+    let mut fam = 0
+    while fam < N_FAMILIES {
+        let mut bnd = 0
+        while bnd < N_BANDS {
+            let mut cpl = 0
+            let mut fst = 0
+            if neg_mode == 1 {
+                cpl = 400
+                fst = 2000
+            } else {
+                cpl = synth_coupling_x1000(dry_seed, fam, bnd)
+                fst = synth_f_x1000(dry_seed, fam, bnd)
+            }
+            couplings.push(cpl)
+            fstats.push(fst)
+            bnd = bnd + 1
+        }
+        fam = fam + 1
+    }
+
+    let mut cell_pass_count = 0
+    let mut idx = 0
+    while idx < N_CELLS {
+        let c1 = if couplings[idx] >= CELL_COUPLING_MIN_X1000 { 1 } else { 0 }
+        let c2 = if fstats[idx]    >= CELL_F_MIN_X1000        { 1 } else { 0 }
+        if c1 == 1 && c2 == 1 { cell_pass_count = cell_pass_count + 1 }
+        idx = idx + 1
+    }
+    let g10_c3_pass = if cell_pass_count >= CELL_PASS_MIN { 1 } else { 0 }
+
+    let mut fam_means = []
+    let mut fa = 0
+    while fa < N_FAMILIES {
+        let mut s = 0
+        let mut bb = 0
+        while bb < N_BANDS {
+            s = s + couplings[fa * N_BANDS + bb]
+            bb = bb + 1
+        }
+        fam_means.push(s / N_BANDS)
+        fa = fa + 1
+    }
+    let axis_a_f = axis_f_x1000(fam_means, N_FAMILIES)
+
+    let mut band_means = []
+    let mut bi = 0
+    while bi < N_BANDS {
+        let mut s = 0
+        let mut fi = 0
+        while fi < N_FAMILIES {
+            s = s + couplings[fi * N_BANDS + bi]
+            fi = fi + 1
+        }
+        band_means.push(s / N_FAMILIES)
+        bi = bi + 1
+    }
+    let axis_b_f = axis_f_x1000(band_means, N_BANDS)
+
+    let mut hexad_sums = [0, 0, 0, 0, 0, 0]
+    let mut hexad_n    = [0, 0, 0, 0, 0, 0]
+    let mut h_fam = 0
+    while h_fam < N_FAMILIES {
+        let mut h_bnd = 0
+        while h_bnd < N_BANDS {
+            let cat = (h_fam * 2 + h_bnd) % N_HEXAD
+            let cell_val = couplings[h_fam * N_BANDS + h_bnd]
+            hexad_sums[cat] = hexad_sums[cat] + cell_val
+            hexad_n[cat]    = hexad_n[cat] + 1
+            h_bnd = h_bnd + 1
+        }
+        h_fam = h_fam + 1
+    }
+    let mut hexad_means = []
+    let mut hci = 0
+    while hci < N_HEXAD {
+        let n_h = hexad_n[hci]
+        let mean_h = if n_h > 0 { hexad_sums[hci] / n_h } else { 0 }
+        hexad_means.push(mean_h)
+        hci = hci + 1
+    }
+    let axis_c_f = axis_f_x1000(hexad_means, N_HEXAD)
+
+    let g10_c4a = if axis_a_f >= AXIS_F_MIN_X1000 { 1 } else { 0 }
+    let g10_c4b = if axis_b_f >= AXIS_F_MIN_X1000 { 1 } else { 0 }
+    let g10_c4c = if axis_c_f >= AXIS_F_MIN_X1000 { 1 } else { 0 }
+    let g10_pass = if g10_c3_pass == 1 && g10_c4a == 1 && g10_c4b == 1 && g10_c4c == 1 { 1 } else { 0 }
+
+    // ─────────────────────── D+6 G8 simulated MI port ──────────────────────
+    let mut h_marg = []
+    let mut fi6 = 0
+    while fi6 < 5 {
+        let off = falsifier_offset(fi6, neg_mode)
+        let cpl = falsifier_couple(fi6, neg_mode)
+        let hist1d = build_hist_1d(off, cpl)
+        let hh = entropy_x1000_from_hist(hist1d, G8_N_TRIAL)
+        h_marg.push(hh)
+        fi6 = fi6 + 1
+    }
+
+    let mut pair_a = []
+    let mut pair_b = []
+    let mut pair_mi = []
+    let mut pair_violation = []
+    let mut g8_max_mi = 0
+    let mut g8_violations = 0
+    let mut a = 0
+    while a < 5 {
+        let mut b = a + 1
+        while b < 5 {
+            let off_a = falsifier_offset(a, neg_mode)
+            let off_b = falsifier_offset(b, neg_mode)
+            let cpl_a = falsifier_couple(a, neg_mode)
+            let cpl_b = falsifier_couple(b, neg_mode)
+            let joint = build_hist_2d(off_a, off_b, cpl_a, cpl_b)
+            let h_xy = entropy_x1000_from_hist(joint, G8_N_TRIAL)
+            let h_x = h_marg[a]
+            let h_y = h_marg[b]
+            let mut mi = h_x + h_y - h_xy
+            if mi < 0 { mi = 0 }
+            pair_a.push(a)
+            pair_b.push(b)
+            pair_mi.push(mi)
+            let v = if mi > MI_MAX_X1000 { 1 } else { 0 }
+            pair_violation.push(v)
+            if v == 1 { g8_violations = g8_violations + 1 }
+            if mi > g8_max_mi { g8_max_mi = mi }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    let g8_pass = if g8_violations == 0 { 1 } else { 0 }
+
+    // ─────────────────────── D+7 Hard PASS recompute ────────────────────────
+    // synthesized 4/4 backbone-majority for G0/G1/G7 (from existing
+    // mk_xii_hard_pass_composite_v1.json — read-only carry-forward).
+    // In NEG_UNIFORM mode, force G8 and G10 to 0 (already happens above);
+    // backbone-majority gates remain 1 (not perturbed by this falsifier).
+    let g0_pass = 1
+    let g1_pass = 1
+    let g7_pass = 1
+    let g9_pass = 1   // sparse DAG already validated (mk_xii_proposal v2 §3.2)
+    let preflight_pass = 1
+
+    // Hard PASS recompute strict-AND (with G10 NOW INCLUDED — env MK_XII_INCLUDE_G10=1 simulated)
+    let hard_pass_recompute_count = preflight_pass + g0_pass + g1_pass + g7_pass + g8_pass + g9_pass + g10_pass
+    let hard_pass_recompute_required = 7
+    let hard_pass_pass = if hard_pass_recompute_count >= hard_pass_recompute_required { 1 } else { 0 }
+
+    // EHL-3W (PHENOMENAL × SUBSTRATE × TRAINING)
+    //   PHENOMENAL.PASS  ← simulated D+7 PHENOMENAL lock (3/3 EEG STACK assumed PASS in sim)
+    //   SUBSTRATE.PASS   ← S7 A1.Hexad PASS_SIGNIFICANT (already locked pre-D-day)
+    //   TRAINING.PASS    ← CPGD-MCB BRIDGE_CLOSED 9/9 + Q4 caveat 2/4 (already locked pre-D-day)
+    //
+    //   In NEG_UNIFORM, simulate that PHENOMENAL fails (G8 collapse cascades to PHENOMENAL via I2
+    //   transversality breakdown).
+    let ehl_phenomenal = if neg_mode == 1 { 0 } else { 1 }
+    let ehl_substrate  = 1
+    let ehl_training   = 1
+    let ehl_3w_pass    = if ehl_phenomenal == 1 && ehl_substrate == 1 && ehl_training == 1 { 1 } else { 0 }
+
+    // OR-clause-1 (DALI∨SLI weighted-vote): NOT_ELIGIBLE RED carry-over from v2
+    let or_clause_1 = 0   // declarative-only RED, frozen
+    let or_clause_2 = ehl_3w_pass
+
+    // Hard PASS final = 5-gate composite GREEN AND (OR-clause-1 OR OR-clause-2)
+    let hard_pass_final = if hard_pass_pass == 1 && (or_clause_1 == 1 || or_clause_2 == 1) { 1 } else { 0 }
+
+    // ─────────────────────── cluster_confidence (simulated) ─────────────────
+    //   In NEG_UNIFORM, the lifted G8/G10 confidences COLLAPSE to 0 (gate
+    //   FAIL) so cluster_confidence drops below CLUSTER_FLOOR_X1000.
+    let conf_g8_x1000 = if neg_mode == 1 { 0 } else { SIM_CONF_G8_X1000 }
+    let conf_g9_cas_x1000 = SIM_CONF_G9_CASCADE_X1000
+    let conf_g9_rob_x1000 = SIM_CONF_G9_ROBUST_X1000
+    let conf_g10_x1000 = if neg_mode == 1 { 0 } else { SIM_CONF_G10_X1000 }
+    let conf_pre_x1000 = SIM_CONF_PREFLIGHT_X1000
+    let conf_hp_x1000  = if neg_mode == 1 { 0 } else { SIM_CONF_HARDPASS_X1000 }
+
+    let cluster_confs = [conf_g8_x1000, conf_g9_cas_x1000, conf_g9_rob_x1000,
+                         conf_g10_x1000, conf_pre_x1000, conf_hp_x1000]
+    let cluster_min_x1000 = cluster_min(cluster_confs)
+    let cluster_green = if cluster_min_x1000 >= CLUSTER_FLOOR_X1000 { 1 } else { 0 }
+
+    // ─────────────────────── D+22..D+30 first validation verdict ────────────
+    let first_validation_verdict_pass = if hard_pass_final == 1 && cluster_green == 1 && ehl_3w_pass == 1 && g10_pass == 1 && g8_pass == 1 { 1 } else { 0 }
+    let verdict_label = if first_validation_verdict_pass == 1 { "MK_XII_INTEGRATION_VERIFIED_SIMULATED" } else { "MK_XII_INTEGRATION_FALSIFIED_SIMULATED" }
+
+    // ─────────────────────── chained fingerprint ────────────────────────────
+    let mut fp = FNV_OFFSET_BASIS
+    fp = fingerprint_step(fp, dry_seed)
+    fp = fingerprint_step(fp, fixture_len)
+    fp = fingerprint_step(fp, neg_mode)
+    fp = fingerprint_step(fp, cell_pass_count)
+    fp = fingerprint_step(fp, axis_a_f)
+    fp = fingerprint_step(fp, axis_b_f)
+    fp = fingerprint_step(fp, axis_c_f)
+    fp = fingerprint_step(fp, g10_pass)
+    fp = fingerprint_step(fp, g8_max_mi)
+    fp = fingerprint_step(fp, g8_violations)
+    fp = fingerprint_step(fp, g8_pass)
+    fp = fingerprint_step(fp, hard_pass_recompute_count)
+    fp = fingerprint_step(fp, hard_pass_pass)
+    fp = fingerprint_step(fp, ehl_3w_pass)
+    fp = fingerprint_step(fp, hard_pass_final)
+    fp = fingerprint_step(fp, cluster_min_x1000)
+    fp = fingerprint_step(fp, cluster_green)
+    fp = fingerprint_step(fp, first_validation_verdict_pass)
+
+    // ─────────────────────── emit cert ──────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"mk_xii_d_day_simulated_dry_run\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"gpu\": \"none\",\n"
+    cert = cert + "  \"destructive\": false,\n"
+    cert = cert + "  \"frozen_at\": \"2026-04-26\",\n"
+    cert = cert + "  \"scope\": \"Mk.XII Hard PASS first validation simulated D-day dry-run — pre-rehearses post-EEG D+5 G10 + D+6 G8 + D+7 Hard PASS recompute + D+22..D+30 first validation. raw#10 honest: simulated NOT empirical.\",\n"
+    cert = cert + "  \"raw10_honest\": \"This dry-run uses synthetic 16ch fixture as a stand-in for real EEG hardware. cluster_confidence_simulated lifts (0.78->0.85 G8 / 0.70->0.85 G10 / 0.80->0.85 Hard PASS) are SIMULATION-FROZEN ESTIMATES, not measured values. Real D-day workflow remains a strict prerequisite for any MK_XII_INTEGRATION_VERIFIED claim.\",\n"
+    cert = cert + "  \"input\": {\n"
+    cert = cert + "    \"fixture_path\": \"" + fixture_path + "\",\n"
+    cert = cert + "    \"fixture_bytes\": " + str(fixture_len) + ",\n"
+    cert = cert + "    \"fixture_fingerprint\": " + str(fp_extracted) + ",\n"
+    cert = cert + "    \"dry_seed\": " + str(dry_seed) + ",\n"
+    cert = cert + "    \"neg_uniform_mode\": " + str(neg_mode) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"d_plus_5_g10_simulated\": {\n"
+    cert = cert + "    \"families\": [\"Law\", \"Phi\", \"SelfRef\", \"Hexad\"],\n"
+    cert = cert + "    \"bands\": [\"alpha\", \"beta\", \"gamma\", \"theta\"],\n"
+    cert = cert + "    \"cell_pass_count\": " + str(cell_pass_count) + ",\n"
+    cert = cert + "    \"family_means_x1000\": [" + str(fam_means[0]) + "," + str(fam_means[1]) + "," + str(fam_means[2]) + "," + str(fam_means[3]) + "],\n"
+    cert = cert + "    \"band_means_x1000\":   [" + str(band_means[0]) + "," + str(band_means[1]) + "," + str(band_means[2]) + "," + str(band_means[3]) + "],\n"
+    cert = cert + "    \"hexad_means_x1000\":  [" + str(hexad_means[0]) + "," + str(hexad_means[1]) + "," + str(hexad_means[2]) + "," + str(hexad_means[3]) + "," + str(hexad_means[4]) + "," + str(hexad_means[5]) + "],\n"
+    cert = cert + "    \"axis_A_F_x1000\":  " + str(axis_a_f) + ",\n"
+    cert = cert + "    \"axis_B_F_x1000\":  " + str(axis_b_f) + ",\n"
+    cert = cert + "    \"axis_C_F_x1000\":  " + str(axis_c_f) + ",\n"
+    cert = cert + "    \"C3_pass\":         " + str(g10_c3_pass) + ",\n"
+    cert = cert + "    \"C4_axisA_pass\":   " + str(g10_c4a) + ",\n"
+    cert = cert + "    \"C4_axisB_pass\":   " + str(g10_c4b) + ",\n"
+    cert = cert + "    \"C4_axisC_pass\":   " + str(g10_c4c) + ",\n"
+    cert = cert + "    \"g10_pass\":        " + str(g10_pass) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"d_plus_6_g8_simulated\": {\n"
+    cert = cert + "    \"n_trial\": " + str(G8_N_TRIAL) + ",\n"
+    cert = cert + "    \"n_bin\":   " + str(G8_N_BIN) + ",\n"
+    cert = cert + "    \"mi_max_x1000\": " + str(MI_MAX_X1000) + ",\n"
+    cert = cert + "    \"falsifiers\": [\n"
+    let mut fz = 0
+    while fz < 5 {
+        cert = cert + "      {\"idx\": " + str(fz) + ", \"name\": \"" + falsifier_name(fz) + "\", \"H_x1000\": " + str(h_marg[fz]) + "}"
+        if fz < 4 { cert = cert + "," }
+        cert = cert + "\n"
+        fz = fz + 1
+    }
+    cert = cert + "    ],\n"
+    cert = cert + "    \"pairs\": [\n"
+    let mut pi = 0
+    let np = len(pair_a)
+    while pi < np {
+        let ai = pair_a[pi]
+        let bi2 = pair_b[pi]
+        cert = cert + "      {\"a\": \"" + falsifier_name(ai) + "\", \"b\": \"" + falsifier_name(bi2) + "\", \"MI_x1000\": " + str(pair_mi[pi]) + ", \"violation\": " + str(pair_violation[pi]) + "}"
+        if pi < np - 1 { cert = cert + "," }
+        cert = cert + "\n"
+        pi = pi + 1
+    }
+    cert = cert + "    ],\n"
+    cert = cert + "    \"max_mi_x1000\": " + str(g8_max_mi) + ",\n"
+    cert = cert + "    \"violation_count\": " + str(g8_violations) + ",\n"
+    cert = cert + "    \"g8_pass\": " + str(g8_pass) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"d_plus_7_hard_pass_recompute\": {\n"
+    cert = cert + "    \"include_g10\": 1,\n"
+    cert = cert + "    \"hard_pass_rule\": \"preflight.GREEN AND G0>=3/4 AND G1>=3/4 AND G7>=3/4 AND G8.pass=1 AND G9.pass=1 AND G10.pass=1\",\n"
+    cert = cert + "    \"preflight_pass\": " + str(preflight_pass) + ",\n"
+    cert = cert + "    \"G0_pass\": " + str(g0_pass) + ",\n"
+    cert = cert + "    \"G1_pass\": " + str(g1_pass) + ",\n"
+    cert = cert + "    \"G7_pass\": " + str(g7_pass) + ",\n"
+    cert = cert + "    \"G8_pass\": " + str(g8_pass) + ",\n"
+    cert = cert + "    \"G9_pass\": " + str(g9_pass) + ",\n"
+    cert = cert + "    \"G10_pass\": " + str(g10_pass) + ",\n"
+    cert = cert + "    \"hard_pass_count\": " + str(hard_pass_recompute_count) + ",\n"
+    cert = cert + "    \"hard_pass_required\": " + str(hard_pass_recompute_required) + ",\n"
+    cert = cert + "    \"hard_pass_5_gate_composite\": " + str(hard_pass_pass) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"ehl_3w\": {\n"
+    cert = cert + "    \"phenomenal_pass\": " + str(ehl_phenomenal) + ",\n"
+    cert = cert + "    \"substrate_pass\":  " + str(ehl_substrate) + ",\n"
+    cert = cert + "    \"training_pass\":   " + str(ehl_training) + ",\n"
+    cert = cert + "    \"ehl_3w_pass\":     " + str(ehl_3w_pass) + ",\n"
+    cert = cert + "    \"or_clause_1_dali_sli\": " + str(or_clause_1) + ",\n"
+    cert = cert + "    \"or_clause_2_ehl_3w\":   " + str(or_clause_2) + ",\n"
+    cert = cert + "    \"or_disjunction_satisfied\": " + str(if or_clause_1 == 1 || or_clause_2 == 1 { 1 } else { 0 }) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"hard_pass_final\": " + str(hard_pass_final) + ",\n"
+    cert = cert + "  \"cluster_confidence_simulated\": {\n"
+    cert = cert + "    \"per_gate_x1000\": {\n"
+    cert = cert + "      \"G8\":          " + str(conf_g8_x1000) + ",\n"
+    cert = cert + "      \"G9_cascade\":  " + str(conf_g9_cas_x1000) + ",\n"
+    cert = cert + "      \"G9_robust\":   " + str(conf_g9_rob_x1000) + ",\n"
+    cert = cert + "      \"G10\":         " + str(conf_g10_x1000) + ",\n"
+    cert = cert + "      \"preflight\":   " + str(conf_pre_x1000) + ",\n"
+    cert = cert + "      \"hard_pass\":   " + str(conf_hp_x1000) + "\n"
+    cert = cert + "    },\n"
+    cert = cert + "    \"cluster_min_x1000\": " + str(cluster_min_x1000) + ",\n"
+    cert = cert + "    \"cluster_floor_x1000\": " + str(CLUSTER_FLOOR_X1000) + ",\n"
+    cert = cert + "    \"cluster_green\": " + str(cluster_green) + ",\n"
+    cert = cert + "    \"baseline_pre_d_day_min_x1000\": 700,\n"
+    cert = cert + "    \"delta_x1000\": " + str(cluster_min_x1000 - 700) + ",\n"
+    cert = cert + "    \"weakest_link\": \"" + (if neg_mode == 1 { "G8_or_G10_collapsed" } else { "G9_robust" }) + "\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"d_plus_22_30_first_validation\": {\n"
+    cert = cert + "    \"rule\": \"MK_XII_VERIFIED iff hard_pass_final=1 AND cluster_green=1 AND ehl_3w_pass=1 AND g10_pass=1 AND g8_pass=1\",\n"
+    cert = cert + "    \"first_validation_pass\": " + str(first_validation_verdict_pass) + ",\n"
+    cert = cert + "    \"verdict\": \"" + verdict_label + "\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"chained_fingerprint\": " + str(fp) + ",\n"
+    cert = cert + "  \"note\": \"raw#10 honest: simulated dry-run = empirical prerequisite verification, replace 아님. cluster_confidence lifts are SIMULATION-FROZEN ESTIMATES.\"\n"
+    cert = cert + "}\n"
+    write_file(out_path, cert)
+
+    println("─── mk_xii_d_day_simulated_dry_run (raw#9 hexa-only) ───")
+    println("  fixture                     = " + fixture_path)
+    println("  dry_seed                    = " + str(dry_seed))
+    println("  neg_uniform_mode            = " + str(neg_mode))
+    println("  ── D+5 G10 simulated ──")
+    println("    cell_pass_count           = " + str(cell_pass_count) + " / 16")
+    println("    axis_A_F_x1000            = " + str(axis_a_f))
+    println("    axis_B_F_x1000            = " + str(axis_b_f))
+    println("    axis_C_F_x1000            = " + str(axis_c_f))
+    println("    g10_pass                  = " + str(g10_pass))
+    println("  ── D+6 G8 simulated ──")
+    println("    max_mi_x1000              = " + str(g8_max_mi))
+    println("    violation_count           = " + str(g8_violations))
+    println("    g8_pass                   = " + str(g8_pass))
+    println("  ── D+7 Hard PASS recompute (G10 included) ──")
+    println("    hard_pass_count           = " + str(hard_pass_recompute_count) + " / " + str(hard_pass_recompute_required))
+    println("    hard_pass_5_gate          = " + str(hard_pass_pass))
+    println("    EHL-3W phenomenal         = " + str(ehl_phenomenal))
+    println("    EHL-3W substrate          = " + str(ehl_substrate))
+    println("    EHL-3W training           = " + str(ehl_training))
+    println("    EHL-3W pass               = " + str(ehl_3w_pass))
+    println("    OR-clause-1 (DALI∨SLI)    = " + str(or_clause_1) + " (RED carry-over)")
+    println("    OR-clause-2 (EHL-3W)      = " + str(or_clause_2))
+    println("    hard_pass_final           = " + str(hard_pass_final))
+    println("  ── cluster_confidence simulated ──")
+    println("    per_gate G8/G9c/G9r/G10/pre/HP = " + str(conf_g8_x1000) + "/" + str(conf_g9_cas_x1000) + "/" + str(conf_g9_rob_x1000) + "/" + str(conf_g10_x1000) + "/" + str(conf_pre_x1000) + "/" + str(conf_hp_x1000))
+    println("    cluster_min_x1000         = " + str(cluster_min_x1000) + " (baseline 700, Δ=" + str(cluster_min_x1000 - 700) + ")")
+    println("    cluster_green             = " + str(cluster_green))
+    println("  ── D+22..D+30 first validation ──")
+    println("    verdict                   = " + verdict_label)
+    println("  chained_fingerprint         = " + str(fp))
+    println("  output                      = " + out_path)
+
+    if first_validation_verdict_pass == 1 {
+        exit(0)
+    }
+    exit(1)
+}
+
+main()

@@ -1,0 +1,63 @@
+{
+  "cycle": "omega-network-8",
+  "axis": "PSI calibration distribution-drift detector (vs. age-fresh-only)",
+  "timestamp": "2026-04-26",
+  "scope": "/Users/ghost/core/nexus/tool/psi_calibration_drift.hexa (NEW, 519 LOC)",
+  "method": "audit psi_calibrate_emit.hexa formula → port _suggest() identically into drift recomputation → diff cache vs. live-log p95+5 with op-clamp parity",
+  "predecessors": {
+    "omega_network_5": "97c65c8a (per-host PSI threshold emit)",
+    "omega_network_6": "7e309924 (24h-cached applier)",
+    "omega_network_6b": "3506aa14 (daily auto-refresh launchd plist)",
+    "omega_network_7": "b9eaf498 (log retention/rotation)"
+  },
+  "problem_statement": "ω-network-6b keeps the cache age-fresh (re-computed daily) but no tool detects when the underlying log distribution drifts from the cached calibration. The cache could be technically fresh (re-computed yesterday) yet semantically stale relative to today's host load.",
+  "drift_metric": {
+    "per_host": "drift_pct = |cached - recomputed| / cached * 100",
+    "recompute_formula": "identical to psi_calibrate_emit.hexa _suggest(): rej_ratio>0.10 → round(p95+5) capped at 95 floored at current(80); else max<current-20 → round(max+10) floored at 30; else KEEP(80). Op-clamp ubu1/ubu2 ≤ 70.",
+    "thresholds": {"drift": "10%", "stale": "30%"}
+  },
+  "verdict_logic": [
+    "all hosts ≤10% drift → __PSI_DRIFT__ FRESH",
+    "any host >10% but ≤30% → __PSI_DRIFT__ DRIFT",
+    "any host >30% OR new host in log not in cache OR cache mtime < log max_ts → __PSI_DRIFT__ STALE"
+  ],
+  "preflight_skips": [
+    "cache file missing → SKIP reason=cache_missing path=PATH",
+    "log file missing → SKIP reason=log_missing path=PATH",
+    "cache 0 rows → SKIP reason=cache_empty",
+    "per-host samples<50 → INSUFFICIENT for that host (others still computed)"
+  ],
+  "cli": {
+    "flags": ["--cache PATH", "--log PATH", "--drift-threshold P (default 10)", "--stale-threshold P (default 30)", "--quiet", "--json", "--help"],
+    "default_output": "human-readable per-host table HOST CACHED RECOMPUTED DRIFT_PCT VERDICT followed by sentinel",
+    "json_output": "{\"cycle\":\"omega-network-8\",\"verdict\":\"...\",\"max_drift_pct\":...,\"hosts\":[{...per-host...}]}"
+  },
+  "validation_fixtures": {
+    "f1_in_spec_fresh": {"input": "log p95+5=95, cache=70 (op-clamped) for ubu1/ubu2", "expected": "FRESH max=0%", "result": "PASS"},
+    "f2_small_drift": {"input": "hetzner cache=70 vs log p95=75 → recomputed=80", "expected": "DRIFT max≈14.29%", "result": "PASS"},
+    "f3_large_drift": {"input": "hetzner cache=70 vs log p95=92 → recomputed=95 (cap)", "expected": "STALE max≈35.71%", "result": "PASS"},
+    "f4_new_host_in_log": {"input": "log has newhost rows, cache only HETZNER", "expected": "STALE reason=new_hosts_in_log", "result": "PASS"},
+    "f5_insufficient_samples": {"input": "hetzner=10 rows, ubu1=70 rows", "expected": "ubu1 ok, hetzner INSUFFICIENT, sentinel FRESH (insufficient_hosts=1)", "result": "PASS"},
+    "f6_missing_log": {"input": "--log /tmp/nonexistent", "expected": "SKIP reason=log_missing", "result": "PASS"},
+    "f7_json_validity": {"input": "f2 with --json | python -m json.tool", "expected": "valid JSON object with hosts[]", "result": "PASS"}
+  },
+  "edge_cases_tested": [
+    "missing cache (SKIP cache_missing)",
+    "cache containing only header + * default row (SKIP cache_empty)",
+    "real cache + real log (smoke: max_drift=0% but cache_mtime<log_max_ts → STALE — correct, expected behavior)",
+    "--quiet flag (sentinel only, no table)"
+  ],
+  "constraints_honored": [
+    "hexa-only-suffix .hexa raw 9 (NEW file is .hexa)",
+    "READ-ONLY on /tmp/hexa_remote_psi.log (only awk-reads, never writes)",
+    "READ-ONLY on state/psi_calibration_active.tsv (only cat-reads)",
+    "scripts/bin/hexa_remote untouched",
+    "no commit in anima (this closure JSON is UNTRACKED)",
+    "explicit-path commit (only tool/psi_calibration_drift.hexa)",
+    "no parallel-session collision: cli/run.hexa, atlas timeline, atlas composite, n6/*, kick_*, design/kick/* all left untouched"
+  ],
+  "loc": 519,
+  "exit_codes": {"0": "all sentinel modes (FRESH/DRIFT/STALE/SKIP/INSUFFICIENT-only)", "2": "defensive parse fault (unreachable in normal flow)"},
+  "headline": "drift detector closes the freshness gap: ω-network-6 keeps cache age-fresh; ω-network-8 keeps cache distribution-fresh by re-running the formula and flagging hosts whose load has shifted >10%/>30%.",
+  "user_email": "mk911tb@proton.me"
+}

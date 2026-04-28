@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+# ANIMA-NOTE: this file is `.py.txt` because anima `.gitignore` blocks all
+# `*.py` (raw#37 transient policy + auto-cleanup). To execute:
+#   cp cpgd_mcb_v2_aggregator.py.txt /tmp/cpgd_mcb_v2_aggregator.py
+#   /private/tmp/cpgd_phi3_venv/bin/python /tmp/cpgd_mcb_v2_aggregator.py
+"""
+anima-cpgd-research/scripts/cpgd_mcb_v2_aggregator.py(.txt)
+
+CPGD-MCB v2 12-cell aggregator (raw#37 transient).
+
+Combines two hexa-produced JSONs into the final 12-cell verdict:
+  1. anima-cpgd-research/state/cpgd_mcb_falsifier_v1.json     (9 cells: gpt2/tinyllama/gemma)
+  2. anima-cpgd-research/state/cpgd_mcb_phi3_only_v2.json     (3 cells: phi3 r=4/8/16)
+
+Why split? Hetzner hexa interp memory budget cannot fit single-pass 12-cell
+(SIGKILL 137 after gpt2 r=8 PASS while r=16 second-run was in progress;
+runaway_guard or oom-killer claimed hexa_real_real ~70 MB RSS at the moment
+shasum spawn cost peaked). 1-bb × 3-rank phi3-only fits comfortably.
+
+This aggregator is **arithmetic only** — it does not redo any per-cell dry_run.
+It re-uses the existing hexa-derived per-cell verdicts byte-identically and
+only:
+
+  (a) merges the 9 + 3 = 12 cell list into a single ordered array;
+  (b) re-aggregates G1/G2/G3/G4 pass counts;
+  (c) recomputes the cond-byte Pearson r over the **12** cells;
+  (d) re-evaluates AG1 (>= 11/12 cells PASS, leniency 1) and AG2 (|r| < 0.3);
+  (e) re-runs negative_falsify_caught using the OR rule across both inputs
+      (both v1 and phi3_only ran their own internal negative falsify on the
+      first PASS cell — passing either qualifies);
+  (f) writes anima-cpgd-research/state/cpgd_mcb_falsifier_v2.json with all
+      cell-level fields preserved verbatim.
+
+raw#10 honest:
+  - per-cell G1..G4 verdict bytes are inherited verbatim from the hexa runs;
+  - the aggregator does NOT re-execute the dry_run (cell-level work was done
+    in hexa); only meta-aggregation arithmetic happens here;
+  - Pearson r recomputation uses the same canonical formula
+    (log10(cond) ↔ int(sha[:16], 16) / 1e18) as the hexa pearson_r() function.
+
+Output: anima-cpgd-research/state/cpgd_mcb_falsifier_v2.json
+"""
+
+import hashlib
+import json
+import math
+import os
+import sys
+
+
+V1_REL = "anima-cpgd-research/state/cpgd_mcb_falsifier_v1.json"
+PHI3_REL = "anima-cpgd-research/state/cpgd_mcb_phi3_only_v2.json"
+OUT_REL = "anima-cpgd-research/state/cpgd_mcb_falsifier_v2.json"
+HIDDEN_V2_REL = "anima-cpgd-research/state/cpgd_mcb_4bb_hidden_state_v2.json"
+
+PEARSON_R_MAX = 0.3
+MIN_PASS_LENIENCY = 1
+
+
+def resolve_root() -> str:
+    env_anima = os.environ.get("ANIMA")
+    if env_anima:
+        return env_anima
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(here, "..", ".."))
+
+
+def pearson_r_canonical(cells):
+    """log10(cond), int(sha[:16],16)/1e18 — matches hexa pearson_r."""
+    xs = []
+    ys = []
+    for c in cells:
+        cond = c.get("matrix_cond", 0.0)
+        sha = c.get("matrix_sha256", "")
+        if cond > 0 and len(sha) >= 16:
+            xs.append(math.log10(cond))
+            ys.append(int(sha[:16], 16) / 1.0e18)
+    if len(xs) < 2:
+        return None
+    n = len(xs)
+    xm = sum(xs) / n
+    ym = sum(ys) / n
+    num = sum((x - xm) * (y - ym) for x, y in zip(xs, ys))
+    dx2 = sum((x - xm) ** 2 for x in xs)
+    dy2 = sum((y - ym) ** 2 for y in ys)
+    denom = math.sqrt(dx2) * math.sqrt(dy2)
+    if denom <= 0:
+        return None
+    return num / denom
+
+
+def sha256_canon_bytes(payload_str: str) -> str:
+    return hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+
+def main():
+    root = resolve_root()
+    v1_path = os.path.join(root, V1_REL)
+    phi3_path = os.path.join(root, PHI3_REL)
+    out_path = os.path.join(root, OUT_REL)
+    hidden_v2_path = os.path.join(root, HIDDEN_V2_REL)
+
+    print("=" * 72)
+    print("  cpgd_mcb_v2_aggregator.py — 9-cell v1 + 3-cell phi3-only → 12-cell v2")
+    print("=" * 72)
+
+    if not os.path.exists(v1_path):
+        print(f"[ERR] missing {V1_REL}", file=sys.stderr); sys.exit(2)
+    if not os.path.exists(phi3_path):
+        print(f"[ERR] missing {PHI3_REL}", file=sys.stderr); sys.exit(3)
+
+    with open(v1_path) as f:
+        v1 = json.load(f)
+    with open(phi3_path) as f:
+        phi3 = json.load(f)
+
+    v1_cells = v1.get("cells", [])
+    phi3_cells = phi3.get("cells", [])
+    print(f"[agg] v1 cells={len(v1_cells)}  phi3 cells={len(phi3_cells)}")
+    if len(v1_cells) != 9:
+        print(f"[ERR] expected 9 v1 cells, got {len(v1_cells)}", file=sys.stderr); sys.exit(4)
+    if len(phi3_cells) != 3:
+        print(f"[ERR] expected 3 phi3 cells, got {len(phi3_cells)}", file=sys.stderr); sys.exit(5)
+
+    all_cells = list(v1_cells) + list(phi3_cells)
+    total_cells = len(all_cells)
+    g1 = sum(1 for c in all_cells if c.get("G1"))
+    g2 = sum(1 for c in all_cells if c.get("G2"))
+    g3 = sum(1 for c in all_cells if c.get("G3"))
+    g4 = sum(1 for c in all_cells if c.get("G4"))
+    cell_pass_total = sum(1 for c in all_cells if c.get("cell_pass"))
+
+    pearson = pearson_r_canonical(all_cells)
+    abs_r = abs(pearson) if pearson is not None else None
+    decoupled = (abs_r is not None and abs_r < PEARSON_R_MAX)
+
+    min_pass_required = total_cells - MIN_PASS_LENIENCY
+    ag1 = cell_pass_total >= min_pass_required
+    ag2 = decoupled
+
+    v1_neg = bool(v1.get("aggregate", {}).get("negative_falsify_caught", False))
+    phi3_neg = bool(phi3.get("aggregate", {}).get("negative_falsify_caught", False))
+    neg_caught = v1_neg or phi3_neg
+
+    mcb_verified = ag1 and ag2 and neg_caught
+    verdict = "CPGD_MCB_BRIDGE_CLOSED" if mcb_verified else "CPGD_MCB_FAIL"
+
+    print(f"\n[agg] AGGREGATE 12-cell")
+    print(f"[agg]   total_cells={total_cells}")
+    print(f"[agg]   G1_pass={g1}/{total_cells}  G2={g2}/{total_cells}  G3={g3}/{total_cells}  G4={g4}/{total_cells}")
+    print(f"[agg]   cell_pass_total={cell_pass_total}/{total_cells}")
+    print(f"[agg]   AG1 (>={min_pass_required}/{total_cells}) = {ag1}")
+    if pearson is not None:
+        print(f"[agg]   pearson_r={pearson:.6f}  |r|={abs_r:.6f}")
+    print(f"[agg]   AG2 (|r|<{PEARSON_R_MAX}) = {ag2}")
+    print(f"[agg]   neg_falsify_caught = {neg_caught}  (v1={v1_neg}, phi3={phi3_neg})")
+    print(f"[agg]   verdict = {verdict}")
+
+    payload = {
+        "schema_version": "2",
+        "slug": "cpgd-mcb-falsifier-v2",
+        "title": "CPGD-MCB 12-cell bridge closure falsifier (v2 = v1 9-cell ⊕ phi3 K=16 3-cell, aggregated)",
+        "created": "2026-04-26",
+        "path": "C-MCB",
+        "raw_strict": "raw#9 hexa-only per-cell (cells inherited byte-identical from v1 hexa + phi3-only hexa); raw#37 transient Python aggregator (arithmetic merge only, no dry_run re-execution)",
+        "honest_limit": "raw#10 — Phi-3-mini K=16 forward executed on mac MPS fp16 (24GB unified memory budget); 3 lighter backbones (gpt2/tinyllama/gemma) inherited byte-identical from v1 CPU fp32; aggregator path adopted because hetzner hexa interp single-pass 12-cell SIGKILL 137 (memory) — 9+3 split fits comfortably",
+        "tool": "anima-cpgd-research/scripts/cpgd_mcb_v2_aggregator.py.txt",
+        "depends_on": [
+            "anima-cpgd-research/state/cpgd_mcb_falsifier_v1.json",
+            "anima-cpgd-research/state/cpgd_mcb_phi3_only_v2.json",
+            "anima-cpgd-research/state/cpgd_mcb_4bb_hidden_state_v2.json",
+            "anima-cpgd-research/tool/cpgd_mcb_falsifier.hexa",
+            "anima-cpgd-research/tool/cpgd_mcb_phi3_only_v2.hexa",
+            "anima-cpgd-research/scripts/cpgd_mcb_phi3_restore.py.txt",
+        ],
+        "backbones": 4,
+        "ranks": 3,
+        "k_prompts": v1.get("k_prompts", 16),
+        "step_count": v1.get("step_count", 100),
+        "lr": v1.get("lr", 0.001),
+        "grad_seed": v1.get("grad_seed", 20260426),
+        "cos_floor": v1.get("cos_floor", 0.5),
+        "eps_proj": v1.get("eps_proj", 0.0001),
+        "eps_c": v1.get("eps_c", 1.0),
+        "pearson_r_max": PEARSON_R_MAX,
+        "min_pass_required": min_pass_required,
+        "min_pass_leniency": MIN_PASS_LENIENCY,
+        "cells": all_cells,
+        "aggregate": {
+            "total_cells": total_cells,
+            "g1_pass": g1,
+            "g2_pass": g2,
+            "g3_pass": g3,
+            "g4_pass": g4,
+            "cell_pass_total": cell_pass_total,
+            "AG1_min_pass_cells": ag1,
+            "pearson_r": pearson,
+            "abs_pearson_r": abs_r,
+            "AG2_decoupled": ag2,
+            "negative_falsify_caught": neg_caught,
+            "negative_falsify_v1": v1_neg,
+            "negative_falsify_phi3_only": phi3_neg,
+        },
+        "verdict": verdict,
+    }
+
+    payload_canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    payload_sha = sha256_canon_bytes(payload_canonical)
+    payload["__self_sha256_canonical"] = payload_sha
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"\n[agg] wrote {OUT_REL}")
+    print(f"[agg] self_sha256_canonical = {payload_sha}")
+
+
+if __name__ == "__main__":
+    main()

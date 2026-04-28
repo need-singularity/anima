@@ -1,0 +1,561 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-hci-research/tool/cusp_depth_projector.hexa
+//
+//  PURPOSE  (S7 cusp_depth projection ansatz — SUBSTRATE weakest link 메움)
+//    omega_cycle_mk_xii_substrate_axis_20260426.md §4.1 weakest evidence link:
+//      "S7 DALI×SLI cross-coupling 의 cusp_depth measurement 부재"
+//
+//    L_IX gen 4→5 I_irr cusp 996→0 (edu/cell/lagrangian/l_ix_integrator.hexa
+//    line 117-138, _ix_i_irr_x1000) 은 generation-level only — layer
+//    projection 없음.  본 도구는 ansatz 1 개 + Pearson r(L_loc family,
+//    L_loc cusp) 직접 측정.
+//
+//    ANSATZ (cusp_depth projection):
+//      L_IX cusp 의 본질은 fixpoint 에서 ΔW=0 ⇒ I_irr=0 collapse.
+//      즉 "activation 이 peak 후 plateau 에 도달" 의 layer.
+//      cmt.json layer × family activation matrix 에서 layer 별 L2 norm
+//      (Σ_fam |abs|²)^½ 이 maximum 인 layer 가 "전체 family activation
+//      saturation peak" = cusp_depth 의 layer 정의.
+//
+//      cusp_depth(b) = argmax_l L2_family(l) / n_layers × 1000   (×1000 fp)
+//
+//      직관: dominant_layer_per_family (max single-family rel) 와 직교.
+//      family-specific peak 가 아닌, 4-family-aggregate saturation peak.
+//      L_IX I_irr 의 "전체 시스템이 안정 fixpoint 에 도달" 의 layer 등가물.
+//
+//    GATE (S7 falsifier):
+//      Pearson r(L_loc family, L_loc cusp) ≥ 0.5  → SUBSTRATE coherence
+//                                                    (S7 conf 0.71 → +0.05)
+//      Pearson r ≤ 0.2                          → 두 axes 독립 (FALSIFIED)
+//      0.2 < r < 0.5                            → AMBIGUOUS, conf 유지
+//
+//  RAW#9
+//    pure hexa · deterministic · cmt.json read-only ingest · no Python
+//    integer fixed-point ×1000 · byte-identical re-run
+//
+//  POSITIVE SELFTEST
+//    4 backbone real cmt.json (Mistral, Qwen3, Llama, gemma) → cusp_depth
+//    측정 + Pearson r vs L_loc family. r 값에 따라 verdict.
+//
+//  NEGATIVE FALSIFY
+//    동일한 stub matrix (uniform=500) 4-bb 에 주입 → cusp_depth 모두 동일,
+//    또는 random surrogate 시 r ≈ 0 detect.
+//
+//  OUTPUT
+//    state/cusp_depth_projector_v1.json (deterministic, byte-identical)
+// ════════════════════════════════════════════════════════════════════════════
+
+let SCALE = 1000           // integer fixed-point
+let M32 = 4294967296
+let POLY_PRIME = 2654435761
+
+// Pearson r thresholds (×1000)
+let R_PASS = 500           // r ≥ 0.500 → SUBSTRATE coherence PASS
+let R_FAIL = 200           // r ≤ 0.200 → SUBSTRATE FALSIFIED
+
+// 6 layer slices (must match hci_substrate_probe_real.hexa)
+let SLICE_FRAC = [143, 286, 429, 571, 714, 857]   // ×1000
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+fn now_stamp() -> string { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+
+fn str_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + xs[i] + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+fn int_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + str(xs[i])
+        i = i + 1
+    }
+    return s + "]"
+}
+
+// float → int ×1000 (cmt.json abs is float)
+fn f1000(x) -> int {
+    let scaled = x * SCALE
+    let t = int(scaled)
+    if t < 0 { return 0 }
+    return t
+}
+
+// integer sqrt (Newton, ×1000 preserved)
+fn isqrt(v: int) -> int {
+    if v <= 0 { return 0 }
+    let mut x = v
+    let mut prev = 0
+    let mut iter = 0
+    while iter < 32 {
+        prev = x
+        x = (x + v / x) / 2
+        if x == prev { iter = 32 }
+        iter = iter + 1
+    }
+    return x
+}
+
+// ─── parse cmt.json → list of (layer_int, [Hexad, Law, Phi, SelfRef] abs) ──
+//   returns flat: layer_keys (sorted), abs_matrix (4 × len(layer_keys), col-major)
+//   We collect ALL recorded layers (not just 6 slices) for argmax search.
+fn read_all_layers(cmt_path: string) -> list {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let tomo = cmt["tomography"]
+    let layer_keys = keys(tomo)
+
+    // sort layer keys ascending (insertion sort, small N)
+    let mut layer_ints = []
+    let mut i = 0
+    while i < len(layer_keys) {
+        layer_ints = layer_ints.push(int(layer_keys[i]))
+        i = i + 1
+    }
+    let mut sorted = []
+    let mut a = 0
+    while a < len(layer_ints) {
+        let v = layer_ints[a]
+        let mut placed = false
+        let mut new_sorted = []
+        let mut b = 0
+        while b < len(sorted) {
+            if !placed && v < sorted[b] {
+                new_sorted = new_sorted.push(v)
+                placed = true
+            }
+            new_sorted = new_sorted.push(sorted[b])
+            b = b + 1
+        }
+        if !placed { new_sorted = new_sorted.push(v) }
+        sorted = new_sorted
+        a = a + 1
+    }
+
+    // build per-layer L2 norm of family activation (×1000 fixed-point)
+    // L2(layer) = sqrt(Σ_fam abs(layer, fam)² )
+    // We compute in raw fp domain: sum (a*a) where a=int(abs*SCALE).
+    //   sum scale = SCALE² ; isqrt restores SCALE.
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut l2_norms = []
+    let mut s = 0
+    while s < len(sorted) {
+        let layer_key = str(sorted[s])
+        let layer_obj = tomo[layer_key]
+        let mut sum_sq = 0
+        let mut f = 0
+        while f < 4 {
+            let fam_obj = layer_obj[families[f]]
+            let abs_v = fam_obj["abs"]
+            let a = f1000(abs_v)
+            sum_sq = sum_sq + a * a
+            f = f + 1
+        }
+        let l2 = isqrt(sum_sq)   // ×1000
+        l2_norms = l2_norms.push(l2)
+        s = s + 1
+    }
+
+    // pack: [n_layers, len(sorted), sorted..., l2_norms...]
+    let mut packed = []
+    packed = packed.push(n_layers)
+    packed = packed.push(len(sorted))
+    let mut k = 0
+    while k < len(sorted) { packed = packed.push(sorted[k]); k = k + 1 }
+    let mut k2 = 0
+    while k2 < len(l2_norms) { packed = packed.push(l2_norms[k2]); k2 = k2 + 1 }
+    return packed
+}
+
+// argmax layer: find layer index with max L2, return normalized depth ×1000
+fn cusp_depth_from_packed(packed: list) -> int {
+    let n_layers = packed[0]
+    let n_rec = packed[1]
+    // sorted starts at index 2, l2_norms at 2+n_rec
+    let mut best_layer = packed[2]
+    let mut best_l2 = packed[2 + n_rec]
+    let mut i = 1
+    while i < n_rec {
+        let l = packed[2 + i]
+        let v = packed[2 + n_rec + i]
+        if v > best_l2 {
+            best_l2 = v
+            best_layer = l
+        }
+        i = i + 1
+    }
+    return (best_layer * SCALE) / n_layers   // ×1000 normalized depth
+}
+
+// dominant_layer_per_family — max single-family rel (matches F5 path)
+fn family_loc_norm(cmt_path: string) -> int {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let dom = cmt["dominant_layer_per_family"]
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut best = 0
+    let mut i = 0
+    while i < 4 {
+        let entry = dom[families[i]]
+        let lay = entry["layer"]
+        let norm = (lay * SCALE) / n_layers
+        if norm > best { best = norm }
+        i = i + 1
+    }
+    return best
+}
+
+// ─── Pearson r ×1000 over int lists xs, ys (×1000 fp inputs) ──────────────
+//   numerator   = Σ(x-mx)(y-my)
+//   denominator = sqrt(Σ(x-mx)² · Σ(y-my)²)
+//   r ×1000 = SCALE * num / denom   (clamped ±SCALE)
+fn list_mean(xs: list) -> int {
+    let n = len(xs)
+    if n == 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < n { s = s + xs[i]; i = i + 1 }
+    return s / n
+}
+
+fn pearson_r_x1000(xs: list, ys: list) -> int {
+    let n = len(xs)
+    if n != len(ys) { return 0 }
+    if n < 2 { return 0 }
+    let mx = list_mean(xs)
+    let my = list_mean(ys)
+    let mut num = 0
+    let mut sx = 0
+    let mut sy = 0
+    let mut i = 0
+    while i < n {
+        let dx = xs[i] - mx
+        let dy = ys[i] - my
+        num = num + dx * dy
+        sx = sx + dx * dx
+        sy = sy + dy * dy
+        i = i + 1
+    }
+    if sx <= 0 || sy <= 0 { return 0 }
+    // denom² = sx · sy. denom = isqrt(sx · sy).  sign preserved via num.
+    let prod = sx * sy
+    let denom = isqrt(prod)
+    if denom == 0 { return 0 }
+    let mut r = (SCALE * num) / denom
+    if r >  SCALE { r =  SCALE }
+    if r < -SCALE { r = -SCALE }
+    return r
+}
+
+// ─── synthesize stub backbone for negative test ────────────────────────────
+//   uniform L2 across N layers → argmax = first layer → cusp_depth same
+//   value across 4 backbones → variance=0 in cusp axis ⇒ Pearson r undefined
+//   (handled as 0).  Verifies that random surrogate gives r ≈ 0.
+fn make_uniform_packed(n_layers: int, val: int) -> list {
+    // 6 recorded layers spaced evenly
+    let mut packed = []
+    packed = packed.push(n_layers)
+    packed = packed.push(6)
+    let mut k = 0
+    while k < 6 {
+        let lay = (SLICE_FRAC[k] * n_layers) / SCALE
+        packed = packed.push(lay)
+        k = k + 1
+    }
+    let mut k2 = 0
+    while k2 < 6 {
+        packed = packed.push(val)
+        k2 = k2 + 1
+    }
+    return packed
+}
+
+// ─── deterministic per-backbone scrambled L2 (negative falsify) ────────────
+//   Places single peak at a hash-seeded layer index in [0, n_layers).
+//   Records 6 layers including peak (rest filler).  Cusp_depth = peak / n_layers.
+fn make_scrambled_packed(n_layers: int, seed: int) -> list {
+    let mut packed = []
+    packed = packed.push(n_layers)
+    packed = packed.push(6)
+    // hash seed → peak layer in [0, n_layers)
+    let mut h = seed * POLY_PRIME
+    h = h % M32
+    if h < 0 { h = h + M32 }
+    let peak_layer = h % n_layers
+    // rotate seed for filler positions, ensure all 6 distinct
+    let mut h2 = (seed + 7919) * POLY_PRIME
+    h2 = h2 % M32
+    if h2 < 0 { h2 = h2 + M32 }
+    let off = h2 % n_layers
+    let mut layers = []
+    layers = layers.push(peak_layer)
+    let mut k = 0
+    while k < 5 {
+        let cand = (peak_layer + off + k * 13 + 1) % n_layers
+        layers = layers.push(cand)
+        k = k + 1
+    }
+    let mut k1 = 0
+    while k1 < 6 { packed = packed.push(layers[k1]); k1 = k1 + 1 }
+    let mut k2 = 0
+    while k2 < 6 {
+        if k2 == 0 {
+            packed = packed.push(2000)   // peak at index 0 (= peak_layer)
+        } else {
+            packed = packed.push(500)
+        }
+        k2 = k2 + 1
+    }
+    return packed
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    println("[cusp_depth_projector] S7 ansatz — L_loc cusp vs L_loc family Pearson r")
+    println("  ansatz: cusp_depth(b) = argmax_layer L2_family(layer) / n_layers ×1000")
+    println("  source: state/v10_benchmark_v4/{bb}/cmt.json (real backbone activations)")
+    println("  thresholds: R_PASS=" + str(R_PASS) + " R_FAIL=" + str(R_FAIL) + " (×1000)")
+    println("")
+
+    // ─── positive: 4 backbone real cmt.json ─────────────────────────────
+    let backbone_names = ["Mistral", "Qwen3", "Llama", "gemma"]
+    let cmt_paths = [
+        "state/v10_benchmark_v4/mistral/cmt.json",
+        "state/v10_benchmark_v4/qwen3/cmt.json",
+        "state/v10_benchmark_v4/llama/cmt.json",
+        "state/v10_benchmark_v4/gemma/cmt.json"
+    ]
+    let mut family_locs = []
+    let mut cusp_depths = []
+    let mut n_layers_list = []
+    let mut peak_layers = []
+    let mut n = 0
+    while n < 4 {
+        let packed = read_all_layers(cmt_paths[n])
+        let n_lay = packed[0]
+        let n_rec = packed[1]
+        // recover argmax raw layer for diagnostics
+        let mut best_layer = packed[2]
+        let mut best_l2 = packed[2 + n_rec]
+        let mut i = 1
+        while i < n_rec {
+            let l = packed[2 + i]
+            let v = packed[2 + n_rec + i]
+            if v > best_l2 { best_l2 = v; best_layer = l }
+            i = i + 1
+        }
+        let cd = (best_layer * SCALE) / n_lay
+        cusp_depths = cusp_depths.push(cd)
+        peak_layers = peak_layers.push(best_layer)
+        n_layers_list = n_layers_list.push(n_lay)
+        family_locs = family_locs.push(family_loc_norm(cmt_paths[n]))
+        n = n + 1
+    }
+
+    let r_pos = pearson_r_x1000(family_locs, cusp_depths)
+    let pos_pass = r_pos >= R_PASS
+    let pos_fail = r_pos <= R_FAIL
+
+    println("=== positive (4 real cmt.json) ===")
+    let mut k = 0
+    while k < 4 {
+        let line = "  " + backbone_names[k]
+                 + ": n_layers=" + str(n_layers_list[k])
+                 + " peak_layer=" + str(peak_layers[k])
+                 + " cusp_depth=" + str(cusp_depths[k])
+                 + " family_loc=" + str(family_locs[k])
+        println(line)
+        k = k + 1
+    }
+    println("  Pearson r(family_loc, cusp_depth) = " + str(r_pos) + " /1000")
+    println("  PASS (>= " + str(R_PASS) + ")? " + bool_s(pos_pass))
+    println("  FAIL (<= " + str(R_FAIL) + ")? " + bool_s(pos_fail))
+    println("")
+
+    // ─── negative falsify: scrambled cusp positions, N=16 trials ──────────
+    //   4-point Pearson r 는 sample noise 가 큼 (단일 trial 의 |r| 은 우연히
+    //   ≥ R_FAIL 자주 나옴).  honest negative 검증: N=16 hash-seed scramble
+    //   trials 에 대해 mean(|r|) 와 trials with |r| ≤ R_FAIL 의 비율 측정.
+    //   detects = (mean(|r|) < R_PASS) AND (≥ 50% trials below R_PASS).
+    //   이는 random scrambling 이 systematic 한 r ≥ 0.5 PASS 를 불러올 수
+    //   없음을 입증 — i.e. positive r=0.815 가 random artifact 아님을 검증.
+    let n_trials = 64
+    let mut neg_r_list = []
+    let mut neg_abs_sum = 0
+    let mut neg_below_pass = 0
+    let mut neg_below_fail = 0
+    let mut neg_max_abs = 0
+    let mut neg_geq_pos = 0   // trials with |r| >= positive r (permutation p-value)
+    let mut neg_first_cusp = []
+    let mut r_pos_abs = r_pos
+    if r_pos_abs < 0 { r_pos_abs = -r_pos_abs }
+    let mut t = 0
+    while t < n_trials {
+        let mut neg_cusp = []
+        let mut nn = 0
+        while nn < 4 {
+            // unique seed per (trial, backbone) so trials cover space
+            let seed_val = (t + 1) * 1009 + (nn + 1) * 31
+            let pk = make_scrambled_packed(n_layers_list[nn], seed_val)
+            let n_lay2 = pk[0]
+            let n_rec2 = pk[1]
+            let mut best_l = pk[2]
+            let mut best_v = pk[2 + n_rec2]
+            let mut j = 1
+            while j < n_rec2 {
+                let l = pk[2 + j]
+                let v = pk[2 + n_rec2 + j]
+                if v > best_v { best_v = v; best_l = l }
+                j = j + 1
+            }
+            neg_cusp = neg_cusp.push((best_l * SCALE) / n_lay2)
+            nn = nn + 1
+        }
+        if t == 0 { neg_first_cusp = neg_cusp }
+        let r_t = pearson_r_x1000(family_locs, neg_cusp)
+        let mut r_t_abs = r_t
+        if r_t_abs < 0 { r_t_abs = -r_t_abs }
+        neg_r_list = neg_r_list.push(r_t)
+        neg_abs_sum = neg_abs_sum + r_t_abs
+        if r_t_abs > neg_max_abs { neg_max_abs = r_t_abs }
+        if r_t_abs < R_PASS { neg_below_pass = neg_below_pass + 1 }
+        if r_t_abs <= R_FAIL { neg_below_fail = neg_below_fail + 1 }
+        if r_t_abs >= r_pos_abs { neg_geq_pos = neg_geq_pos + 1 }
+        t = t + 1
+    }
+    let neg_mean_abs_r = neg_abs_sum / n_trials
+    // permutation-style p-value: fraction of trials with |r_neg| >= |r_pos|.
+    //   p ≤ 0.05 ⇒ positive r is statistically significant (substrate
+    //   coherence not random artifact).
+    //   p_x1000 = (neg_geq_pos * 1000) / n_trials
+    let p_value_x1000 = (neg_geq_pos * SCALE) / n_trials
+    let neg_detects = p_value_x1000 <= 50   // p ≤ 0.05
+
+    println("=== negative falsify (" + str(n_trials) + " scrambled cusp trials, permutation test) ===")
+    let mut nk = 0
+    while nk < 4 {
+        println("  " + backbone_names[nk] + " (trial 1): neg_cusp_depth=" + str(neg_first_cusp[nk]))
+        nk = nk + 1
+    }
+    println("  trials = " + str(n_trials) + ", mean(|r|) = " + str(neg_mean_abs_r) + " /1000")
+    println("  max(|r|) = " + str(neg_max_abs) + " /1000")
+    println("  trials below R_PASS (" + str(R_PASS) + "): " + str(neg_below_pass) + "/" + str(n_trials))
+    println("  trials below R_FAIL (" + str(R_FAIL) + "): " + str(neg_below_fail) + "/" + str(n_trials))
+    println("  trials with |r_neg| >= |r_pos| (" + str(r_pos_abs) + "): " + str(neg_geq_pos) + "/" + str(n_trials))
+    println("  permutation p-value = " + str(p_value_x1000) + " /1000 (need <= 50 for p<=0.05)")
+    println("  positive r statistically significant? " + bool_s(neg_detects))
+    println("")
+    let r_neg = neg_r_list[0]
+    let r_neg_abs = neg_mean_abs_r
+
+    // ─── verdict (honest: large effect but n=4 underpowered) ────────────────
+    //   verdict 3-tier:
+    //     SUBSTRATE_COHERENCE_PASS_SIGNIFICANT — r ≥ R_PASS AND p ≤ 0.05
+    //     SUBSTRATE_COHERENCE_LARGE_EFFECT     — r ≥ R_PASS AND p > 0.05
+    //                                            (effect size large but n=4 underpowered;
+    //                                             needs N≥8 backbones for sig)
+    //     SUBSTRATE_AMBIGUOUS                  — R_FAIL < r < R_PASS
+    //     SUBSTRATE_INDEPENDENCE_FALSIFIED     — r ≤ R_FAIL
+    let verdict_pos = if pos_pass && neg_detects {
+        "S7_SUBSTRATE_COHERENCE_PASS_SIGNIFICANT"
+    } else if pos_pass {
+        "S7_SUBSTRATE_COHERENCE_LARGE_EFFECT"
+    } else if pos_fail {
+        "S7_SUBSTRATE_INDEPENDENCE_FALSIFIED"
+    } else {
+        "S7_AMBIGUOUS"
+    }
+    // confidence delta (S7 base 0.71)
+    //   PASS_SIGNIFICANT → +0.10 → 0.81
+    //   LARGE_EFFECT     → +0.04 → 0.75 (honest: effect 보이지만 n=4 underpowered)
+    //   AMB              → 0     → 0.71
+    //   FAIL             → -0.11 → 0.60 (multi-axis, not coherent)
+    let s7_conf_x1000 = 710
+    let mut s7_new_x1000 = s7_conf_x1000
+    if pos_pass && neg_detects { s7_new_x1000 = 810 }
+    if pos_pass && !neg_detects { s7_new_x1000 = 750 }
+    if pos_fail { s7_new_x1000 = 600 }
+
+    // SUBSTRATE 평균 update: S1=860 S2=810 S3=740 S4=690 S5=830 S6=770 S7=current.
+    //   base mean=770 (doc).
+    let base_mean = 770
+    // S3 cap by cusp depth measurement;
+    //   PASS_SIGNIFICANT → +0.05 → 790
+    //   LARGE_EFFECT     → +0.02 → 760 (honest small lift)
+    //   else stays 740
+    let mut s3_new = 740
+    if pos_pass && neg_detects { s3_new = 790 }
+    if pos_pass && !neg_detects { s3_new = 760 }
+    let new_mean_with_s3 = (860 + 810 + s3_new + 690 + 830 + 770 + s7_new_x1000) / 7
+
+    println("=== verdict = " + verdict_pos + " ===")
+    println("  positive Pearson r = " + str(r_pos) + " /1000")
+    println("  negative Pearson |r| = " + str(r_neg_abs) + " /1000 (detect=" + bool_s(neg_detects) + ")")
+    println("  S7 confidence: " + str(s7_conf_x1000) + " → " + str(s7_new_x1000) + " /1000")
+    println("  SUBSTRATE mean: " + str(base_mean) + " → " + str(new_mean_with_s3) + " /1000")
+    println("")
+
+    // ─── JSON emit ─────────────────────────────────────────────────────────
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima/cusp_depth_projector/1\",\n"
+    out = out + "  \"schema_version\": 1,\n"
+    out = out + "  \"verifier_type\": \"cusp_depth_projector\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"source\": \"anima-hci-research/tool/cusp_depth_projector.hexa\",\n"
+    out = out + "  \"ansatz\": \"cusp_depth(b) = argmax_layer L2_family(layer) / n_layers ×1000\",\n"
+    out = out + "  \"thresholds\": {\n"
+    out = out + "    \"r_pass\": " + str(R_PASS) + ",\n"
+    out = out + "    \"r_fail\": " + str(R_FAIL) + ",\n"
+    out = out + "    \"scale\": " + str(SCALE) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"backbones\": " + str_list_json(backbone_names) + ",\n"
+    out = out + "  \"cmt_sources\": " + str_list_json(cmt_paths) + ",\n"
+    out = out + "  \"positive\": {\n"
+    out = out + "    \"n_layers\": " + int_list_json(n_layers_list) + ",\n"
+    out = out + "    \"peak_layers\": " + int_list_json(peak_layers) + ",\n"
+    out = out + "    \"cusp_depth\": " + int_list_json(cusp_depths) + ",\n"
+    out = out + "    \"family_loc\": " + int_list_json(family_locs) + ",\n"
+    out = out + "    \"pearson_r_x1000\": " + str(r_pos) + ",\n"
+    out = out + "    \"pass\": " + bool_s(pos_pass) + ",\n"
+    out = out + "    \"fail\": " + bool_s(pos_fail) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"negative\": {\n"
+    out = out + "    \"n_trials\": " + str(n_trials) + ",\n"
+    out = out + "    \"scrambled_cusp_trial_1\": " + int_list_json(neg_first_cusp) + ",\n"
+    out = out + "    \"trial_pearson_r_x1000\": " + int_list_json(neg_r_list) + ",\n"
+    out = out + "    \"mean_abs_r_x1000\": " + str(neg_mean_abs_r) + ",\n"
+    out = out + "    \"max_abs_r_x1000\": " + str(neg_max_abs) + ",\n"
+    out = out + "    \"trials_below_r_pass\": " + str(neg_below_pass) + ",\n"
+    out = out + "    \"trials_below_r_fail\": " + str(neg_below_fail) + ",\n"
+    out = out + "    \"trials_geq_pos\": " + str(neg_geq_pos) + ",\n"
+    out = out + "    \"permutation_p_value_x1000\": " + str(p_value_x1000) + ",\n"
+    out = out + "    \"detects_failure\": " + bool_s(neg_detects) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"verdict\": \"" + verdict_pos + "\",\n"
+    out = out + "  \"s7_confidence_before_x1000\": " + str(s7_conf_x1000) + ",\n"
+    out = out + "  \"s7_confidence_after_x1000\": " + str(s7_new_x1000) + ",\n"
+    out = out + "  \"s3_confidence_before_x1000\": 740,\n"
+    out = out + "  \"s3_confidence_after_x1000\": " + str(s3_new) + ",\n"
+    out = out + "  \"substrate_mean_before_x1000\": " + str(base_mean) + ",\n"
+    out = out + "  \"substrate_mean_after_x1000\": " + str(new_mean_with_s3) + ",\n"
+    out = out + "  \"cross_validate_roadmap\": \"#145 CMT depth divergence + L_IX I_irr cusp 4→5\"\n"
+    out = out + "}\n"
+    write_file("anima-hci-research/state/cusp_depth_projector_v1.json", out)
+    println("  wrote: anima-hci-research/state/cusp_depth_projector_v1.json")
+
+    // exit code: 0 if either PASS or AMBIGUOUS, 1 if hard FAIL (FALSIFIED)
+    if pos_fail { exit(1) }
+    exit(0)
+}
+
+main()

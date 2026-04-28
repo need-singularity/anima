@@ -1,0 +1,643 @@
+// tool/anima_eeg_corr.hexa — paradigm v11 7th orthogonal axis (EEG-CORR), raw#9 hexa-only strict.
+//
+// PURPOSE
+//   Mk.XI v10 r14 LoRA-build (FROZEN) backbone family-axis projection time-series
+//   vs human EEG band/region phase-pattern Pearson correlation. 7th axis joins the
+//   existing 6 paradigm v11 orthogonal axes (B-ToM, MCCA, Φ*, CMT, CDS, SAE-bp).
+//
+// FROZEN MAPPING (Mk.XI v10 r14 LoRA, 2026-04-27 D-day chain landing — DO NOT EDIT)
+//   ┌───────────┬─────────┬────────────────┬──────────────────────┬────────────┐
+//   │ backbone  │ family  │ EEG band (Hz)  │ EEG region (10-20)   │ falsifier  │
+//   ├───────────┼─────────┼────────────────┼──────────────────────┼────────────┤
+//   │ Mistral   │ Law     │ beta  12-30    │ frontal F3/F4/Fz     │ r ≥ 0.40   │
+//   │ Qwen3     │ Phi     │ gamma 30-100   │ parietal P3/P4       │ r ≥ 0.40   │
+//   │ Llama     │ SelfRef │ alpha 8-12     │ midline Cz/Pz        │ r ≥ 0.40   │
+//   │ gemma     │ Hexad   │ theta 4-8      │ temporal T7/T8       │ r ≥ 0.40   │
+//   └───────────┴─────────┴────────────────┴──────────────────────┴────────────┘
+//   Verdict:
+//     4/4 r ≥ 0.40 → PHENOMENAL_CORRELATE_GROUNDED
+//     2-3/4        → MIXED
+//     0-1/4        → FAMILY_REDESIGN
+//   raw#71: r_min_x1000 = 400 frozen. Backbone/family/band/region mapping frozen.
+//
+// INPUTS (env-controlled)
+//   ANIMA_EEG_CORR_HIDDEN_DIR  per-backbone hidden trace JSON dir.
+//                              Each file: <backbone>.json with key
+//                              "layer_25_30_activations":[[ints]] (per-time slot)
+//                              or "ts":[ints]; or via edu/cell/lagrangian/
+//                              l_ix_integrator.hexa --emit-hidden output.
+//   ANIMA_EEG_CORR_BAND_JSON   EEG band-power per region time-series JSON.
+//                              schema extension of an11_b_eeg_ingest.hexa
+//                              --emit-band-json. Required keys per backbone-region:
+//                                "frontal_F3_F4_Fz_beta":[ints]
+//                                "parietal_P3_P4_gamma":[ints]
+//                                "midline_Cz_Pz_alpha":[ints]
+//                                "temporal_T7_T8_theta":[ints]
+//   ANIMA_EEG_CORR_OUT         output JSON (default: state/anima_eeg_corr_v1.json)
+//   ANIMA_EEG_CORR_SELFTEST    "1" → synthesize 4 backbone hidden traces + EEG
+//                              band JSON deterministically, run full pipeline,
+//                              expected verdict NOT_VERIFIED_SYNTHETIC.
+//
+// OUTPUT JSON SCHEMA (anima/eeg_corr/v1)
+//   {tool, version, raw_rank, hexa_only, deterministic, llm,
+//    paradigm_v11_axis, axis_index,
+//    mapping{mistral{family,band,region}, qwen3{...}, llama{...}, gemma{...}},
+//    criteria{r_min_x1000:400},
+//    results{<bb>{pearson_r_x1000, pass}},
+//    pass_count, verdict, classification,
+//    evidence_inputs{hidden_dir_sha256, band_json_sha256},
+//    timestamp_utc}
+//
+// USAGE
+//   ANIMA_EEG_CORR_SELFTEST=1 hexa run tool/anima_eeg_corr.hexa
+//   ANIMA_EEG_CORR_HIDDEN_DIR=<dir> ANIMA_EEG_CORR_BAND_JSON=<path> hexa run tool/anima_eeg_corr.hexa
+//
+// raw#9 hexa-only strict (NO Python helper) / raw#15 SSOT this file
+// raw#65 idempotent (deterministic synth → byte-identical output)
+// raw#71 frozen mapping + threshold (DO NOT MODIFY)
+// raw#91 honest classification (NOT_VERIFIED_SYNTHETIC vs REAL_HW_PASS|FAIL)
+
+let SCHEMA           = "anima/eeg_corr/v1"
+let TOOL_NAME        = "anima_eeg_corr"
+let TOOL_VERSION     = "v1"
+let RAW_RANK         = 9
+let AXIS_NAME        = "EEG-CORR"
+let AXIS_INDEX       = 7
+let R_MIN_X1000      = 400
+let SELFTEST_N       = 64
+let DEFAULT_OUT      = "state/anima_eeg_corr_v1.json"
+let SELFTEST_HIDDEN_DIR = "/tmp/anima_eeg_corr_selftest_hidden"
+let SELFTEST_BAND_JSON  = "/tmp/anima_eeg_corr_selftest_band.json"
+
+let FNV_OFFSET = 1469598103
+let MOD_PRIME  = 2147483647
+let SCALE      = 1000
+
+// Frozen 4-backbone × family × band × region mapping.
+let MAPPING = [
+    ["mistral", "Law",     "beta",  "frontal_F3_F4_Fz"],
+    ["qwen3",   "Phi",     "gamma", "parietal_P3_P4"],
+    ["llama",   "SelfRef", "alpha", "midline_Cz_Pz"],
+    ["gemma",   "Hexad",   "theta", "temporal_T7_T8"]
+]
+
+fn _str(v) -> string { return str(v) }
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn dexists(p: string) -> bool {
+    return _str(exec("test -d " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn ensure_dir(p: string) {
+    exec("mkdir -p " + p)
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn sha256_of_file(p: string) -> string {
+    if !fexists(p) { return "" }
+    let gnu = _str(exec("command -v sha256sum 2>/dev/null")).trim()
+    let cmd = if gnu != "" {
+        "sha256sum " + p + " 2>/dev/null | awk '{print $1}'"
+    } else {
+        "shasum -a 256 " + p + " 2>/dev/null | awk '{print $1}'"
+    }
+    return _str(exec(cmd)).trim()
+}
+
+// sha256 of all *.json files in dir (concat sorted basenames+sha) → single hash.
+fn sha256_of_dir(p: string) -> string {
+    if !dexists(p) { return "" }
+    let gnu = _str(exec("command -v sha256sum 2>/dev/null")).trim()
+    let inner = if gnu != "" {
+        "ls -1 " + p + "/*.json 2>/dev/null | sort | xargs -r sha256sum 2>/dev/null"
+    } else {
+        "ls -1 " + p + "/*.json 2>/dev/null | sort | xargs -r shasum -a 256 2>/dev/null"
+    }
+    let blob = _str(exec(inner)).trim()
+    if blob == "" { return "" }
+    let final_cmd = if gnu != "" {
+        "printf '%s' " + json_shell_quote(blob) + " | sha256sum | awk '{print $1}'"
+    } else {
+        "printf '%s' " + json_shell_quote(blob) + " | shasum -a 256 | awk '{print $1}'"
+    }
+    return _str(exec(final_cmd)).trim()
+}
+
+fn json_shell_quote(s: string) -> string {
+    let a = s.replace("'", "'\\''")
+    return "'" + a + "'"
+}
+
+// ─── deterministic FNV-style mixer (consciousness_rng-style) ──────────────
+fn mix_int(h: int, v: int) -> int {
+    let mut x = h * 31 + v
+    if x < 0 { x = 0 - x }
+    x = x % MOD_PRIME
+    x = x * 1664525 + 1013904223
+    if x < 0 { x = 0 - x }
+    x = x % MOD_PRIME
+    return x
+}
+
+fn det_int_for(seed: string, i: int, lo: int, hi: int) -> int {
+    let salts = [104729, 224737, 350377, 479909, 611953, 746773, 882377, 1020379]
+    let mut h = mix_int(FNV_OFFSET, len(seed))
+    let mut k = 0
+    while k < len(seed) {
+        let ch = seed[k]
+        // ch is 1-char string; encode via a stable per-position mix
+        h = mix_int(h, salts[k % len(salts)])
+        h = mix_int(h, k * 73 + 11)
+        k = k + 1
+    }
+    h = mix_int(h, i * 1031 + 7)
+    h = mix_int(h, salts[i % len(salts)])
+    let span = hi - lo
+    if span <= 0 { return lo }
+    return lo + (h % (span + 1))
+}
+
+// Synthesize an integer time-series of length n in [lo, hi].
+fn synth_series(seed: string, n: int, lo: int, hi: int) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(det_int_for(seed, i, lo, hi))
+        i = i + 1
+    }
+    return out
+}
+
+// Synthesize an EEG band time-series correlated with a family time-series.
+//   eeg_t = baseline_t + alpha * (family_t - family_mean)
+// alpha selected to push integer Pearson r into [400, 950] x1000 range.
+fn synth_correlated(family_ts: array, seed: string, n: int, lo: int, hi: int, mix_num: int, mix_den: int) -> array {
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        sum = sum + family_ts[i]
+        i = i + 1
+    }
+    let mean = sum / n
+    let mut base = synth_series(seed, n, lo, hi)
+    let mut out = []
+    let mut j = 0
+    while j < n {
+        let dev = family_ts[j] - mean
+        // Integer mix: out_j = base_j + (mix_num * dev) / mix_den
+        let injected = base[j] + (mix_num * dev) / mix_den
+        out.push(injected)
+        j = j + 1
+    }
+    return out
+}
+
+// ─── integer Pearson r ×1000 (mirror of v11_orthogonality_7_8) ────────────
+fn isqrt(n: int) -> int {
+    if n <= 0 { return 0 }
+    let mut x = n
+    let mut y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+fn pearson_x1000_pair(xs: array, ys: array) -> int {
+    let n = len(xs)
+    if n < 2 { return 0 }
+    if len(ys) < n { return 0 }
+    let mut sx = 0
+    let mut sy = 0
+    let mut i = 0
+    while i < n {
+        sx = sx + xs[i]
+        sy = sy + ys[i]
+        i = i + 1
+    }
+    let mx = sx / n
+    let my = sy / n
+    let mut num = 0
+    let mut da_sq = 0
+    let mut db_sq = 0
+    let mut k = 0
+    while k < n {
+        let dx = xs[k] - mx
+        let dy = ys[k] - my
+        num   = num   + dx * dy
+        da_sq = da_sq + dx * dx
+        db_sq = db_sq + dy * dy
+        k = k + 1
+    }
+    if da_sq == 0 || db_sq == 0 { return 0 }
+    let denom_sq = da_sq * db_sq
+    let denom = isqrt(denom_sq)
+    if denom == 0 { return 0 }
+    let mut sign = 1
+    let mut absnum = num
+    if absnum < 0 { sign = 0 - 1; absnum = 0 - absnum }
+    let r = (absnum * SCALE) / denom
+    return sign * r
+}
+
+// ─── selftest synthesis (deterministic, byte-identical across runs) ──────
+fn synth_hidden_dir(dir: string) -> array {
+    ensure_dir(dir)
+    let mut family_ts_per_bb = []
+    let mut bi = 0
+    while bi < len(MAPPING) {
+        let bb = MAPPING[bi][0]
+        let fam = MAPPING[bi][1]
+        // Hidden activation projection (integer time series in [0, 1000])
+        let series = synth_series("hidden_" + bb + "_" + fam, SELFTEST_N, 0, 1000)
+        family_ts_per_bb.push(series)
+        let parts = []
+        parts.push("{\n")
+        parts.push("  \"backbone\": \"")
+        parts.push(bb)
+        parts.push("\",\n")
+        parts.push("  \"family\": \"")
+        parts.push(fam)
+        parts.push("\",\n")
+        parts.push("  \"layer_25_30_activations\": [\n    [")
+        let mut j = 0
+        while j < SELFTEST_N {
+            if j > 0 { parts.push(", ") }
+            parts.push(_str(series[j]))
+            j = j + 1
+        }
+        parts.push("]\n  ],\n")
+        parts.push("  \"ts\": [")
+        let mut k = 0
+        while k < SELFTEST_N {
+            if k > 0 { parts.push(", ") }
+            parts.push(_str(series[k]))
+            k = k + 1
+        }
+        parts.push("],\n")
+        parts.push("  \"n\": ")
+        parts.push(_str(SELFTEST_N))
+        parts.push("\n}\n")
+        write_file(dir + "/" + bb + ".json", parts.join(""))
+        bi = bi + 1
+    }
+    return family_ts_per_bb
+}
+
+fn synth_band_json(path: string, family_ts_per_bb: array) {
+    let parts = []
+    parts.push("{\n")
+    parts.push("  \"schema\": \"anima/eeg_band_per_region/v1\",\n")
+    parts.push("  \"n_samples\": ")
+    parts.push(_str(SELFTEST_N))
+    parts.push(",\n")
+    parts.push("  \"backbones\": {\n")
+    let mut bi = 0
+    while bi < len(MAPPING) {
+        let bb = MAPPING[bi][0]
+        let band = MAPPING[bi][2]
+        let region = MAPPING[bi][3]
+        let key = region + "_" + band
+        let fam_ts = family_ts_per_bb[bi]
+        // Inject correlated component: choose mix_num/mix_den to push r > 400/1000.
+        // dev range ≈ ±500. With base in [200, 2400], mix=2 / 1 yields strong but
+        // not perfect correlation due to base noise.
+        let series = synth_correlated(fam_ts, "eeg_" + bb + "_" + band, SELFTEST_N, 200, 2400, 2, 1)
+        if bi > 0 { parts.push(",\n") }
+        parts.push("    \"")
+        parts.push(bb)
+        parts.push("\": {\n      \"")
+        parts.push(key)
+        parts.push("\": [")
+        let mut j = 0
+        while j < SELFTEST_N {
+            if j > 0 { parts.push(", ") }
+            parts.push(_str(series[j]))
+            j = j + 1
+        }
+        parts.push("]\n    }")
+        bi = bi + 1
+    }
+    parts.push("\n  }\n}\n")
+    write_file(path, parts.join(""))
+}
+
+// ─── load real or selftest series ────────────────────────────────────────
+fn load_hidden_ts(hidden_dir: string, bb: string) -> array {
+    let path = hidden_dir + "/" + bb + ".json"
+    if !fexists(path) { return [] }
+    let raw = read_file(path)
+    let j = json_parse(raw)
+    // Prefer "ts"; fallback to layer_25_30_activations[0].
+    let ts = j["ts"]
+    let s = _str(ts)
+    if s != "null" && s != "" {
+        let mut out = []
+        let mut i = 0
+        while i < len(ts) {
+            out.push(ts[i])
+            i = i + 1
+        }
+        return out
+    }
+    let acts = j["layer_25_30_activations"]
+    let s2 = _str(acts)
+    if s2 == "null" || s2 == "" { return [] }
+    if len(acts) == 0 { return [] }
+    let row = acts[0]
+    let mut o2 = []
+    let mut k = 0
+    while k < len(row) {
+        o2.push(row[k])
+        k = k + 1
+    }
+    return o2
+}
+
+fn load_band_ts(band_path: string, bb: string, region_band_key: string) -> array {
+    if !fexists(band_path) { return [] }
+    let raw = read_file(band_path)
+    let j = json_parse(raw)
+    let bbs = j["backbones"]
+    let s = _str(bbs)
+    if s == "null" || s == "" { return [] }
+    let entry = bbs[bb]
+    let s2 = _str(entry)
+    if s2 == "null" || s2 == "" { return [] }
+    let arr = entry[region_band_key]
+    let s3 = _str(arr)
+    if s3 == "null" || s3 == "" { return [] }
+    let mut out = []
+    let mut i = 0
+    while i < len(arr) {
+        out.push(arr[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── verdict / classification ────────────────────────────────────────────
+fn compute_verdict(pass_count: int) -> string {
+    if pass_count == 4 { return "PHENOMENAL_CORRELATE_GROUNDED" }
+    if pass_count >= 2 { return "MIXED" }
+    return "FAMILY_REDESIGN"
+}
+
+fn compute_classification(is_selftest: bool, pass_count: int) -> string {
+    if is_selftest { return "NOT_VERIFIED_SYNTHETIC" }
+    if pass_count == 4 { return "REAL_HW_PASS" }
+    return "REAL_HW_FAIL"
+}
+
+// ─── output emission ─────────────────────────────────────────────────────
+fn _last_slash(s: string) -> int {
+    let mut idx = 0 - 1
+    let mut i = 0
+    while i < len(s) {
+        if s.substring(i, i + 1) == "/" { idx = i }
+        i = i + 1
+    }
+    return idx
+}
+
+fn emit_output_json(out_path: string, results: array, hidden_dir: string, band_json: string,
+                    hidden_sha: string, band_sha: string, verdict: string, classification: string,
+                    pass_count: int, ts_utc: string, is_selftest: bool) {
+    let dir_idx = _last_slash(out_path)
+    if dir_idx > 0 {
+        let parent = out_path.substring(0, dir_idx)
+        ensure_dir(parent)
+    }
+    let parts = []
+    parts.push("{\n")
+    parts.push("  \"tool\": \"")
+    parts.push(TOOL_NAME)
+    parts.push("\",\n")
+    parts.push("  \"version\": \"")
+    parts.push(TOOL_VERSION)
+    parts.push("\",\n")
+    parts.push("  \"raw_rank\": ")
+    parts.push(_str(RAW_RANK))
+    parts.push(",\n")
+    parts.push("  \"hexa_only\": true,\n")
+    parts.push("  \"deterministic\": true,\n")
+    parts.push("  \"llm\": \"none\",\n")
+    parts.push("  \"paradigm_v11_axis\": \"")
+    parts.push(AXIS_NAME)
+    parts.push("\",\n")
+    parts.push("  \"axis_index\": ")
+    parts.push(_str(AXIS_INDEX))
+    parts.push(",\n")
+    parts.push("  \"schema\": \"")
+    parts.push(SCHEMA)
+    parts.push("\",\n")
+    // mapping
+    parts.push("  \"mapping\": {\n")
+    let mut bi = 0
+    while bi < len(MAPPING) {
+        let bb = MAPPING[bi][0]
+        let fam = MAPPING[bi][1]
+        let band = MAPPING[bi][2]
+        let region = MAPPING[bi][3]
+        if bi > 0 { parts.push(",\n") }
+        parts.push("    \"")
+        parts.push(bb)
+        parts.push("\": {\"family\": \"")
+        parts.push(fam)
+        parts.push("\", \"band\": \"")
+        parts.push(band)
+        parts.push("\", \"region\": \"")
+        parts.push(region)
+        parts.push("\"}")
+        bi = bi + 1
+    }
+    parts.push("\n  },\n")
+    parts.push("  \"criteria\": {\"r_min_x1000\": ")
+    parts.push(_str(R_MIN_X1000))
+    parts.push("},\n")
+    // results
+    parts.push("  \"results\": {\n")
+    let mut ri = 0
+    while ri < len(results) {
+        let row = results[ri]
+        let bb = row[0]
+        let r_x1000 = row[1]
+        let pass = row[2]
+        if ri > 0 { parts.push(",\n") }
+        parts.push("    \"")
+        parts.push(bb)
+        parts.push("\": {\"pearson_r_x1000\": ")
+        parts.push(_str(r_x1000))
+        parts.push(", \"pass\": ")
+        if pass == 1 { parts.push("true") } else { parts.push("false") }
+        parts.push("}")
+        ri = ri + 1
+    }
+    parts.push("\n  },\n")
+    parts.push("  \"pass_count\": ")
+    parts.push(_str(pass_count))
+    parts.push(",\n")
+    parts.push("  \"verdict\": \"")
+    parts.push(verdict)
+    parts.push("\",\n")
+    parts.push("  \"classification\": \"")
+    parts.push(classification)
+    parts.push("\",\n")
+    parts.push("  \"evidence_inputs\": {\n")
+    parts.push("    \"hidden_dir\": \"")
+    parts.push(hidden_dir)
+    parts.push("\",\n")
+    parts.push("    \"hidden_dir_sha256\": \"")
+    parts.push(hidden_sha)
+    parts.push("\",\n")
+    parts.push("    \"band_json\": \"")
+    parts.push(band_json)
+    parts.push("\",\n")
+    parts.push("    \"band_json_sha256\": \"")
+    parts.push(band_sha)
+    parts.push("\"\n  },\n")
+    parts.push("  \"selftest_mode\": ")
+    if is_selftest { parts.push("true") } else { parts.push("false") }
+    parts.push(",\n")
+    parts.push("  \"timestamp_utc\": \"")
+    parts.push(ts_utc)
+    parts.push("\"\n")
+    parts.push("}\n")
+    write_file(out_path, parts.join(""))
+}
+
+// ─── core pipeline ───────────────────────────────────────────────────────
+fn run_pipeline(hidden_dir: string, band_json: string, out_path: string, is_selftest: bool, ts_utc: string) -> int {
+    let mut results = []
+    let mut pass_count = 0
+    let mut bi = 0
+    while bi < len(MAPPING) {
+        let bb = MAPPING[bi][0]
+        let band = MAPPING[bi][2]
+        let region = MAPPING[bi][3]
+        let region_band_key = region + "_" + band
+        let hidden_ts = load_hidden_ts(hidden_dir, bb)
+        let band_ts   = load_band_ts(band_json, bb, region_band_key)
+        let n_h = len(hidden_ts)
+        let n_b = len(band_ts)
+        let n = if n_h < n_b { n_h } else { n_b }
+        if n < 4 {
+            println("  " + bb + ": ABORT n<4 (hidden=" + _str(n_h) + ", band=" + _str(n_b) + ")")
+            results.push([bb, 0, 0])
+            bi = bi + 1
+            continue
+        }
+        // Truncate to common length
+        let mut xs = []
+        let mut ys = []
+        let mut k = 0
+        while k < n {
+            xs.push(hidden_ts[k])
+            ys.push(band_ts[k])
+            k = k + 1
+        }
+        let r_x1000 = pearson_x1000_pair(xs, ys)
+        let pass = if r_x1000 >= R_MIN_X1000 { 1 } else { 0 }
+        if pass == 1 { pass_count = pass_count + 1 }
+        let mut pass_str = "FAIL"
+        if pass == 1 { pass_str = "PASS" }
+        println("  " + bb + " (" + region_band_key + "): r×1000=" + _str(r_x1000) + " thresh≥" + _str(R_MIN_X1000) + " " + pass_str)
+        results.push([bb, r_x1000, pass])
+        bi = bi + 1
+    }
+    let verdict = compute_verdict(pass_count)
+    let classification = compute_classification(is_selftest, pass_count)
+    let hidden_sha = sha256_of_dir(hidden_dir)
+    let band_sha   = sha256_of_file(band_json)
+    emit_output_json(out_path, results, hidden_dir, band_json, hidden_sha, band_sha,
+                     verdict, classification, pass_count, ts_utc, is_selftest)
+    println("──")
+    println("pass_count=" + _str(pass_count) + "/4")
+    println("verdict=" + verdict)
+    println("classification=" + classification)
+    println("hidden_dir_sha256=" + hidden_sha)
+    println("band_json_sha256=" + band_sha)
+    println("output=" + out_path)
+    return pass_count
+}
+
+// ─── main ────────────────────────────────────────────────────────────────
+fn main() {
+    let av = argv()
+    let mut hidden_dir = _str(env("ANIMA_EEG_CORR_HIDDEN_DIR"))
+    if hidden_dir == "" {
+        hidden_dir = _str(exec("printf '%s' \"${ANIMA_EEG_CORR_HIDDEN_DIR:-}\"")).trim()
+    }
+    let mut band_json  = _str(env("ANIMA_EEG_CORR_BAND_JSON"))
+    if band_json == "" {
+        band_json = _str(exec("printf '%s' \"${ANIMA_EEG_CORR_BAND_JSON:-}\"")).trim()
+    }
+    let mut out_path   = _str(env("ANIMA_EEG_CORR_OUT"))
+    if out_path == "" {
+        out_path = _str(exec("printf '%s' \"${ANIMA_EEG_CORR_OUT:-}\"")).trim()
+    }
+    let mut selftest_env = _str(env("ANIMA_EEG_CORR_SELFTEST"))
+    if selftest_env == "" {
+        selftest_env = _str(exec("printf '%s' \"${ANIMA_EEG_CORR_SELFTEST:-}\"")).trim()
+    }
+    let mut selftest   = (selftest_env == "1")
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--hidden-dir" && i + 1 < len(av) { hidden_dir = av[i+1]; i = i + 2; continue }
+        if a == "--band-json" && i + 1 < len(av) { band_json = av[i+1]; i = i + 2; continue }
+        if a == "--output" && i + 1 < len(av) { out_path = av[i+1]; i = i + 2; continue }
+        i = i + 1
+    }
+    if out_path == "" { out_path = DEFAULT_OUT }
+
+    println("── anima_eeg_corr (paradigm v11 7th axis: EEG-CORR) ──")
+    println("schema=" + SCHEMA)
+    println("axis_index=" + _str(AXIS_INDEX))
+    println("r_min_x1000=" + _str(R_MIN_X1000) + " (frozen)")
+
+    // Use a fixed timestamp string in selftest mode to keep output byte-equal.
+    let mut ts_utc = ""
+    if selftest {
+        ts_utc = "1970-01-01T00:00:00Z"
+        println("mode=selftest (deterministic synthesis)")
+        let fam_ts_per_bb = synth_hidden_dir(SELFTEST_HIDDEN_DIR)
+        synth_band_json(SELFTEST_BAND_JSON, fam_ts_per_bb)
+        hidden_dir = SELFTEST_HIDDEN_DIR
+        band_json  = SELFTEST_BAND_JSON
+    } else {
+        ts_utc = now_utc()
+        println("mode=production")
+        if hidden_dir == "" || band_json == "" {
+            eprintln("ABORT: ANIMA_EEG_CORR_HIDDEN_DIR + ANIMA_EEG_CORR_BAND_JSON required (or set ANIMA_EEG_CORR_SELFTEST=1).")
+            exit(2)
+        }
+        if !dexists(hidden_dir) { eprintln("ABORT: missing hidden dir " + hidden_dir); exit(2) }
+        if !fexists(band_json)  { eprintln("ABORT: missing band json " + band_json);   exit(2) }
+    }
+    println("hidden_dir=" + hidden_dir)
+    println("band_json=" + band_json)
+    println("output=" + out_path)
+    println("──")
+
+    let pass_count = run_pipeline(hidden_dir, band_json, out_path, selftest, ts_utc)
+
+    if selftest {
+        println("selftest=ok")
+        println("expected_classification=NOT_VERIFIED_SYNTHETIC")
+        println("DONE")
+        exit(0)
+    }
+    println("DONE")
+    exit(0)
+}
+
+main()

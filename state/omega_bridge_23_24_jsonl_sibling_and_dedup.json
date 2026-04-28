@@ -1,0 +1,75 @@
+{
+  "cycle": "omega_bridge_23_24",
+  "axis": "bridge / alert subscriber — JSONL sibling persistence + per-rule cooldown dedup",
+  "timestamp": "2026-04-26T22:45:00Z",
+  "user_email": "mk225599@proton.me",
+  "title": "atlas_alert_subscriber — JSONL sibling history (bridge-23) + per-rule cooldown dedup (bridge-24)",
+  "summary": "Combined cycle for two orthogonal-but-same-file features in tool/atlas_alert_subscriber.hexa. PART A (ω-bridge-23): in addition to bridge-21's TSV append, mirror every FIRED event into atlas_alert_history.jsonl as a JSON-Lines row with scope='atlas_alert' (discriminator vs scope='bridge_anomaly' / 'bridge_registry'). Independent failure handling — JSONL fault doesn't invalidate TSV success. PART B (ω-bridge-24): per-rule cooldown — same rule firing within --cooldown-minutes M of the LAST same-rule TSV row is SUPPRESSED, NOT persisted to TSV/JSONL, but emitted as a distinct __ATLAS_ALERT__ SUPPRESSED sentinel so operators can distinguish dedup from quiescence. Both features off-by-default for full backward compat with bridge-21 callers.",
+  "context": {
+    "predecessors": {
+      "omega_bridge_17": "atlas_alert_subscriber initial — JSONL stream alerter on bridge_anomaly rows",
+      "omega_bridge_19": "added time-shape rules: consecutive_warn + recent_warn_ratio",
+      "omega_bridge_21": "TSV history persistence at state/atlas_alert_history.tsv (raw 77, FIRED only). This cycle adds the JSONL sibling and the cooldown gate around the FIRED-emit path."
+    },
+    "problem_part_a": "TSV is grep-friendly but downstream tooling (jq pipelines, alerting integrations, schema-evolution-tolerant consumers) prefers JSON-Lines. bridge-16 established this dual-write pattern for bridge_anomaly; bridge-23 mirrors it for atlas_alert.",
+    "problem_part_b": "Today the same rule can re-fire repeatedly within seconds while underlying conditions persist. Floods both stdout and the history TSV. Operators want a cooldown gate so a rule that fired N minutes ago doesn't re-fire if the same N+δ check produces the same verdict."
+  },
+  "files_edited": [
+    {
+      "path": "/Users/ghost/core/nexus/tool/atlas_alert_subscriber.hexa",
+      "delta_loc": "+172 / -9",
+      "site_a_jsonl_sibling": [
+        "DEFAULT_HISTORY_JSONL constant + ATLAS_ALERT_HISTORY_JSONL env override",
+        "ALERT_SCOPE='atlas_alert' discriminator string",
+        "parallel array event_jsonl_bodies (lockstep with fired/event_rows/fired_rules)",
+        "JSON body builders per rule (warn_ratio / insufficient_ratio / consecutive_warn / recent_warn_ratio)",
+        "history-append block emits both TSV and JSONL with INDEPENDENT try/catch failure handling — TSV success not invalidated by JSONL fault and vice versa"
+      ],
+      "site_b_cooldown": [
+        "--cooldown-minutes flag + ATLAS_ALERT_COOLDOWN env (env > flag > default 0)",
+        "DEDUP_TAIL_K=20 perf bound — only scan last 20 TSV rows for same-rule history",
+        "post-rule-firing dedup block: tail TSV → strip header → for each candidate rule, walk lines reverse, find last same-rule ts, compute (now - ts) in minutes via python3 datetime.strptime, compare to cooldown_min",
+        "suppress drops the candidate from fired/event_rows/event_jsonl_bodies/fired_rules and pushes a distinct __ATLAS_ALERT__ SUPPRESSED sentinel",
+        "raw 71 honoured: SUPPRESSED is fully ephemeral — no TSV/JSONL row written"
+      ]
+    }
+  ],
+  "files_created": [],
+  "schema_extensions": {
+    "jsonl_row": {
+      "ts": "system-clock UTC at emit time (matches sibling TSV ts exactly — both written from the same now_iso variable)",
+      "scope": "atlas_alert (constant; discriminator vs other JSONL emitters)",
+      "rule": "one of warn_ratio | insufficient_ratio | consecutive_warn | recent_warn_ratio",
+      "ratio": "float — observed ratio (0.0 for streak rule which has no ratio)",
+      "threshold": "configured threshold (0 for streak which uses K instead)",
+      "last_n": "configured last-N window (0 for recent_warn_ratio which uses minutes)",
+      "sampled": "actual rows sampled",
+      "extra": "rule-specific encoded string ('' for ratio rules, 'streak=K' for consecutive_warn, 'window_minutes=M' for recent_warn_ratio)"
+    },
+    "suppressed_sentinel": "__ATLAS_ALERT__ SUPPRESSED rule=R reason=cooldown last_fired_ago_min=X cooldown_minutes=M"
+  },
+  "validation": [
+    {"step": "fixture A — FIRE → TSV + JSONL both get rows", "result": "TSV: 1 row warn_ratio; JSONL: 1 row scope=atlas_alert with all 8 fields, parses cleanly through python -m json.tool", "verdict": "PASS"},
+    {"step": "fixture B — cooldown=10, retry within window", "command": "second invocation against same fixture with --cooldown-minutes 10", "result": "__ATLAS_ALERT__ SUPPRESSED rule=warn_ratio reason=cooldown last_fired_ago_min=0.2365 cooldown_minutes=10; TSV row count stays at 1; JSONL row count stays at 1 — suppression IS ephemeral as designed", "verdict": "PASS"},
+    {"step": "fixture C — cooldown=0 disabled (backward compat)", "command": "--cooldown-minutes 0 against fresh history", "result": "FIRED normally, identical behaviour to bridge-21", "verdict": "PASS"},
+    {"step": "fixture D — multi-rule firing", "command": "--warn-threshold 0.4 --streak-threshold 2", "result": "both warn_ratio and consecutive_warn FIRED in same invocation; TSV gets 2 rows; JSONL gets 2 rows; row order matches firing order; consecutive_warn JSONL row correctly encodes ratio=0.0, threshold=0, extra=streak=2", "verdict": "PASS"},
+    {"step": "fixture E — cooldown active but TSV missing", "result": "first FIRED emits normally — no prior to compare against", "verdict": "PASS"}
+  ],
+  "validation_caveats": {
+    "remote_routing_interference": "Same as ω-cleanup-1: /Users/ghost/core/hexa-lang/hexa wrapper routes through hexa_remote when hetzner is reachable, hanging python3 sub-execs in the test path. Workaround: invoke /Users/ghost/core/hexa-lang/build/hexa_interp directly."
+  },
+  "scope_constraints_honoured": [
+    "hexa-only-suffix (raw 9): single existing tracked .hexa edited",
+    "raw 71 report-only: SUPPRESSED is ephemeral, never persisted; HISTORY_WRITE_FAIL is non-fatal sentinel",
+    "raw 73 admissibility: --cooldown-minutes / ATLAS_ALERT_COOLDOWN / ATLAS_ALERT_HISTORY_JSONL all scope-isolated",
+    "raw 77 append-only respect: TSV unchanged write semantics; new JSONL is append-only by construction (one object per line)",
+    "raw 80 sentinel: existing FIRED/PASS/SKIP shapes unchanged; new SUPPRESSED is additive",
+    "no parallel-session collision: only tool/atlas_alert_subscriber.hexa edited; cli/run.hexa, atlas_health_timeline.jsonl, n6/*, kick_*, design/kick/*, .own all untouched",
+    "no commit in anima — closure JSON written as untracked"
+  ],
+  "agent_handoff_note": "ω-bridge-23+24 was launched as a background agent that completed the .hexa edit (+172/-9) but did not commit or write closure JSON before the session terminated. Main session validated all 5 fixtures + closed the cycle directly. Closure + commit are MAIN-SESSION work; .hexa edits are AGENT-AUTHORED.",
+  "head_pinned": {
+    "nexus_at_audit_start": "a9c3feca (post-meta-2)",
+    "nexus_at_close": "(set after commit)"
+  }
+}

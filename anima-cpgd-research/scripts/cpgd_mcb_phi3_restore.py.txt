@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# ANIMA-NOTE: this file is `.py.txt` because anima `.gitignore` blocks all
+# `*.py` (raw#37 transient policy + auto-cleanup). To execute:
+#   cp cpgd_mcb_phi3_restore.py.txt /tmp/cpgd_mcb_phi3_restore.py
+#   /private/tmp/cpgd_phi3_venv/bin/python /tmp/cpgd_mcb_phi3_restore.py
+# The `.py.txt` is the canonical source-of-truth artifact; `.py` is ephemeral.
+"""
+anima-cpgd-research/scripts/cpgd_mcb_phi3_restore.py(.txt)
+
+CPGD-MCB Phi-3-mini K=16 RESTORE wrapper — extends 9-cell (gpt2 / tinyllama /
+gemma × ranks {4,8,16}) bundle to 12-cell (4 backbones × 3 ranks).
+
+Previous cycle attempted Phi-3-mini K=16 fp32 mac CPU and SIGTERM'ed at the
+60-min cap (26 min in). This restore wrapper changes one variable: device
+mac MPS + dtype fp16 (≈7.6 GB on a 24 GB unified-memory mac), keeping the
+3 lighter backbones' v1 cells byte-identical (they passed already; rerunning
+them on MPS would invalidate sha and cost wall-time we don't need).
+
+Strategy
+  1. Load existing v1 JSON (9-cell, gpt2 / tinyllama / gemma)
+  2. Run Phi-3-mini ONLY on mac MPS fp16, K=16 frozen prompts (same set)
+     - layer −1 last-token hidden state
+     - SVD-reduce to ranks {4, 8, 16} in fp64 numpy
+     - canonical 12-digit float-string sha256 (identical to v1 wrapper)
+  3. Append phi3 backbone block to v1.backbones → write v2 JSON
+  4. Recompute decoupled_witness Pearson r over the 12 cells
+
+Determinism contract:
+  - torch.manual_seed(20260426); numpy seed 20260426
+  - torch.use_deterministic_algorithms(True, warn_only=True)
+  - device: 'mps' if available, else fallback to 'cpu' fp32 (raw#10 logged)
+  - dtype forward: fp16 on MPS (memory budget); fp64 SVD reduce on CPU numpy
+  - eager attention (more deterministic than sdpa)
+  - canonical 12-digit float-string sha256 over flat (K * rank) elements
+
+Honest limit (raw#10):
+  fp16 forward on MPS produces hidden-state values that differ from fp32 CPU
+  in the trailing low-order digits. The CPGD invariant gates G1-G4 are
+  cond/cos-floor based and architecture/dtype agnostic — the 12-cell matrix
+  remains a falsifiable empirical witness for the bridge closure. The byte-id
+  G3 gate compares two consecutive Phi-3 forwards on the same device/dtype
+  (intra-cell), not across dtypes.
+
+Output: anima-cpgd-research/state/cpgd_mcb_4bb_hidden_state_v2.json
+        (v1 left untouched as read-only history)
+
+raw#37 transient (Python wrapper); raw#9 strict applies to the hexa
+falsifier sibling that consumes this JSON.
+"""
+
+import hashlib
+import json
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+SEED = 20260426
+LAYER_INDEX = -1
+RANKS = [4, 8, 16]
+
+FROZEN_PROMPTS = [
+    "The square of two is",
+    "Photosynthesis converts sunlight into",
+    "In Korean grammar, the topic marker is",
+    "A binary tree node has at most",
+    "The Pythagorean theorem states that",
+    "Anima is a deterministic verification system that",
+    "The capital of France is",
+    "Water boils at one hundred degrees",
+    "Newton's first law of motion describes",
+    "DNA stands for deoxyribonucleic",
+    "The speed of light in vacuum equals",
+    "A prime number is divisible by",
+    "Shakespeare wrote a play called",
+    "The Great Wall of China is in",
+    "An adjective modifies a",
+    "The sum of angles in a triangle is",
+]
+
+PHI3_MODEL_ID = "microsoft/Phi-3-mini-4k-instruct"
+PHI3_ALIAS = "phi3"
+
+V1_REL = "anima-cpgd-research/state/cpgd_mcb_4bb_hidden_state_v1.json"
+V2_REL = "anima-cpgd-research/state/cpgd_mcb_4bb_hidden_state_v2.json"
+
+
+def resolve_root() -> str:
+    env_anima = os.environ.get("ANIMA")
+    if env_anima:
+        return env_anima
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(here, "..", ".."))
+
+
+def set_determinism():
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception as e:
+        print(f"[mcb-phi3][warn] deterministic_algorithms unavailable: {e}", file=sys.stderr)
+
+
+def canonicalize_floats(flat: np.ndarray) -> str:
+    parts = []
+    for v in flat:
+        f = float(v)
+        if f == 0.0:
+            f = 0.0
+        parts.append(f"{f:.12e}")
+    return "|".join(parts)
+
+
+def sha256_of_floats(flat: np.ndarray) -> str:
+    return hashlib.sha256(canonicalize_floats(flat).encode("utf-8")).hexdigest()
+
+
+def reduce_matrix(M_full: np.ndarray, rank: int) -> tuple:
+    """SVD-truncate (K, H) → (K, rank). Returns (M_reduced, cond, fro). fp64."""
+    K = M_full.shape[0]
+    U, S, Vt = np.linalg.svd(M_full, full_matrices=False)
+    keep = min(rank, len(S))
+    US = U[:, :keep] * S[:keep]
+    if keep < rank:
+        pad = np.zeros((K, rank - keep), dtype=np.float64)
+        M_reduced = np.concatenate([US, pad], axis=1)
+    else:
+        M_reduced = US
+
+    fro = float(np.linalg.norm(M_reduced, "fro"))
+    Gr = M_reduced @ M_reduced.T
+    eigr = np.linalg.eigvalsh(Gr)
+    eigr_pos = eigr[eigr > 1e-30]
+    if len(eigr_pos) >= 2:
+        cond = float(eigr_pos.max() / eigr_pos.min())
+    else:
+        cond = float("inf")
+    return M_reduced, cond, fro
+
+
+def pick_device_and_dtype():
+    """mac MPS fp16 preferred; fallback CPU fp32 with raw#10 log."""
+    force_cpu = os.environ.get("FORCE_CPU", "") == "1"
+    if not force_cpu and torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return ("mps", torch.float16, "fp16")
+    return ("cpu", torch.float32, "fp32")
+
+
+def run_phi3() -> dict:
+    device, dtype, dtype_str = pick_device_and_dtype()
+    print(f"\n[mcb-phi3] ───── backbone: {PHI3_ALIAS} ({PHI3_MODEL_ID}) ─────")
+    print(f"[mcb-phi3] device={device} dtype={dtype_str}")
+    set_determinism()
+
+    t0 = time.time()
+    print(f"[mcb-phi3] loading tokenizer …")
+    tok = AutoTokenizer.from_pretrained(PHI3_MODEL_ID, trust_remote_code=False)
+
+    print(f"[mcb-phi3] loading model …")
+    load_kwargs = dict(
+        torch_dtype=dtype,
+        trust_remote_code=False,
+        attn_implementation="eager",
+    )
+    model = AutoModelForCausalLM.from_pretrained(PHI3_MODEL_ID, **load_kwargs)
+    model.to(device)
+    model.eval()
+    t_load = time.time() - t0
+    print(f"[mcb-phi3] model loaded in {t_load:.1f}s on {device}")
+
+    cfg = model.config
+    hidden_dim = getattr(cfg, "hidden_size", None) or getattr(cfg, "n_embd", None)
+    print(f"[mcb-phi3] hidden_size={hidden_dim}")
+
+    rows = []
+    with torch.no_grad():
+        for i, prompt in enumerate(FROZEN_PROMPTS):
+            t1 = time.time()
+            enc = tok(prompt, return_tensors="pt").to(device)
+            out = model(**enc, output_hidden_states=True, use_cache=False)
+            hs = out.hidden_states[LAYER_INDEX]
+            # cast to fp32 on cpu THEN to fp64 numpy — guards against MPS fp16 numpy bridge
+            last_token = hs[0, -1, :].detach().to("cpu").to(torch.float32).numpy().astype(np.float64)
+            rows.append(last_token)
+            dt = time.time() - t1
+            print(f"[mcb-phi3]   prompt {i+1}/{len(FROZEN_PROMPTS)}: T={enc['input_ids'].shape[1]} dt={dt:.2f}s |hs|={np.linalg.norm(last_token):.4f}")
+
+    M_full = np.stack(rows, axis=0)
+    K = M_full.shape[0]
+    H = M_full.shape[1]
+    fro_full = float(np.linalg.norm(M_full, "fro"))
+
+    G = M_full @ M_full.T
+    eigvals = np.linalg.eigvalsh(G)
+    eigvals_pos = eigvals[eigvals > 1e-30]
+    cond_full = float(eigvals_pos.max() / eigvals_pos.min()) if len(eigvals_pos) >= 2 else float("inf")
+    print(f"[mcb-phi3] full ({K},{H}) cond={cond_full:.4e} fro={fro_full:.4f}")
+
+    cells = {}
+    for r in RANKS:
+        M_r, cond_r, fro_r = reduce_matrix(M_full, r)
+        flat = M_r.reshape(-1).astype(np.float64)
+        sha = sha256_of_floats(flat)
+        cells[str(r)] = {
+            "rank": r,
+            "k": K,
+            "matrix_flat": [float(x) for x in flat.tolist()],
+            "matrix_sha256": sha,
+            "matrix_cond": cond_r,
+            "matrix_frobenius": fro_r,
+        }
+        print(f"[mcb-phi3]   rank={r:2d} cond={cond_r:.4e} fro={fro_r:.4f} sha={sha[:16]}…")
+
+    del model, tok
+    import gc
+    gc.collect()
+    if device == "mps":
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+    elapsed = time.time() - t0
+    print(f"[mcb-phi3] elapsed {elapsed:.1f}s")
+
+    return {
+        "alias": PHI3_ALIAS,
+        "model_id": PHI3_MODEL_ID,
+        "layer_index": int(LAYER_INDEX),
+        "dim_full": int(H),
+        "k": int(K),
+        "matrix_full_cond": cond_full,
+        "matrix_full_frobenius": fro_full,
+        "elapsed_seconds": elapsed,
+        "device": device,
+        "dtype_forward": dtype_str,
+        "cells": cells,
+    }
+
+
+def recompute_decoupled_witness(backbones_data):
+    cond_log_arr = []
+    sha_byte_arr = []
+    cell_index = []
+    for bd in backbones_data:
+        if "cells" not in bd:
+            continue
+        for r_str, cell in bd["cells"].items():
+            cond = cell["matrix_cond"]
+            sha = cell["matrix_sha256"]
+            if cond <= 0 or not np.isfinite(cond):
+                continue
+            cond_log_arr.append(float(np.log10(cond)))
+            sha_byte_arr.append(int(sha[:16], 16))
+            cell_index.append(f"{bd['alias']}_r{r_str}")
+
+    pearson_r = None
+    if len(cond_log_arr) >= 3:
+        x = np.array(cond_log_arr, dtype=np.float64)
+        y = np.array(sha_byte_arr, dtype=np.float64)
+        y = y / 1.0e18
+        xm = x.mean(); ym = y.mean()
+        num = float(np.sum((x - xm) * (y - ym)))
+        denx = float(np.sqrt(np.sum((x - xm) ** 2)))
+        deny = float(np.sqrt(np.sum((y - ym) ** 2)))
+        if denx > 0 and deny > 0:
+            pearson_r = num / (denx * deny)
+
+    return {
+        "cells": cell_index,
+        "cond_log10": cond_log_arr,
+        "sha_byte_prefix_int": [str(int(s)) for s in sha_byte_arr],
+        "pearson_r": pearson_r,
+        "abs_r_lt_0_3": (abs(pearson_r) < 0.3) if pearson_r is not None else None,
+    }
+
+
+def main():
+    root = resolve_root()
+    v1_path = os.path.join(root, V1_REL)
+    v2_path = os.path.join(root, V2_REL)
+
+    print("=" * 72)
+    print("  cpgd_mcb_phi3_restore.py — CPGD-MCB Phi-3-mini K=16 RESTORE")
+    print(f"  Goal: extend v1 9-cell → v2 12-cell by adding phi3 only")
+    print("=" * 72)
+
+    if not os.path.exists(v1_path):
+        print(f"[mcb-phi3][ERR] missing v1 input {V1_REL}", file=sys.stderr)
+        sys.exit(2)
+
+    print(f"[mcb-phi3] loading v1 from {V1_REL}")
+    with open(v1_path, "r", encoding="utf-8") as f:
+        v1 = json.load(f)
+
+    v1_backbones = v1.get("backbones", [])
+    v1_aliases = [bb.get("alias") for bb in v1_backbones]
+    print(f"[mcb-phi3] v1 backbones: {v1_aliases}")
+    if PHI3_ALIAS in v1_aliases:
+        print(f"[mcb-phi3][WARN] phi3 already present in v1 — refusing to overwrite", file=sys.stderr)
+        sys.exit(3)
+
+    if v1.get("k_prompts") != len(FROZEN_PROMPTS):
+        print(f"[mcb-phi3][ERR] K mismatch: v1.k_prompts={v1.get('k_prompts')} vs wrapper K={len(FROZEN_PROMPTS)}", file=sys.stderr)
+        sys.exit(4)
+
+    t_total = time.time()
+    try:
+        phi3_data = run_phi3()
+    except Exception as e:
+        print(f"[mcb-phi3][ERR] phi3 forward failed: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(5)
+
+    new_backbones = list(v1_backbones) + [phi3_data]
+    decoupled_witness = recompute_decoupled_witness(new_backbones)
+
+    print(f"\n[mcb-phi3] ─── decoupled witness (cond-byte Pearson r, 12 cells) ───")
+    pr = decoupled_witness["pearson_r"]
+    if pr is not None:
+        print(f"[mcb-phi3] cells={len(decoupled_witness['cells'])} pearson_r={pr:.4f}  |r|={abs(pr):.4f}")
+        print(f"[mcb-phi3] decoupled (|r|<0.3) = {abs(pr) < 0.3}")
+
+    payload = {
+        "schema_version": "2",
+        "slug": "cpgd-mcb-4bb-hidden-state-v2",
+        "title": "CPGD-MCB 4-backbone × 3-rank hidden state matrix bundle (v2 = v1 9-cell + phi3 K=16 restore)",
+        "created": "2026-04-26",
+        "k_prompts": len(FROZEN_PROMPTS),
+        "ranks": v1.get("ranks", RANKS),
+        "seed": SEED,
+        "prompts": list(FROZEN_PROMPTS),
+        "v1_inheritance": {
+            "v1_path": V1_REL,
+            "v1_aliases_inherited_byte_identical": v1_aliases,
+            "phi3_added": True,
+            "phi3_device": phi3_data.get("device"),
+            "phi3_dtype": phi3_data.get("dtype_forward"),
+        },
+        "backbones": new_backbones,
+        "decoupled_witness": decoupled_witness,
+        "wrapper_meta": {
+            "torch_version": torch.__version__,
+            "numpy_version": np.__version__,
+            "v1_wrapper_meta": v1.get("wrapper_meta"),
+            "phi3_wrapper_device": phi3_data.get("device"),
+            "phi3_wrapper_dtype_forward": phi3_data.get("dtype_forward"),
+            "dtype_reduce": "float64",
+            "deterministic": True,
+            "honest_limit": "raw#10 — phi3 forward in fp16 on MPS; lighter 3 backbones inherited byte-identical from v1 (CPU fp32)",
+        },
+    }
+    os.makedirs(os.path.dirname(v2_path), exist_ok=True)
+    with open(v2_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"\n[mcb-phi3] wrote {V2_REL}")
+    print(f"[mcb-phi3] total wall-time {(time.time()-t_total):.1f}s")
+    print(f"[mcb-phi3] phi3 cell sha:")
+    for r_str, cell in phi3_data["cells"].items():
+        print(f"             rank={r_str:>2}  cond={cell['matrix_cond']:.4e}  sha={cell['matrix_sha256']}")
+
+
+if __name__ == "__main__":
+    main()

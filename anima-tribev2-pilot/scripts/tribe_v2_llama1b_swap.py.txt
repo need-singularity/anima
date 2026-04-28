@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""tribe_v2_llama1b_swap.py — TRIBE v2 text encoder swap to Llama-3.2-1B (cross-bench).
+
+frozen 2026-04-26 — anima ω-cycle session 28+ (TRIBE v2 multi-backbone bench).
+
+PURPOSE
+-------
+TRIBE v2 의 text encoder 는 `meta-llama/Llama-3.2-3B` (specific). 본 cross-bench 는
+1B 로 swap 시 brain prediction 일반화 검증.
+
+Hypothesis (frozen):
+  - **expected**: 1B encoder 는 family separation 약화 → cortical map degeneration
+    (Pilot-T1 v2 3B 결과 대비 inter_family_r 상승 + intra_family_r 하강)
+  - **falsify**: 1B 에서도 동등 family separation (1B == 3B inter/intra r)
+  - **null**: encoder size 와 cortical separation 사이 monotone 관계 없음
+
+modes
+-----
+- `--mode=full` : full TRIBE v2 forward (GPU, HF gated Llama-3.2-1B 필요)
+  * 3B 와 동일한 pipeline, model_name 만 swap
+- `--mode=approx`: mac local deterministic encoder-dim-aware approximation
+  * 1B hidden_dim=2048 vs 3B hidden_dim=3072 차이 반영
+  * 작은 dim → 더 작은 family-specific basis projection variance → inter r 상승 시뮬
+  * raw#10 honest: approximation 은 brain prediction NOT, 단지 cross-bench 회로 검증
+- `--mode=negative`: random encoder (PRNG-only, no family signal) — falsify control
+
+raw#10 honest:
+  - approx mode 는 actual TRIBE forward NOT 이며, 본 결과는 phenomenal claim NOT
+  - 1B vs 3B 비교는 generalization 검증 회로의 구조적 정합성만 검증
+  - 실제 1B forward 는 GPU + HF gated approval 가 충족된 후에만 실행 가능
+
+Determinism:
+  - SEED=20260426; per-prompt seed = blake2b(prompt_text)
+  - 3B 와 1B 양쪽 모두 동일 SEED → cortical map 차이 = encoder 차이 only
+"""
+from __future__ import annotations
+import argparse, datetime as _dt, hashlib, json, sys, time, traceback
+from pathlib import Path
+import numpy as np
+
+SEED = 20260426
+N_VERTICES_TARGET = 20484
+FAMILIES = ["Law", "Phi", "SelfRef", "Hexad"]
+FAMILY_TO_CATEGORY = {"Law": "law", "Phi": "phi", "SelfRef": "selfref", "Hexad": "hexad"}
+
+# Llama-3.2 hidden dims (HF config.json reference)
+LLAMA_3B_HIDDEN = 3072
+LLAMA_1B_HIDDEN = 2048
+
+# TRIBE v2 layers extracted: [0, 0.2, 0.4, 0.6, 0.8, 1.0] (6 layers)
+TRIBE_TEXT_LAYERS = 6
+
+
+def utc_now() -> str:
+    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log(msg: str) -> None:
+    print(f"[{utc_now()}] {msg}", flush=True)
+
+
+def select_prompts(corpus_path: Path, n_per_family: int) -> dict:
+    by_cat = {v: [] for v in FAMILY_TO_CATEGORY.values()}
+    with corpus_path.open() as f:
+        for line in f:
+            r = json.loads(line)
+            if r.get("category") in by_cat and r.get("id", "").endswith("_en"):
+                by_cat[r["category"]].append(r)
+    selected = {}
+    for fam, cat in FAMILY_TO_CATEGORY.items():
+        items = sorted(by_cat[cat], key=lambda x: x["id"])
+        if len(items) < n_per_family:
+            raise RuntimeError(
+                f"family {fam} only {len(items)} _en items, need {n_per_family}"
+            )
+        selected[fam] = items[:n_per_family]
+    return selected
+
+
+def prompt_seed(text: str) -> int:
+    h = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(h, "big") % (2**32 - 1)
+
+
+def family_seed(family: str, base: int) -> int:
+    h = hashlib.blake2b(family.encode("utf-8"), digest_size=8).digest()
+    return (int.from_bytes(h, "big") + base) % (2**32 - 1)
+
+
+def family_basis(family: str, hidden_dim: int, n_vertices: int = N_VERTICES_TARGET) -> np.ndarray:
+    """Family-specific cortical basis vector (deterministic).
+
+    1B vs 3B 차이: hidden_dim 가 작을수록 random projection σ 가 작아 family
+    signal 이 vertex space 에 더 약하게 사상됨.
+    """
+    rng = np.random.default_rng(family_seed(family, SEED))
+    # Step 1: family hidden-dim signature
+    sig = rng.standard_normal(hidden_dim).astype(np.float64)
+    sig /= max(np.linalg.norm(sig), 1e-8)
+    # Step 2: random projection hidden_dim -> n_vertices
+    proj = rng.standard_normal((hidden_dim, n_vertices)).astype(np.float64)
+    proj /= np.sqrt(hidden_dim)  # standard random projection scaling
+    return sig @ proj  # (n_vertices,)
+
+
+def prompt_perturbation(prompt_text: str, hidden_dim: int, n_vertices: int = N_VERTICES_TARGET) -> np.ndarray:
+    """Per-prompt within-family perturbation (deterministic from prompt content)."""
+    rng = np.random.default_rng(prompt_seed(prompt_text))
+    # 작은 perturbation: hidden_dim 의 √ 에 inversely scaled
+    perturb = rng.standard_normal(n_vertices).astype(np.float64)
+    perturb /= np.sqrt(hidden_dim)
+    return perturb
+
+
+def encoder_strength_factor(hidden_dim: int, encoder_size: str) -> float:
+    """Encoder size → family signal strength (heuristic).
+
+    가설: 작은 encoder 는 family axis 에 대한 representational capacity 가 약함.
+    3B (3072 hidden) → 1.0
+    1B (2048 hidden) → ~0.667 (linear hidden ratio; honest heuristic only)
+    random → 0.0
+    """
+    if encoder_size == "random":
+        return 0.0
+    base_ratio = hidden_dim / LLAMA_3B_HIDDEN
+    return float(base_ratio)
+
+
+def synthesize_cortical_map(family: str, prompt_text: str, hidden_dim: int,
+                            encoder_size: str) -> np.ndarray:
+    """Cortical map approximation: family signal × encoder strength + perturbation.
+
+    raw#10 honest: 본 함수는 actual TRIBE forward NOT. 1B vs 3B 비교 회로의
+    encoder-size monotonicity 가설 검증만.
+    """
+    strength = encoder_strength_factor(hidden_dim, encoder_size)
+    family_component = strength * family_basis(family, hidden_dim)
+    perturb = prompt_perturbation(prompt_text, hidden_dim)
+    return family_component + perturb
+
+
+def aggregate_segments_to_map(preds: np.ndarray) -> np.ndarray:
+    if preds.ndim != 2:
+        raise ValueError(f"unexpected preds shape: {preds.shape}")
+    return preds.mean(axis=0)
+
+
+def pearson_r(a: np.ndarray, b: np.ndarray) -> float:
+    a = a.astype(np.float64).ravel()
+    b = b.astype(np.float64).ravel()
+    a -= a.mean()
+    b -= b.mean()
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def family_stats(maps: dict) -> dict:
+    fams = sorted(maps.keys())
+    intra = {}
+    for f in fams:
+        m = maps[f]
+        n = m.shape[0]
+        rs = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                rs.append(pearson_r(m[i], m[j]))
+        intra[f] = rs
+    intra_mean = {f: float(np.mean(v)) if v else 0.0 for f, v in intra.items()}
+    means = {f: maps[f].mean(axis=0) for f in fams}
+    inter = {}
+    for i, fa in enumerate(fams):
+        for fb in fams[i + 1 :]:
+            inter[f"{fa}_x_{fb}"] = pearson_r(means[fa], means[fb])
+    return {
+        "intra_family_r": {f: [round(x, 6) for x in v] for f, v in intra.items()},
+        "intra_family_r_mean": {f: round(intra_mean[f], 6) for f in fams},
+        "inter_family_r": {k: round(v, 6) for k, v in inter.items()},
+        "inter_family_r_max": round(max(inter.values()), 6) if inter else 0.0,
+        "inter_family_r_min": round(min(inter.values()), 6) if inter else 0.0,
+    }
+
+
+def determine_verdict(stats: dict) -> tuple:
+    inter = stats["inter_family_r"]
+    intra_mean = stats["intra_family_r_mean"]
+    pass_inter = any(v < 0.7 for v in inter.values())
+    pass_intra = all(v > 0.85 for v in intra_mean.values())
+    fail_high = all(v > 0.95 for v in inter.values()) if inter else False
+    flags = {
+        "passcrit_inter_lt_0p7_any": pass_inter,
+        "passcrit_intra_gt_0p85_all": pass_intra,
+        "failcrit_inter_gt_0p95_any": fail_high,
+    }
+    if fail_high:
+        v = "T1_1B_FAIL"
+    elif pass_inter and pass_intra:
+        v = "T1_1B_PASS"
+    else:
+        v = "T1_1B_INCONCLUSIVE"
+    return v, flags
+
+
+def cross_bench_compare(stats_1b: dict, stats_3b_v1: dict | None) -> dict:
+    """1B vs 3B (Pilot-T1 v1 stub baseline) comparison."""
+    if stats_3b_v1 is None:
+        return {
+            "compared": False,
+            "reason": "3B baseline (pilot_t1_result.json) unavailable",
+        }
+    delta = {}
+    for k, v_1b in stats_1b["inter_family_r"].items():
+        v_3b = stats_3b_v1["inter_family_r"].get(k)
+        if v_3b is not None:
+            delta[k] = round(v_1b - v_3b, 6)
+    intra_delta = {}
+    for f, v_1b in stats_1b["intra_family_r_mean"].items():
+        v_3b = stats_3b_v1["intra_family_r_mean"].get(f)
+        if v_3b is not None:
+            intra_delta[f] = round(v_1b - v_3b, 6)
+    inter_max_delta = round(
+        stats_1b["inter_family_r_max"] - stats_3b_v1["inter_family_r_max"], 6
+    )
+    # generalization verdict
+    if abs(inter_max_delta) < 0.05 and all(abs(v) < 0.05 for v in intra_delta.values()):
+        verdict = "GENERALIZATION_EQUIVALENT"
+    elif inter_max_delta > 0.1 or any(v < -0.1 for v in intra_delta.values()):
+        verdict = "GENERALIZATION_DEGRADED_1B_WEAKER"
+    elif inter_max_delta < -0.1 or any(v > 0.1 for v in intra_delta.values()):
+        verdict = "GENERALIZATION_INVERTED_1B_STRONGER"
+    else:
+        verdict = "GENERALIZATION_PARTIAL"
+    return {
+        "compared": True,
+        "inter_family_r_delta_1b_minus_3b": delta,
+        "intra_family_r_mean_delta_1b_minus_3b": intra_delta,
+        "inter_family_r_max_delta": inter_max_delta,
+        "generalization_verdict": verdict,
+    }
+
+
+def write_result(out_path: Path, payload: dict) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def run_full_mode(args, payload, selected, cache_dir, out_maps):
+    """Full TRIBE v2 forward with Llama-3.2-1B text encoder."""
+    try:
+        np.random.seed(SEED)
+        try:
+            import torch
+            torch.manual_seed(SEED)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(SEED)
+        except Exception:
+            pass
+        sys.path.insert(0, args.tribev2_src)
+        # Monkey-patch defaults.text_feature.model_name BEFORE import
+        from tribev2.grids import defaults as _defaults
+        _defaults.text_feature["model_name"] = "meta-llama/Llama-3.2-1B"
+        log(f"text encoder model_name patched: {_defaults.text_feature['model_name']}")
+        from tribev2.demo_utils import TribeModel
+    except Exception as e:
+        payload["verdict"] = "T1_1B_DEFERRED_IMPORT_BLOCKED"
+        payload["errors"].append({
+            "stage": "import_tribev2",
+            "exc": str(e),
+            "tb": traceback.format_exc(),
+        })
+        return payload, 12
+
+    try:
+        log(f"Loading TribeModel from {args.checkpoint} (text encoder=Llama-3.2-1B)...")
+        model = TribeModel.from_pretrained(args.checkpoint, cache_folder=str(cache_dir))
+        log("Model loaded.")
+    except Exception as e:
+        payload["verdict"] = "T1_1B_DEFERRED_MODEL_LOAD_BLOCKED"
+        payload["errors"].append({
+            "stage": "model_load",
+            "exc": str(e),
+            "tb": traceback.format_exc(),
+        })
+        return payload, 13
+
+    family_maps = {f: [] for f in FAMILIES}
+    n_vertices_actual = None
+    for fam in FAMILIES:
+        for idx, item in enumerate(selected[fam]):
+            txt = item["prompt"] + " " + item["response"]
+            stem = hashlib.sha256(item["id"].encode()).hexdigest()[:12]
+            txt_path = cache_dir / f"{stem}.txt"
+            txt_path.write_text(txt, encoding="utf-8")
+            try:
+                events = model.get_events_dataframe(text_path=str(txt_path))
+                preds, _ = model.predict(events, verbose=False)
+                pmap = aggregate_segments_to_map(preds)
+                if n_vertices_actual is None:
+                    n_vertices_actual = pmap.shape[0]
+                family_maps[fam].append(pmap)
+                log(f"OK {fam}[{idx+1}/{args.n_per_family}] id={item['id']}")
+            except Exception as e:
+                payload["errors"].append({
+                    "stage": "predict",
+                    "family": fam,
+                    "id": item["id"],
+                    "exc": str(e),
+                    "tb": traceback.format_exc()[-2000:],
+                })
+                log(f"FAIL {fam} id={item['id']}: {e!r}")
+
+    arrs = {}
+    for fam in FAMILIES:
+        if not family_maps[fam]:
+            payload["verdict"] = "T1_1B_DEFERRED_PREDICT_BLOCKED"
+            return payload, 14
+        arrs[fam] = np.stack(family_maps[fam], axis=0)
+
+    payload["n_vertices"] = int(n_vertices_actual or N_VERTICES_TARGET)
+    out_maps.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_maps, **arrs)
+    log(f"maps written: {out_maps}")
+
+    stats = family_stats(arrs)
+    verdict, flags = determine_verdict(stats)
+    payload["stats"] = stats
+    payload.update(flags)
+    payload["verdict"] = verdict
+    payload["family_mean_map_sha256"] = {
+        f: hashlib.sha256(arrs[f].mean(axis=0).astype(np.float32).tobytes()).hexdigest()
+        for f in FAMILIES
+    }
+    return payload, 0
+
+
+def run_approx_mode(args, payload, selected, encoder_size: str):
+    """Mac local deterministic encoder-dim-aware approximation."""
+    if encoder_size == "1b":
+        hidden_dim = LLAMA_1B_HIDDEN
+    elif encoder_size == "3b":
+        hidden_dim = LLAMA_3B_HIDDEN
+    elif encoder_size == "random":
+        hidden_dim = LLAMA_1B_HIDDEN  # unused (strength=0)
+    else:
+        raise ValueError(f"unknown encoder_size: {encoder_size}")
+    payload["approx_hidden_dim"] = hidden_dim
+    payload["approx_encoder_strength_factor"] = encoder_strength_factor(hidden_dim, encoder_size)
+    log(f"approx mode: encoder_size={encoder_size} hidden_dim={hidden_dim} "
+        f"strength={payload['approx_encoder_strength_factor']:.4f}")
+
+    family_maps = {f: [] for f in FAMILIES}
+    for fam in FAMILIES:
+        for item in selected[fam]:
+            txt = item["prompt"] + " " + item["response"]
+            pmap = synthesize_cortical_map(fam, txt, hidden_dim, encoder_size)
+            family_maps[fam].append(pmap)
+        log(f"family={fam} synthesized n={len(family_maps[fam])}")
+
+    arrs = {f: np.stack(v, axis=0) for f, v in family_maps.items()}
+    payload["n_vertices"] = int(arrs[FAMILIES[0]].shape[1])
+    stats = family_stats(arrs)
+    verdict, flags = determine_verdict(stats)
+    payload["stats"] = stats
+    payload.update(flags)
+    payload["verdict"] = verdict
+    payload["family_mean_map_sha256"] = {
+        f: hashlib.sha256(arrs[f].mean(axis=0).astype(np.float32).tobytes()).hexdigest()
+        for f in FAMILIES
+    }
+    return payload, arrs
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--corpus", default="experiments/alm_r14/corpus_alm_r14_v1.jsonl")
+    ap.add_argument("--tribev2-src", default="references/tribev2")
+    ap.add_argument("--n-per-family", type=int, default=16)
+    ap.add_argument("--mode", choices=["full", "approx", "negative"], default="approx")
+    ap.add_argument("--encoder-size", choices=["1b", "3b", "random"], default="1b")
+    ap.add_argument("--out-result", required=True)
+    ap.add_argument("--out-maps", default=None)
+    ap.add_argument("--cache-dir", default="./tribe_cache_1b")
+    ap.add_argument("--checkpoint", default="facebook/tribev2")
+    ap.add_argument("--baseline-3b", default=None,
+                    help="Path to Pilot-T1 v1 result JSON for cross-bench comparison")
+    args = ap.parse_args()
+
+    t0 = time.time()
+    out_result = Path(args.out_result)
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "frozen_at": "2026-04-26",
+        "mode": args.mode,
+        "encoder_size": args.encoder_size,
+        "seed": SEED,
+        "n_per_family": args.n_per_family,
+        "n_vertices": N_VERTICES_TARGET,
+        "family_to_category": FAMILY_TO_CATEGORY,
+        "checkpoint": args.checkpoint,
+        "encoder_model": "meta-llama/Llama-3.2-1B" if args.encoder_size == "1b"
+                         else "meta-llama/Llama-3.2-3B" if args.encoder_size == "3b"
+                         else "random_PRNG_only",
+        "encoder_hidden_dim": LLAMA_1B_HIDDEN if args.encoder_size == "1b"
+                              else LLAMA_3B_HIDDEN if args.encoder_size == "3b"
+                              else 0,
+        "omega_cycle": {
+            "iteration": 1,
+            "step1_design": "frozen H0 + cross-bench protocol",
+            "step2_implement": "scripts/tribe_v2_llama1b_swap.py.txt",
+            "step3_positive_selftest": "Mk.XI v10 4-family × 16 prompts approx mode",
+            "step4_negative_falsify": "encoder_size=random → degenerate cortical map",
+            "step5_byte_identical": "deterministic seed-driven (verifiable)",
+            "step6_iterate": "pending GPU pod for full-mode 1B forward",
+        },
+        "verdict": "T1_1B_PENDING",
+        "errors": [],
+        "raw_10_honest": [
+            f"mode={args.mode}: " + (
+                "approx mode 는 actual TRIBE forward NOT, encoder-dim-aware approximation."
+                if args.mode == "approx" else
+                "full mode 는 GPU pod + HF gated Llama-3.2-1B 승인 후에만 실행 가능."
+                if args.mode == "full" else
+                "negative mode 는 PRNG-only encoder, family signal NOT."
+            ),
+            "1B vs 3B 비교는 generalization 검증 회로의 구조적 정합성만 검증.",
+            "본 결과는 phenomenal claim NOT (Mk.XI v10 raw#10 honest 정책).",
+            "actual 1B forward 는 future cycle (GPU + HF approval) 이후만 authoritative.",
+        ],
+    }
+
+    try:
+        selected = select_prompts(Path(args.corpus), args.n_per_family)
+        payload["prompt_counts"] = {f: len(v) for f, v in selected.items()}
+        log(f"prompts selected: {payload['prompt_counts']}")
+    except Exception as e:
+        payload["verdict"] = "T1_1B_DEFERRED_CORPUS_BLOCKED"
+        payload["errors"].append({
+            "stage": "select_prompts",
+            "exc": str(e),
+            "tb": traceback.format_exc(),
+        })
+        write_result(out_result, payload)
+        return 11
+
+    arrs = None
+    if args.mode == "full":
+        if args.encoder_size != "1b":
+            log("WARNING: full mode only supports encoder-size=1b for this swap script")
+        out_maps = Path(args.out_maps) if args.out_maps else (
+            out_result.parent / "tribe_v2_llama1b_maps.npz"
+        )
+        payload, rc = run_full_mode(args, payload, selected, cache_dir, out_maps)
+        if rc != 0:
+            payload["elapsed_seconds"] = round(time.time() - t0, 2)
+            write_result(out_result, payload)
+            return rc
+    elif args.mode in ("approx", "negative"):
+        encoder_size = "random" if args.mode == "negative" else args.encoder_size
+        payload["encoder_size"] = encoder_size
+        payload["encoder_model"] = (
+            "meta-llama/Llama-3.2-1B" if encoder_size == "1b"
+            else "meta-llama/Llama-3.2-3B" if encoder_size == "3b"
+            else "random_PRNG_only"
+        )
+        payload, arrs = run_approx_mode(args, payload, selected, encoder_size)
+        if args.out_maps:
+            out_maps = Path(args.out_maps)
+            out_maps.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(out_maps, **arrs)
+            log(f"maps written: {out_maps}")
+
+    # Cross-bench: 1B vs 3B baseline
+    if args.baseline_3b and Path(args.baseline_3b).exists():
+        try:
+            with Path(args.baseline_3b).open() as f:
+                baseline = json.load(f)
+            stats_3b = baseline.get("stats")
+            payload["cross_bench_vs_3b"] = cross_bench_compare(payload["stats"], stats_3b)
+            log(f"cross-bench verdict: {payload['cross_bench_vs_3b'].get('generalization_verdict')}")
+        except Exception as e:
+            payload["cross_bench_vs_3b"] = {
+                "compared": False,
+                "reason": f"baseline load failed: {e!r}",
+            }
+    else:
+        payload["cross_bench_vs_3b"] = {
+            "compared": False,
+            "reason": "baseline-3b not provided",
+        }
+
+    payload["elapsed_seconds"] = round(time.time() - t0, 2)
+    write_result(out_result, payload)
+    log(f"verdict={payload['verdict']} elapsed={payload['elapsed_seconds']}s")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

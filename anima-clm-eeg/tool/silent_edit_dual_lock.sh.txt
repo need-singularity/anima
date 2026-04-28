@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# silent_edit_dual_lock.sh — Path A frozen v1+v1.1 산출물 silent edit 재발 방지
+#
+# Dual-lock strategy (two orthogonal mechanisms):
+#   (L1) chflags uchg  — OS-level user immutable flag
+#                        * write/truncate/rename/delete 모두 차단 (root 도 chflags nouchg 선행 필요)
+#                        * 잠재적 silent-edit attempt 가 즉시 OS error 로 surface (EPERM)
+#                        * file-system feature, repo 외부 actor (Claude / IDE / build script) 에 효과
+#   (L2) git add (track) — VCS-level drift detection
+#                        * untracked file 은 silent edit 후 git diff 가 잡지 못함 (#61 v1.1.json case)
+#                        * tracked 가 되면 향후 silent edit 시 working-tree diff 로 즉시 surface
+#                        * commit 은 본 script 에서 실행 X (사용자 명시 승인 후 manual)
+#
+# Orthogonality 분석:
+#   - L1 (chflags) 는 file-system layer 에서 'edit 자체 차단' (defense-in-depth: prevention)
+#   - L2 (git add)  는 VCS layer 에서 'edit 발생 후 detection' (defense-in-depth: detection)
+#   - L1 단독은 untracked drift detection 불가 (#61 v1.1 trajectory)
+#   - L2 단독은 actor 가 chflags 없는 file 을 silently edit 후 stage 하면 missing
+#   - 두 layer 직교: edit 시도 → L1 차단 → 실패 surface (immediate); L1 우회/해제 후 edit → L2 detection (delayed)
+#
+# Usage:
+#   DRY_RUN=1 bash silent_edit_dual_lock.sh.txt   # plan 만 출력, 실행 X (default; verify 용)
+#   CHFLAGS_AI_ACK=1 bash silent_edit_dual_lock.sh.txt   # 실제 lock 적용 (사용자 명시 승인 후)
+#
+# 안전망:
+#   - 8 file 중 하나라도 missing → abort (positive prerequisite)
+#   - chflags uchg 실패 시 abort (do not partial-lock)
+#   - git add 는 commit X (사용자 승인 후 manual)
+#   - DRY_RUN=1 default, CHFLAGS_AI_ACK=1 명시 X 면 plan-only
+
+set -euo pipefail
+
+REPO_ROOT="/Users/ghost/core/anima"
+DRY_RUN="${DRY_RUN:-1}"
+CHFLAGS_AI_ACK="${CHFLAGS_AI_ACK:-0}"
+
+# 8 target files (frozen v1 + v1.1 산출물)
+declare -a TARGETS=(
+  "anima-clm-eeg/state/clm_eeg_pre_register_v1.json"
+  "anima-clm-eeg/state/clm_eeg_pre_register_v1_1.json"
+  "anima-clm-eeg/tool/clm_eeg_synthetic_fixture.hexa"
+  "anima-clm-eeg/tool/clm_eeg_p1_lz_pre_register.hexa"
+  "anima-clm-eeg/tool/clm_eeg_p2_tlr_pre_register.hexa"
+  "anima-clm-eeg/tool/clm_eeg_p3_gcg_pre_register.hexa"
+  "anima-clm-eeg/tool/clm_eeg_harness_smoke.hexa"
+  "anima-clm-eeg/fixtures/synthetic_16ch_v1.json"
+)
+
+cd "$REPO_ROOT"
+
+echo "=== silent_edit_dual_lock.sh ==="
+echo "REPO_ROOT      = $REPO_ROOT"
+echo "DRY_RUN        = $DRY_RUN  (1=plan-only, 0=execute)"
+echo "CHFLAGS_AI_ACK = $CHFLAGS_AI_ACK  (must be 1 to apply chflags)"
+echo "target_count   = ${#TARGETS[@]}"
+echo ""
+
+# Step A: positive prerequisite — 8 file 모두 존재 verify
+echo "--- step A: existence verify (positive prerequisite) ---"
+missing=0
+for rel in "${TARGETS[@]}"; do
+  if [[ -f "$rel" ]]; then
+    sha=$(shasum -a 256 "$rel" | awk '{print $1}')
+    flags=$(ls -lO "$rel" | awk '{print $5}')
+    echo "OK  $rel  sha=${sha:0:12}  flags=$flags"
+  else
+    echo "MISS $rel"
+    missing=$((missing+1))
+  fi
+done
+if [[ "$missing" -gt 0 ]]; then
+  echo ""
+  echo "ABORT: $missing file(s) missing. Lock NOT applied."
+  exit 2
+fi
+echo ""
+
+# Step B: git track plan (L2)
+echo "--- step B: git track plan (L2 / VCS-level detection) ---"
+declare -a TO_GIT_ADD=()
+for rel in "${TARGETS[@]}"; do
+  if git ls-files --error-unmatch "$rel" >/dev/null 2>&1; then
+    echo "tracked      $rel"
+  else
+    echo "untracked    $rel  (will git add)"
+    TO_GIT_ADD+=("$rel")
+  fi
+done
+echo "to_git_add_count=${#TO_GIT_ADD[@]}"
+echo ""
+
+# Step C: chflags uchg plan (L1)
+echo "--- step C: chflags uchg plan (L1 / OS-level prevention) ---"
+declare -a TO_CHFLAGS=()
+for rel in "${TARGETS[@]}"; do
+  flags=$(ls -lO "$rel" | awk '{print $5}')
+  if [[ "$flags" == *"uchg"* ]]; then
+    echo "already_uchg  $rel"
+  else
+    echo "needs_uchg    $rel"
+    TO_CHFLAGS+=("$rel")
+  fi
+done
+echo "to_chflags_count=${#TO_CHFLAGS[@]}"
+echo ""
+
+# Gate: DRY_RUN + CHFLAGS_AI_ACK
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "DRY_RUN=1 → plan-only, no mutation. Re-run with DRY_RUN=0 CHFLAGS_AI_ACK=1 to apply."
+  exit 0
+fi
+
+if [[ "$CHFLAGS_AI_ACK" != "1" ]]; then
+  echo "ABORT: CHFLAGS_AI_ACK!=1. chflags uchg 는 file-system level mutation. 실행하려면 CHFLAGS_AI_ACK=1 필요."
+  exit 3
+fi
+
+# Step D: execute (chflags first, then git add)
+echo "--- step D: execute (chflags uchg + git add) ---"
+
+# D.1 chflags uchg (L1)
+for rel in "${TO_CHFLAGS[@]}"; do
+  echo "chflags uchg  $rel"
+  chflags uchg "$rel" || { echo "FAIL chflags $rel"; exit 4; }
+done
+
+# D.2 git add (L2) — commit X (사용자 승인 후 manual)
+for rel in "${TO_GIT_ADD[@]}"; do
+  echo "git add       $rel"
+  git add "$rel" || { echo "FAIL git add $rel"; exit 5; }
+done
+
+echo ""
+echo "--- step E: post-lock verify ---"
+for rel in "${TARGETS[@]}"; do
+  flags=$(ls -lO "$rel" | awk '{print $5}')
+  tracked="no"
+  git ls-files --error-unmatch "$rel" >/dev/null 2>&1 && tracked="yes"
+  staged="no"
+  git diff --cached --name-only -- "$rel" 2>/dev/null | grep -qx "$rel" && staged="yes"
+  echo "verify  $rel  flags=$flags  tracked=$tracked  staged=$staged"
+done
+
+echo ""
+echo "DONE. dual-lock applied. NOTE: git commit 는 본 script 에서 실행 X — 사용자 명시 승인 후 manual."
+echo "      chflags 해제: 'sudo chflags nouchg <file>' (사용자 명시 의도 시에만)"

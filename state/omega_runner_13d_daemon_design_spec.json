@@ -1,0 +1,266 @@
+{
+  "cycle": "omega_runner_13d",
+  "axis": "runner / hexa-daemon design (NOT implementation)",
+  "timestamp": "2026-04-26T22:30:00Z",
+  "user_email": "mk911tb@proton.me",
+  "title": "design specification for cross-invocation hexa-daemon (E1-E4 phasing)",
+  "verdict": "DESIGN_FROZEN_IMPLEMENT_OPTIONAL",
+  "headline": "Daemon design is complete and implementable; HONEST verdict is DO-NOT-IMPLEMENT-NOW because no current workload uses HEXA_REMOTE_DOCKER=1 in batch — savings would be theoretical until a docker-mode batch workload appears. Design is preserved for the moment one does.",
+  "context": {
+    "predecessors": {
+      "omega_runner_13_phase_a": "established bench harness (with /bin/true fixture bug, corrected in 13b)",
+      "omega_runner_13b": "proved persistent FIFO docker-exec achieves p50=1-3ms vs fresh ~80ms (25-50× speedup). Single-process, single-session FIFO POC.",
+      "omega_runner_13c": "audit-only close — bridge_health.sh runs hexa LOCALLY on host, not via docker exec; the 13b speedup applies only to docker-exec floor. Daemonization deferred to 13d as a dedicated cycle."
+    },
+    "this_cycle_scope": "DESIGN ONLY. Produce a complete spec a future ω-runner-13e can implement directly. No daemon code is written this cycle. The deliverable is this closure JSON plus an optional design-print .hexa for human browsing."
+  },
+  "head_pinned": {
+    "nexus_at_design_start": "423823514908e1639b248acfe300ecb5b566d699",
+    "anima_pin": "n/a (no commit in anima per PSC convention)"
+  },
+  "design": {
+    "1_lifecycle": {
+      "model": "lazy-spawn-on-first-request, idle-timeout-stop. NOT launchd-always-on.",
+      "rationale": "Always-on launchd KeepAlive reserves resources for workloads that may never run; lazy-spawn matches the actual usage pattern (sweeps run on demand, then idle). Idle-timeout (default 600s) reaps the daemon when unused.",
+      "start": {
+        "trigger": "client (hexa_remote or wrapper) checks for live socket; if dead/missing, attempts to acquire spawn lock and exec daemon binary",
+        "spawn_method": "double-fork + setsid to detach from client TTY; client returns when socket accepts a PING (with 2s budget)",
+        "reaper": "daemon traps SIGCHLD on its interp children; on parent exit, all children die"
+      },
+      "stop": {
+        "idle_timeout": "HEXA_DAEMON_IDLE_SECS (default 600). Daemon tracks last_request_ts; if now - last > idle, exit cleanly.",
+        "explicit": "client may send LINE `__SHUTDOWN__\\n`; daemon flushes in-flight requests, closes socket, removes pid+sock+lock, exits.",
+        "signal": "SIGTERM → graceful (same as __SHUTDOWN__). SIGKILL → unclean; recovery handled by next client via stale-detection."
+      },
+      "filesystem_layout": {
+        "base_dir": "$HOME/.hx/run/  (already exists on this host; consistent with hexa-lang convention)",
+        "pid_file": "$HOME/.hx/run/hexa_daemon.pid",
+        "socket": "$HOME/.hx/run/hexa_daemon.sock",
+        "lock_file": "$HOME/.hx/run/hexa_daemon.lock  (flock LOCK_EX | LOCK_NB at spawn, held by daemon for life)",
+        "log_file": "$HOME/.hx/log/hexa_daemon.log  (rotating, simple append; no syslog dep)"
+      },
+      "lock_rationale": "Two clients racing the spawn must produce exactly one daemon. flock(LOCK_EX|LOCK_NB) on $HOME/.hx/run/hexa_daemon.lock — the loser falls back to retry-connect-with-backoff (3 tries × 200ms)."
+    },
+    "2_ipc_protocol": {
+      "transport": "Unix domain socket (SOCK_STREAM) at $HOME/.hx/run/hexa_daemon.sock",
+      "rationale_vs_alternatives": "FIFO/named-pipe is multi-writer-unsafe and one-shot per open. TCP/localhost adds firewall+port-bind concerns and is reachable by other local users. Unix socket gives kernel-enforced same-host scope, file-perm authentication, and bidirectional bytestream — the cleanest match.",
+      "wire_format": "length-prefixed JSON: 4-byte big-endian unsigned length, then UTF-8 JSON object. Bidirectional. Client sends one request frame, daemon sends one response frame, then connection closes. Connection-per-request keeps state-machine trivial.",
+      "rationale_vs_line_protocol": "Line protocol (mirror of 13b) loses on (a) embedded newlines in stdin/stdout payloads requiring escape, (b) no clean way to multiplex stderr, (c) JSON gives free schema-evolution. 4-byte length prefix is 1ms cheaper than scanning for sentinel and avoids any in-band collision risk.",
+      "request_schema": {
+        "v": 1,
+        "op": "RUN | PING | SHUTDOWN | STATUS",
+        "cmd": ["hexa", "run", "tool/foo.hexa", "--selftest"],
+        "cwd": "/Users/ghost/core/nexus",
+        "env": {"HEXA_ARGV": "--quiet", "HEXA_RESOLVER_NO_REROUTE": "1"},
+        "stdin": "base64-encoded bytes (empty string if none)",
+        "timeout_ms": 30000,
+        "id": "uuid-or-monotonic-counter (echoed in response for client correlation)"
+      },
+      "response_schema": {
+        "v": 1,
+        "id": "(echoed)",
+        "exit_code": 0,
+        "stdout": "base64-encoded bytes",
+        "stderr": "base64-encoded bytes",
+        "wall_ms": 47,
+        "spawn_ms": 12,
+        "error": null
+      },
+      "control_ops": {
+        "PING": "request {op:PING}; response {ok:true, daemon_pid:N, uptime_s:S, served:K}",
+        "STATUS": "PING + {idle_s, in_flight, last_request_ts}",
+        "SHUTDOWN": "request {op:SHUTDOWN}; daemon ACKs then exits after draining"
+      },
+      "framing_correctness_note": "4-byte length is unsigned big-endian; max frame size 16 MiB (hard cap, daemon rejects larger with error frame to prevent OOM)."
+    },
+    "3_recovery_health": {
+      "client_side_timeout": "every RUN has a per-request timeout_ms (default 30000). On timeout: client closes socket, marks daemon as suspect, falls back to fresh-exec for THIS request, records suspect-count.",
+      "suspect_threshold": "after 3 consecutive timeouts within 60s, client treats socket as dead, removes stale pid/sock, attempts fresh spawn.",
+      "stale_detection": [
+        "pid_file exists but kill(pid, 0) fails with ESRCH → stale → cleanup + respawn",
+        "socket exists but connect() fails with ECONNREFUSED → stale → cleanup + respawn",
+        "socket connect() succeeds but PING times out at 2s → suspect → fall back this call, mark for next-cycle cleanup"
+      ],
+      "ping_pong": "PING op exists but is NOT used as a periodic keepalive — clients PING once before each RUN only if last successful RUN was > 60s ago (avoids amortizing PING cost into the savings the daemon is supposed to provide).",
+      "restart_policy": "manual on intentional shutdown (next client respawns lazily). NO launchd KeepAlive — see 1_lifecycle rationale.",
+      "crash_recovery_invariant": "client RUN must NEVER hang indefinitely. Worst case: timeout fires → fresh-exec fallback → request still completes. Daemon failure is degradation, not denial."
+    },
+    "4_auth_trust": {
+      "primary_mechanism": "Unix socket file mode 0600, owned by $UID, in directory $HOME/.hx/run/ also mode 0700.",
+      "kernel_enforced_invariant": "On macOS+Linux, only the owning UID can connect() to a 0600 socket. Other local users get EACCES.",
+      "defense_in_depth": [
+        "daemon calls getpeereid() (macOS) / SO_PEERCRED (Linux) on every accept(); if peer_uid != getuid() → close + log warn + drop request",
+        "directory $HOME/.hx/run/ pre-created with mode 0700 by daemon (mkdir + chmod), so even if root weakens the socket, the dir gates traversal",
+        "no shared-secret auth in v1 — would add complexity for marginal gain on single-user hosts; revisit in v2 if a multi-tenant target appears"
+      ],
+      "threat_model_decision": "Same-uid-on-same-host is the trust boundary. Anything inside is implicit-trust (matches existing hexa_remote model)."
+    },
+    "5_state_isolation": {
+      "decision": "Daemon is a request ORCHESTRATOR. Each RUN forks-execs a FRESH hexa-interp child. Daemon process itself never imports hexa-lang internals.",
+      "rationale": "ω-runner-13c flagged interpreter-side state-leak as the open question for in-process amortization. Forking a fresh interp per request eliminates that risk entirely AT THE COST of losing the ~35ms host-side hexa-startup amortization. The remaining savings come from docker-exec floor amortization (when used) and elimination of the per-call hexa_remote overhead (resolver, env-prep, ssh handshake if applicable).",
+      "implication": "Daemon savings = (per-call docker-exec floor savings via persistent docker-exec coproc inside daemon) + (per-call hexa_remote setup elimination). NOT (host-side hexa-interp startup savings). This narrows the candidate workloads — see section 9.",
+      "alternative_rejected": "in-process hexa eval with module-system reset hook: requires hexa-lang change (out of nexus scope), high engineering cost, and one missed reset hook silently corrupts cross-request state. Fork-per-request is the safe default and is what 13c implicitly recommended.",
+      "docker_exec_amortization_inside_daemon": "Daemon at startup spawns ONE persistent `docker exec -i $C sh` coproc per configured remote target (using 13b's FIFO pattern). For RUN ops whose resolved transport is docker-exec, daemon multiplexes through the existing coproc. Cross-target requests use distinct coprocs."
+    },
+    "6_integration_contract": {
+      "client_detection": "single env var: HEXA_DAEMON_SOCK. If set and non-empty AND ping-ok → route through socket. Else → existing fresh-exec path. Operator-toggleable without modifying hexa_remote code.",
+      "auto_discovery": "if HEXA_DAEMON_SOCK is unset BUT $HOME/.hx/run/hexa_daemon.sock exists AND is a socket AND PING returns ok within 200ms → use it (opportunistic). This is a minor convenience and CAN be disabled by HEXA_DAEMON_SOCK=NONE.",
+      "hexa_remote_patch_scope": "minimal: detect socket + length-prefixed JSON request + length-prefixed JSON response. ~30-50 LoC near L1228 (the existing HEXA_REMOTE_DOCKER branch). Falls back unchanged if socket absent.",
+      "operator_toggle_examples": [
+        "HEXA_DAEMON_SOCK=$HOME/.hx/run/hexa_daemon.sock hexa_remote ...   # opt in",
+        "HEXA_DAEMON_SOCK=NONE hexa_remote ...                              # opt out (forces fresh)",
+        "(unset) hexa_remote ...                                            # auto-discover"
+      ],
+      "wrapper_hexa_remote_relation": "scripts/bin/hexa_remote remains the canonical client; daemon is invisible to scripts that already use hexa_remote. Scripts calling `$HEXA_BIN run` directly (like bridge_health.sh L248) bypass the daemon — by design, since 13c showed bridge_health.sh's bottleneck is host-local startup, not docker-exec floor."
+    },
+    "7_threat_model": {
+      "in_scope": {
+        "compromised_socket_or_dir_perms": "mitigated by mode 0700 dir + 0600 sock + getpeereid() check",
+        "stale_pid_or_socket_after_crash": "mitigated by kill(pid,0) probe + connect-with-2s-PING + cleanup-and-respawn under flock",
+        "race_on_spawn": "mitigated by flock LOCK_EX|LOCK_NB on lock_file; loser retries connect"
+      },
+      "accepted_residual": {
+        "compromised_daemon_process": "if attacker code runs as $UID and ptrace-attaches the daemon, all subsequent requests are exposed. Mitigation: same trust domain as the user's shell; equivalent to attacker already owning the user account.",
+        "compromised_hexa_binary": "out of scope; same as fresh-exec model"
+      },
+      "explicitly_out_of_scope": [
+        "multi-tenant hosts (would need shared-secret auth + per-tenant socket dirs)",
+        "container escape via daemon (daemon never runs in privileged container; if user opts to run daemon inside container, they accept that boundary)",
+        "side-channel timing attacks across requests (no hardening; same as fresh-exec)"
+      ]
+    },
+    "8_failure_modes": [
+      {"mode": "daemon crashed; pid file stale", "detect": "kill(pid,0) ESRCH", "recover": "remove pid+sock+lock; respawn under flock"},
+      {"mode": "socket exists but daemon dead", "detect": "connect() ECONNREFUSED", "recover": "remove sock; respawn"},
+      {"mode": "daemon hung (deadlock or infinite loop)", "detect": "PING timeout 2s; or per-request timeout_ms", "recover": "client falls back to fresh-exec for current request; if 3 timeouts in 60s, force-cleanup + respawn"},
+      {"mode": "two clients race-spawn", "detect": "flock contention", "recover": "loser retries connect 3× 200ms"},
+      {"mode": "socket file mode tampered to 0666", "detect": "daemon's accept-time getpeereid() rejects non-self uid", "recover": "log warn; drop connection; alert via stderr"},
+      {"mode": "frame > 16 MiB", "detect": "length prefix exceeds cap", "recover": "daemon sends error frame {error: 'frame_too_large'}; closes connection; no state corruption"},
+      {"mode": "child interp hangs past timeout_ms", "detect": "daemon's per-request timer fires", "recover": "daemon SIGKILLs child; returns {exit_code: -1, error: 'timeout'} to client"},
+      {"mode": "disk full while writing log", "detect": "write() ENOSPC", "recover": "daemon swallows log error; serves requests (logs are best-effort)"},
+      {"mode": "rapid spawn-stop-spawn loop", "detect": "pid_file mtime delta < 1s on 5+ spawns", "recover": "daemon writes warning to log; this is operator misconfiguration, not a daemon-level recovery target"}
+    ],
+    "9_performance_ceiling_reestimate": {
+      "daemon_overhead_per_request": {
+        "socket_dial_unix": "1-2 ms (uds, same host)",
+        "frame_serialize_json": "<1 ms for typical request (1-4 KB)",
+        "frame_deserialize_response": "<1 ms",
+        "fork_exec_hexa_interp_child": "~35 ms (the host-side hexa startup IS still paid because we fork-per-request; see section 5)",
+        "child_run_body": "workload-dependent",
+        "total_overhead_added_by_daemon_path": "~3-5 ms vs direct $HEXA_BIN run"
+      },
+      "savings_only_realize_when": "transport floor > daemon overhead. Concretely: docker-exec mode (floor ~80ms → savings ~75ms via persistent coproc) — net win. Pure local hexa run (floor ~35ms → savings 0, since fork-per-request still pays it) — NET LOSS of ~3-5ms per call.",
+      "candidate_workloads_evaluated": [
+        {"name": "bridge_health.sh sweep (16 bridges, host-local hexa)", "verdict": "DAEMON DOES NOT HELP — fork-per-request still pays 35ms × 16, daemon adds 3-5ms overhead per call. Use `hexa batch` (when implemented in hexa-lang) instead."},
+        {"name": "hypothetical bridge_health.sh sweep with HEXA_REMOTE_DOCKER=1 routed via daemon", "verdict": "WOULD BENEFIT (16 × ~75ms = ~1.2s saved per sweep). But this routing does not exist today."},
+        {"name": "interactive REPL-style usage (developer running hexa run X repeatedly)", "verdict": "MARGINAL — saves 35ms hexa_remote overhead per call, but interactive cadence is human-paced. Negligible."},
+        {"name": "future CI workload running 100+ hexa runs in docker-exec mode", "verdict": "STRONG WIN — 100 × 75ms = 7.5s saved. Hypothetical."}
+      ],
+      "honest_verdict_on_implementation": {
+        "recommendation": "DO NOT IMPLEMENT NOW",
+        "primary_reasoning": "No current workload uses HEXA_REMOTE_DOCKER=1 in batch. The dominant nexus workload (bridge_health.sh) runs hexa locally and would NOT benefit (in fact would regress slightly). 13b's 25-50× speedup is real but is locked behind 'all calls go through docker exec'. Until a docker-mode batch workload appears, this daemon is a solution looking for a problem.",
+        "secondary_reasoning": "Operational burden is non-trivial — pid+lock+sock lifecycle, recovery, peer-uid checks, framing — all for ZERO measured benefit on the current workload mix.",
+        "what_changes_the_calculus": "(a) bridge_health.sh sweep is rerouted through hexa_remote in HEXA_REMOTE_DOCKER=1 mode, OR (b) a new CI workload spawns ≥50 docker-exec hexa runs per sweep. EITHER condition flips this from theoretical to ~10-50× win.",
+        "shelf_value_of_this_design": "the design is pre-baked, frozen, reviewable. When a triggering workload appears, the implementer's day-zero is not 'design from scratch' — it is 'execute E1-E4 below'. Estimated implementation cost dropped from ~3 cycles (with design+impl) to ~1.5 cycles (impl only)."
+      }
+    },
+    "10_implementation_phasing": {
+      "E1_minimal_daemon": {
+        "goal": "prove socket+spawn+request wiring end-to-end on a single workload",
+        "scope": [
+          "single client at a time (no multi-client mux)",
+          "Unix socket at $HOME/.hx/run/hexa_daemon.sock",
+          "length-prefixed JSON RUN op only (no PING, no STATUS, no SHUTDOWN — daemon stays up forever in E1)",
+          "fork-exec hexa-interp per request",
+          "no pid file, no lock file, no recovery, no auth (mode 0600 set but no peer-uid check yet)",
+          "no idle timeout — daemon runs until SIGTERM"
+        ],
+        "deliverable": "tool/hexa_daemon.hexa (or scripts/bin/hexa_daemon shell wrapper if hexa-lang lacks socket primitives)",
+        "validation": "client spawns daemon, sends 100 RUN reqs to `hexa run tool/runner_exec_bench.hexa --runs 1`, all return exit_code 0; wall-time matches direct fork-exec within ±5ms",
+        "exit_criteria": "demonstrably-routed request, no state leak across requests (each request gets its own child)",
+        "estimated_loc": "~250-350"
+      },
+      "E2_lock_pid_recovery": {
+        "goal": "harden against multi-spawn, crash, hang",
+        "scope": [
+          "pid file write+read; flock on lock file",
+          "stale-pid detection (kill(pid,0) ESRCH → cleanup)",
+          "stale-socket detection (connect ECONNREFUSED → cleanup)",
+          "per-request timeout_ms in daemon; SIGKILL child on timeout",
+          "client-side fresh-exec fallback on connect failure or PING timeout",
+          "PING + STATUS + SHUTDOWN ops added"
+        ],
+        "validation": "kill -9 daemon mid-request → next client request still completes (via respawn or fallback); two-client race spawns exactly one daemon",
+        "estimated_loc": "+150-250"
+      },
+      "E3_launchd_optional": {
+        "goal": "optional always-on mode for users who want it (NOT default)",
+        "scope": [
+          "$HOME/Library/LaunchAgents/com.hexa.daemon.plist generator",
+          "RunAtLoad: false; KeepAlive: SuccessfulExit: false (only restart on crash)",
+          "operator opt-in: `hexa daemon install` / `hexa daemon uninstall` subcommands",
+          "lazy-spawn remains the default; launchd is for users with constant docker-exec batch traffic"
+        ],
+        "validation": "install + reboot + first hexa_remote call uses daemon without spawn",
+        "estimated_loc": "+80-120"
+      },
+      "E4_hexa_remote_wiring": {
+        "goal": "actually route hexa_remote requests through daemon when HEXA_DAEMON_SOCK is set or auto-discovered",
+        "scope": [
+          "scripts/bin/hexa_remote: detect HEXA_DAEMON_SOCK, framed JSON request, framed JSON response",
+          "fallback to existing fresh-exec path on any daemon-side error",
+          "respect HEXA_DAEMON_SOCK=NONE escape hatch",
+          "auto-discovery only if PING completes within 200ms"
+        ],
+        "blockers": "scripts/bin/hexa_remote is currently in parallel-session collision set per ω-runner-13d brief; E4 must NOT proceed until that file is no longer locked across sessions",
+        "validation": "with daemon up: 16-bridge HEXA_REMOTE_DOCKER=1 sweep wall-time drops by ≥10× vs daemon-off baseline",
+        "estimated_loc": "+30-50 in hexa_remote; +20 in any wrapper scripts that opt in"
+      }
+    }
+  },
+  "five_bullet_summary": [
+    "lifecycle: lazy-spawn-on-first-request; idle-timeout 600s; pid+lock+sock under $HOME/.hx/run/; double-fork+setsid; flock LOCK_EX|LOCK_NB to prevent race-spawn",
+    "ipc protocol: Unix domain SOCK_STREAM at $HOME/.hx/run/hexa_daemon.sock with 4-byte big-endian length prefix + JSON v1 frame; RUN/PING/STATUS/SHUTDOWN ops; connection-per-request",
+    "auth: socket mode 0600 + dir 0700 + accept-time getpeereid()/SO_PEERCRED self-uid check (defense in depth); single-user trust domain; no shared-secret in v1",
+    "state isolation: daemon is a request orchestrator; each RUN forks a fresh hexa-interp child; savings come ONLY from docker-exec floor amortization (per-target persistent coproc inside daemon), NOT from host-side hexa startup",
+    "integration: HEXA_DAEMON_SOCK env var toggles routing; auto-discovery with 200ms PING budget; HEXA_DAEMON_SOCK=NONE forces fresh-exec; minimal patch in hexa_remote near L1228 (deferred until that file leaves parallel-session lock)"
+  ],
+  "honest_verdict": {
+    "should_implement_now": false,
+    "reason": "no current workload uses HEXA_REMOTE_DOCKER=1 in batch. Dominant workload (bridge_health.sh) runs hexa locally and would slightly regress. The 13b 25-50× speedup is locked behind a transport (docker-exec floor) that no batch workload currently uses.",
+    "trigger_to_revisit": "(a) bridge_health.sh sweep is rerouted through HEXA_REMOTE_DOCKER=1, OR (b) a new ≥50-call docker-mode batch workload appears in CI",
+    "shelf_value": "design is frozen — when a trigger fires, implementer skips ~1.5 cycles of design work and goes straight to E1"
+  },
+  "files_edited": [],
+  "files_created": [
+    {
+      "path": "/Users/ghost/core/anima/state/omega_runner_13d_daemon_design_spec.json",
+      "tracked": false,
+      "reason": "anima closure JSONs are untracked per PSC convention"
+    },
+    {
+      "path": "/Users/ghost/core/nexus/tool/hexa_daemon_design.hexa",
+      "tracked": true,
+      "reason": "design-print tool — prints the 5-bullet summary + verdict for human browsing; no executable daemon code; raw 9 .hexa-only-suffix compliant; raw 71 report-only"
+    }
+  ],
+  "scope_constraints_honoured": [
+    "no edit to parallel-session-locked files: cli/run.hexa, state/atlas_health_timeline.jsonl, bisociation/spectra/g_atlas_composite_v3.json, tool/omega_cycle_atlas_ingest.hexa, n6/*, tool/kick_*.hexa, design/kick/*, .own, scripts/bin/hexa_remote — none touched",
+    "hexa-only-suffix (raw 9): only one new file in nexus, tool/hexa_daemon_design.hexa (.hexa suffix, sweeper-safe)",
+    "raw 71 report-only: design-print emits to stdout, writes nothing to disk",
+    "raw 80 sentinel: __HEXA_DAEMON_DESIGN__ pattern preserved",
+    "no commit in anima — closure JSON written as untracked",
+    "explicit-path commit only — `git add tool/hexa_daemon_design.hexa` (no -A, no .)",
+    "history op safety: HEAD pinned to 423823514908e1639b248acfe300ecb5b566d699, no HEAD~N references",
+    "CLI-only inter-call: design-print is a pure stdout tool"
+  ],
+  "next_followups": [
+    "ω-runner-13e (CONDITIONAL on a triggering workload appearing): execute E1-E4 from this spec directly. Estimated ~1.5 cycles given design is pre-frozen.",
+    "ω-hexa-batch (independent track): if `hexa batch` ever lands in hexa-lang, bridge_health.sh sweep can be amortized WITHOUT a daemon — re-evaluate which path is actually shipped.",
+    "monitor for the trigger conditions: bridge_health.sh sweep ever rerouted through HEXA_REMOTE_DOCKER=1; OR a new ≥50-call docker-mode batch workload in CI",
+    "if/when scripts/bin/hexa_remote leaves parallel-session lock, the E4 patch surface is the L1228 docker-exec branch — note that for the cycle that picks this up"
+  ],
+  "honesty_note": "ω-runner-13c flagged daemon as 'non-trivial and out of scope for one cycle' — that was correct. ω-runner-13d's role is to make that statement REVERSIBLE: the next cycle can flip from 'out of scope' to 'execute E1-E4' with the design already done. The honest verdict on implementation is still NO at this moment because the workload doesn't justify it; but the option is now cheap to exercise.",
+  "commit_sha_in_nexus": "PENDING_AT_CLOSURE_WRITE_TIME",
+  "anima_closure_path": "/Users/ghost/core/anima/state/omega_runner_13d_daemon_design_spec.json"
+}

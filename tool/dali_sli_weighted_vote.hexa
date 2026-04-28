@@ -1,0 +1,555 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/dali_sli_weighted_vote.hexa
+//
+//  PURPOSE  (Mk.XII proposal §4 Hard PASS chain UPDATE — DALI+SLI 권고 보강)
+//
+//    CONTEXT
+//      이전 cycle (anima_dali_sli_coupled.hexa) 에서 DALI+SLI 를 single Hard PASS
+//      conjunctive gate (DALI ∧ SLI ∧ COUPLED) 로 통합 시도 → JOINT_FAIL
+//      (DALI_min=236, SLI=240, COUPLED=237). 4-bb substrate backbone-conditional
+//      diagnostic evidence (.roadmap #145 cross-validate).
+//
+//    UPDATE
+//      single Hard PASS 게이트 형태 → 두 metric 별개 weak-signal **weighted-vote
+//      chain integration** 으로 재설계. DALI 와 SLI 가 mutually reinforcing 이
+//      아니라 orthogonal weak signals 일 수 있다는 가설을 수용.
+//
+//    DESIGN  (Step 1 frozen)
+//      vote A:  v_DALI    = 1 if DALI_min  >= 700 else 0
+//      vote B:  v_SLI     = 1 if SLI       >= 500 else 0
+//      vote C:  v_JOINT   = 1 if COUPLED   >= 600 else 0
+//      majority verdict   = MAJ_PASS   if (v_DALI + v_SLI + v_JOINT) >= 2
+//      weighted_score     = (400*DALI_norm + 400*SLI_norm + 200*joint_norm) / 1000
+//        where DALI_norm  = clamp(DALI_min /SCALE, 0, SCALE)
+//              SLI_norm   = clamp(SLI      /SCALE, 0, SCALE)
+//              joint_norm = clamp(COUPLED  /SCALE, 0, SCALE)
+//      weighted verdict   = WEIGHTED_PASS if weighted_score >= 500
+//      OVERALL_PASS       = MAJ_PASS  OR  WEIGHTED_PASS    (softer chain)
+//
+//    Mk.XII §4 Hard PASS chain integration 자격
+//      Hard PASS chain = G0 ∧ G1 ∧ G7 ∧ G8 ∧ G9 ∧ (DALI ∨ SLI weighted-vote)
+//      → 본 도구는 OR 항 contribution. ELIGIBLE 조건:
+//          (1) positive negotiation: OVERALL_PASS true     (4-bb real)
+//              OR positive partial:  weighted_score >= 250   (≥ minimum signal)
+//          (2) negative falsifier discriminates:
+//              random scramble PASS rate <= 5 %
+//
+//  RAW#9
+//    pure hexa · deterministic · cmt.json read-only · no Python · no file mutate
+//    integer fixed-point ×1000 · byte-identical re-run
+//
+//  POSITIVE SELFTEST
+//    4 backbone real cmt.json (Mistral / Qwen3 / Llama / gemma) reuse
+//    이전 측정값 reuse: DALI_min=236, SLI=240, COUPLED=237 (state/dali_sli_coupled_v1.json)
+//    → vote 분해 + weighted_score 계산 + Mk.XII chain eligibility 결정.
+//
+//  NEGATIVE FALSIFY
+//    cusp_depth hash-seed scramble (N=64) → SLI fluctuates → joint random.
+//    weighted-vote PASS rate <= 5 % 검증.
+//
+//  OUTPUT
+//    anima-clm-eeg/state/dali_sli_weighted_vote_v1.json
+// ════════════════════════════════════════════════════════════════════════════
+
+let SCALE = 1000
+let M32 = 4294967296
+let POLY_PRIME = 2654435761
+
+// individual vote thresholds (×1000)
+let DALI_VOTE_PASS = 700
+let SLI_VOTE_PASS = 500
+let JOINT_VOTE_PASS = 600
+
+// weighted-score weights (sum = 1000)
+let W_DALI = 400
+let W_SLI = 400
+let W_JOINT = 200
+
+// weighted-score gate
+let WEIGHTED_GATE = 500
+
+// minimum signal floor (partial eligibility)
+let WEIGHTED_FLOOR = 250
+
+// negative discrimination: PASS rate <= 5 %
+let NEG_RATE_GATE = 50  // /1000
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+fn now_stamp() -> string { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+
+fn str_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + xs[i] + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+fn int_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + str(xs[i])
+        i = i + 1
+    }
+    return s + "]"
+}
+
+fn f1000(x) -> int {
+    let scaled = x * SCALE
+    let t = int(scaled)
+    if t < 0 { return 0 }
+    return t
+}
+
+fn isqrt(v: int) -> int {
+    if v <= 0 { return 0 }
+    let mut x = v
+    let mut prev = 0
+    let mut iter = 0
+    while iter < 32 {
+        prev = x
+        x = (x + v / x) / 2
+        if x == prev { iter = 32 }
+        iter = iter + 1
+    }
+    return x
+}
+
+fn abs_int(v: int) -> int {
+    if v < 0 { return -v }
+    return v
+}
+
+fn clamp_scale(v: int) -> int {
+    if v < 0 { return 0 }
+    if v > SCALE { return SCALE }
+    return v
+}
+
+// ─── parse cmt.json: full layer × family L2 ───────────────────────────────
+fn read_cusp_depth(cmt_path: string) -> list {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let tomo = cmt["tomography"]
+    let layer_keys = keys(tomo)
+
+    let mut layer_ints = []
+    let mut i = 0
+    while i < len(layer_keys) {
+        layer_ints = layer_ints.push(int(layer_keys[i]))
+        i = i + 1
+    }
+    let mut sorted = []
+    let mut a = 0
+    while a < len(layer_ints) {
+        let v = layer_ints[a]
+        let mut placed = false
+        let mut new_sorted = []
+        let mut b = 0
+        while b < len(sorted) {
+            if !placed && v < sorted[b] {
+                new_sorted = new_sorted.push(v)
+                placed = true
+            }
+            new_sorted = new_sorted.push(sorted[b])
+            b = b + 1
+        }
+        if !placed { new_sorted = new_sorted.push(v) }
+        sorted = new_sorted
+        a = a + 1
+    }
+
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut best_layer = sorted[0]
+    let mut best_l2 = -1
+    let mut s = 0
+    while s < len(sorted) {
+        let layer_key = str(sorted[s])
+        let layer_obj = tomo[layer_key]
+        let mut sum_sq = 0
+        let mut f = 0
+        while f < 4 {
+            let fam_obj = layer_obj[families[f]]
+            let abs_v = fam_obj["abs"]
+            let av = f1000(abs_v)
+            sum_sq = sum_sq + av * av
+            f = f + 1
+        }
+        let l2 = isqrt(sum_sq)
+        if l2 > best_l2 {
+            best_l2 = l2
+            best_layer = sorted[s]
+        }
+        s = s + 1
+    }
+    let cusp_x1000 = (best_layer * SCALE) / n_layers
+    let mut out = []
+    out = out.push(n_layers)
+    out = out.push(best_layer)
+    out = out.push(cusp_x1000)
+    return out
+}
+
+fn family_loc_norm(cmt_path: string) -> int {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let dom = cmt["dominant_layer_per_family"]
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut best = 0
+    let mut i = 0
+    while i < 4 {
+        let entry = dom[families[i]]
+        let lay = entry["layer"]
+        let norm = (lay * SCALE) / n_layers
+        if norm > best { best = norm }
+        i = i + 1
+    }
+    return best
+}
+
+// ─── DALI + SLI + COUPLED (mirror coupled tool, integer ×1000) ───────────
+fn dali_pairs(family_locs: list, names: list) -> list {
+    let n = len(family_locs)
+    let mut pair_vals = []
+    let mut pair_labels = []
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            let d = abs_int(family_locs[i] - family_locs[j])
+            let dali = SCALE - d
+            pair_vals = pair_vals.push(dali)
+            pair_labels = pair_labels.push(names[i] + "-" + names[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let mut out = []
+    out = out.push(pair_vals)
+    out = out.push(pair_labels)
+    return out
+}
+
+fn list_min(xs: list) -> int {
+    if len(xs) == 0 { return 0 }
+    let mut m = xs[0]
+    let mut i = 1
+    while i < len(xs) {
+        if xs[i] < m { m = xs[i] }
+        i = i + 1
+    }
+    return m
+}
+fn list_max(xs: list) -> int {
+    if len(xs) == 0 { return 0 }
+    let mut m = xs[0]
+    let mut i = 1
+    while i < len(xs) {
+        if xs[i] > m { m = xs[i] }
+        i = i + 1
+    }
+    return m
+}
+fn list_mean(xs: list) -> int {
+    let n = len(xs)
+    if n == 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < n { s = s + xs[i]; i = i + 1 }
+    return s / n
+}
+
+fn sli_metric(cusp_depths: list) -> int {
+    let n = len(cusp_depths)
+    if n == 0 { return 0 }
+    let m = list_mean(cusp_depths)
+    let mut sum_sq_dev = 0
+    let mut i = 0
+    while i < n {
+        let dv = cusp_depths[i] - m
+        sum_sq_dev = sum_sq_dev + dv * dv
+        i = i + 1
+    }
+    let var = sum_sq_dev / n
+    let std = isqrt(var)
+    let mut cv_x1000 = 0
+    if m > 0 { cv_x1000 = (std * SCALE) / m }
+    let mut sli = SCALE - cv_x1000
+    if sli < 0 { sli = 0 }
+    if sli > SCALE { sli = SCALE }
+    return sli
+}
+
+fn coupled_metric(dali_min: int, sli: int) -> int {
+    if dali_min <= 0 || sli <= 0 { return 0 }
+    let prod = dali_min * sli
+    let gm = isqrt(prod)
+    return gm
+}
+
+// ─── weighted-vote core (NEW) ─────────────────────────────────────────────
+fn vote_dali(dali_min: int) -> int { if dali_min >= DALI_VOTE_PASS { return 1 } return 0 }
+fn vote_sli(sli: int) -> int       { if sli      >= SLI_VOTE_PASS  { return 1 } return 0 }
+fn vote_joint(coupled: int) -> int { if coupled  >= JOINT_VOTE_PASS{ return 1 } return 0 }
+
+fn weighted_score(dali_min: int, sli: int, coupled: int) -> int {
+    let d = clamp_scale(dali_min)
+    let s = clamp_scale(sli)
+    let j = clamp_scale(coupled)
+    let raw = W_DALI * d + W_SLI * s + W_JOINT * j   // /1000 * /1000
+    return raw / SCALE   // back to ×1000
+}
+
+// classify under weighted-vote chain
+fn classify_weighted(vd: int, vs: int, vj: int, ws: int) -> string {
+    let votes = vd + vs + vj
+    let maj_pass = votes >= 2
+    let weighted_pass = ws >= WEIGHTED_GATE
+    let weighted_partial = ws >= WEIGHTED_FLOOR
+    if maj_pass && weighted_pass { return "OVERALL_PASS_BOTH" }
+    if maj_pass                  { return "MAJORITY_PASS_ONLY" }
+    if weighted_pass             { return "WEIGHTED_PASS_ONLY" }
+    if weighted_partial          { return "WEAK_SIGNAL_PARTIAL" }
+    return "OVERALL_FAIL"
+}
+
+fn scrambled_cusp(n_layers: int, seed: int) -> int {
+    let mut h = seed * POLY_PRIME
+    h = h % M32
+    if h < 0 { h = h + M32 }
+    let peak_layer = h % n_layers
+    return (peak_layer * SCALE) / n_layers
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+fn main() {
+    println("[dali_sli_weighted_vote] Mk.XII §4 Hard PASS chain UPDATE")
+    println("  3-vote majority + weighted_score (0.4 DALI + 0.4 SLI + 0.2 JOINT)")
+    println("  votes:  DALI>=" + str(DALI_VOTE_PASS) + ", SLI>=" + str(SLI_VOTE_PASS) + ", JOINT>=" + str(JOINT_VOTE_PASS))
+    println("  weighted gate=" + str(WEIGHTED_GATE) + " floor=" + str(WEIGHTED_FLOOR))
+    println("")
+
+    let backbone_names = ["Mistral", "Qwen3", "Llama", "gemma"]
+    let cmt_paths = [
+        "state/v10_benchmark_v4/mistral/cmt.json",
+        "state/v10_benchmark_v4/qwen3/cmt.json",
+        "state/v10_benchmark_v4/llama/cmt.json",
+        "state/v10_benchmark_v4/gemma/cmt.json"
+    ]
+
+    // ─── 1. ingest (reuse same path as coupled tool) ────────────────────
+    let mut cusp_depths = []
+    let mut family_locs = []
+    let mut n_layers_list = []
+    let mut peak_layers = []
+    let mut n = 0
+    while n < 4 {
+        let cd = read_cusp_depth(cmt_paths[n])
+        n_layers_list = n_layers_list.push(cd[0])
+        peak_layers = peak_layers.push(cd[1])
+        cusp_depths = cusp_depths.push(cd[2])
+        family_locs = family_locs.push(family_loc_norm(cmt_paths[n]))
+        n = n + 1
+    }
+
+    println("=== positive (4 real cmt.json reuse) ===")
+    let mut k = 0
+    while k < 4 {
+        let line = "  " + backbone_names[k]
+                 + ": cusp_depth=" + str(cusp_depths[k])
+                 + " family_loc=" + str(family_locs[k])
+        println(line)
+        k = k + 1
+    }
+    println("")
+
+    // ─── 2. compute DALI / SLI / COUPLED ────────────────────────────────
+    let dali_res = dali_pairs(family_locs, backbone_names)
+    let dali_vals = dali_res[0]
+    let dali_labels = dali_res[1]
+    let dali_min = list_min(dali_vals)
+    let sli = sli_metric(cusp_depths)
+    let coupled = coupled_metric(dali_min, sli)
+    println("=== base metrics (reuse) ===")
+    println("  DALI_min=" + str(dali_min) + " SLI=" + str(sli) + " COUPLED=" + str(coupled))
+    println("")
+
+    // ─── 3. 3-vote decomposition + weighted_score ────────────────────────
+    let v_dali = vote_dali(dali_min)
+    let v_sli  = vote_sli(sli)
+    let v_joint = vote_joint(coupled)
+    let votes_total = v_dali + v_sli + v_joint
+    let ws = weighted_score(dali_min, sli, coupled)
+    let pos_verdict = classify_weighted(v_dali, v_sli, v_joint, ws)
+    let pos_overall_pass = pos_verdict == "OVERALL_PASS_BOTH"
+    let pos_majority_pass = (v_dali + v_sli + v_joint) >= 2
+    let pos_weighted_pass = ws >= WEIGHTED_GATE
+    let pos_partial = ws >= WEIGHTED_FLOOR
+
+    println("=== 3-vote + weighted_score (positive) ===")
+    println("  v_DALI=" + str(v_dali) + " v_SLI=" + str(v_sli) + " v_JOINT=" + str(v_joint) + " (sum=" + str(votes_total) + "/3)")
+    println("  weighted_score = (400*" + str(clamp_scale(dali_min)) + " + 400*" + str(clamp_scale(sli)) + " + 200*" + str(clamp_scale(coupled)) + ")/1000 = " + str(ws))
+    println("  majority PASS (>=2/3)? " + bool_s(pos_majority_pass))
+    println("  weighted PASS (>=" + str(WEIGHTED_GATE) + ")? " + bool_s(pos_weighted_pass))
+    println("  weighted floor (>=" + str(WEIGHTED_FLOOR) + ")? " + bool_s(pos_partial))
+    println("  positive verdict = " + pos_verdict)
+    println("")
+
+    // ─── 4. negative falsify (cusp_depth scramble) ───────────────────────
+    let n_trials = 64
+    let mut neg_overall_pass_count = 0
+    let mut neg_maj_pass_count = 0
+    let mut neg_weighted_pass_count = 0
+    let mut neg_partial_count = 0
+    let mut neg_first_cusp = []
+    let mut neg_first_sli = 0
+    let mut neg_first_coupled = 0
+    let mut neg_first_ws = 0
+    let mut neg_first_verdict = ""
+    let mut neg_max_ws = 0
+    let mut t = 0
+    while t < n_trials {
+        let mut neg_cusp = []
+        let mut nn = 0
+        while nn < 4 {
+            let seed_val = (t + 1) * 1009 + (nn + 1) * 31
+            let c = scrambled_cusp(n_layers_list[nn], seed_val)
+            neg_cusp = neg_cusp.push(c)
+            nn = nn + 1
+        }
+        if t == 0 { neg_first_cusp = neg_cusp }
+        let neg_sli = sli_metric(neg_cusp)
+        let neg_coupled = coupled_metric(dali_min, neg_sli)
+        let nvd = vote_dali(dali_min)
+        let nvs = vote_sli(neg_sli)
+        let nvj = vote_joint(neg_coupled)
+        let nws = weighted_score(dali_min, neg_sli, neg_coupled)
+        let nverd = classify_weighted(nvd, nvs, nvj, nws)
+        if t == 0 {
+            neg_first_sli = neg_sli
+            neg_first_coupled = neg_coupled
+            neg_first_ws = nws
+            neg_first_verdict = nverd
+        }
+        if nws > neg_max_ws { neg_max_ws = nws }
+        if nverd == "OVERALL_PASS_BOTH" { neg_overall_pass_count = neg_overall_pass_count + 1 }
+        if (nvd + nvs + nvj) >= 2 { neg_maj_pass_count = neg_maj_pass_count + 1 }
+        if nws >= WEIGHTED_GATE { neg_weighted_pass_count = neg_weighted_pass_count + 1 }
+        if nws >= WEIGHTED_FLOOR { neg_partial_count = neg_partial_count + 1 }
+        t = t + 1
+    }
+    let neg_overall_rate_x1000 = (neg_overall_pass_count * SCALE) / n_trials
+    let neg_maj_rate_x1000 = (neg_maj_pass_count * SCALE) / n_trials
+    let neg_weighted_rate_x1000 = (neg_weighted_pass_count * SCALE) / n_trials
+    let neg_detects = neg_overall_rate_x1000 <= NEG_RATE_GATE   // <= 5%
+
+    println("=== negative falsify (" + str(n_trials) + " scrambled cusp trials) ===")
+    println("  trial 1: SLI=" + str(neg_first_sli) + " COUPLED=" + str(neg_first_coupled) + " ws=" + str(neg_first_ws) + " verdict=" + neg_first_verdict)
+    println("  OVERALL PASS trials: " + str(neg_overall_pass_count) + "/" + str(n_trials) + " (rate=" + str(neg_overall_rate_x1000) + " /1000)")
+    println("  majority PASS trials: " + str(neg_maj_pass_count) + "/" + str(n_trials) + " (rate=" + str(neg_maj_rate_x1000) + " /1000)")
+    println("  weighted PASS trials: " + str(neg_weighted_pass_count) + "/" + str(n_trials) + " (rate=" + str(neg_weighted_rate_x1000) + " /1000)")
+    println("  max weighted_score: " + str(neg_max_ws))
+    println("  random scrambling fails systematic OVERALL PASS (<=5%)? " + bool_s(neg_detects))
+    println("")
+
+    // ─── 5. Mk.XII Hard PASS chain integration eligibility ───────────────
+    // ELIGIBLE if (positive overall_pass OR positive partial signal) AND negative discriminates
+    let positive_signal = pos_overall_pass || pos_partial
+    let mk_xii_eligible = positive_signal && neg_detects
+    let mut eligibility_class = "NOT_ELIGIBLE"
+    if pos_overall_pass && neg_detects { eligibility_class = "ELIGIBLE_FULL" }
+    else { if pos_partial && neg_detects { eligibility_class = "ELIGIBLE_PARTIAL_WEAK" } }
+
+    println("=== Mk.XII §4 Hard PASS chain integration ===")
+    println("  positive overall PASS: " + bool_s(pos_overall_pass))
+    println("  positive partial signal (ws>=" + str(WEIGHTED_FLOOR) + "): " + bool_s(pos_partial))
+    println("  negative falsifier discriminates: " + bool_s(neg_detects))
+    println("  ELIGIBLE for Mk.XII chain: " + bool_s(mk_xii_eligible) + "  class=" + eligibility_class)
+    println("")
+
+    // ─── 6. JSON emit ────────────────────────────────────────────────────
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima/dali_sli_weighted_vote/1\",\n"
+    out = out + "  \"schema_version\": 1,\n"
+    out = out + "  \"verifier_type\": \"dali_sli_weighted_vote\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"source\": \"tool/dali_sli_weighted_vote.hexa\",\n"
+    out = out + "  \"design\": {\n"
+    out = out + "    \"vote_dali\":  \"v_DALI = 1 if DALI_min >= " + str(DALI_VOTE_PASS) + " else 0\",\n"
+    out = out + "    \"vote_sli\":   \"v_SLI  = 1 if SLI      >= " + str(SLI_VOTE_PASS)  + " else 0\",\n"
+    out = out + "    \"vote_joint\": \"v_JOINT= 1 if COUPLED  >= " + str(JOINT_VOTE_PASS)+ " else 0\",\n"
+    out = out + "    \"majority_rule\": \"v_DALI + v_SLI + v_JOINT >= 2\",\n"
+    out = out + "    \"weighted_score\": \"(400*DALI_min + 400*SLI + 200*COUPLED) / 1000\",\n"
+    out = out + "    \"weighted_gate\": " + str(WEIGHTED_GATE) + ",\n"
+    out = out + "    \"weighted_floor\": " + str(WEIGHTED_FLOOR) + ",\n"
+    out = out + "    \"chain_or_clause\": \"Mk.XII §4 Hard PASS = G0 ∧ G1 ∧ G7 ∧ G8 ∧ G9 ∧ (DALI ∨ SLI weighted-vote)\"\n"
+    out = out + "  },\n"
+    out = out + "  \"thresholds\": {\n"
+    out = out + "    \"dali_vote_pass\": " + str(DALI_VOTE_PASS) + ",\n"
+    out = out + "    \"sli_vote_pass\": " + str(SLI_VOTE_PASS) + ",\n"
+    out = out + "    \"joint_vote_pass\": " + str(JOINT_VOTE_PASS) + ",\n"
+    out = out + "    \"weights\": {\"dali\": " + str(W_DALI) + ", \"sli\": " + str(W_SLI) + ", \"joint\": " + str(W_JOINT) + "},\n"
+    out = out + "    \"weighted_gate\": " + str(WEIGHTED_GATE) + ",\n"
+    out = out + "    \"weighted_floor\": " + str(WEIGHTED_FLOOR) + ",\n"
+    out = out + "    \"neg_rate_gate_x1000\": " + str(NEG_RATE_GATE) + ",\n"
+    out = out + "    \"scale\": " + str(SCALE) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"backbones\": " + str_list_json(backbone_names) + ",\n"
+    out = out + "  \"cmt_sources\": " + str_list_json(cmt_paths) + ",\n"
+    out = out + "  \"positive\": {\n"
+    out = out + "    \"n_layers\": " + int_list_json(n_layers_list) + ",\n"
+    out = out + "    \"peak_layers\": " + int_list_json(peak_layers) + ",\n"
+    out = out + "    \"cusp_depth_x1000\": " + int_list_json(cusp_depths) + ",\n"
+    out = out + "    \"family_loc_x1000\": " + int_list_json(family_locs) + ",\n"
+    out = out + "    \"dali_min_x1000\": " + str(dali_min) + ",\n"
+    out = out + "    \"sli_x1000\": " + str(sli) + ",\n"
+    out = out + "    \"coupled_x1000\": " + str(coupled) + ",\n"
+    out = out + "    \"v_dali\": " + str(v_dali) + ",\n"
+    out = out + "    \"v_sli\": " + str(v_sli) + ",\n"
+    out = out + "    \"v_joint\": " + str(v_joint) + ",\n"
+    out = out + "    \"votes_total\": " + str(votes_total) + ",\n"
+    out = out + "    \"weighted_score_x1000\": " + str(ws) + ",\n"
+    out = out + "    \"majority_pass\": " + bool_s(pos_majority_pass) + ",\n"
+    out = out + "    \"weighted_pass\": " + bool_s(pos_weighted_pass) + ",\n"
+    out = out + "    \"weighted_partial\": " + bool_s(pos_partial) + ",\n"
+    out = out + "    \"verdict\": \"" + pos_verdict + "\",\n"
+    out = out + "    \"overall_pass\": " + bool_s(pos_overall_pass) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"negative\": {\n"
+    out = out + "    \"n_trials\": " + str(n_trials) + ",\n"
+    out = out + "    \"scrambled_cusp_trial_1\": " + int_list_json(neg_first_cusp) + ",\n"
+    out = out + "    \"trial_1_sli_x1000\": " + str(neg_first_sli) + ",\n"
+    out = out + "    \"trial_1_coupled_x1000\": " + str(neg_first_coupled) + ",\n"
+    out = out + "    \"trial_1_weighted_score_x1000\": " + str(neg_first_ws) + ",\n"
+    out = out + "    \"trial_1_verdict\": \"" + neg_first_verdict + "\",\n"
+    out = out + "    \"overall_pass_count\": " + str(neg_overall_pass_count) + ",\n"
+    out = out + "    \"overall_pass_rate_x1000\": " + str(neg_overall_rate_x1000) + ",\n"
+    out = out + "    \"majority_pass_count\": " + str(neg_maj_pass_count) + ",\n"
+    out = out + "    \"weighted_pass_count\": " + str(neg_weighted_pass_count) + ",\n"
+    out = out + "    \"partial_count\": " + str(neg_partial_count) + ",\n"
+    out = out + "    \"max_weighted_score_x1000\": " + str(neg_max_ws) + ",\n"
+    out = out + "    \"detects_failure\": " + bool_s(neg_detects) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"mk_xii_eligibility\": {\n"
+    out = out + "    \"positive_overall_pass\": " + bool_s(pos_overall_pass) + ",\n"
+    out = out + "    \"positive_partial_signal\": " + bool_s(pos_partial) + ",\n"
+    out = out + "    \"negative_falsifier_discriminates\": " + bool_s(neg_detects) + ",\n"
+    out = out + "    \"eligible_for_chain_integration\": " + bool_s(mk_xii_eligible) + ",\n"
+    out = out + "    \"eligibility_class\": \"" + eligibility_class + "\"\n"
+    out = out + "  },\n"
+    out = out + "  \"cross_validate\": \"anima-clm-eeg/docs/mk_xii_proposal_outline_20260426.md §4 / state/dali_sli_coupled_v1.json (prior JOINT_FAIL)\"\n"
+    out = out + "}\n"
+    write_file("anima-clm-eeg/state/dali_sli_weighted_vote_v1.json", out)
+    println("  wrote: anima-clm-eeg/state/dali_sli_weighted_vote_v1.json")
+
+    // exit code: 0 if eligible, 1 otherwise
+    if mk_xii_eligible { exit(0) }
+    exit(1)
+}

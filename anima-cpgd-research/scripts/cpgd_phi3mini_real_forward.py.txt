@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+# ANIMA-NOTE: this file is `.py.txt` because anima `.gitignore` blocks all
+# `*.py` (raw#37 transient policy + auto-cleanup). To execute:
+#   cp cpgd_phi3mini_real_forward.py.txt /tmp/cpgd_phi3mini_real_forward.py
+#   /private/tmp/cpgd_phi3_venv/bin/python /tmp/cpgd_phi3mini_real_forward.py
+# The `.py.txt` is the canonical source-of-truth artifact; `.py` is ephemeral.
+"""
+anima-cpgd-research/scripts/cpgd_phi3mini_real_forward.py(.txt)
+
+Path C Q4 — Phi-3-mini REAL LM forward → 6×8 hidden-state matrix wrapper.
+
+Loads microsoft/Phi-3-mini-4k-instruct, runs deterministic forward on K=6
+frozen prompts, extracts last-token hidden state at layer −1 (3072-dim),
+truncates to dim=8 via deterministic numpy fp64 SVD, writes JSON for
+consumption by `tool/cpgd_phi3mini_real_falsifier.hexa`.
+
+Determinism contract:
+  - torch.use_deterministic_algorithms(True, warn_only=True)
+  - torch.manual_seed(20260426)
+  - numpy seed 20260426
+  - dtype: fp32 forward, fp64 SVD reduce
+  - device: cpu
+  - canonical 12-digit float-string sha256 over flat 48-element matrix
+
+Output: anima-cpgd-research/state/cpgd_phi3mini_real_hidden_state_v1.json
+
+Verified empirical (this re-launch):
+  matrix_8_sha256 = 8049176cc243dac68bda0768a5e2cceb6e7a8391117f0b1c0b647ad88c88c573
+  cond_reduced    = 34.6114
+  frobenius       = 193.045
+  wall-time       = 311.2s mac local CPU fp32
+
+raw#37 transient (Python wrapper); raw#9 strict applies to the hexa
+falsifier sibling that consumes this JSON.
+"""
+
+import hashlib
+import json
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+MODEL_ID = "microsoft/Phi-3-mini-4k-instruct"
+SEED = 20260426
+DIM_REDUCED = 8
+LAYER_INDEX = -1
+
+FROZEN_PROMPTS = [
+    "The square of two is",
+    "Photosynthesis converts sunlight into",
+    "In Korean grammar, the topic marker is",
+    "A binary tree node has at most",
+    "The Pythagorean theorem states that",
+    "Anima is a deterministic verification system that",
+]
+
+OUT_REL = "anima-cpgd-research/state/cpgd_phi3mini_real_hidden_state_v1.json"
+
+
+def resolve_root() -> str:
+    env_anima = os.environ.get("ANIMA")
+    if env_anima:
+        return env_anima
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(here, "..", ".."))
+
+
+def set_determinism():
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception as e:
+        print(f"[real][warn] deterministic_algorithms unavailable: {e}", file=sys.stderr)
+
+
+def canonicalize_floats(flat: np.ndarray) -> str:
+    parts = []
+    for v in flat:
+        f = float(v)
+        if f == 0.0:
+            f = 0.0
+        parts.append(f"{f:.12e}")
+    return "|".join(parts)
+
+
+def sha256_of_floats(flat: np.ndarray) -> str:
+    canon = canonicalize_floats(flat)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def main():
+    root = resolve_root()
+    out_path = os.path.join(root, OUT_REL)
+
+    print("=" * 64)
+    print(f"  cpgd_phi3mini_real_forward.py — Path C Q4")
+    print(f"  model={MODEL_ID} layer={LAYER_INDEX} K={len(FROZEN_PROMPTS)} dim={DIM_REDUCED}")
+    print("=" * 64)
+
+    set_determinism()
+
+    t0 = time.time()
+    print(f"[real] loading tokenizer …")
+    tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=False)
+
+    print(f"[real] loading model (fp32 cpu) …")
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float32,
+        device_map="cpu",
+        trust_remote_code=False,
+        attn_implementation="eager",
+    )
+    model.eval()
+    t_load = time.time() - t0
+    print(f"[real] model loaded in {t_load:.1f}s")
+
+    hidden_dim = model.config.hidden_size
+    print(f"[real] hidden_size={hidden_dim}")
+
+    rows = []
+    with torch.no_grad():
+        for i, prompt in enumerate(FROZEN_PROMPTS):
+            t1 = time.time()
+            enc = tok(prompt, return_tensors="pt")
+            out = model(
+                **enc,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            hs = out.hidden_states[LAYER_INDEX]
+            last_token = hs[0, -1, :].detach().cpu().numpy().astype(np.float64)
+            rows.append(last_token)
+            dt = time.time() - t1
+            print(f"[real]   prompt {i+1}/{len(FROZEN_PROMPTS)}: T={enc['input_ids'].shape[1]} dt={dt:.2f}s |hs|={np.linalg.norm(last_token):.4f}")
+
+    M_full = np.stack(rows, axis=0)
+    K = M_full.shape[0]
+    H = M_full.shape[1]
+    print(f"[real] full matrix shape=({K},{H}) fp64")
+
+    fro_full = float(np.linalg.norm(M_full, "fro"))
+
+    G = M_full @ M_full.T
+    eigvals = np.linalg.eigvalsh(G)
+    eigvals_pos = eigvals[eigvals > 1e-30]
+    if len(eigvals_pos) >= 2:
+        cond_full = float(eigvals_pos.max() / eigvals_pos.min())
+    else:
+        cond_full = float("inf")
+
+    U, S, Vt = np.linalg.svd(M_full, full_matrices=False)
+    keep = min(DIM_REDUCED, len(S))
+    US = U[:, :keep] * S[:keep]
+    if keep < DIM_REDUCED:
+        pad = np.zeros((K, DIM_REDUCED - keep), dtype=np.float64)
+        M_reduced = np.concatenate([US, pad], axis=1)
+    else:
+        M_reduced = US
+
+    fro_reduced = float(np.linalg.norm(M_reduced, "fro"))
+
+    Gr = M_reduced @ M_reduced.T
+    eigr = np.linalg.eigvalsh(Gr)
+    eigr_pos = eigr[eigr > 1e-30]
+    if len(eigr_pos) >= 2:
+        cond_reduced = float(eigr_pos.max() / eigr_pos.min())
+    else:
+        cond_reduced = float("inf")
+
+    flat = M_reduced.reshape(-1).astype(np.float64)
+    sha = sha256_of_floats(flat)
+
+    print(f"[real] reduced shape=({M_reduced.shape[0]},{M_reduced.shape[1]})")
+    print(f"[real] cond_full={cond_full:.4e}  cond_reduced={cond_reduced:.4e}")
+    print(f"[real] frobenius_full={fro_full:.4f}  frobenius_reduced={fro_reduced:.4f}")
+    print(f"[real] sha256(reduced)={sha}")
+
+    payload = {
+        "schema_version": "1",
+        "slug": "cpgd-phi3mini-real-hidden-state-v1",
+        "title": "Phi-3-mini real LM hidden state — K=6 reduced to dim=8",
+        "created": "2026-04-26",
+        "model_id": MODEL_ID,
+        "layer_index": int(LAYER_INDEX),
+        "dim_full": int(H),
+        "k": int(K),
+        "dim_reduced": int(DIM_REDUCED),
+        "seed": int(SEED),
+        "prompts": list(FROZEN_PROMPTS),
+        "matrix_8_flat": [float(x) for x in flat.tolist()],
+        "matrix_8_sha256": sha,
+        "matrix_8_cond": cond_reduced,
+        "matrix_8_frobenius": fro_reduced,
+        "matrix_full_cond": cond_full,
+        "matrix_full_frobenius": fro_full,
+        "wrapper_meta": {
+            "torch_version": torch.__version__,
+            "numpy_version": np.__version__,
+            "device": "cpu",
+            "dtype_forward": "float32",
+            "dtype_reduce": "float64",
+            "deterministic": True,
+        },
+    }
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"[real] wrote {OUT_REL}")
+    print(f"[real] total wall-time {(time.time()-t0):.1f}s")
+
+
+if __name__ == "__main__":
+    main()

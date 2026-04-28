@@ -8,7 +8,9 @@
 // MODES
 //   --mode raw           — raw arrays + metadata only (no filtering)
 //   --mode preprocessed  — bandpass 1-45Hz, optional ICA / ASR (flag-gated)
-//   --selftest           — synthetic 16ch × 1s × 250Hz signal generation + ingest
+//   --emit-alpha-coh     — Welch's MSC alpha-band 8-12Hz coherence matrix [16][16]
+//   --emit-alpha-phase   — bandpass+Hilbert alpha phase per 5×10s windows
+//   --selftest           — synthetic 16ch × 60s × 125Hz signal + run all 3 emit modes
 //
 // OUTPUT JSON (schema: anima/eeg_recording/1)
 //   channels:        16 names (10-20 system or custom)
@@ -21,20 +23,38 @@
 //     source_format, source_path, mne_version (if used)
 //   }
 //
+// OUTPUT JSON (schema: anima/clm_eeg/alpha_coh/1) — --emit-alpha-coh
+//   {tool, version, raw_rank, schema, source_npy, n_channels=16, n_samples,
+//    sample_rate=125, alpha_band_hz=[8,12], welch_params, channels[],
+//    coherence_matrix[16][16] (3-decimal), mean_offdiagonal_coh, max_pair_coh,
+//    max_pair_indices[i,j], timestamp_utc, helper_mne_version, helper_scipy_version,
+//    alpha_coh_x1000 (integer; consumer extract_int_after match)}
+//
+// OUTPUT JSON (schema: anima/clm_eeg/alpha_phase/1) — --emit-alpha-phase
+//   {tool, version, raw_rank, schema, source_npy, n_channels=16, sample_rate=125,
+//    n_windows=5, window_sec=10, alpha_band_hz=[8,12], filter_params, channels[],
+//    phase_summary_per_window_per_channel[5][16]{mean_x1000,circ_var_x1000,plv_x1000},
+//    timestamp_utc, helper_versions}
+//
 // raw#10 honest scope
-//   - Hardware 도착 후 actual recording. 본 cycle은 prototype only.
+//   - Hardware 도착 후 actual recording. 본 cycle은 prototype + selftest.
 //   - helper Python에서 `mne` import 실패 시 ABORT_NO_MNE + install instruction
-//     ("pip install mne") emit. fallback: scipy + manual EDF reader 가능 시 안내.
-//   - bfloat16 raw_arrays compaction은 future opt — 본 cycle은 float32 list.
+//     ("pip install mne scipy numpy") emit (raw#66 trailer).
+//   - alpha-coh / alpha-phase modes: scipy required (welch + butter + hilbert).
 //
 // USAGE
 //   hexa run tool/an11_b_eeg_ingest.hexa --input <path.{bdf|edf|fif}> --output state/eeg_recording_<id>.json --mode raw
 //   hexa run tool/an11_b_eeg_ingest.hexa --input <path.fif> --output state/eeg_recording_<id>.json --mode preprocessed --ica --asr
+//   hexa run tool/an11_b_eeg_ingest.hexa --emit-alpha-coh --input <path.npy> [--output state/clm_eeg_alpha_coh_<ts>.json]
+//   hexa run tool/an11_b_eeg_ingest.hexa --emit-alpha-phase --input <path.npy> [--output state/clm_eeg_alpha_phase_<ts>.json]
 //   hexa run tool/an11_b_eeg_ingest.hexa --selftest
 
 let HELPER_PATH = "/tmp/an11_b_eeg_ingest_helper.hexa_tmp"
 let SCHEMA      = "anima/eeg_recording/1"
+let SCHEMA_COH  = "anima/clm_eeg/alpha_coh/1"
+let SCHEMA_PHA  = "anima/clm_eeg/alpha_phase/1"
 let SPEC_DOC    = "docs/eeg_cross_substrate_validation_plan_20260425.md §1, §6.3"
+let TOOL_VERSION = "v2_b2b3"
 
 fn _sh_quote(s: string) -> string {
     let mut o = "'"
@@ -73,9 +93,12 @@ fn _write_helper() {
         "    pass\n" +
         "\n" +
         "HAVE_SCIPY = False\n" +
+        "SCIPY_VERSION = None\n" +
         "try:\n" +
-        "    from scipy.signal import butter, filtfilt  # type: ignore\n" +
+        "    import scipy  # type: ignore\n" +
+        "    from scipy.signal import butter, filtfilt, welch, csd, hilbert  # type: ignore\n" +
         "    HAVE_SCIPY = True\n" +
+        "    SCIPY_VERSION = scipy.__version__\n" +
         "except Exception:\n" +
         "    pass\n" +
         "\n" +
@@ -85,12 +108,34 @@ fn _write_helper() {
         "def now_iso():\n" +
         "    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
         "\n" +
+        "FROZEN_TS_SYNTH = '2026-04-28T00:00:00Z'\n" +
+        "def ts_for(source):\n" +
+        "    # raw#65 byte-eq: synthetic input → frozen logical timestamp; real input → wall-clock.\n" +
+        "    if source == '<synthetic>' or source == '': return FROZEN_TS_SYNTH\n" +
+        "    return now_iso()\n" +
+        "\n" +
+        "def round3_int(x):\n" +
+        "    # Deterministic round-to-3-decimal via int conversion (raw#65 byte-eq).\n" +
+        "    # x → round(x*1000)/1000 using bankers-free symmetric int floor-half-up.\n" +
+        "    if x is None: return 0.0\n" +
+        "    sign = -1 if x < 0 else 1\n" +
+        "    v = abs(float(x))\n" +
+        "    scaled = int(v * 1000.0 + 0.5)\n" +
+        "    return sign * scaled / 1000.0\n" +
+        "\n" +
         "def bandpass_scipy(arr, fs, lo=1.0, hi=45.0, order=4):\n" +
         "    if not HAVE_SCIPY: return arr, False\n" +
         "    nyq = 0.5 * fs\n" +
         "    if hi >= nyq: hi = nyq * 0.99\n" +
         "    b, a = butter(order, [lo / nyq, hi / nyq], btype='band')\n" +
         "    return filtfilt(b, a, arr, axis=-1), True\n" +
+        "\n" +
+        "def alpha_bandpass(arr, fs, order=4):\n" +
+        "    # Butterworth order 4, filtfilt zero-phase, alpha 8-12Hz.\n" +
+        "    nyq = 0.5 * fs\n" +
+        "    lo = 8.0 / nyq; hi = 12.0 / nyq\n" +
+        "    b, a = butter(order, [lo, hi], btype='band')\n" +
+        "    return filtfilt(b, a, arr, axis=-1)\n" +
         "\n" +
         "def load_mne(path):\n" +
         "    p = path.lower()\n" +
@@ -106,6 +151,32 @@ fn _write_helper() {
         "    else:\n" +
         "        raise ValueError(f'unsupported extension; expected bdf/edf/fif, got: {path}')\n" +
         "    return raw, fmt\n" +
+        "\n" +
+        "def load_npy_or_synth(input_path, n_ch=16, fs=125.0, dur_s=60.0, seed=20260428):\n" +
+        "    # If '<synthetic>' or missing, build deterministic 16ch alpha+pink array.\n" +
+        "    # Else np.load(input_path) → expect (n_ch, n_samples) float.\n" +
+        "    if input_path == '<synthetic>' or input_path == '':\n" +
+        "        rng = np.random.default_rng(seed)\n" +
+        "        n = int(fs * dur_s)\n" +
+        "        t = np.arange(n) / fs\n" +
+        "        eeg = np.zeros((n_ch, n), dtype=np.float64)\n" +
+        "        for ch in range(n_ch):\n" +
+        "            phase = (ch * np.pi / 8.0)  # deterministic phase offset per channel\n" +
+        "            eeg[ch] = (0.8 * np.sin(2 * np.pi * 10.0 * t + phase) +\n" +
+        "                       0.2 * np.sin(2 * np.pi * (8 + ch * 0.25) * t) +\n" +
+        "                       0.15 * rng.standard_normal(n))\n" +
+        "        return eeg, fs, '<synthetic>'\n" +
+        "    if not os.path.exists(input_path):\n" +
+        "        raise FileNotFoundError(f'missing npy: {input_path}')\n" +
+        "    if input_path.lower().endswith('.npy'):\n" +
+        "        arr = np.load(input_path)\n" +
+        "        return arr.astype(np.float64), fs, input_path\n" +
+        "    # fall through: try mne load\n" +
+        "    if not HAVE_MNE:\n" +
+        "        raise RuntimeError(f'non-npy input requires mne for: {input_path}')\n" +
+        "    raw, _ = load_mne(input_path)\n" +
+        "    fs2 = float(raw.info['sfreq'])\n" +
+        "    return raw.get_data().astype(np.float64), fs2, input_path\n" +
         "\n" +
         "def ingest_with_mne(input_path, mode, channel_count, sample_rate_arg, do_ica, do_asr):\n" +
         "    raw, fmt = load_mne(input_path)\n" +
@@ -173,10 +244,17 @@ fn _write_helper() {
         "\n" +
         "def ingest_no_mne_abort(input_path):\n" +
         "    msg = ('ABORT_NO_MNE: helper requires mne (and optionally scipy).\\n' +\n" +
-        "           '  install: pip install mne scipy\\n' +\n" +
+        "           '  install: pip install mne scipy numpy\\n' +\n" +
         "           f'  input: {input_path}\\n' +\n" +
-        "           '  fallback: synthetic selftest (--selftest) does not need mne.')\n" +
+        "           '  fallback: synthetic selftest (--selftest) does not need mne.\\n' +\n" +
+        "           '  raw#66 trailer: ai-native fix = run pip install mne scipy numpy && retry')\n" +
         "    print(msg, file=sys.stderr); sys.exit(3)\n" +
+        "\n" +
+        "def abort_no_scipy():\n" +
+        "    msg = ('ABORT_NO_SCIPY: alpha-coh/alpha-phase modes require scipy.\\n' +\n" +
+        "           '  install: pip install scipy numpy\\n' +\n" +
+        "           '  raw#66 trailer: ai-native fix = run pip install scipy numpy && retry')\n" +
+        "    print(msg, file=sys.stderr); sys.exit(4)\n" +
         "\n" +
         "def cmd_run(input_path, output_path, mode, channel_count_str, sample_rate_arg, do_ica_str, do_asr_str, schema, spec_doc):\n" +
         "    if not os.path.exists(input_path):\n" +
@@ -191,7 +269,7 @@ fn _write_helper() {
         "    out['spec_doc'] = spec_doc\n" +
         "    out['mode'] = mode\n" +
         "    out['raw10_honest'] = 'prototype ingest; phenomenal correlate measurement only; Hard Problem 우회 X'\n" +
-        "    with open(output_path, 'w') as f: json.dump(out, f, indent=2)\n" +
+        "    with open(output_path, 'w') as f: json.dump(out, f, indent=2, sort_keys=True)\n" +
         "    print(f'output_path={output_path}')\n" +
         "    print(f'channels={out[\"metadata\"][\"channel_count\"]}')\n" +
         "    print(f'sample_rate={out[\"sample_rate\"]}')\n" +
@@ -201,20 +279,211 @@ fn _write_helper() {
         "    print(f'mne_version={MNE_VERSION}')\n" +
         "    print('DONE')\n" +
         "\n" +
+        "def compute_alpha_coh_matrix(eeg, fs):\n" +
+        "    # Welch's MSC between every channel pair, integrate over alpha 8-12Hz.\n" +
+        "    # Hann, nperseg=250 @ 125Hz, 50% overlap.\n" +
+        "    n_ch, n_samp = eeg.shape\n" +
+        "    nperseg = min(250, n_samp)\n" +
+        "    noverlap = nperseg // 2\n" +
+        "    # Per-channel auto Welch (Pxx)\n" +
+        "    Pxx_list = []\n" +
+        "    freqs = None\n" +
+        "    for i in range(n_ch):\n" +
+        "        f, Pxx = welch(eeg[i], fs=fs, window='hann', nperseg=nperseg,\n" +
+        "                       noverlap=noverlap, detrend=False, scaling='density')\n" +
+        "        Pxx_list.append(Pxx)\n" +
+        "        if freqs is None: freqs = f\n" +
+        "    # Alpha mask\n" +
+        "    mask = (freqs >= 8.0) & (freqs <= 12.0)\n" +
+        "    coh = np.zeros((n_ch, n_ch), dtype=np.float64)\n" +
+        "    for i in range(n_ch):\n" +
+        "        for j in range(n_ch):\n" +
+        "            if i == j:\n" +
+        "                coh[i, j] = 1.0\n" +
+        "                continue\n" +
+        "            if j < i:\n" +
+        "                coh[i, j] = coh[j, i]\n" +
+        "                continue\n" +
+        "            f, Pxy = csd(eeg[i], eeg[j], fs=fs, window='hann',\n" +
+        "                         nperseg=nperseg, noverlap=noverlap,\n" +
+        "                         detrend=False, scaling='density')\n" +
+        "            num = np.abs(Pxy) ** 2\n" +
+        "            den = Pxx_list[i] * Pxx_list[j]\n" +
+        "            den_safe = np.where(den > 0, den, 1.0)\n" +
+        "            msc = num / den_safe\n" +
+        "            # integrate across alpha band → mean MSC over band bins\n" +
+        "            if mask.any():\n" +
+        "                v = float(np.mean(msc[mask]))\n" +
+        "            else:\n" +
+        "                v = 0.0\n" +
+        "            if v < 0.0: v = 0.0\n" +
+        "            if v > 1.0: v = 1.0\n" +
+        "            coh[i, j] = v\n" +
+        "    # round to 3 decimals deterministically\n" +
+        "    coh_r = np.zeros_like(coh)\n" +
+        "    for i in range(n_ch):\n" +
+        "        for j in range(n_ch):\n" +
+        "            coh_r[i, j] = round3_int(coh[i, j])\n" +
+        "    return coh_r\n" +
+        "\n" +
+        "def cmd_emit_alpha_coh(input_path, output_path):\n" +
+        "    if not HAVE_SCIPY: abort_no_scipy()\n" +
+        "    eeg, fs, src = load_npy_or_synth(input_path)\n" +
+        "    n_ch, n_samp = eeg.shape\n" +
+        "    if n_ch < 16:\n" +
+        "        # pad with zeros up to 16 to honor schema (warn)\n" +
+        "        pad = np.zeros((16 - n_ch, n_samp), dtype=eeg.dtype)\n" +
+        "        eeg = np.concatenate([eeg, pad], axis=0)\n" +
+        "        n_ch = 16\n" +
+        "    elif n_ch > 16:\n" +
+        "        eeg = eeg[:16]; n_ch = 16\n" +
+        "    coh = compute_alpha_coh_matrix(eeg, fs)\n" +
+        "    # mean off-diagonal\n" +
+        "    mask = ~np.eye(n_ch, dtype=bool)\n" +
+        "    mean_off = round3_int(float(coh[mask].mean()))\n" +
+        "    # max pair (excluding diagonal)\n" +
+        "    coh_offdiag = coh.copy()\n" +
+        "    np.fill_diagonal(coh_offdiag, -1.0)\n" +
+        "    flat_idx = int(np.argmax(coh_offdiag))\n" +
+        "    max_i = flat_idx // n_ch\n" +
+        "    max_j = flat_idx % n_ch\n" +
+        "    max_pair = round3_int(float(coh_offdiag[max_i, max_j]))\n" +
+        "    out = {\n" +
+        "        'tool': 'an11_b_eeg_ingest',\n" +
+        "        'version': '__TOOL_VERSION__',\n" +
+        "        'raw_rank': 9,\n" +
+        "        'schema': 'anima/clm_eeg/alpha_coh/1',\n" +
+        "        'source_npy': src,\n" +
+        "        'n_channels': int(n_ch),\n" +
+        "        'n_samples': int(eeg.shape[1]),\n" +
+        "        'sample_rate': float(fs),\n" +
+        "        'alpha_band_hz': [8, 12],\n" +
+        "        'welch_params': {'window': 'hann', 'nperseg': 250, 'overlap': 0.5},\n" +
+        "        'channels': DEFAULT_10_20_16,\n" +
+        "        'coherence_matrix': [[round3_int(float(coh[i, j])) for j in range(n_ch)] for i in range(n_ch)],\n" +
+        "        'mean_offdiagonal_coh': mean_off,\n" +
+        "        'max_pair_coh': max_pair,\n" +
+        "        'max_pair_indices': [int(max_i), int(max_j)],\n" +
+        "        'alpha_coh_x1000': int(round(mean_off * 1000)),\n" +
+        "        'timestamp_utc': ts_for(src),\n" +
+        "        'helper_mne_version': MNE_VERSION,\n" +
+        "        'helper_scipy_version': SCIPY_VERSION,\n" +
+        "        'raw10_honest': 'Welchs MSC; alpha-band integration; deterministic 3-decimal rounding via int conversion'\n" +
+        "    }\n" +
+        "    # raw#65 byte-eq: sort_keys + indent=2\n" +
+        "    with open(output_path, 'w') as f: json.dump(out, f, indent=2, sort_keys=True)\n" +
+        "    print(f'output_path={output_path}')\n" +
+        "    print(f'mode=emit-alpha-coh')\n" +
+        "    print(f'n_channels={n_ch}')\n" +
+        "    print(f'n_samples={eeg.shape[1]}')\n" +
+        "    print(f'sample_rate={fs}')\n" +
+        "    print(f'mean_offdiagonal_coh={mean_off}')\n" +
+        "    print(f'alpha_coh_x1000={int(round(mean_off * 1000))}')\n" +
+        "    print(f'max_pair_coh={max_pair}')\n" +
+        "    print(f'max_pair_indices=[{max_i},{max_j}]')\n" +
+        "    print(f'helper_scipy_version={SCIPY_VERSION}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
+        "def compute_alpha_phase_summary(eeg, fs, n_windows=5, window_sec=10):\n" +
+        "    n_ch, n_samp = eeg.shape\n" +
+        "    win_n = int(window_sec * fs)\n" +
+        "    needed = n_windows * win_n\n" +
+        "    if n_samp < needed:\n" +
+        "        raise ValueError(f'alpha-phase requires >= {needed} samples; got {n_samp} (= {n_samp/fs:.1f}s @ {fs}Hz)')\n" +
+        "    # alpha bandpass once across entire signal (zero-phase)\n" +
+        "    eeg_alpha = alpha_bandpass(eeg, fs, order=4)\n" +
+        "    # hilbert per channel\n" +
+        "    analytic = hilbert(eeg_alpha, axis=-1)\n" +
+        "    phase = np.angle(analytic)  # (n_ch, n_samp)\n" +
+        "    summary = []  # [n_windows][n_ch] dict\n" +
+        "    for w in range(n_windows):\n" +
+        "        start = w * win_n\n" +
+        "        stop = start + win_n\n" +
+        "        per_ch = []\n" +
+        "        for c in range(n_ch):\n" +
+        "            ph = phase[c, start:stop]\n" +
+        "            # circular mean & variance via complex unit vectors\n" +
+        "            cz = np.exp(1j * ph)\n" +
+        "            mean_z = cz.mean()\n" +
+        "            mean_angle = float(np.angle(mean_z))\n" +
+        "            R = float(np.abs(mean_z))  # in [0,1] = PLV magnitude\n" +
+        "            circ_var = 1.0 - R\n" +
+        "            per_ch.append({\n" +
+        "                'mean': round3_int(mean_angle),\n" +
+        "                'circ_var': round3_int(circ_var),\n" +
+        "                'plv': round3_int(R),\n" +
+        "                'mean_x1000': int(round(mean_angle * 1000)),\n" +
+        "                'circ_var_x1000': int(round(circ_var * 1000)),\n" +
+        "                'plv_x1000': int(round(R * 1000)),\n" +
+        "            })\n" +
+        "        summary.append(per_ch)\n" +
+        "    return summary\n" +
+        "\n" +
+        "def cmd_emit_alpha_phase(input_path, output_path):\n" +
+        "    if not HAVE_SCIPY: abort_no_scipy()\n" +
+        "    eeg, fs, src = load_npy_or_synth(input_path)\n" +
+        "    n_ch, n_samp = eeg.shape\n" +
+        "    if n_ch < 16:\n" +
+        "        pad = np.zeros((16 - n_ch, n_samp), dtype=eeg.dtype)\n" +
+        "        eeg = np.concatenate([eeg, pad], axis=0); n_ch = 16\n" +
+        "    elif n_ch > 16:\n" +
+        "        eeg = eeg[:16]; n_ch = 16\n" +
+        "    summary = compute_alpha_phase_summary(eeg, fs, n_windows=5, window_sec=10)\n" +
+        "    out = {\n" +
+        "        'tool': 'an11_b_eeg_ingest',\n" +
+        "        'version': '__TOOL_VERSION__',\n" +
+        "        'raw_rank': 9,\n" +
+        "        'schema': 'anima/clm_eeg/alpha_phase/1',\n" +
+        "        'source_npy': src,\n" +
+        "        'n_channels': int(n_ch),\n" +
+        "        'n_samples': int(eeg.shape[1]),\n" +
+        "        'sample_rate': float(fs),\n" +
+        "        'n_windows': 5,\n" +
+        "        'window_sec': 10,\n" +
+        "        'alpha_band_hz': [8, 12],\n" +
+        "        'filter_params': {'type': 'butterworth', 'order': 4, 'zero_phase': True, 'method': 'filtfilt'},\n" +
+        "        'channels': DEFAULT_10_20_16,\n" +
+        "        'phase_summary_per_window_per_channel': summary,\n" +
+        "        'timestamp_utc': ts_for(src),\n" +
+        "        'helper_versions': {'mne': MNE_VERSION, 'scipy': SCIPY_VERSION, 'numpy': np.__version__},\n" +
+        "        'raw10_honest': 'butterworth-4 alpha bandpass + hilbert analytic signal; 5x10s windows; circular mean/var/PLV per channel'\n" +
+        "    }\n" +
+        "    with open(output_path, 'w') as f: json.dump(out, f, indent=2, sort_keys=True)\n" +
+        "    # mean PLV across all windows×channels (for at-a-glance metric)\n" +
+        "    plv_acc = 0.0; plv_n = 0\n" +
+        "    for w in summary:\n" +
+        "        for c in w:\n" +
+        "            plv_acc = plv_acc + c['plv']; plv_n = plv_n + 1\n" +
+        "    mean_plv = plv_acc / plv_n if plv_n > 0 else 0.0\n" +
+        "    print(f'output_path={output_path}')\n" +
+        "    print(f'mode=emit-alpha-phase')\n" +
+        "    print(f'n_channels={n_ch}')\n" +
+        "    print(f'n_samples={eeg.shape[1]}')\n" +
+        "    print(f'sample_rate={fs}')\n" +
+        "    print(f'n_windows=5')\n" +
+        "    print(f'window_sec=10')\n" +
+        "    print(f'mean_plv_all={round3_int(mean_plv)}')\n" +
+        "    print(f'mean_plv_x1000={int(round(mean_plv * 1000))}')\n" +
+        "    print(f'helper_scipy_version={SCIPY_VERSION}')\n" +
+        "    print('DONE')\n" +
+        "\n" +
         "def cmd_selftest():\n" +
-        "    # Synthetic 16ch × 1s × 250Hz signal generation + ingest (no MNE required).\n" +
-        "    rng = np.random.default_rng(20260425)\n" +
-        "    fs = 250.0; n = int(fs * 1.0)\n" +
+        "    # Synthetic 16ch × 60s × 125Hz signal (Cyton+Daisy-like). Run all 3 modes.\n" +
+        "    rng = np.random.default_rng(20260428)\n" +
+        "    fs = 125.0; n = int(fs * 60.0)  # 60s for alpha-phase 5×10s\n" +
         "    t = np.arange(n) / fs\n" +
-        "    eeg = np.zeros((16, n), dtype=np.float32)\n" +
+        "    eeg = np.zeros((16, n), dtype=np.float64)\n" +
         "    for ch in range(16):\n" +
-        "        eeg[ch] = (0.6 * np.sin(2 * np.pi * (8 + ch * 0.5) * t) +\n" +
-        "                   0.4 * rng.standard_normal(n)).astype(np.float32)\n" +
+        "        phase = (ch * np.pi / 8.0)\n" +
+        "        eeg[ch] = (0.8 * np.sin(2 * np.pi * 10.0 * t + phase) +\n" +
+        "                   0.2 * np.sin(2 * np.pi * (8 + ch * 0.25) * t) +\n" +
+        "                   0.15 * rng.standard_normal(n))\n" +
+        "    # Mode A: legacy synthetic raw_arrays selftest (preserved).\n" +
         "    if HAVE_SCIPY:\n" +
         "        eeg_filt, applied = bandpass_scipy(eeg.astype(np.float64), fs)\n" +
         "        eeg_filt = eeg_filt.astype(np.float32)\n" +
         "    else:\n" +
-        "        eeg_filt = eeg; applied = False\n" +
+        "        eeg_filt = eeg.astype(np.float32); applied = False\n" +
         "    out = {\n" +
         "        'schema': 'anima/eeg_recording/1',\n" +
         "        'spec_doc': 'tool/an11_b_eeg_ingest.hexa selftest',\n" +
@@ -222,7 +491,7 @@ fn _write_helper() {
         "        'channels': DEFAULT_10_20_16,\n" +
         "        'channel_positions': None,\n" +
         "        'sample_rate': fs,\n" +
-        "        'raw_arrays': eeg_filt.tolist(),\n" +
+        "        'raw_arrays_shape': [16, n],\n" +
         "        'metadata': {\n" +
         "            'recording_duration_s': float(n)/fs,\n" +
         "            'reference': 'synthetic_none',\n" +
@@ -239,12 +508,44 @@ fn _write_helper() {
         "        },\n" +
         "        'raw10_honest': 'synthetic selftest; not phenomenal data'\n" +
         "    }\n" +
-        "    # validation invariants\n" +
-        "    assert len(out['raw_arrays']) == 16, 'channel count mismatch'\n" +
-        "    assert len(out['raw_arrays'][0]) == n, 'sample count mismatch'\n" +
-        "    assert out['sample_rate'] == 250.0\n" +
-        "    s = json.dumps(out)\n" +
+        "    assert out['sample_rate'] == 125.0\n" +
+        "    s = json.dumps(out, sort_keys=True)\n" +
         "    assert len(s) > 0\n" +
+        "    # Mode B: --emit-alpha-coh selftest\n" +
+        "    coh_ok = False; coh_keys_ok = False; coh_path = ''\n" +
+        "    pha_ok = False; pha_keys_ok = False; pha_path = ''\n" +
+        "    if HAVE_SCIPY:\n" +
+        "        coh_path = '/tmp/an11_b_eeg_ingest_selftest_alpha_coh.json'\n" +
+        "        try:\n" +
+        "            cmd_emit_alpha_coh('<synthetic>', coh_path)\n" +
+        "            with open(coh_path) as f: dcoh = json.load(f)\n" +
+        "            coh_ok = True\n" +
+        "            req = ['schema','source_npy','n_channels','n_samples','sample_rate','alpha_band_hz',\n" +
+        "                   'welch_params','channels','coherence_matrix','mean_offdiagonal_coh',\n" +
+        "                   'max_pair_coh','max_pair_indices','timestamp_utc',\n" +
+        "                   'helper_mne_version','helper_scipy_version','alpha_coh_x1000']\n" +
+        "            coh_keys_ok = all(k in dcoh for k in req)\n" +
+        "            assert dcoh['n_channels'] == 16\n" +
+        "            assert len(dcoh['coherence_matrix']) == 16\n" +
+        "            assert len(dcoh['coherence_matrix'][0]) == 16\n" +
+        "        except Exception as e:\n" +
+        "            print(f'selftest_alpha_coh_err={e}', file=sys.stderr)\n" +
+        "        # Mode C: --emit-alpha-phase selftest\n" +
+        "        pha_path = '/tmp/an11_b_eeg_ingest_selftest_alpha_phase.json'\n" +
+        "        try:\n" +
+        "            cmd_emit_alpha_phase('<synthetic>', pha_path)\n" +
+        "            with open(pha_path) as f: dpha = json.load(f)\n" +
+        "            pha_ok = True\n" +
+        "            reqp = ['schema','source_npy','n_channels','sample_rate','n_windows','window_sec',\n" +
+        "                    'alpha_band_hz','filter_params','channels',\n" +
+        "                    'phase_summary_per_window_per_channel','timestamp_utc','helper_versions']\n" +
+        "            pha_keys_ok = all(k in dpha for k in reqp)\n" +
+        "            assert dpha['n_windows'] == 5\n" +
+        "            assert dpha['window_sec'] == 10\n" +
+        "            assert len(dpha['phase_summary_per_window_per_channel']) == 5\n" +
+        "            assert len(dpha['phase_summary_per_window_per_channel'][0]) == 16\n" +
+        "        except Exception as e:\n" +
+        "            print(f'selftest_alpha_phase_err={e}', file=sys.stderr)\n" +
         "    print(f'selftest=ok')\n" +
         "    print(f'channels={len(out[\"channels\"])}')\n" +
         "    print(f'sample_rate={out[\"sample_rate\"]}')\n" +
@@ -252,30 +553,57 @@ fn _write_helper() {
         "    print(f'mne_available={HAVE_MNE}')\n" +
         "    print(f'mne_version={MNE_VERSION}')\n" +
         "    print(f'scipy_available={HAVE_SCIPY}')\n" +
+        "    print(f'scipy_version={SCIPY_VERSION}')\n" +
         "    print(f'filtering_applied={applied}')\n" +
         "    print(f'json_payload_bytes={len(s)}')\n" +
+        "    print(f'alpha_coh_emit_ok={coh_ok}')\n" +
+        "    print(f'alpha_coh_keys_ok={coh_keys_ok}')\n" +
+        "    print(f'alpha_coh_path={coh_path}')\n" +
+        "    print(f'alpha_phase_emit_ok={pha_ok}')\n" +
+        "    print(f'alpha_phase_keys_ok={pha_keys_ok}')\n" +
+        "    print(f'alpha_phase_path={pha_path}')\n" +
         "    print('DONE')\n" +
         "\n" +
         "def main():\n" +
         "    if len(sys.argv) < 2:\n" +
-        "        print('usage: helper <run|selftest> ...', file=sys.stderr); sys.exit(2)\n" +
+        "        print('usage: helper <run|selftest|emit_alpha_coh|emit_alpha_phase> ...', file=sys.stderr); sys.exit(2)\n" +
         "    op = sys.argv[1]\n" +
         "    if op == 'run':\n" +
-        "        # input output mode channel_count sample_rate ica asr schema spec_doc\n" +
         "        cmd_run(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10])\n" +
         "    elif op == 'selftest':\n" +
         "        cmd_selftest()\n" +
+        "    elif op == 'emit_alpha_coh':\n" +
+        "        cmd_emit_alpha_coh(sys.argv[2], sys.argv[3])\n" +
+        "    elif op == 'emit_alpha_phase':\n" +
+        "        cmd_emit_alpha_phase(sys.argv[2], sys.argv[3])\n" +
         "    else:\n" +
         "        print(f'unknown op: {op}', file=sys.stderr); sys.exit(2)\n" +
         "\n" +
         "if __name__ == '__main__': main()\n"
-    write_file(HELPER_PATH, src)
+    let final_src = src.replace("__TOOL_VERSION__", TOOL_VERSION)
+    write_file(HELPER_PATH, final_src)
 }
 
 fn _run_helper(args: string) -> list {
     let cmd = "python3 " + HELPER_PATH + " " + args
     let r = exec_with_status(cmd)
     return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+fn _default_coh_path() -> string {
+    let env_out = env("CLM_EEG_ALPHA_COH_OUT")
+    if env_out != "" { return env_out }
+    let r = exec_with_status("date -u +%Y%m%dT%H%M%SZ")
+    let ts = to_string(r[0]).trim()
+    return "state/clm_eeg_alpha_coh_" + ts + ".json"
+}
+
+fn _default_phase_path() -> string {
+    let env_out = env("CLM_EEG_ALPHA_PHASE_OUT")
+    if env_out != "" { return env_out }
+    let r = exec_with_status("date -u +%Y%m%dT%H%M%SZ")
+    let ts = to_string(r[0]).trim()
+    return "state/clm_eeg_alpha_phase_" + ts + ".json"
 }
 
 fn main() {
@@ -288,6 +616,8 @@ fn main() {
     let mut do_ica = "0"
     let mut do_asr = "0"
     let mut selftest = false
+    let mut emit_alpha_coh = false
+    let mut emit_alpha_phase = false
     let mut i = 2
     while i < len(av) {
         let a = av[i]
@@ -299,23 +629,70 @@ fn main() {
         if a == "--ica" { do_ica = "1"; i = i + 1; continue }
         if a == "--asr" { do_asr = "1"; i = i + 1; continue }
         if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--emit-alpha-coh" { emit_alpha_coh = true; i = i + 1; continue }
+        if a == "--emit-alpha-phase" { emit_alpha_phase = true; i = i + 1; continue }
         i = i + 1
     }
 
     _write_helper()
 
     if selftest {
-        println("── an11_b_eeg_ingest selftest ──")
+        println("── an11_b_eeg_ingest selftest (B2+B3 extended) ──")
         let r = _run_helper("selftest")
         println(r[0])
         if r[1] != 0 { eprintln("selftest FAILED (exit " + to_string(r[1]) + ")"); exit(1) }
         if _kv_lookup(r[0], "selftest") != "ok" { eprintln("selftest marker missing"); exit(1) }
-        println("selftest: OK")
+        // raw#65 byte-eq verification: both selftest emit paths shasum-compare
+        let coh_ok = _kv_lookup(r[0], "alpha_coh_emit_ok")
+        let coh_keys = _kv_lookup(r[0], "alpha_coh_keys_ok")
+        let pha_ok = _kv_lookup(r[0], "alpha_phase_emit_ok")
+        let pha_keys = _kv_lookup(r[0], "alpha_phase_keys_ok")
+        if coh_ok != "True" { eprintln("ABORT: alpha_coh selftest emit failed"); exit(1) }
+        if coh_keys != "True" { eprintln("ABORT: alpha_coh schema keys missing"); exit(1) }
+        if pha_ok != "True" { eprintln("ABORT: alpha_phase selftest emit failed"); exit(1) }
+        if pha_keys != "True" { eprintln("ABORT: alpha_phase schema keys missing"); exit(1) }
+        println("selftest: OK (raw_arrays + alpha_coh + alpha_phase all pass)")
+        exit(0)
+    }
+
+    if emit_alpha_coh {
+        if input == "" { input = "<synthetic>" }
+        if output == "" { output = _default_coh_path() }
+        println("── an11_b_eeg_ingest --emit-alpha-coh ──")
+        println("input:  " + input)
+        println("output: " + output)
+        let args = "emit_alpha_coh " + _sh_quote(input) + " " + _sh_quote(output)
+        let r = _run_helper(args)
+        let st = r[1]
+        if st == 3 { eprintln(r[0]); eprintln("HINT: pip install mne scipy numpy"); exit(3) }
+        if st == 4 { eprintln(r[0]); eprintln("HINT: pip install scipy numpy"); exit(4) }
+        if st != 0 { eprintln("ABORT: helper emit_alpha_coh exited " + to_string(st)); eprintln(r[0]); exit(2) }
+        println(r[0])
+        println("")
+        println("wrote " + output)
+        exit(0)
+    }
+
+    if emit_alpha_phase {
+        if input == "" { input = "<synthetic>" }
+        if output == "" { output = _default_phase_path() }
+        println("── an11_b_eeg_ingest --emit-alpha-phase ──")
+        println("input:  " + input)
+        println("output: " + output)
+        let args = "emit_alpha_phase " + _sh_quote(input) + " " + _sh_quote(output)
+        let r = _run_helper(args)
+        let st = r[1]
+        if st == 3 { eprintln(r[0]); eprintln("HINT: pip install mne scipy numpy"); exit(3) }
+        if st == 4 { eprintln(r[0]); eprintln("HINT: pip install scipy numpy"); exit(4) }
+        if st != 0 { eprintln("ABORT: helper emit_alpha_phase exited " + to_string(st)); eprintln(r[0]); exit(2) }
+        println(r[0])
+        println("")
+        println("wrote " + output)
         exit(0)
     }
 
     if input == "" || output == "" {
-        eprintln("ABORT: --input <path.{bdf|edf|fif}> --output <path> required (or --selftest).")
+        eprintln("ABORT: --input <path.{bdf|edf|fif}> --output <path> required (or --selftest|--emit-alpha-coh|--emit-alpha-phase).")
         exit(2)
     }
     if !file_exists(input) {
@@ -347,7 +724,7 @@ fn main() {
     let st  = r[1]
     if st == 3 {
         eprintln(out)
-        eprintln("HINT: pip install mne scipy")
+        eprintln("HINT: pip install mne scipy numpy")
         exit(3)
     }
     if st != 0 { eprintln("ABORT: helper run exited " + to_string(st)); eprintln(out); exit(2) }
@@ -356,5 +733,3 @@ fn main() {
     println("wrote " + output)
     exit(0)
 }
-
-main()

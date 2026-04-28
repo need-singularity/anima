@@ -1,0 +1,131 @@
+{
+  "cycle": "omega_bridge_19",
+  "axis": "bridge / time-shape alert rules — consecutive_warn streak + recent_warn_ratio window",
+  "timestamp": "2026-04-26T20:45:00Z",
+  "user_email": "mk911tb@proton.me",
+  "title": "atlas_alert_subscriber.hexa — add streak-threshold + window-minutes rule modes",
+  "summary": "Extend tool/atlas_alert_subscriber.hexa (ω-bridge-17) with two time-shape alert rules that the original ratio-only rules cannot detect. (a) consecutive_warn — fires when the last K matching rows are ALL WARN, catching hot anomalies that started recently and which a moderate ratio would dilute. (b) recent_warn_ratio — fires when the WARN-ratio over the last M minutes (parsed from the ts field) >= --warn-threshold, escalating closer-in-time anomalies faster than a fixed-N tail. Both are off-by-default (K=0 / M=0); existing ratio rules and SKIP/PASS semantics unchanged when new flags are absent.",
+  "context": {
+    "predecessors": {
+      "omega_bridge_16": "promoted __BRIDGE_ANOMALY__ sentinel into a structured sibling JSONL row scoped 'bridge_anomaly' with ISO-8601 ts field",
+      "omega_bridge_17": "built tool/atlas_alert_subscriber.hexa — JSONL-stream subscriber with warn_ratio + insufficient_ratio rules",
+      "omega_bridge_18": "wired -L flag into bridge_health.sh so the subscriber runs as part of the single-CLI sweep"
+    },
+    "problem": "Ratio-only rules over a fixed-N tail miss two important time-shape patterns. A bridge that starts failing 5 minutes ago shows up as a 4/10 = 0.4 ratio (right at or below the default warn-threshold) even though every recent row is WARN — the older PASS rows dilute the signal. Likewise, 'last 24h with 3 WARNs in the most recent hour' is operationally far more urgent than '24h with 3 WARNs spread evenly', but warn_ratio sees them identically.",
+    "design_alternatives_considered": [
+      {
+        "option": "A — exponential decay weighting on ratio compute",
+        "rejected_because": "loses interpretability ('why did it fire?') and requires a half-life knob that operators have no calibration data for yet"
+      },
+      {
+        "option": "B — separate consecutive_warn (count-based) + recent_warn_ratio (time-based) rules (CHOSEN)",
+        "chosen_because": "two orthogonal levers, each with a single intuitive parameter; can be enabled independently; sentinels carry observed/streak/ratio for forensic readback; both off-by-default preserves existing-behaviour"
+      },
+      {
+        "option": "C — new tool altogether (atlas_alert_streak.hexa)",
+        "rejected_because": "wasteful surface; the read-pipeline (load → filter scope → tally) is identical and would be duplicated; raw 9 hexa-only-suffix is satisfied either way but maintenance is higher"
+      }
+    ]
+  },
+  "files_modified": [
+    {
+      "path": "/Users/ghost/core/nexus/tool/atlas_alert_subscriber.hexa",
+      "edits": [
+        "header sentinels list: added FIRED rule=consecutive_warn and FIRED rule=recent_warn_ratio shapes",
+        "header rules section: documented --streak-threshold K and --window-minutes M (both default 0 = disabled)",
+        "DEFAULT_STREAK = \"0\" and DEFAULT_WINDOW_MIN = \"0\" constants",
+        "argv parser: --streak-threshold and --window-minutes flag handlers; --help text extended",
+        "consecutive_warn rule body: walks tail_lines from end, counts trailing consecutive WARN rows, fires when observed >= K; rules_evaluated incremented; emits __ATLAS_ALERT__ FIRED rule=consecutive_warn streak=K observed=K last_n=N sampled=S",
+        "recent_warn_ratio rule body: writes joined matched-rows to /tmp/atlas_alert_window_<ts>_<n>.jsonl, shells out to python3 to parse ISO-8601 ts and compute WARN-ratio over [now-M*60, now] (skipping future-dated and parse-failed rows defensively), reuses --warn-threshold as the firing threshold; emits __ATLAS_ALERT__ FIRED rule=recent_warn_ratio ratio=R threshold=T window_minutes=M sampled=S; tmp file cleaned up via rm -f"
+      ]
+    }
+  ],
+  "files_created": [],
+  "new_flags": [
+    "--streak-threshold K  (default 0 = disabled)",
+    "--window-minutes M    (default 0 = disabled)"
+  ],
+  "new_sentinels": [
+    "__ATLAS_ALERT__ FIRED rule=consecutive_warn streak=K observed=K last_n=N sampled=S",
+    "__ATLAS_ALERT__ FIRED rule=recent_warn_ratio ratio=R threshold=T window_minutes=M sampled=S"
+  ],
+  "edge_cases_handled": {
+    "streak_non_matching_skipped": "tail_lines is already filtered to scope=bridge_anomaly upstream, so the streak walk operates only on matching rows by construction (the spec's 'skip non-matching to compute streak only on matching rows' edge case is satisfied automatically)",
+    "window_parse_failure": "python3 try/except around datetime.strptime — any row whose ts cannot be parsed is silently skipped (raw 71 report-only)",
+    "window_future_dated": "explicit `if t > now: continue` excludes future-dated rows from the count (defensive — prevents a clock-skewed producer from inflating recent_warn_ratio)",
+    "window_no_in_window_rows": "if win_total == 0 the rule is treated as 'nothing to evaluate' and does NOT fire (avoids divide-by-zero and avoids false positives over an empty sample)",
+    "both_rules_simultaneous": "consecutive_warn and recent_warn_ratio fire independently of each other and of the existing warn_ratio / insufficient_ratio rules; each emits its own __ATLAS_ALERT__ line",
+    "compat_when_flags_absent": "DEFAULT_STREAK=\"0\" and DEFAULT_WINDOW_MIN=\"0\" gate the new blocks behind != \"0\" checks; rules_evaluated stays at 2 (matching pre-bridge-19 baseline)"
+  },
+  "compliance": {
+    "raw_9_hexa_only_suffix": "edited an existing tracked .hexa file; no new non-.hexa files created",
+    "raw_71_report_only": "tool remains read-only on the timeline; tmp file is in /tmp/ and cleaned up; rule firing does not change exit code",
+    "raw_73_admissibility": "scope=bridge_anomaly filter unchanged; new rules operate on the same matched rowset",
+    "raw_77_append_only_respect": "tool does not append to atlas_health_timeline.jsonl",
+    "raw_80_sentinel": "two new __ATLAS_ALERT__ FIRED shapes added; existing PASS / SKIP / FIRED shapes untouched",
+    "no_parallel_session_collision": "edited only tool/atlas_alert_subscriber.hexa; did not touch cli/run.hexa, state/atlas_health_timeline.jsonl, bisociation/spectra/g_atlas_composite_v3.json, tool/omega_cycle_atlas_ingest.hexa, n6/*, tool/kick_*.hexa, design/kick/*, .own"
+  },
+  "validation": {
+    "fixtures_dir": "/tmp/ob19/",
+    "fixtures": [
+      {
+        "name": "F1 streak_last4_warn — 10 rows, last 4 are WARN",
+        "K=4_expected": "consecutive_warn FIRES",
+        "K=4_observed": "__ATLAS_ALERT__ FIRED rule=consecutive_warn streak=4 observed=4 last_n=10 sampled=10",
+        "K=4_pass": true,
+        "K=5_expected": "consecutive_warn does NOT fire",
+        "K=5_observed": "only __ATLAS_ALERT__ FIRED rule=warn_ratio (existing rule); no consecutive_warn line",
+        "K=5_pass": true
+      },
+      {
+        "name": "F2 streak_broken — last 4 are WARN+PASS+WARN+WARN",
+        "K=3_expected": "consecutive_warn does NOT fire (broken streak — observed=2)",
+        "K=3_observed": "__ATLAS_ALERT__ PASS sampled=10 rules_evaluated=3",
+        "K=3_pass": true
+      },
+      {
+        "name": "F3 window_recent — 5 rows in last 30min (3 WARN + 2 PASS) + 5 older PASS",
+        "M=60_thr=0.5_expected": "recent_warn_ratio FIRES with ratio=0.6",
+        "M=60_thr=0.5_observed": "__ATLAS_ALERT__ FIRED rule=recent_warn_ratio ratio=0.6000 threshold=0.5 window_minutes=60 sampled=5",
+        "M=60_thr=0.5_pass": true
+      },
+      {
+        "name": "F4 compat — no new flags",
+        "expected": "rules_evaluated=2 (pre-bridge-19 baseline), human-readable summary unchanged",
+        "observed": "__ATLAS_ALERT__ PASS sampled=10 rules_evaluated=2; human summary shows PASS=7 WARN=3 INSUFFICIENT_DATA=0; ratios warn=0.3000 / insuf=0.0000; 'no rules fired'",
+        "pass": true
+      },
+      {
+        "name": "edge — future-dated + broken-ts rows",
+        "fixture": "/tmp/ob19/window_edge.jsonl (1 future-dated WARN, 1 broken-ts WARN, 1 in-window WARN, 1 too-old PASS)",
+        "M=60_thr=0.5_expected": "future + broken-ts skipped, only the in-window WARN counted, ratio=1.0",
+        "M=60_thr=0.5_observed": "__ATLAS_ALERT__ FIRED rule=recent_warn_ratio ratio=1.0000 threshold=0.5 window_minutes=60 sampled=1",
+        "pass": true
+      },
+      {
+        "name": "all-rules-together",
+        "command": "HEXA_ARGV='--timeline F1 --last 10 --warn-threshold 0.3 --streak-threshold 4 --window-minutes 60' hexa run ...",
+        "observed": "warn_ratio + consecutive_warn + recent_warn_ratio all fire on the same sweep, three independent __ATLAS_ALERT__ lines emitted",
+        "pass": true
+      }
+    ],
+    "all_pass": true
+  },
+  "operational_notes": {
+    "wiring_into_bridge_health_sh": "ω-bridge-19 does NOT modify bridge_health.sh; operators who want streak/window rules in the cron pipeline can extend ALERT_*_THR env vars in a future cycle. The subscriber accepts the new flags directly when invoked outside the -L wrapper.",
+    "calibration_guidance": [
+      "--streak-threshold 3 catches a fresh outage within ~3 sweeps (~3-15 minutes typical cron cadence)",
+      "--window-minutes 60 with --warn-threshold 0.5 catches 'majority WARN over the last hour' regardless of how long the timeline is",
+      "for high-cadence sweeps, reduce --window-minutes (e.g. 15) and tighten threshold; for low-cadence, increase both"
+    ],
+    "back_compat": "all existing invocations continue to work; both new flags default to 0 (disabled)"
+  },
+  "follow_ups": {
+    "future_candidates": [
+      "ALERT_STREAK_K and ALERT_WINDOW_MIN env-vars in bridge_health.sh -L wrapper (one-line addition each)",
+      "exponential-decay weighted ratio as a third time-shape rule",
+      "alert dispatch integration (slack/email) on FIRED",
+      "fingerprint suppression — don't refire the same alert within a cooldown window"
+    ]
+  }
+}

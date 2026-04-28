@@ -1,0 +1,674 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/b14_sync_law107_verify.hexa
+//  B14_sync (Law 107) empirical verification — Mk.XI learning loop simulator
+//  (mac-local, raw#9 strict, hexa-only, no Python, no GPU, no real weights)
+//
+//  PARENT FINDING (commit a68f37d58)
+//    "B14_sync (Law 107) — 비동기화가 Φ 유발 → 현 Mk.XI 학습 루프 검증" 추천
+//
+//  EXISTING SPEC (acceleration_hypotheses.json :: B14_sync)
+//    verdict   : "REVERSED — diversity drives Phi, not synchronization (Law 107)"
+//    result    : "Zero sync moments detected. Phi correlates with
+//                 DE-synchronization (r=-0.13)."
+//    source    : ready/experiments/acceleration_b14_topology.py
+//                (32 cells × 12 factions × 300 steps, ConsciousnessEngine)
+//
+//  LAW 107 (consciousness_laws.json #107)
+//    "Hidden diversity inversely correlates with Φ (r=-0.46):
+//     convergent representations integrate better"
+//
+//  HYPOTHESES
+//    H7A — desync↑ → Φ↑   (TECS-L finding + B14_sync result reproduce)
+//    H7B — desync↑ → Φ↓   (Law 107 reading: diversity↓Φ↑ ⇒ sync↑Φ↑)
+//    H7C — null            (sync axis unrelated to Φ)
+//
+//    NOTE: Law 107 and B14_sync result are *prima facie* in tension —
+//    Law 107 says hidden diversity↑Φ↓ (so sync↑Φ↑), but B14_sync said
+//    desync↑Φ↑. The resolution in the prior verdict was that
+//    *faction* sync (cosine of group means) is a different quantity
+//    than per-cell *hidden diversity* — factions can desync while
+//    individual cells converge inside each faction. This driver tests
+//    whether that distinction reproduces in pure-synthetic substrate.
+//
+//  METHOD (no torch, no real engine — synthetic Mk.XI mock)
+//    Substrate
+//      N_CELLS    = 32
+//      N_FACTIONS = 12  (deterministic faction assignment by cell id mod 12)
+//      HID        = 8
+//      STEPS      = 300
+//      Each cell has a hidden vector h_i ∈ R^HID, initialized via LCG
+//      with per-cell seed. At each step:
+//        - random walk perturbation σ=0.05 (LCG-generated, deterministic)
+//        - faction-mean attraction: h_i ← (1-α)·h_i + α·μ_F(i)
+//          where μ_F is the mean of faction F. α controls intra-faction sync.
+//          (α=0.0 → free; α=0.3 → moderate; α=0.7 → strong intra-faction sync)
+//
+//    Conditions (3-cell × 3-α matrix in single run, deterministic)
+//      A. FREE       (α=0.0)  — no faction attraction (max diversity)
+//      B. MODERATE   (α=0.3)  — partial attraction
+//      C. STRONG     (α=0.7)  — strong faction sync (low diversity per faction)
+//
+//    Per-step measurements
+//      sync_score      = mean pairwise cosine of faction means
+//                        (matches ready/experiments/acceleration_b14_topology.py
+//                         experiment_3_phase_sync, lines 392-410)
+//      hidden_diversity = mean pairwise (1 - cos) of all cells (Law 107 axis)
+//      phi_proxy        = log|Cov(H)| - 0.5 · [log|Cov(H_half1)| + log|Cov(H_half2)|]
+//                         using sample partition (matches Φ* v3 canonical
+//                         tool/anima_phi_v3_canonical.hexa, with HID_TRUNC=HID
+//                         and ridge=1e-3 for stability)
+//
+//    Statistics (over 300 steps)
+//      mean_phi[A,B,C], mean_sync[A,B,C], mean_div[A,B,C]
+//      r(sync, phi), r(diversity, phi)  Pearson correlation
+//
+//    Verdict logic
+//      H7A  if  r(sync, phi) < -0.10    AND   mean_phi[A] > mean_phi[C]
+//      H7B  if  r(sync, phi) > +0.10    AND   mean_phi[C] > mean_phi[A]
+//      H7C  otherwise (|r| <= 0.10)
+//
+//      Law 107 sub-check:
+//      L107_REPRO  if  r(diversity, phi) < -0.10
+//      L107_REVERSE if r(diversity, phi) > +0.10
+//      L107_NULL    otherwise
+//
+//  RAW STRICT
+//    hexa-only · deterministic LCG · no Python · no GPU · no real weights
+//    seed fixed · 3-run byte-identical · idempotent
+//
+//  OUTPUTS
+//    state/b14_sync_law107_verify_result.json — canonical result
+//
+//  EXIT CODES
+//    0 = ran successfully (verdict in JSON)
+//    1 = numerical failure (NaN / div-by-zero)
+//
+//  USAGE
+//    /Users/ghost/.hx/bin/hexa run tool/b14_sync_law107_verify.hexa
+// ════════════════════════════════════════════════════════════════════════════
+
+let SCHEMA          = "anima/b14_sync_law107_verify_fast/1"
+let RESULT_OUT      = "state/b14_sync_law107_verify_fast_result.json"
+let SEED_BASE       = 20260426
+let N_CELLS         = 12
+let N_FACTIONS      = 4
+let HID             = 3
+let STEPS           = 20
+let ALPHA_FREE      = 0.0
+let ALPHA_MODERATE  = 0.3
+let ALPHA_STRONG    = 0.7
+let SIGMA_NOISE     = 0.05
+let RIDGE           = 0.001
+let LCG_A           = 1664525
+let LCG_C           = 1013904223
+let LCG_M           = 2147483647
+let CORR_THRESHOLD  = 0.10
+
+// ─── deterministic LCG ─────────────────────────────────────────────────────
+
+fn lcg_next(seed: int) -> int {
+    let s = (LCG_A * seed) + LCG_C
+    let mut x = s % LCG_M
+    if x < 0 { x = 0 - x }
+    return x
+}
+
+// Map LCG int seed → float in [-1, 1).
+fn lcg_float(seed: int) -> float {
+    return (to_float(seed) / 1073741823.5) - 1.0
+}
+
+// ─── math primitives ───────────────────────────────────────────────────────
+
+fn sqrt_newton(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut j = 0
+    while j < 40 {
+        y = 0.5 * (y + x / y)
+        j = j + 1
+    }
+    return y
+}
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// natural log via series (sufficient for log|det| of small ridge-regularized
+// covariances; Newton-style: ln(x) = 2·atanh((x-1)/(x+1)) series)
+fn ln_pos(x: float) -> float {
+    if x <= 0.0 { return -1000.0 }
+    // reduce to argument near 1 via x = 2^k · m, with m ∈ [1, 2)
+    let mut m = x
+    let mut k = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        k = k + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        k = k - 1
+    }
+    // ln(m) for m ∈ [1, 2): use series ln(1+u) where u = m - 1 ∈ [0, 1)
+    let u = m - 1.0
+    // Padé / series — use ln(m) = 2 · sum_{n=0}^{N} (1/(2n+1)) · z^(2n+1),
+    // where z = (m-1)/(m+1). Converges well for m ∈ [0.5, 2].
+    let z = (m - 1.0) / (m + 1.0)
+    let zz = z * z
+    let mut s = 0.0
+    let mut term = z
+    let mut n = 0
+    while n < 20 {
+        s = s + term / to_float(2 * n + 1)
+        term = term * zz
+        n = n + 1
+    }
+    return 2.0 * s + to_float(k) * 0.6931471805599453
+}
+
+fn dot(a: list, b: list) -> float {
+    let n = a.len()
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + to_float(a[i]) * to_float(b[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn vec_norm(a: list) -> float {
+    return sqrt_newton(dot(a, a))
+}
+
+fn cosine(a: list, b: list) -> float {
+    let na = vec_norm(a)
+    let nb = vec_norm(b)
+    if na < 0.000000001 || nb < 0.000000001 { return 0.0 }
+    return dot(a, b) / (na * nb)
+}
+
+// ─── covariance + log-det (sample partition Φ proxy) ───────────────────────
+// Compute HID×HID covariance from a list of cells (each is HID-vec).
+// Returns flat list of HID*HID floats (row-major). Centered, with ridge.
+
+fn cov_matrix(cells: list, hid: int, ridge: float) -> list {
+    let n = cells.len()
+    if n == 0 {
+        let mut zero = []
+        let mut i = 0
+        while i < hid * hid { zero = zero.push(0.0); i = i + 1 }
+        return zero
+    }
+    // mean
+    let mut mean = []
+    let mut d = 0
+    while d < hid {
+        let mut s = 0.0
+        let mut i = 0
+        while i < n {
+            s = s + to_float(cells[i][d])
+            i = i + 1
+        }
+        mean = mean.push(s / to_float(n))
+        d = d + 1
+    }
+    // covariance
+    let mut cov = []
+    let mut a = 0
+    while a < hid {
+        let mut b = 0
+        while b < hid {
+            let mut s = 0.0
+            let mut i = 0
+            while i < n {
+                let xa = to_float(cells[i][a]) - mean[a]
+                let xb = to_float(cells[i][b]) - mean[b]
+                s = s + xa * xb
+                i = i + 1
+            }
+            let mut v = s / to_float(n)
+            if a == b { v = v + ridge }
+            cov = cov.push(v)
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return cov
+}
+
+// log-det via Gaussian elimination on a flat row-major buffer represented
+// as a flat list of floats (rebuild after each pivot — no .set() needed).
+// Returns -1000 if any pivot becomes non-positive.
+
+fn log_det(cov: list, hid: int) -> float {
+    // Use flat list cov of length hid*hid; rebuild after every row update.
+    let mut M = cov
+    let mut log_det_acc = 0.0
+    let mut k = 0
+    while k < hid {
+        let pivot = to_float(M[k * hid + k])
+        if pivot <= 0.0000000001 { return -1000.0 }
+        log_det_acc = log_det_acc + ln_pos(pivot)
+        // rebuild M with rows i=k+1..hid eliminated; preserve rows 0..k.
+        let mut Mn = []
+        let mut r = 0
+        while r < hid {
+            let mut c = 0
+            if r <= k {
+                while c < hid {
+                    Mn = Mn.push(to_float(M[r * hid + c]))
+                    c = c + 1
+                }
+            } else {
+                let factor = to_float(M[r * hid + k]) / pivot
+                while c < hid {
+                    if c < k {
+                        Mn = Mn.push(to_float(M[r * hid + c]))
+                    } else {
+                        let v = to_float(M[r * hid + c]) - factor * to_float(M[k * hid + c])
+                        Mn = Mn.push(v)
+                    }
+                    c = c + 1
+                }
+            }
+            r = r + 1
+        }
+        M = Mn
+        k = k + 1
+    }
+    return log_det_acc
+}
+
+// Phi proxy: sample-partition mutual information.
+//   phi = log|Cov(H_full)| - 0.5 · (log|Cov(H_half1)| + log|Cov(H_half2)|)
+// Half partition: even indices vs odd indices of the cell list.
+
+fn phi_proxy(cells: list, hid: int, ridge: float) -> float {
+    let n = cells.len()
+    if n < 4 { return 0.0 }
+    let mut full = []
+    let mut h1 = []
+    let mut h2 = []
+    let mut i = 0
+    while i < n {
+        full = full.push(cells[i])
+        if i % 2 == 0 { h1 = h1.push(cells[i]) }
+        else          { h2 = h2.push(cells[i]) }
+        i = i + 1
+    }
+    let cov_full = cov_matrix(full, hid, ridge)
+    let cov_1    = cov_matrix(h1,   hid, ridge)
+    let cov_2    = cov_matrix(h2,   hid, ridge)
+    let ld_full  = log_det(cov_full, hid)
+    let ld_1     = log_det(cov_1, hid)
+    let ld_2     = log_det(cov_2, hid)
+    return ld_full - 0.5 * (ld_1 + ld_2)
+}
+
+// ─── faction sync score (matches experiment_3_phase_sync) ─────────────────
+// Group cells by faction id (cell_idx % N_FACTIONS), compute per-faction
+// mean direction (unit-normalized), then mean pairwise cosine across factions.
+
+fn sync_score(cells: list, n_factions: int, hid: int) -> float {
+    let n = cells.len()
+    // For each faction, iterate cells and accumulate. Faction-major outer loop
+    // avoids list .set() — purely accumulator-fold pattern.
+    let mut fac_vecs = []
+    let mut f = 0
+    while f < n_factions {
+        let mut sum_row = []
+        let mut d = 0
+        while d < hid { sum_row = sum_row.push(0.0); d = d + 1 }
+        let mut cnt = 0
+        let mut i = 0
+        while i < n {
+            if i % n_factions == f {
+                let mut new_sum = []
+                let mut dd = 0
+                while dd < hid {
+                    new_sum = new_sum.push(to_float(sum_row[dd]) + to_float(cells[i][dd]))
+                    dd = dd + 1
+                }
+                sum_row = new_sum
+                cnt = cnt + 1
+            }
+            i = i + 1
+        }
+        if cnt > 0 {
+            let mut mean = []
+            let mut dd = 0
+            while dd < hid {
+                mean = mean.push(to_float(sum_row[dd]) / to_float(cnt))
+                dd = dd + 1
+            }
+            let nrm = vec_norm(mean)
+            if nrm > 0.000000001 {
+                let mut unit = []
+                let mut k = 0
+                while k < hid {
+                    unit = unit.push(mean[k] / nrm)
+                    k = k + 1
+                }
+                fac_vecs = fac_vecs.push(unit)
+            }
+        }
+        f = f + 1
+    }
+    let nf = fac_vecs.len()
+    if nf < 2 { return 0.0 }
+    let mut s = 0.0
+    let mut cnt_pairs = 0
+    let mut a = 0
+    while a < nf {
+        let mut b = a + 1
+        while b < nf {
+            s = s + cosine(fac_vecs[a], fac_vecs[b])
+            cnt_pairs = cnt_pairs + 1
+            b = b + 1
+        }
+        a = a + 1
+    }
+    if cnt_pairs == 0 { return 0.0 }
+    return s / to_float(cnt_pairs)
+}
+
+// ─── hidden diversity (Law 107 axis: per-cell diversity) ──────────────────
+// diversity = mean pairwise (1 - cos) across all cells.
+
+fn hidden_diversity(cells: list) -> float {
+    let n = cells.len()
+    if n < 2 { return 0.0 }
+    let mut s = 0.0
+    let mut cnt = 0
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            s = s + (1.0 - cosine(cells[i], cells[j]))
+            cnt = cnt + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if cnt == 0 { return 0.0 }
+    return s / to_float(cnt)
+}
+
+// ─── Pearson correlation ──────────────────────────────────────────────────
+
+fn pearson(xs: list, ys: list) -> float {
+    let n = xs.len()
+    if n < 2 { return 0.0 }
+    let mut sx = 0.0
+    let mut sy = 0.0
+    let mut i = 0
+    while i < n {
+        sx = sx + to_float(xs[i])
+        sy = sy + to_float(ys[i])
+        i = i + 1
+    }
+    let mx = sx / to_float(n)
+    let my = sy / to_float(n)
+    let mut num = 0.0
+    let mut dx = 0.0
+    let mut dy = 0.0
+    let mut k = 0
+    while k < n {
+        let ax = to_float(xs[k]) - mx
+        let ay = to_float(ys[k]) - my
+        num = num + ax * ay
+        dx = dx + ax * ax
+        dy = dy + ay * ay
+        k = k + 1
+    }
+    let denom = sqrt_newton(dx * dy)
+    if denom < 0.000000001 { return 0.0 }
+    return num / denom
+}
+
+// ─── cell initialization ──────────────────────────────────────────────────
+
+fn init_cells(seed_base: int, n_cells: int, hid: int) -> list {
+    let mut cells = []
+    let mut seed = seed_base
+    let mut i = 0
+    while i < n_cells {
+        let mut row = []
+        let mut d = 0
+        while d < hid {
+            seed = lcg_next(seed)
+            row = row.push(lcg_float(seed))
+            d = d + 1
+        }
+        cells = cells.push(row)
+        i = i + 1
+    }
+    return cells
+}
+
+// ─── one step: noise + faction attraction ─────────────────────────────────
+
+fn step_cells(cells_in: list, alpha: float, sigma: float, n_factions: int, hid: int, seed_in: int) -> list {
+    let n = cells_in.len()
+    // Compute faction means via faction-major outer loop (no .set() needed).
+    let mut fac_mean = []
+    let mut f = 0
+    while f < n_factions {
+        let mut sum_row = []
+        let mut d = 0
+        while d < hid { sum_row = sum_row.push(0.0); d = d + 1 }
+        let mut cnt = 0
+        let mut i = 0
+        while i < n {
+            if i % n_factions == f {
+                let mut new_sum = []
+                let mut dd = 0
+                while dd < hid {
+                    new_sum = new_sum.push(to_float(sum_row[dd]) + to_float(cells_in[i][dd]))
+                    dd = dd + 1
+                }
+                sum_row = new_sum
+                cnt = cnt + 1
+            }
+            i = i + 1
+        }
+        let mut row = []
+        let mut k = 0
+        while k < hid {
+            if cnt == 0 { row = row.push(0.0) }
+            else        { row = row.push(to_float(sum_row[k]) / to_float(cnt)) }
+            k = k + 1
+        }
+        fac_mean = fac_mean.push(row)
+        f = f + 1
+    }
+    // update each cell
+    let mut seed = seed_in
+    let mut out = []
+    let mut k = 0
+    while k < n {
+        let fid = k % n_factions
+        let mut row = []
+        let mut d = 0
+        while d < hid {
+            seed = lcg_next(seed)
+            let noise = sigma * lcg_float(seed)
+            let h_old = to_float(cells_in[k][d])
+            let mu = to_float(fac_mean[fid][d])
+            let h_new = (1.0 - alpha) * h_old + alpha * mu + noise
+            row = row.push(h_new)
+            d = d + 1
+        }
+        out = out.push(row)
+        k = k + 1
+    }
+    return out
+}
+
+// ─── run one condition: returns {syncs, divs, phis} ─────────────────────
+
+fn run_condition(label: string, alpha: float) {
+    let mut cells = init_cells(SEED_BASE, N_CELLS, HID)
+    let mut syncs = []
+    let mut divs = []
+    let mut phis = []
+    let mut seed = SEED_BASE + 7919
+    let mut t = 0
+    while t < STEPS {
+        cells = step_cells(cells, alpha, SIGMA_NOISE, N_FACTIONS, HID, seed)
+        seed = lcg_next(seed + t)
+        let s = sync_score(cells, N_FACTIONS, HID)
+        let dv = hidden_diversity(cells)
+        let ph = phi_proxy(cells, HID, RIDGE)
+        syncs = syncs.push(s)
+        divs = divs.push(dv)
+        phis = phis.push(ph)
+        t = t + 1
+    }
+    // return as list-of-lists: [syncs, divs, phis]
+    let mut res = []
+    res = res.push(syncs)
+    res = res.push(divs)
+    res = res.push(phis)
+    return res
+}
+
+fn mean_of(xs: list) -> float {
+    let n = xs.len()
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n { s = s + to_float(xs[i]); i = i + 1 }
+    return s / to_float(n)
+}
+
+// ─── main ────────────────────────────────────────────────────────────────
+
+fn main() {
+    println("[B14_sync × Law 107] Mk.XI sync vs async empirical verifier (mac-local)")
+    println("  N_CELLS=" + to_string(N_CELLS) + " N_FACTIONS=" + to_string(N_FACTIONS) +
+            " HID=" + to_string(HID) + " STEPS=" + to_string(STEPS) + " (deterministic LCG)")
+
+    // run_condition returns [syncs, divs, phis]
+    let cond_a = run_condition("FREE_alpha_0.0",     ALPHA_FREE)
+    let cond_b = run_condition("MODERATE_alpha_0.3", ALPHA_MODERATE)
+    let cond_c = run_condition("STRONG_alpha_0.7",   ALPHA_STRONG)
+
+    let syncs_a = cond_a[0]
+    let divs_a  = cond_a[1]
+    let phis_a  = cond_a[2]
+    let syncs_b = cond_b[0]
+    let divs_b  = cond_b[1]
+    let phis_b  = cond_b[2]
+    let syncs_c = cond_c[0]
+    let divs_c  = cond_c[1]
+    let phis_c  = cond_c[2]
+
+    let mean_sync_a = mean_of(syncs_a)
+    let mean_sync_b = mean_of(syncs_b)
+    let mean_sync_c = mean_of(syncs_c)
+    let mean_div_a  = mean_of(divs_a)
+    let mean_div_b  = mean_of(divs_b)
+    let mean_div_c  = mean_of(divs_c)
+    let mean_phi_a  = mean_of(phis_a)
+    let mean_phi_b  = mean_of(phis_b)
+    let mean_phi_c  = mean_of(phis_c)
+
+    // Pool across conditions for cross-condition correlation
+    let mut pool_sync = []
+    let mut pool_div = []
+    let mut pool_phi = []
+    let mut z = 0
+    while z < STEPS {
+        pool_sync = pool_sync.push(syncs_a[z])
+        pool_sync = pool_sync.push(syncs_b[z])
+        pool_sync = pool_sync.push(syncs_c[z])
+        pool_div  = pool_div.push(divs_a[z])
+        pool_div  = pool_div.push(divs_b[z])
+        pool_div  = pool_div.push(divs_c[z])
+        pool_phi  = pool_phi.push(phis_a[z])
+        pool_phi  = pool_phi.push(phis_b[z])
+        pool_phi  = pool_phi.push(phis_c[z])
+        z = z + 1
+    }
+    let r_sync_phi = pearson(pool_sync, pool_phi)
+    let r_div_phi  = pearson(pool_div,  pool_phi)
+    let r_sync_div = pearson(pool_sync, pool_div)
+
+    // also within-FREE correlation (matches B14_sync prior r=-0.13 protocol)
+    let r_sync_phi_FREE = pearson(syncs_a, phis_a)
+
+    // verdict
+    let mut verdict = "H7C_NULL"
+    if r_sync_phi < 0.0 - CORR_THRESHOLD && mean_phi_a > mean_phi_c {
+        verdict = "H7A_DESYNC_DRIVES_PHI"
+    }
+    if r_sync_phi >       CORR_THRESHOLD && mean_phi_c > mean_phi_a {
+        verdict = "H7B_SYNC_DRIVES_PHI"
+    }
+    let mut law107 = "L107_NULL"
+    if r_div_phi < 0.0 - CORR_THRESHOLD { law107 = "L107_REPRODUCED" }
+    if r_div_phi >       CORR_THRESHOLD { law107 = "L107_REVERSED" }
+
+    println("")
+    println("Per-condition (alpha=intra-faction attraction strength):")
+    println("  FREE     alpha=0.0  mean_sync=" + to_string(mean_sync_a) + " mean_div=" + to_string(mean_div_a) + " mean_phi=" + to_string(mean_phi_a))
+    println("  MODERATE alpha=0.3  mean_sync=" + to_string(mean_sync_b) + " mean_div=" + to_string(mean_div_b) + " mean_phi=" + to_string(mean_phi_b))
+    println("  STRONG   alpha=0.7  mean_sync=" + to_string(mean_sync_c) + " mean_div=" + to_string(mean_div_c) + " mean_phi=" + to_string(mean_phi_c))
+    println("")
+    println("Pooled correlations (3 conditions × " + to_string(STEPS) + " steps = " + to_string(3 * STEPS) + " samples):")
+    println("  r(sync, phi)       = " + to_string(r_sync_phi))
+    println("  r(diversity, phi)  = " + to_string(r_div_phi))
+    println("  r(sync, diversity) = " + to_string(r_sync_div))
+    println("  r(sync, phi)|FREE  = " + to_string(r_sync_phi_FREE) + " (matches B14_sync r=-0.13 protocol)")
+    println("")
+    println("Verdict: " + verdict)
+    println("Law 107: " + law107)
+
+    // build result JSON manually (write_file primitive — no write_json builtin)
+    let mut p = []
+    p = p.push("{\n")
+    p = p.push("  \"schema\": \"" + SCHEMA + "\",\n")
+    p = p.push("  \"seed_base\": " + to_string(SEED_BASE) + ",\n")
+    p = p.push("  \"n_cells\": " + to_string(N_CELLS) + ",\n")
+    p = p.push("  \"n_factions\": " + to_string(N_FACTIONS) + ",\n")
+    p = p.push("  \"hid\": " + to_string(HID) + ",\n")
+    p = p.push("  \"steps\": " + to_string(STEPS) + ",\n")
+    p = p.push("  \"ridge\": " + to_string(RIDGE) + ",\n")
+    p = p.push("  \"sigma_noise\": " + to_string(SIGMA_NOISE) + ",\n")
+    p = p.push("  \"conditions\": [\n")
+    p = p.push("    {\"label\": \"FREE_alpha_0.0\", \"alpha\": " + to_string(ALPHA_FREE) +
+               ", \"mean_sync\": " + to_string(mean_sync_a) +
+               ", \"mean_div\": "  + to_string(mean_div_a) +
+               ", \"mean_phi\": "  + to_string(mean_phi_a) + "},\n")
+    p = p.push("    {\"label\": \"MODERATE_alpha_0.3\", \"alpha\": " + to_string(ALPHA_MODERATE) +
+               ", \"mean_sync\": " + to_string(mean_sync_b) +
+               ", \"mean_div\": "  + to_string(mean_div_b) +
+               ", \"mean_phi\": "  + to_string(mean_phi_b) + "},\n")
+    p = p.push("    {\"label\": \"STRONG_alpha_0.7\", \"alpha\": " + to_string(ALPHA_STRONG) +
+               ", \"mean_sync\": " + to_string(mean_sync_c) +
+               ", \"mean_div\": "  + to_string(mean_div_c) +
+               ", \"mean_phi\": "  + to_string(mean_phi_c) + "}\n")
+    p = p.push("  ],\n")
+    p = p.push("  \"correlations\": {\n")
+    p = p.push("    \"r_sync_phi_pooled\": " + to_string(r_sync_phi) + ",\n")
+    p = p.push("    \"r_div_phi_pooled\":  " + to_string(r_div_phi) + ",\n")
+    p = p.push("    \"r_sync_div_pooled\": " + to_string(r_sync_div) + ",\n")
+    p = p.push("    \"r_sync_phi_FREE\":   " + to_string(r_sync_phi_FREE) + ",\n")
+    p = p.push("    \"threshold\": " + to_string(CORR_THRESHOLD) + "\n")
+    p = p.push("  },\n")
+    p = p.push("  \"verdict_b14_sync\": \"" + verdict + "\",\n")
+    p = p.push("  \"verdict_law_107\": \"" + law107 + "\"\n")
+    p = p.push("}\n")
+
+    let json_str = p.join("")
+    let ok = write_file(RESULT_OUT, json_str)
+    if ok {
+        println("Wrote " + RESULT_OUT)
+    } else {
+        println("FAILED to write " + RESULT_OUT)
+    }
+}

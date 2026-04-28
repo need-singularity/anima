@@ -1,0 +1,123 @@
+phase4_dual_stream_complete
+============================
+
+module       anima-eeg/dual_stream.hexa
+date         2026-04-26
+phase        Phase 4 WRAPPER (simultaneous Anima Φ + EEG capture)
+status       COMPLETE — raw#9 strict WRAPPER + helper raw#37 transient
+
+LOC
+  pre   25 (stub: 2 trivial structs + 2 placeholder fns)
+  post  694 (~27.8x expansion; realtime sibling = 708L same idiom)
+
+sha256
+  pre   d304a9862a40236b6b1743657024395f011637371584fb140bbe466340288dfe
+  post  5a5644b180056ae690010e93b05517723041c641c161e683b5a4de593491de40
+
+schemas
+  dual_stream    anima-eeg/dual_stream/1
+  spec_doc       anima-eeg/MIGRATION_PLAN.md §6 Phase 4 WRAPPER
+control_hz       4.0
+helper_path      /tmp/anima_eeg_dual_stream_helper.hexa_tmp (3541 bytes)
+
+streams (synchronous, single-tick alignment)
+  Stream A — Anima Φ (synthetic proxy = 0.5 + 0.4*cos(2πt/6) + 0.1*sin(2πt/1.5))
+                       Range bounded [0.0, 1.0] verified at T4. Real sampling
+                       requires anima_runtime hook (raw#10 placeholder).
+  Stream B — EEG band powers (alpha/beta/theta/gamma)
+                       Synthetic = 4-phase deterministic fixture
+                       (expand→focus→dream→neutral) byte-identical to
+                       realtime.synth_step / closed_loop.synth_step / bci_control.
+
+cross-stream analysis
+  Pearson r          single-pass (Σx, Σx², Σy, Σy², Σxy) computed at stop_session.
+                     16s synthetic run → pearson_r_phi_alpha = -0.00283672
+                     (near-zero by design: Φ cos sweep vs 4-phase EEG fixture
+                     have different periods → low correlation, as expected for
+                     a falsifiable null-hypothesis substrate test).
+
+CLI flags
+  --selftest                        run 10 deterministic tests
+  --mode synthetic|hardware         eeg ingest mode (default synthetic)
+  --board <id>                      hardware board id (cyton|cytondaisy|ganglion|synthetic)
+  --duration <sec>                  run length seconds (default 8.0; --duration=N supported)
+  --emit-json <basename>            write summary JSON to state/dual_stream_<basename>.json
+                                    (use --emit-json=NAME equals-style for reliability)
+  --write-helper                    emit raw#37 hardware helper to /tmp and exit
+
+selftest
+  cmd       /Users/ghost/.hx/bin/hexa_real run anima-eeg/dual_stream.hexa --selftest
+  result    10 PASS / 0 FAIL out of 10
+  tests     [T1]  session start/stop lifecycle
+            [T2]  synthetic 32-tick run hits all 4 modes (phi_n=32)
+            [T3]  synthetic determinism (twin run identical for alpha/phi/r/mode/peak)
+            [T4]  phi proxy stays bounded in [0, 1] (peak=0.972973, min=0.1)
+            [T5]  pearson_r is well-formed (-1 ≤ r ≤ 1)
+            [T6]  KV schema parity with realtime (alpha/beta/theta/gamma + phi)
+            [T7]  classify_mode parity with realtime (dream > expand > focus > neutral)
+            [T8]  hardware skeleton disconnect handling
+            [T9]  ticks_for_duration math (4Hz)
+            [T10] negative falsify: zero-variance phi -> r=0
+
+byte-identical (HEXA_NO_MARKER=1, two clean runs of --selftest)
+  stdout_sha     a8e386e42f693ee1325862ec34a0fe51e154648a064aa7b3fc3b53f7dff5ad11
+  stdout_lines   353
+  twin_diff      empty (byte-identical confirmed)
+
+emit-json verification
+  cmd           --duration=16 --emit-json=dual_demo
+  json_path     state/dual_stream_dual_demo.json
+  json_sha      bea31e7f25ee9e2eddca7528314d4a5dc333dd2a90c5ef73890f5adc840aa713
+  schema        anima-eeg/dual_stream/1
+  phi_block     n=64, peak=0.972973, min=0.1 (16s * 4Hz = 64 samples)
+  correlation   pearson_r_phi_alpha = -0.00283672 (near-zero null as designed)
+  run_block     steps=64, count_neutral=16, count_expand=16,
+                count_focus=16, count_dream=16 (4-phase parity)
+
+KV schema compatibility (vs realtime.hexa + closed_loop.hexa)
+  shared keys   tick / t / mode / alpha_power / beta_power / theta_power / gamma_power
+  dual_stream   adds phi (Stream A inline next to EEG)
+  realtime      adds genius_score / tension_input / mind_*
+  closed_loop   adds protocol={nback|meditation} + nback_*/med_*
+  parity        synthetic 4-phase fixture byte-identical across all three
+                modules at the (alpha/beta/theta/gamma) substrate (verified via
+                tick=1 t=0.25 mode=expand alpha_power=25 beta_power=5 theta_power=4
+                gamma_power=2 — matches realtime exactly + dual_stream adds phi=0.9)
+
+negative falsify
+  zero-variance phi    → pearson_r=0 (T10 PASS — finalize_pearson EPS-guard)
+  hardware skeleton    → disconnected=1 + helper-skeleton emit, no crash
+  classify baseline    → mode classification flips (parity with realtime T10)
+
+raw10_honest
+  - Φ "proxy" in synthetic = cos sweep wobble (NO Anima runtime call;
+    real Φ sampling = anima_runtime hook out of Phase 4 scope)
+  - hardware mode = wrapper-skeleton; pipe ingest of two streams in parallel
+    is the caller's responsibility (hexa-lang 0.2.0 has no native threads
+    or duplex IO)
+  - Pearson r computed offline at run end (single-pass means + Welford
+    covariance), not live. No streaming r; no rolling window.
+  - "alignment" = same tick index = same wallclock window; we do NOT account
+    for board lag / brainflow buffering (caller's responsibility).
+  - Phase 4 WRAPPER 7-of-9 (closed_loop landed in same session; protocols/
+    multi_eeg + scripts/organize_recordings remaining)
+
+resolver routing
+  - direct invocation via /Users/ghost/.hx/bin/hexa_real (mitigation for
+    'hexa anima-eeg/...' subcommand misroute observed at /Users/ghost/core/hexa-lang/hexa)
+
+interpreter quirk noted (non-blocking)
+  - Space-style flag chains starting with --duration N --emit-json X exhibit
+    flag-eating in this hexa-lang 0.2.0 build (closed_loop reproduces same
+    behaviour). Workaround: equals-style --duration=N --emit-json=X both
+    parse correctly. Selftest unaffected (no compound flags). All --emit-json
+    paths in this marker used the equals-style.
+
+iter
+  iter 1 — initial implementation 10/10 PASS first-pass, no debug needed.
+           CLI flag parser amended to add --duration=N / --mode=X / --board=X /
+           --emit-json=X equals-style fallback (matches realtime.hexa idiom)
+           after discovering interpreter quirk in space-style chain.
+
+omega_cycle_steps
+  design+implement+positive+negative+byte-identical+iterate ALL DONE

@@ -1,0 +1,646 @@
+// tool/anima_v11_axis96_disambig.hexa — paradigm v11 axis 96 disambiguation
+// (raw#9 hexa-only, raw#10 honest, raw#15 SSOT this file).
+//
+// PURPOSE
+//   axis 96 (family-decoupling) HFD-A vs HFD-B vs HFD-C disambiguation.
+//   3 step:
+//     Step 1: Llama stride=1 full scan (HFD-C artifact 검증) — BLOCKED by HF gated access (Llama-3.1-8B manual approval pending for dancinlife account; reuse axis 105 finding)
+//     Step 2: DeepSeek-llm-7b-base 5번째 backbone CMT measurement (decoupling matrix 확장)
+//     Step 3: BBA matrix correlation 6+1 axes (HFD-A vs HFD-B 결정)
+//
+// METHOD
+//   1. DeepSeek cmt_v3.json (residual-passthrough ablation) → decoupling score
+//      (depth_norm per family, depth_std, partition).
+//   2. 4-bb existing decoupling scores (state/v11_axis96_family_decoupling/*) +
+//      DeepSeek 추가 → 5-bb decoupling matrix.
+//   3. 6-axis BBA scalars (state/v10_benchmark_v4/*/backbone_aware_composite.json)
+//      + family-decoupling 7번째 → 4-bb 4-vector each → Pearson |r| 계산.
+//   4. Verdict gate:
+//      |r|_max(family_decoupling vs any of 6 axes) > 0.7 → HFD-B (CMT sub-axis)
+//      |r|_max < 0.3                                    → HFD-A (independent axis)
+//      mid (0.3-0.7)                                    → HFD-A_PARTIAL
+//   5. Cross-check with DeepSeek decoupling: > 0.1 → HFD-B (LLama-arch reappears)
+//                                              < 0.05 → HFD-A (different distribution)
+//
+// USAGE
+//   hexa run tool/anima_v11_axis96_disambig.hexa --selftest
+//   hexa run tool/anima_v11_axis96_disambig.hexa
+//
+// raw#9 strict (no python helper, hexa-only) / raw#15 SSOT this file
+// raw#10 honest: see _emit_caveats() at end.
+
+let SCHEMA = "anima/v11_axis96_disambig/1"
+let OUT_DIR = "state/v11_axis96_disambiguation"
+let DEEPSEEK_CMT = "state/v11_axis96_disambiguation/step2_deepseek_cmt/cmt_v3.json"
+
+// 4-bb existing decoupling scores
+let EXISTING_DECOUP = [
+    ["mistral", "state/v11_axis96_family_decoupling/mistral/decoupling_score.json"],
+    ["qwen3",   "state/v11_axis96_family_decoupling/qwen3/decoupling_score.json"],
+    ["llama",   "state/v11_axis96_family_decoupling/llama/decoupling_score.json"],
+    ["gemma",   "state/v11_axis96_family_decoupling/gemma/decoupling_score.json"]
+]
+
+// 4-bb BBA composite paths (6-axis: AN11_b/B_ToM/MCCA/PhiStar/CMT/CDS)
+let BBA_PATHS = [
+    ["mistral", "state/v10_benchmark_v4/mistral/backbone_aware_composite.json"],
+    ["qwen3",   "state/v10_benchmark_v4/qwen3/backbone_aware_composite.json"],
+    ["llama",   "state/v10_benchmark_v4/llama/backbone_aware_composite.json"],
+    ["gemma",   "state/v10_benchmark_v4/gemma/backbone_aware_composite.json"]
+]
+
+let AXES_6 = ["AN11_b", "B_ToM", "MCCA", "PhiStar", "CMT", "CDS"]
+let FAMILIES = ["Hexad", "Law", "Phi", "SelfRef"]
+
+fn _str(v) -> string { return str(v) }
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn ensure_dir(p: string) {
+    exec("mkdir -p " + p)
+}
+
+fn json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    return b
+}
+
+// Compute DeepSeek decoupling from cmt_v3.json
+fn compute_deepseek_decoupling() {
+    if !fexists(DEEPSEEK_CMT) {
+        println("  ✗ MISSING " + DEEPSEEK_CMT)
+        return null
+    }
+    let raw = read_file(DEEPSEEK_CMT)
+    let j = json_parse(raw)
+    let tomo = j["tomography"]
+    let n_layers = j["n_layers"]
+    // Iterate 4 families, find dominant layer per family.
+    let depths = []
+    let layers = []
+    let dom = json_parse("{}")
+    let mut fi = 0
+    while fi < len(FAMILIES) {
+        let fam = FAMILIES[fi]
+        // Iterate present layer keys (we know stride=4 → 0,4,8,12,16,20,24,28).
+        let candidates = [0, 4, 8, 12, 16, 20, 24, 28]
+        let mut best_layer = -1
+        let mut best_rel = -1.0
+        let mut ci = 0
+        while ci < len(candidates) {
+            let layer_idx = candidates[ci]
+            let key = str(layer_idx)
+            let v = tomo[key]
+            let s = _str(v)
+            if s != "null" && s != "" {
+                let rel = v[fam]["rel"]
+                if best_layer == -1 || rel > best_rel {
+                    best_layer = layer_idx
+                    best_rel = rel
+                }
+            }
+            ci = ci + 1
+        }
+        let depth_norm = (best_layer * 1000) / (n_layers - 1)  // x1000 fixed-point
+        depths.push(depth_norm)
+        layers.push(best_layer)
+        let entry = json_parse("{}")
+        entry["layer"] = best_layer
+        entry["rel"] = best_rel
+        entry["depth_norm_x1000"] = depth_norm
+        dom[fam] = entry
+        println("  " + fam + ": L=" + str(best_layer) + " rel=" + str(best_rel) + " depth=" + str(depth_norm) + "/1000")
+        fi = fi + 1
+    }
+    // Compute depth_std (mean abs deviation x1000).
+    let mut sum = 0
+    let mut k = 0
+    while k < len(depths) {
+        sum = sum + depths[k]
+        k = k + 1
+    }
+    let mean = sum / len(depths)
+    let mut sq = 0
+    let mut k2 = 0
+    while k2 < len(depths) {
+        let d = depths[k2] - mean
+        sq = sq + d * d
+        k2 = k2 + 1
+    }
+    let var_x1000 = sq / len(depths)
+    // sqrt approximation via Newton 4 iter (var → std)
+    let mut s_est = 1
+    if var_x1000 > 0 {
+        s_est = var_x1000 / 2
+        let mut it = 0
+        while it < 8 {
+            if s_est > 0 {
+                s_est = (s_est + var_x1000 / s_est) / 2
+            }
+            it = it + 1
+        }
+    }
+    // depth_std x1000 (rough — output as int).
+    let depth_range = max_of(depths) - min_of(depths)
+    let n_distinct = count_distinct(depths)
+
+    let result = json_parse("{}")
+    result["backbone"] = "deepseek-llm-7b-base"
+    result["n_layers"] = n_layers
+    result["dominant_per_family"] = dom
+    result["depths_x1000"] = depths
+    result["layers"] = layers
+    result["depth_std_x1000"] = s_est
+    result["depth_range_x1000"] = depth_range
+    result["n_distinct_layers"] = n_distinct
+    let mut verdict = "FULLY_COUPLED"
+    if n_distinct >= 2 && depth_range > 100 { verdict = "DECOUPLED" }
+    else if n_distinct >= 2 { verdict = "WEAKLY_DECOUPLED" }
+    result["verdict"] = verdict
+    return result
+}
+
+fn max_of(arr) {
+    let mut m = arr[0]
+    let mut i = 1
+    while i < len(arr) {
+        if arr[i] > m { m = arr[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn min_of(arr) {
+    let mut m = arr[0]
+    let mut i = 1
+    while i < len(arr) {
+        if arr[i] < m { m = arr[i] }
+        i = i + 1
+    }
+    return m
+}
+
+fn count_distinct(arr) {
+    let seen = []
+    let mut cnt = 0
+    let mut i = 0
+    while i < len(arr) {
+        let v = arr[i]
+        let mut found = false
+        let mut j = 0
+        while j < len(seen) {
+            if seen[j] == v { found = true; break }
+            j = j + 1
+        }
+        if !found {
+            seen.push(v)
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// Load existing 4-bb decoupling scores.
+fn load_existing_decoup() {
+    let out = []
+    let mut i = 0
+    while i < len(EXISTING_DECOUP) {
+        let row = EXISTING_DECOUP[i]
+        let bb = _str(row[0])
+        let path = _str(row[1])
+        if fexists(path) {
+            let j = json_parse(read_file(path))
+            let entry = json_parse("{}")
+            entry["backbone"] = bb
+            // depth_std is float; we promote to x10000 for fixed-point.
+            entry["depth_std_x10000"] = j["decoupling_metrics"]["depth_std"] * 10000
+            entry["depth_range_x10000"] = j["decoupling_metrics"]["depth_range"] * 10000
+            entry["n_distinct"] = j["decoupling_metrics"]["n_distinct_layers"]
+            entry["verdict"] = j["verdict"]
+            out.push(entry)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Pearson correlation x1000.
+// Inputs: arr1, arr2 — equal-length numeric arrays.
+// Uses native float to avoid fixed-point sqrt overflow on large products.
+fn pearson_x1000(a, b) {
+    let n = len(a)
+    if n < 2 { return 0 }
+    // Convert to float by /1.0 to ensure float arithmetic
+    let mut sa = 0.0
+    let mut sb = 0.0
+    let mut k = 0
+    while k < n {
+        sa = sa + a[k] * 1.0
+        sb = sb + b[k] * 1.0
+        k = k + 1
+    }
+    let ma = sa / (n * 1.0)
+    let mb = sb / (n * 1.0)
+    let mut num = 0.0
+    let mut da = 0.0
+    let mut db = 0.0
+    let mut k2 = 0
+    while k2 < n {
+        let xa = a[k2] * 1.0 - ma
+        let xb = b[k2] * 1.0 - mb
+        num = num + xa * xb
+        da = da + xa * xa
+        db = db + xb * xb
+        k2 = k2 + 1
+    }
+    if da <= 0.0 || db <= 0.0 { return 0 }
+    // sqrt via Newton on float (more stable for large values).
+    let prod = da * db
+    let mut s_est = prod / 2.0
+    if s_est < 1.0 { s_est = 1.0 }
+    let mut it = 0
+    while it < 32 {
+        s_est = (s_est + prod / s_est) / 2.0
+        it = it + 1
+    }
+    let r = num / s_est
+    let r1000_f = r * 1000.0
+    // Convert to int (round to nearest by floor(x+0.5) trick).
+    let mut r1000_int = 0
+    if r1000_f >= 0.0 {
+        r1000_int = (r1000_f + 0.5) / 1
+    } else {
+        r1000_int = (r1000_f - 0.5) / 1
+    }
+    return r1000_int
+}
+
+// Load 6-axis BBA scalars per backbone (4-bb).
+fn load_bba_scalars() {
+    let out = []
+    let mut i = 0
+    while i < len(BBA_PATHS) {
+        let row = BBA_PATHS[i]
+        let bb = _str(row[0])
+        let path = _str(row[1])
+        if fexists(path) {
+            let j = json_parse(read_file(path))
+            let scalars = j["backbones"][0]["axis_scalars"]
+            let entry = json_parse("{}")
+            entry["backbone"] = bb
+            // x10000 fixed-point for each axis.
+            let mut ai = 0
+            while ai < len(AXES_6) {
+                let ax = AXES_6[ai]
+                entry[ax] = scalars[ax] * 10000
+                ai = ai + 1
+            }
+            out.push(entry)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn compute_bba_correlation(bba_scalars, decoup_4bb) {
+    // Build 7-axis 4-vector matrix; column = backbone.
+    let n_bb = len(bba_scalars)
+    let n_axes = len(AXES_6) + 1
+    // Use depth_std_x10000 as decoupling axis value (already integer in load_existing_decoup).
+    let mut decoup_vec = []
+    let mut bi = 0
+    while bi < n_bb {
+        let target_bb = _str(bba_scalars[bi]["backbone"])
+        let mut found = false
+        let mut di = 0
+        while di < len(decoup_4bb) {
+            if _str(decoup_4bb[di]["backbone"]) == target_bb {
+                decoup_vec.push(decoup_4bb[di]["depth_std_x10000"])
+                found = true
+                break
+            }
+            di = di + 1
+        }
+        if !found {
+            decoup_vec.push(0)
+        }
+        bi = bi + 1
+    }
+    // For each of 6 axes, compute Pearson with decoup_vec.
+    let corrs = json_parse("{}")
+    let mut max_abs_r1000 = 0
+    let mut max_axis = ""
+    let mut ai = 0
+    while ai < len(AXES_6) {
+        let ax = AXES_6[ai]
+        let axis_vec = []
+        let mut bi2 = 0
+        while bi2 < n_bb {
+            axis_vec.push(bba_scalars[bi2][ax])
+            bi2 = bi2 + 1
+        }
+        let r1000 = pearson_x1000(axis_vec, decoup_vec)
+        let abs_r = if r1000 < 0 { -r1000 } else { r1000 }
+        corrs[ax] = r1000
+        if abs_r > max_abs_r1000 {
+            max_abs_r1000 = abs_r
+            max_axis = ax
+        }
+        ai = ai + 1
+    }
+    let result = json_parse("{}")
+    result["correlations_r_x1000"] = corrs
+    result["max_abs_r_x1000"] = max_abs_r1000
+    result["max_axis"] = max_axis
+    result["n_bb"] = n_bb
+    result["decoup_vec_x10000"] = decoup_vec
+    return result
+}
+
+fn compute_verdict(deepseek_dec, decoup_4bb, bba_corr) {
+    let v = json_parse("{}")
+    // 5-bb decoupling tally.
+    let n_decoupled = 0
+    let n_weakly = 0
+    let n_coupled = 0
+    let mut i = 0
+    let mut nd = 0
+    let mut nw = 0
+    let mut nc = 0
+    while i < len(decoup_4bb) {
+        let vv = _str(decoup_4bb[i]["verdict"])
+        if vv == "DECOUPLED" { nd = nd + 1 }
+        else if vv == "WEAKLY_DECOUPLED" { nw = nw + 1 }
+        else { nc = nc + 1 }
+        i = i + 1
+    }
+    let dsv = _str(deepseek_dec["verdict"])
+    if dsv == "DECOUPLED" { nd = nd + 1 }
+    else if dsv == "WEAKLY_DECOUPLED" { nw = nw + 1 }
+    else { nc = nc + 1 }
+    v["n_decoupled"] = nd
+    v["n_weakly_decoupled"] = nw
+    v["n_fully_coupled"] = nc
+    v["n_total_bb"] = nd + nw + nc
+
+    // Step 2 verdict
+    let step2 = "DECOUPLE_REAPPEARS"
+    let ds_std_x1000 = deepseek_dec["depth_std_x1000"]
+    if ds_std_x1000 > 100 {
+        // > 0.1 in fractional form → strong
+        step2 = "DECOUPLE_REAPPEARS_STRONG_HFD_B_LIKE"
+    } else if ds_std_x1000 > 50 {
+        step2 = "DECOUPLE_REAPPEARS_MODERATE_HFD_B_LIKE"
+    } else if ds_std_x1000 > 10 {
+        step2 = "DECOUPLE_WEAK_AMBIGUOUS"
+    } else {
+        step2 = "NO_DECOUPLE_HFD_A_LIKE"
+    }
+    v["step2_verdict"] = step2
+    v["deepseek_depth_std_x1000"] = ds_std_x1000
+
+    // Step 3 verdict (BBA correlation)
+    let max_r = bba_corr["max_abs_r_x1000"]
+    let step3 = "?"
+    if max_r > 700 {
+        step3 = "BBA_HIGH_CORR_HFD_B_SUB_AXIS"
+    } else if max_r < 300 {
+        step3 = "BBA_LOW_CORR_HFD_A_INDEPENDENT"
+    } else {
+        step3 = "BBA_MID_CORR_HFD_A_PARTIAL"
+    }
+    v["step3_verdict"] = step3
+    v["max_abs_r_x1000"] = max_r
+    v["max_corr_axis"] = bba_corr["max_axis"]
+
+    // Final verdict combining steps 2+3 (Step 1 BLOCKED).
+    let final_v = "?"
+    if step2 == "DECOUPLE_REAPPEARS_STRONG_HFD_B_LIKE" && step3 == "BBA_HIGH_CORR_HFD_B_SUB_AXIS" {
+        final_v = "HFD_B_CONFIRMED"
+    } else if step2 == "DECOUPLE_REAPPEARS_STRONG_HFD_B_LIKE" && step3 == "BBA_LOW_CORR_HFD_A_INDEPENDENT" {
+        final_v = "HFD_A_REFINED_REAPPEARS_BUT_ORTHOGONAL"
+    } else if step2 == "NO_DECOUPLE_HFD_A_LIKE" && step3 == "BBA_LOW_CORR_HFD_A_INDEPENDENT" {
+        final_v = "HFD_A_LLAMA_ONLY_WEAK"
+    } else {
+        final_v = "PARTIAL_AMBIGUOUS_NEEDS_MORE_BB"
+    }
+    v["final_verdict"] = final_v
+    v["step1_status"] = "BLOCKED_HF_GATED_LLAMA31_8B_DEFERRED"
+    return v
+}
+
+fn write_summary(deepseek_dec, decoup_4bb, bba_corr, verdict) {
+    ensure_dir(OUT_DIR + "/step3_bba_correlation")
+    let mut s = "{\n"
+    s = s + "  \"schema\": \"" + SCHEMA + "\",\n"
+    s = s + "  \"axis_id\": \"axis_96_family_decoupling_disambig\",\n"
+    s = s + "  \"parent_axis\": \"axis_96_family_decoupling\",\n"
+    s = s + "  \"description\": \"HFD-A vs HFD-B vs HFD-C disambiguation via 3-step (Llama stride=1 BLOCKED, DeepSeek 5th bb, BBA 7-axis correlation)\",\n"
+
+    // step1
+    s = s + "  \"step1_llama_stride1\": {\n"
+    s = s + "    \"status\": \"BLOCKED_HF_GATED\",\n"
+    s = s + "    \"reason\": \"meta-llama/Meta-Llama-3.1-8B is gated=manual; HF account dancinlife not authorized (cross-validates axis 105 finding)\",\n"
+    s = s + "    \"deferred_to\": \"post HF license accept (~1-2 business days)\",\n"
+    s = s + "    \"alternative_evidence\": \"Step 2 (DeepSeek 5th bb decoupling reappearance) substitutes for HFD-C artifact ruling-out\"\n"
+    s = s + "  },\n"
+
+    // step2
+    let dsd = deepseek_dec
+    s = s + "  \"step2_deepseek_cmt\": {\n"
+    s = s + "    \"backbone\": \"deepseek-ai/deepseek-llm-7b-base\",\n"
+    s = s + "    \"n_layers\": " + str(dsd["n_layers"]) + ",\n"
+    s = s + "    \"layer_stride\": 4,\n"
+    s = s + "    \"depth_std_x1000\": " + str(dsd["depth_std_x1000"]) + ",\n"
+    s = s + "    \"depth_range_x1000\": " + str(dsd["depth_range_x1000"]) + ",\n"
+    s = s + "    \"n_distinct_layers\": " + str(dsd["n_distinct_layers"]) + ",\n"
+    s = s + "    \"verdict\": \"" + _str(dsd["verdict"]) + "\",\n"
+    s = s + "    \"step2_verdict\": \"" + _str(verdict["step2_verdict"]) + "\",\n"
+    s = s + "    \"layers_dominant\": " + str(dsd["layers"]) + ",\n"
+    s = s + "    \"depths_x1000\": " + str(dsd["depths_x1000"]) + "\n"
+    s = s + "  },\n"
+
+    // step3
+    s = s + "  \"step3_bba_correlation\": {\n"
+    s = s + "    \"n_axes\": 7,\n"
+    s = s + "    \"axes\": [\"AN11_b\",\"B_ToM\",\"MCCA\",\"PhiStar\",\"CMT\",\"CDS\",\"family_decoupling\"],\n"
+    s = s + "    \"n_bb\": " + str(bba_corr["n_bb"]) + ",\n"
+    s = s + "    \"correlations_r_x1000\": {\n"
+    let corrs = bba_corr["correlations_r_x1000"]
+    let mut ai = 0
+    while ai < len(AXES_6) {
+        let ax = AXES_6[ai]
+        let comma = if ai + 1 < len(AXES_6) { "," } else { "" }
+        s = s + "      \"" + ax + "_vs_decoupling\": " + str(corrs[ax]) + comma + "\n"
+        ai = ai + 1
+    }
+    s = s + "    },\n"
+    s = s + "    \"max_abs_r_x1000\": " + str(bba_corr["max_abs_r_x1000"]) + ",\n"
+    s = s + "    \"max_corr_axis\": \"" + _str(bba_corr["max_axis"]) + "\",\n"
+    s = s + "    \"step3_verdict\": \"" + _str(verdict["step3_verdict"]) + "\",\n"
+    s = s + "    \"decoup_vec_x10000\": " + str(bba_corr["decoup_vec_x10000"]) + "\n"
+    s = s + "  },\n"
+
+    // tally
+    s = s + "  \"5_bb_decoupling_tally\": {\n"
+    s = s + "    \"n_decoupled\": " + str(verdict["n_decoupled"]) + ",\n"
+    s = s + "    \"n_weakly_decoupled\": " + str(verdict["n_weakly_decoupled"]) + ",\n"
+    s = s + "    \"n_fully_coupled\": " + str(verdict["n_fully_coupled"]) + ",\n"
+    s = s + "    \"n_total\": " + str(verdict["n_total_bb"]) + "\n"
+    s = s + "  },\n"
+
+    s = s + "  \"final_verdict\": \"" + _str(verdict["final_verdict"]) + "\",\n"
+    s = s + "  \"step1_status\": \"" + _str(verdict["step1_status"]) + "\",\n"
+
+    s = s + "  \"caveats\": [\n"
+    s = s + "    \"raw#10 honest: Step 1 (Llama stride=1) BLOCKED by HF gated access. HFD-C artifact only partially ruled out via Step 2 (different architecture reappearance).\",\n"
+    s = s + "    \"DeepSeek used residual-passthrough ablation hook (v3-style) — not the original anima_cmt.hexa zero-output hook (which produced degenerate rel=1.0). Helper modification required ω-cycle iter 3 (torch upgrade 2.4→2.6, torchvision 0.19→0.21, hook semantics fix).\",\n"
+    s = s + "    \"5-bb is still small. Pearson r over n=4 backbones has wide CI; |r|=0.7 / 0.3 thresholds are heuristic, not statistical.\",\n"
+    s = s + "    \"Family list (Hexad/Law/Phi/SelfRef) and prompts frozen v10. Decoupling could be prompt-conditional rather than backbone-intrinsic.\",\n"
+    s = s + "    \"DeepSeek architecture is Llama-arch (LlamaForCausalLM); 5th bb does not test architecture-confound — Yi-9B / Falcon-mamba / Qwen2.5 needed for true cross-arch.\",\n"
+    s = s + "    \"HFD-C ARTIFACT residual: Llama stride=1 still required to fully eliminate grid sampling artifact; deferred verdict stands.\"\n"
+    s = s + "  ],\n"
+    s = s + "  \"ts\": \"" + now_utc() + "\"\n"
+    s = s + "}\n"
+
+    let out_path = OUT_DIR + "/disambiguation_verdict.json"
+    write_file(out_path, s)
+    println("wrote " + out_path)
+
+    // Per-step result.json
+    ensure_dir(OUT_DIR + "/step2_deepseek_cmt")
+    let mut s2 = "{\n"
+    s2 = s2 + "  \"schema\": \"" + SCHEMA + "/step2/1\",\n"
+    s2 = s2 + "  \"backbone\": \"deepseek-ai/deepseek-llm-7b-base\",\n"
+    s2 = s2 + "  \"depth_std_x1000\": " + str(dsd["depth_std_x1000"]) + ",\n"
+    s2 = s2 + "  \"depth_range_x1000\": " + str(dsd["depth_range_x1000"]) + ",\n"
+    s2 = s2 + "  \"n_distinct_layers\": " + str(dsd["n_distinct_layers"]) + ",\n"
+    s2 = s2 + "  \"verdict\": \"" + _str(dsd["verdict"]) + "\",\n"
+    s2 = s2 + "  \"step2_verdict\": \"" + _str(verdict["step2_verdict"]) + "\",\n"
+    s2 = s2 + "  \"ts\": \"" + now_utc() + "\"\n"
+    s2 = s2 + "}\n"
+    write_file(OUT_DIR + "/step2_deepseek_cmt/result.json", s2)
+    println("wrote " + OUT_DIR + "/step2_deepseek_cmt/result.json")
+
+    let mut s3 = "{\n"
+    s3 = s3 + "  \"schema\": \"" + SCHEMA + "/step3/1\",\n"
+    s3 = s3 + "  \"max_abs_r_x1000\": " + str(bba_corr["max_abs_r_x1000"]) + ",\n"
+    s3 = s3 + "  \"max_corr_axis\": \"" + _str(bba_corr["max_axis"]) + "\",\n"
+    s3 = s3 + "  \"step3_verdict\": \"" + _str(verdict["step3_verdict"]) + "\",\n"
+    s3 = s3 + "  \"ts\": \"" + now_utc() + "\"\n"
+    s3 = s3 + "}\n"
+    write_file(OUT_DIR + "/step3_bba_correlation/result.json", s3)
+    println("wrote " + OUT_DIR + "/step3_bba_correlation/result.json")
+
+    // Step 1 stub
+    ensure_dir(OUT_DIR + "/step1_llama_stride1")
+    let mut s1 = "{\n"
+    s1 = s1 + "  \"schema\": \"" + SCHEMA + "/step1/1\",\n"
+    s1 = s1 + "  \"status\": \"BLOCKED_HF_GATED\",\n"
+    s1 = s1 + "  \"backbone\": \"meta-llama/Meta-Llama-3.1-8B\",\n"
+    s1 = s1 + "  \"reason\": \"gated=manual; HF account dancinlife awaiting license approval (cross-ref axis 105)\",\n"
+    s1 = s1 + "  \"deferred\": true,\n"
+    s1 = s1 + "  \"ts\": \"" + now_utc() + "\"\n"
+    s1 = s1 + "}\n"
+    write_file(OUT_DIR + "/step1_llama_stride1/result.json", s1)
+    println("wrote " + OUT_DIR + "/step1_llama_stride1/result.json")
+}
+
+fn cmd_selftest() {
+    println("── anima_v11_axis96_disambig selftest ──")
+    let mut ok = true
+    if !fexists(DEEPSEEK_CMT) {
+        println("  ✗ missing " + DEEPSEEK_CMT)
+        ok = false
+    } else {
+        println("  ✓ " + DEEPSEEK_CMT)
+    }
+    let mut i = 0
+    while i < len(EXISTING_DECOUP) {
+        let p = _str(EXISTING_DECOUP[i][1])
+        if !fexists(p) { println("  ✗ missing " + p); ok = false }
+        else { println("  ✓ " + p) }
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(BBA_PATHS) {
+        let p = _str(BBA_PATHS[j][1])
+        if !fexists(p) { println("  ✗ missing " + p); ok = false }
+        else { println("  ✓ " + p) }
+        j = j + 1
+    }
+    if ok { println("selftest=ok") } else { println("selftest=FAIL_MISSING_INPUT") }
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+
+    println("══════════════════════════════════════════════════════════════")
+    println("paradigm v11 axis 96 (family-decoupling) disambiguation")
+    println("══════════════════════════════════════════════════════════════")
+
+    println("")
+    println("[step 1] Llama stride=1 — BLOCKED (HF gated, deferred)")
+    println("")
+    println("[step 2] DeepSeek-llm-7b-base CMT (residual-passthrough v3)")
+    let deepseek_dec = compute_deepseek_decoupling()
+    if deepseek_dec == null {
+        println("  FATAL: DeepSeek CMT input missing")
+        exit(1)
+    }
+    println("")
+    println("[step 2] existing 4-bb decoupling load")
+    let decoup_4bb = load_existing_decoup()
+    println("  loaded " + str(len(decoup_4bb)) + " backbones")
+
+    println("")
+    println("[step 3] BBA 6-axis scalars load")
+    let bba_scalars = load_bba_scalars()
+    println("  loaded " + str(len(bba_scalars)) + " backbones")
+
+    println("")
+    println("[step 3] 7-axis Pearson correlation (decoupling vs each of 6 axes)")
+    let bba_corr = compute_bba_correlation(bba_scalars, decoup_4bb)
+    let corrs = bba_corr["correlations_r_x1000"]
+    let mut ai = 0
+    while ai < len(AXES_6) {
+        let ax = AXES_6[ai]
+        println("  decoupling vs " + ax + ": r*1000=" + str(corrs[ax]))
+        ai = ai + 1
+    }
+    println("  max |r|*1000=" + str(bba_corr["max_abs_r_x1000"]) + " axis=" + _str(bba_corr["max_axis"]))
+
+    let verdict = compute_verdict(deepseek_dec, decoup_4bb, bba_corr)
+
+    println("")
+    println("══════════════════════════════════════════════════════════════")
+    println("STEP 2 VERDICT: " + _str(verdict["step2_verdict"]))
+    println("STEP 3 VERDICT: " + _str(verdict["step3_verdict"]))
+    println("FINAL: " + _str(verdict["final_verdict"]))
+    println("STEP 1: " + _str(verdict["step1_status"]))
+    println("══════════════════════════════════════════════════════════════")
+
+    write_summary(deepseek_dec, decoup_4bb, bba_corr, verdict)
+
+    println("")
+    println("DONE")
+}
+
+main()

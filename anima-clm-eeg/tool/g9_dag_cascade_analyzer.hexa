@@ -1,0 +1,362 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/g9_dag_cascade_analyzer.hexa
+//
+//  PURPOSE
+//    G9 (Dependency Graph Sparsity + Cascade) gate analyzer for Mk.XII
+//    Integration tier 5-component DAG.
+//
+//    components (deterministic order):
+//      idx=0  HCI            substrate          (anima-hci-research/)
+//      idx=1  CPGD           training           (anima-cpgd-research/)
+//      idx=2  EEG_STACK      phenomenal         (anima-clm-eeg/)
+//      idx=3  TRIBE_v2       brain-anchored     (anima-tribev2-pilot/)
+//      idx=4  PARADIGM_V11   8-axis measurement (tool/anima_*.hexa)
+//
+//    adjacency matrix A[i][j] = 1 iff component i directly depends on
+//    component j (i.e. fail of j strictly limits i). Encoding from
+//    Mk.XII proposal §3.1 + §3.2 (sha 4f7fd4d2..., sister doc):
+//
+//      4 ← 0 (PARADIGM_V11 ← HCI)         soft edge
+//      4 ← 1 (PARADIGM_V11 ← CPGD)        soft edge
+//      4 ← 2 (PARADIGM_V11 ← EEG_STACK)   hard edge
+//      4 ← 3 (PARADIGM_V11 ← TRIBE_v2)    hard edge
+//
+//    All other entries are 0.  The Mk.XI v10 root is OUTSIDE the 5x5
+//    DAG by design (it is the substrate root, not a peer component).
+//
+//    G9 frozen criteria (this run):
+//      A.  edge_count            ≤ 7   (sparsity)
+//      B.  cascade_max_impact    ≤ 2   (1-fail → downstream component count)
+//
+//    paradigm_v11 = measurement sink, NOT excluded — its cascade is
+//    compared raw against criterion B.  An offender flag is emitted
+//    when violations occur.
+//
+//  USAGE
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run \
+//      anima-clm-eeg/tool/g9_dag_cascade_analyzer.hexa --selftest
+//
+//    Negative falsifier (dense DAG):
+//      G9_DENSE=1 HEXA_RESOLVER_NO_REROUTE=1 hexa run \
+//        anima-clm-eeg/tool/g9_dag_cascade_analyzer.hexa
+//
+//  OUTPUT
+//    state/g9_dag_cascade_analyzer.json
+//
+//  ENV
+//    G9_DAG_OUT   output JSON path
+//    G9_DENSE     when "1": replace adjacency with a dense 5x5 (edge=12)
+//                 to exercise the negative falsifier.
+//
+//  RAW
+//    raw#9 · hexa-only · deterministic · LLM=none · pure-aggregator
+// ════════════════════════════════════════════════════════════════════════════
+
+let M32 = 4294967296
+let FNV_PRIME = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+let N = 5
+
+let EDGE_BUDGET = 7
+let CASCADE_BUDGET = 2
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+fn env_int(key: string, default_val: int) -> int {
+    let s = env(key)
+    if s == "" { return default_val }
+    if s == "1" { return 1 }
+    if s == "0" { return 0 }
+    return default_val
+}
+
+// ─── fingerprint (FNV-style) ────────────────────────────────────────────────
+fn fnv_step(h: int, byte: int) -> int {
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fingerprint_step(fp: int, val: int) -> int {
+    let mut h = fp
+    h = fnv_step(h, val % 256)
+    h = fnv_step(h, (val / 256) % 256)
+    h = fnv_step(h, (val / 65536) % 256)
+    h = fnv_step(h, (val / 16777216) % 256)
+    return h
+}
+
+// ─── adjacency matrix encoding ─────────────────────────────────────────────
+// Returns a flat list of length 25 (row-major).  A[i][j] at index i*5 + j.
+fn build_adjacency(dense_mode: int) -> [int] {
+    let mut a = [
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+    ]
+    if dense_mode == 1 {
+        // Dense complete-DAG falsifier: every i depends on every j != i,
+        // upper-triangular (acyclic).  Edge count = C(5,2) = 10  > 7.
+        let mut i = 0
+        while i < N {
+            let mut j = i + 1
+            while j < N {
+                a[i * N + j] = 1
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return a
+    }
+    // Sparse canonical encoding (Mk.XII proposal §3.1 + §3.2):
+    //   row 4 (PARADIGM_V11) depends on rows 0..3
+    a[4 * N + 0] = 1
+    a[4 * N + 1] = 1
+    a[4 * N + 2] = 1
+    a[4 * N + 3] = 1
+    return a
+}
+
+// Returns a parallel "hardness" list (1=hard, 0=soft) for non-zero edges.
+// Zero entries are 0 here too. Index layout matches build_adjacency().
+fn build_hardness(dense_mode: int) -> [int] {
+    let mut h = [
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+    ]
+    if dense_mode == 1 {
+        let mut i = 0
+        while i < N {
+            let mut j = i + 1
+            while j < N {
+                h[i * N + j] = 1
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return h
+    }
+    // Sparse: edges 4←0 / 4←1 are SOFT; 4←2 / 4←3 are HARD.
+    h[4 * N + 0] = 0
+    h[4 * N + 1] = 0
+    h[4 * N + 2] = 1
+    h[4 * N + 3] = 1
+    return h
+}
+
+// ─── graph metrics ─────────────────────────────────────────────────────────
+fn count_edges(a: [int]) -> int {
+    let mut total = 0
+    let mut i = 0
+    while i < N {
+        let mut j = 0
+        while j < N {
+            total = total + a[i * N + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return total
+}
+
+fn count_hard_edges(h: [int]) -> int {
+    let mut total = 0
+    let mut i = 0
+    while i < N {
+        let mut j = 0
+        while j < N {
+            total = total + h[i * N + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// 1-component fail cascade impact: number of OTHER components that
+// directly depend on the failed component (i.e. column j, sum over i).
+fn cascade_impact_of(a: [int], j: int) -> int {
+    let mut total = 0
+    let mut i = 0
+    while i < N {
+        if i != j {
+            total = total + a[i * N + j]
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// ─── component name lookup ─────────────────────────────────────────────────
+fn comp_name(idx: int) -> string {
+    if idx == 0 { return "HCI" }
+    if idx == 1 { return "CPGD" }
+    if idx == 2 { return "EEG_STACK" }
+    if idx == 3 { return "TRIBE_v2" }
+    if idx == 4 { return "PARADIGM_V11" }
+    return "UNKNOWN"
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    let out_path = env_str("G9_DAG_OUT", "state/g9_dag_cascade_analyzer.json")
+    let dense_mode = env_int("G9_DENSE", 0)
+
+    let a = build_adjacency(dense_mode)
+    let h = build_hardness(dense_mode)
+    let edge_count = count_edges(a)
+    let hard_edge_count = count_hard_edges(h)
+    let soft_edge_count = edge_count - hard_edge_count
+
+    // cascade per component
+    let c0 = cascade_impact_of(a, 0)
+    let c1 = cascade_impact_of(a, 1)
+    let c2 = cascade_impact_of(a, 2)
+    let c3 = cascade_impact_of(a, 3)
+    let c4 = cascade_impact_of(a, 4)
+
+    // max cascade + offender
+    let mut cmax = c0
+    let mut offender_idx = 0
+    if c1 > cmax { cmax = c1; offender_idx = 1 }
+    if c2 > cmax { cmax = c2; offender_idx = 2 }
+    if c3 > cmax { cmax = c3; offender_idx = 3 }
+    if c4 > cmax { cmax = c4; offender_idx = 4 }
+    let offender = comp_name(offender_idx)
+
+    let edge_pass = if edge_count <= EDGE_BUDGET { 1 } else { 0 }
+    let cascade_pass = if cmax <= CASCADE_BUDGET { 1 } else { 0 }
+    let g9_pass = if edge_pass == 1 {
+        if cascade_pass == 1 { 1 } else { 0 }
+    } else { 0 }
+
+    // fingerprint over the full adjacency + hardness + budgets
+    let mut fp = FNV_OFFSET_BASIS
+    fp = fingerprint_step(fp, dense_mode)
+    fp = fingerprint_step(fp, EDGE_BUDGET)
+    fp = fingerprint_step(fp, CASCADE_BUDGET)
+    let mut k = 0
+    while k < N * N {
+        fp = fingerprint_step(fp, a[k])
+        fp = fingerprint_step(fp, h[k])
+        k = k + 1
+    }
+    fp = fingerprint_step(fp, edge_count)
+    fp = fingerprint_step(fp, hard_edge_count)
+    fp = fingerprint_step(fp, cmax)
+    fp = fingerprint_step(fp, offender_idx)
+    fp = fingerprint_step(fp, g9_pass)
+
+    // ── emit cert ──────────────────────────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"g9_dag_cascade_analyzer\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"gate\": \"G9\",\n"
+    cert = cert + "  \"dense_mode\": " + str(dense_mode) + ",\n"
+    cert = cert + "  \"budgets\": {\n"
+    cert = cert + "    \"edge_max\": " + str(EDGE_BUDGET) + ",\n"
+    cert = cert + "    \"cascade_max\": " + str(CASCADE_BUDGET) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"components\": [\n"
+    cert = cert + "    {\"idx\": 0, \"name\": \"HCI\",          \"layer\": \"substrate\"},\n"
+    cert = cert + "    {\"idx\": 1, \"name\": \"CPGD\",         \"layer\": \"training\"},\n"
+    cert = cert + "    {\"idx\": 2, \"name\": \"EEG_STACK\",    \"layer\": \"phenomenal\"},\n"
+    cert = cert + "    {\"idx\": 3, \"name\": \"TRIBE_v2\",     \"layer\": \"brain_anchored\"},\n"
+    cert = cert + "    {\"idx\": 4, \"name\": \"PARADIGM_V11\", \"layer\": \"measurement\"}\n"
+    cert = cert + "  ],\n"
+    cert = cert + "  \"adjacency\": [\n"
+    let mut i = 0
+    while i < N {
+        cert = cert + "    ["
+        let mut j = 0
+        while j < N {
+            cert = cert + str(a[i * N + j])
+            if j < N - 1 { cert = cert + ", " }
+            j = j + 1
+        }
+        cert = cert + "]"
+        if i < N - 1 { cert = cert + "," }
+        cert = cert + "\n"
+        i = i + 1
+    }
+    cert = cert + "  ],\n"
+    cert = cert + "  \"hardness\": [\n"
+    let mut i2 = 0
+    while i2 < N {
+        cert = cert + "    ["
+        let mut j2 = 0
+        while j2 < N {
+            cert = cert + str(h[i2 * N + j2])
+            if j2 < N - 1 { cert = cert + ", " }
+            j2 = j2 + 1
+        }
+        cert = cert + "]"
+        if i2 < N - 1 { cert = cert + "," }
+        cert = cert + "\n"
+        i2 = i2 + 1
+    }
+    cert = cert + "  ],\n"
+    cert = cert + "  \"edge_count\": " + str(edge_count) + ",\n"
+    cert = cert + "  \"hard_edge_count\": " + str(hard_edge_count) + ",\n"
+    cert = cert + "  \"soft_edge_count\": " + str(soft_edge_count) + ",\n"
+    cert = cert + "  \"cascade\": {\n"
+    cert = cert + "    \"HCI\":          " + str(c0) + ",\n"
+    cert = cert + "    \"CPGD\":         " + str(c1) + ",\n"
+    cert = cert + "    \"EEG_STACK\":    " + str(c2) + ",\n"
+    cert = cert + "    \"TRIBE_v2\":     " + str(c3) + ",\n"
+    cert = cert + "    \"PARADIGM_V11\": " + str(c4) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"cascade_max\": " + str(cmax) + ",\n"
+    cert = cert + "  \"offender\": \"" + offender + "\",\n"
+    cert = cert + "  \"edge_pass\": " + str(edge_pass) + ",\n"
+    cert = cert + "  \"cascade_pass\": " + str(cascade_pass) + ",\n"
+    cert = cert + "  \"g9_pass\": " + str(g9_pass) + ",\n"
+    cert = cert + "  \"fingerprint\": " + str(fp) + ",\n"
+    cert = cert + "  \"note\": \"5x5 adjacency from Mk.XII proposal sha 4f7fd4d2 sec 3.1+3.2; Mk.XI v10 root is OUTSIDE the peer DAG by design.\"\n"
+    cert = cert + "}\n"
+    write_file(out_path, cert)
+
+    println("─── g9_dag_cascade_analyzer (raw#9 hexa-only) ───")
+    println("  dense_mode             = " + str(dense_mode))
+    println("  edge_count             = " + str(edge_count) + "  (budget " + str(EDGE_BUDGET) + ")")
+    println("  hard_edge_count        = " + str(hard_edge_count))
+    println("  soft_edge_count        = " + str(soft_edge_count))
+    println("  cascade.HCI            = " + str(c0))
+    println("  cascade.CPGD           = " + str(c1))
+    println("  cascade.EEG_STACK      = " + str(c2))
+    println("  cascade.TRIBE_v2       = " + str(c3))
+    println("  cascade.PARADIGM_V11   = " + str(c4))
+    println("  cascade_max            = " + str(cmax) + "  (budget " + str(CASCADE_BUDGET) + ")")
+    println("  offender               = " + offender)
+    println("  edge_pass              = " + str(edge_pass))
+    println("  cascade_pass           = " + str(cascade_pass))
+    println("  g9_pass                = " + str(g9_pass))
+    println("  fingerprint            = " + str(fp))
+    println("  output                 = " + out_path)
+
+    if g9_pass == 1 {
+        println("  verdict                = G9_PASS")
+        exit(0)
+    }
+    println("  verdict                = G9_FAIL  (offender=" + offender + ")")
+    exit(1)
+}
+
+main()

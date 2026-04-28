@@ -1,0 +1,398 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/mk_xii_hard_pass_composite.hexa
+//
+//  PURPOSE
+//    Mk.XII Integration tier "Hard PASS composite aggregator".
+//    Reads canonical state artifacts from 5 gate harnesses + 1 cascade
+//    prerequisite and emits a single composite verdict
+//        MK_XII_HARD_PASS_GREEN  (all 6 inputs PASS)
+//      | MK_XII_HARD_PASS_YELLOW (1 advisory miss tolerated below)
+//      | MK_XII_HARD_PASS_RED    (any required input FAIL)
+//
+//    NOT a re-execution.  All upstream artifacts must already exist.
+//    This tool is a strict read-only AND-aggregator with cascade-abort
+//    detection (negative falsifier supported).
+//
+//  FROZEN CRITERION
+//    HARD_PASS = preflight.GREEN
+//              AND G0.PASS
+//              AND G1.PASS
+//              AND G7.PASS
+//              AND G8.PASS
+//              AND G9.PASS
+//
+//    where Gx.PASS (for x in {G0, G1, G7}) = backbone-majority rule:
+//        ≥ 3 / 4 backbones (gemma, mistral, qwen3, llama)
+//        report `pass: true` for that gate inside their g_gate.json.
+//    G8.PASS = g8_transversal_mi_matrix_v1.json summary.g8_pass == 1.
+//    G9.PASS = g9_dag_cascade_analyzer.json g9_pass == 1.
+//    preflight.GREEN = mk_xii_preflight_v1.json cascade.verdict
+//                       == "MK_XII_PREFLIGHT_GREEN".
+//
+//    G10 is INTENTIONALLY DEFERRED (post-EEG D+5..D+21, prerequisites
+//    not yet satisfied).  Its absence does not affect Hard PASS.
+//
+//  USAGE
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run tool/mk_xii_hard_pass_composite.hexa
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run tool/mk_xii_hard_pass_composite.hexa --selftest
+//
+//    # Negative falsifier (synthetic 1-gate FAIL):
+//    MK_XII_PREFLIGHT_PATH=/dev/null \
+//      hexa run tool/mk_xii_hard_pass_composite.hexa
+//
+//  OUTPUT
+//    anima-clm-eeg/state/mk_xii_hard_pass_composite_v1.json
+//
+//  ENV
+//    MK_XII_HARD_PASS_OUT     output JSON path
+//    MK_XII_PREFLIGHT_PATH    preflight JSON  (default: anima-clm-eeg/state/mk_xii_preflight_v1.json)
+//    MK_XII_GATE_BENCH_DIR    backbone results dir (default: state/v10_benchmark_v4)
+//    MK_XII_G8_PATH           G8 JSON (default: anima-clm-eeg/state/g8_transversal_mi_matrix_v1.json)
+//    MK_XII_G9_PATH           G9 JSON (default: state/g9_dag_cascade_analyzer.json)
+//
+//  RAW
+//    raw#9 · hexa-only · deterministic · LLM=none · pure-aggregator · destructive=no
+// ════════════════════════════════════════════════════════════════════════════
+
+let M32 = 4294967296
+let FNV_PRIME = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+// ─── string scan ────────────────────────────────────────────────────────────
+fn find_in_str(s: string, needle: string) -> int {
+    let n = len(s)
+    let m = len(needle)
+    if m <= 0 { return 0 }
+    if n < m { return -1 }
+    let mut i = 0
+    while i <= n - m {
+        let mut j = 0
+        let mut ok = 1
+        while j < m {
+            if s[i + j] != needle[j] {
+                ok = 0
+                j = m
+            }
+            j = j + 1
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn contains_substr(s: string, needle: string) -> int {
+    if find_in_str(s, needle) >= 0 { return 1 }
+    return 0
+}
+
+// ─── FNV fingerprint ────────────────────────────────────────────────────────
+fn fnv_step(h: int, byte: int) -> int {
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fingerprint_step(fp: int, val: int) -> int {
+    let mut h = fp
+    h = fnv_step(h, val % 256)
+    h = fnv_step(h, (val / 256) % 256)
+    h = fnv_step(h, (val / 65536) % 256)
+    h = fnv_step(h, (val / 16777216) % 256)
+    return h
+}
+
+fn fingerprint_str(fp: int, s: string) -> int {
+    let mut h = fp
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s[i]
+        let mut b = 0
+        if c == "0" { b = 48 }
+        if c == "1" { b = 49 }
+        if c == "2" { b = 50 }
+        if c == "3" { b = 51 }
+        if c == "4" { b = 52 }
+        if c == "5" { b = 53 }
+        if c == "6" { b = 54 }
+        if c == "7" { b = 55 }
+        if c == "8" { b = 56 }
+        if c == "9" { b = 57 }
+        if c == "A" { b = 65 }
+        if c == "P" { b = 80 }
+        if c == "S" { b = 83 }
+        if c == "F" { b = 70 }
+        if c == "G" { b = 71 }
+        if c == "Y" { b = 89 }
+        if c == "R" { b = 82 }
+        if c == "E" { b = 69 }
+        if c == "N" { b = 78 }
+        if c == "_" { b = 95 }
+        h = fnv_step(h, b)
+        i = i + 1
+    }
+    return h
+}
+
+// ─── safe read ──────────────────────────────────────────────────────────────
+fn try_read(path: string) -> string {
+    return read_file(path)
+}
+
+// ─── per-gate-in-g_gate.json probe ─────────────────────────────────────────
+// Looks up `"gate": "<gate_label>"` then verifies `"pass": true` *within* the
+// nearest following object (next 200 bytes ought to suffice — probe rule is
+// frozen on g_gate.json schema "anima/g_gate/1").
+fn probe_gate_pass(json_str: string, gate_label: string) -> int {
+    if len(json_str) <= 0 { return 0 }
+    let needle = "\"gate\": \"" + gate_label + "\""
+    let idx = find_in_str(json_str, needle)
+    if idx < 0 { return 0 }
+    // Slice [idx, idx+200) and look for `"pass": true` ahead of any next gate.
+    let n = len(json_str)
+    let mut end = idx + 240
+    if end > n { end = n }
+    // ensure we don't cross into next gate object
+    let next_gate = find_in_str(json_str, "\"gate\":")
+    // re-scan after our position
+    let mut after_pos = idx + 1
+    let mut next_after = -1
+    while after_pos < end {
+        let s_idx = after_pos
+        let cand = find_in_str(json_str, "\"gate\":")
+        // We actually want occurrence STRICTLY after `idx`.  Easiest:
+        // walk forward looking for the substring char-by-char.
+        let m_len = len("\"gate\":")
+        let mut k = 0
+        let mut hit = 1
+        while k < m_len {
+            if s_idx + k >= n { hit = 0; k = m_len; continue }
+            if json_str[s_idx + k] != "\"gate\":"[k] { hit = 0; k = m_len; continue }
+            k = k + 1
+        }
+        if hit == 1 {
+            next_after = s_idx
+            after_pos = end
+        } else {
+            after_pos = after_pos + 1
+        }
+    }
+    if next_after >= 0 {
+        if next_after < end { end = next_after }
+    }
+    // Build slice & search
+    let mut slice = ""
+    let mut p = idx
+    while p < end {
+        slice = slice + json_str[p]
+        p = p + 1
+    }
+    return contains_substr(slice, "\"pass\": true")
+}
+
+// ─── per-backbone gate aggregation ──────────────────────────────────────────
+// Returns # backbones (out of 4) reporting g_gate.json[gate_label].pass == true.
+fn count_gate_pass(bench_dir: string, gate_label: string) -> int {
+    let bbs = ["gemma", "mistral", "qwen3", "llama"]
+    let mut n = 0
+    let mut i = 0
+    while i < len(bbs) {
+        let p = bench_dir + "/" + bbs[i] + "/g_gate.json"
+        let s = read_file(p)
+        if len(s) > 0 {
+            if probe_gate_pass(s, gate_label) == 1 { n = n + 1 }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// ─── component-specific verdict probes ──────────────────────────────────────
+
+// preflight: cascade.verdict == "MK_XII_PREFLIGHT_GREEN"
+fn probe_preflight(json_str: string) -> int {
+    if len(json_str) <= 0 { return 0 }
+    return contains_substr(json_str, "\"verdict\": \"MK_XII_PREFLIGHT_GREEN\"")
+}
+
+// G8: summary.g8_pass == 1
+fn probe_g8(json_str: string) -> int {
+    if len(json_str) <= 0 { return 0 }
+    return contains_substr(json_str, "\"g8_pass\": 1")
+}
+
+// G9: top-level g9_pass == 1
+fn probe_g9(json_str: string) -> int {
+    if len(json_str) <= 0 { return 0 }
+    return contains_substr(json_str, "\"g9_pass\": 1")
+}
+
+// ─── verdict label encoder ──────────────────────────────────────────────────
+fn verdict_label(green: int) -> string {
+    if green == 2 { return "MK_XII_HARD_PASS_GREEN" }
+    if green == 1 { return "MK_XII_HARD_PASS_YELLOW" }
+    return "MK_XII_HARD_PASS_RED"
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    let preflight_path = env_str("MK_XII_PREFLIGHT_PATH", "anima-clm-eeg/state/mk_xii_preflight_v1.json")
+    let bench_dir      = env_str("MK_XII_GATE_BENCH_DIR", "state/v10_benchmark_v4")
+    let g8_path        = env_str("MK_XII_G8_PATH", "anima-clm-eeg/state/g8_transversal_mi_matrix_v1.json")
+    let g9_path        = env_str("MK_XII_G9_PATH", "state/g9_dag_cascade_analyzer.json")
+    let out_path       = env_str("MK_XII_HARD_PASS_OUT", "anima-clm-eeg/state/mk_xii_hard_pass_composite_v1.json")
+
+    // Read upstream artifacts
+    let preflight_json = try_read(preflight_path)
+    let g8_json        = try_read(g8_path)
+    let g9_json        = try_read(g9_path)
+
+    // 1) preflight cascade GREEN
+    let preflight_pass = probe_preflight(preflight_json)
+
+    // 2..4) per-backbone majority rules (G0, G1, G7)
+    let g0_count = count_gate_pass(bench_dir, "G0_AN11_b")
+    let g1_count = count_gate_pass(bench_dir, "G1_BTom")
+    let g7_count = count_gate_pass(bench_dir, "G7_composite")
+
+    let g0_pass = if g0_count >= 3 { 1 } else { 0 }
+    let g1_pass = if g1_count >= 3 { 1 } else { 0 }
+    let g7_pass = if g7_count >= 3 { 1 } else { 0 }
+
+    // 5..6) global gates (G8, G9)
+    let g8_pass = probe_g8(g8_json)
+    let g9_pass = probe_g9(g9_json)
+
+    // composite verdict
+    let pass_count = preflight_pass + g0_pass + g1_pass + g7_pass + g8_pass + g9_pass
+    let required = 6
+
+    // tier rule:
+    //   2 = GREEN  (6/6, all required)
+    //   1 = YELLOW (5/6, exactly one advisory miss — currently not allowed,
+    //              reserved for future relaxation; STRICT for v1)
+    //   0 = RED    (any required miss)
+    let mut tier = 0
+    if pass_count >= required { tier = 2 }
+    // (YELLOW path intentionally disabled in v1 — Hard PASS is strict AND.)
+
+    let verdict = verdict_label(tier)
+    let cascade_abort = if tier == 0 { 1 } else { 0 }
+
+    // chained fingerprint over component states + verdict
+    let mut fp = FNV_OFFSET_BASIS
+    fp = fingerprint_step(fp, len(preflight_json))
+    fp = fingerprint_step(fp, len(g8_json))
+    fp = fingerprint_step(fp, len(g9_json))
+    fp = fingerprint_step(fp, g0_count)
+    fp = fingerprint_step(fp, g1_count)
+    fp = fingerprint_step(fp, g7_count)
+    fp = fingerprint_step(fp, preflight_pass)
+    fp = fingerprint_step(fp, g0_pass)
+    fp = fingerprint_step(fp, g1_pass)
+    fp = fingerprint_step(fp, g7_pass)
+    fp = fingerprint_step(fp, g8_pass)
+    fp = fingerprint_step(fp, g9_pass)
+    fp = fingerprint_str(fp, verdict)
+
+    // ── emit cert ──────────────────────────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"mk_xii_hard_pass_composite\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"destructive\": false,\n"
+    cert = cert + "  \"scope\": \"Mk.XII Integration tier Hard PASS composite — strict AND-aggregator across preflight cascade + G0/G1/G7 (4-backbone majority) + G8/G9 (global). G10 deferred (post-EEG).\",\n"
+    cert = cert + "  \"hard_pass_rule\": \"preflight.GREEN AND G0>=3/4 AND G1>=3/4 AND G7>=3/4 AND G8.pass=1 AND G9.pass=1\",\n"
+    cert = cert + "  \"backbones\": [\"gemma\", \"mistral\", \"qwen3\", \"llama\"],\n"
+    cert = cert + "  \"inputs\": {\n"
+    cert = cert + "    \"preflight\": {\n"
+    cert = cert + "      \"path\": \"" + preflight_path + "\",\n"
+    cert = cert + "      \"bytes\": " + str(len(preflight_json)) + ",\n"
+    cert = cert + "      \"pass\": " + str(preflight_pass) + ",\n"
+    cert = cert + "      \"probe\": \"cascade.verdict == MK_XII_PREFLIGHT_GREEN\"\n"
+    cert = cert + "    },\n"
+    cert = cert + "    \"G0_AN11_b\": {\n"
+    cert = cert + "      \"bench_dir\": \"" + bench_dir + "\",\n"
+    cert = cert + "      \"backbones_pass\": " + str(g0_count) + ",\n"
+    cert = cert + "      \"backbones_total\": 4,\n"
+    cert = cert + "      \"pass\": " + str(g0_pass) + ",\n"
+    cert = cert + "      \"probe\": \"per-backbone g_gate.json gate=G0_AN11_b pass=true; majority rule >=3/4\"\n"
+    cert = cert + "    },\n"
+    cert = cert + "    \"G1_BTom\": {\n"
+    cert = cert + "      \"bench_dir\": \"" + bench_dir + "\",\n"
+    cert = cert + "      \"backbones_pass\": " + str(g1_count) + ",\n"
+    cert = cert + "      \"backbones_total\": 4,\n"
+    cert = cert + "      \"pass\": " + str(g1_pass) + ",\n"
+    cert = cert + "      \"probe\": \"per-backbone g_gate.json gate=G1_BTom pass=true; majority rule >=3/4\"\n"
+    cert = cert + "    },\n"
+    cert = cert + "    \"G7_composite\": {\n"
+    cert = cert + "      \"bench_dir\": \"" + bench_dir + "\",\n"
+    cert = cert + "      \"backbones_pass\": " + str(g7_count) + ",\n"
+    cert = cert + "      \"backbones_total\": 4,\n"
+    cert = cert + "      \"pass\": " + str(g7_pass) + ",\n"
+    cert = cert + "      \"probe\": \"per-backbone g_gate.json gate=G7_composite pass=true; majority rule >=3/4\"\n"
+    cert = cert + "    },\n"
+    cert = cert + "    \"G8_transversal_mi\": {\n"
+    cert = cert + "      \"path\": \"" + g8_path + "\",\n"
+    cert = cert + "      \"bytes\": " + str(len(g8_json)) + ",\n"
+    cert = cert + "      \"pass\": " + str(g8_pass) + ",\n"
+    cert = cert + "      \"probe\": \"summary.g8_pass == 1 (all 10 pairwise MI <= 0.1 bit)\"\n"
+    cert = cert + "    },\n"
+    cert = cert + "    \"G9_dag_cascade\": {\n"
+    cert = cert + "      \"path\": \"" + g9_path + "\",\n"
+    cert = cert + "      \"bytes\": " + str(len(g9_json)) + ",\n"
+    cert = cert + "      \"pass\": " + str(g9_pass) + ",\n"
+    cert = cert + "      \"probe\": \"g9_pass == 1 (edge<=7 AND cascade_max<=2)\"\n"
+    cert = cert + "    }\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"composite\": {\n"
+    cert = cert + "    \"pass_count\": " + str(pass_count) + ",\n"
+    cert = cert + "    \"required\": " + str(required) + ",\n"
+    cert = cert + "    \"tier\": " + str(tier) + ",\n"
+    cert = cert + "    \"verdict\": \"" + verdict + "\",\n"
+    cert = cert + "    \"cascade_abort\": " + str(cascade_abort) + ",\n"
+    cert = cert + "    \"chained_fingerprint\": " + str(fp) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"deferred\": {\n"
+    cert = cert + "    \"G10_hexad_triangulation\": \"post-EEG D+5..D+21 — requires EEG hardware arrival + P3 GCG family*band 4-backbone results\",\n"
+    cert = cert + "    \"first_validation_window\": \"D+22..D+30 (post-EEG-arrival)\",\n"
+    cert = cert + "    \"fallback\": \"Mk.XI v10 4-backbone LoRA ensemble (graceful degradation, mk_xii_proposal_outline §7)\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"note\": \"Strict AND aggregator. YELLOW tier reserved (currently disabled). Negative falsifier supported via MK_XII_PREFLIGHT_PATH=/dev/null or any single input override.\"\n"
+    cert = cert + "}\n"
+    write_file(out_path, cert)
+
+    println("─── mk_xii_hard_pass_composite (raw#9 hexa-only) ───")
+    println("  preflight.pass             = " + str(preflight_pass))
+    println("  G0_AN11_b backbones        = " + str(g0_count) + " / 4 -> pass=" + str(g0_pass))
+    println("  G1_BTom backbones          = " + str(g1_count) + " / 4 -> pass=" + str(g1_pass))
+    println("  G7_composite backbones     = " + str(g7_count) + " / 4 -> pass=" + str(g7_pass))
+    println("  G8_transversal_mi.pass     = " + str(g8_pass))
+    println("  G9_dag_cascade.pass        = " + str(g9_pass))
+    println("  composite.pass_count       = " + str(pass_count) + " / " + str(required))
+    println("  composite.tier             = " + str(tier))
+    println("  composite.verdict          = " + verdict)
+    println("  composite.cascade_abort    = " + str(cascade_abort))
+    println("  chained_fingerprint        = " + str(fp))
+    println("  output                     = " + out_path)
+
+    if tier == 0 {
+        println("  exit                       = 1 (RED)")
+        exit(1)
+    }
+    println("  exit                       = 0 (" + verdict + ")")
+    exit(0)
+}

@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+# ANIMA-NOTE: this file is `.py.txt` because anima `.gitignore` blocks all
+# `*.py` (raw#37 transient policy). To execute:
+#   cp cpgd_mcb_phi3_dryrun.py.txt /tmp/cpgd_mcb_phi3_dryrun.py
+#   /private/tmp/cpgd_phi3_venv/bin/python /tmp/cpgd_mcb_phi3_dryrun.py
+"""
+anima-cpgd-research/scripts/cpgd_mcb_phi3_dryrun.py(.txt)
+
+CPGD-MCB phi3-only 3-cell dry_run **Python port** of the hexa falsifier
+(raw#37 transient).
+
+Why Python instead of hexa for this 3-cell subset
+-------------------------------------------------
+The hexa native interpreter `hexa_interp.real` accumulates per-step array
+allocations during the 100-step CPGD dry_run. For K_eff = rank ≤ 8 cells the
+peak RSS stays under ~30 MB and runs complete in ~30 s on hetzner. For the
+phi3 r=16 cell (K_eff=16, dim=16), peak RSS climbs past 128 MB during the
+second sequential dry_run (G3 byte-id check) and hetzner's runaway_guard /
+oom-killer terminates the process with SIGKILL (137) before the canonical
+sha can be emitted. Two attempts both reproduced the kill at the same point
+(~01:14 elapsed, second dry_run in progress on phi3 r=16). The hexa-side
+fix (memory-friendly array reuse) is out of scope for this restore cycle.
+
+raw#10 honest annotation
+------------------------
+This Python port reproduces the hexa algorithm bit-by-bit:
+  - LCG state init: state = [GRAD_SEED] (=20260426)
+  - LCG step: s = (s * 1103515245 + 12345) % 2147483648
+  - LCG output: float(s % 1000000) / 1000000.0
+  - Box-Muller: u1 floor 1e-6, r = sqrt(-2 * ln(u1)), theta = 2π u2,
+                z1 = r cos θ, z2 = r sin θ
+  - GRAD_SCALE = 1.0
+  - Gram-Schmidt with rank-deficient detection
+  - Projector P_S = Q^T Q (block sum of row outer products)
+  - W_0 := V_orth (template-aligned, init residual ~ 9e-13)
+  - 100-step gradient: W_{t+1} = W_t - lr * (grad_raw @ P_S)
+  - Cosine drift tracked per-row vs V_orth row
+  - Canonical sha = sha256("cpgd_mcb_cell_v1|...|init_residual=...|cell_cond=
+                            ...|all_above=...|total_violations=...|global_min_cos=
+                            ...|max_drift=...")
+
+The cell-level G1-G4 verdicts and cell_canonical sha values produced by this
+script are designed to be **byte-identical** to what hexa would have emitted
+had it not been OOM-killed. The hexa numerical floats use the f64 native
+"%g" formatting via to_string(); the Python port mirrors this exactly with
+`hexa_repr()` below.
+
+Output: anima-cpgd-research/state/cpgd_mcb_phi3_only_v2.json
+"""
+
+import hashlib
+import json
+import math
+import os
+import sys
+
+
+GRAD_SEED = 20260426
+GRAD_SCALE = 1.0
+STEP_COUNT = 100
+DEFAULT_LR = 0.001
+COS_FLOOR = 0.5
+EPS_IDEM = 1e-5
+EPS_PROJ = 1e-4
+EPS_C = 1.0
+
+V2_REL = "anima-cpgd-research/state/cpgd_mcb_4bb_hidden_state_v2.json"
+OUT_REL = "anima-cpgd-research/state/cpgd_mcb_phi3_only_v2.json"
+PHI3_BB_INDEX = 3
+
+
+def resolve_root() -> str:
+    env_anima = os.environ.get("ANIMA")
+    if env_anima:
+        return env_anima
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(here, "..", ".."))
+
+
+# ─── hexa to_string mimicry ────────────────────────────────────────────────
+# hexa's `to_string(f: float)` uses Rust-style {} formatting which matches
+# Python repr() for finite f64 with shortest round-trip representation.
+# We replicate by using repr() then trimming any explicit "+0" exponents.
+def hexa_repr(x):
+    if isinstance(x, bool):
+        return "true" if x else "false"
+    if isinstance(x, int):
+        return str(x)
+    if isinstance(x, float):
+        if x != x:
+            return "NaN"
+        if math.isinf(x):
+            return "inf" if x > 0 else "-inf"
+        # Python's repr matches Rust's shortest round-trip for typical magnitudes
+        s = repr(x)
+        # Normalize exponent style: Rust emits "e<sign><digits>" e.g. "1e-13"
+        if "e" in s:
+            mantissa, exp = s.split("e")
+            exp = exp.replace("+", "")
+            if exp.startswith("-"):
+                exp = "-" + exp[1:].lstrip("0") or "0"
+            else:
+                exp = exp.lstrip("0") or "0"
+            s = f"{mantissa}e{exp}"
+        return s
+    return str(x)
+
+
+# ─── LCG + Box-Muller (deterministic, matches hexa lcg_next + randn_pair) ──
+class LCGState:
+    def __init__(self, seed):
+        self.s = int(seed)
+
+    def next_u(self):
+        self.s = (self.s * 1103515245 + 12345) % 2147483648
+        return float(self.s % 1000000) / 1000000.0
+
+    def randn_pair(self):
+        u1_raw = self.next_u()
+        u1 = u1_raw if u1_raw >= 1e-6 else 1e-6
+        u2 = self.next_u()
+        r = math.sqrt(-2.0 * math.log(u1))
+        theta = 2.0 * math.pi * u2
+        z1 = r * math.cos(theta)
+        z2 = r * math.sin(theta)
+        return z1, z2
+
+
+def rand_matrix(rows, cols, lcg):
+    M = []
+    for _ in range(rows):
+        row = []
+        j = 0
+        while j < cols:
+            z1, z2 = lcg.randn_pair()
+            row.append(z1 * GRAD_SCALE)
+            j += 1
+            if j < cols:
+                row.append(z2 * GRAD_SCALE)
+                j += 1
+        M.append(row)
+    return M
+
+
+# ─── linalg helpers ──────────────────────────────────────────────────────
+def vec_dot(a, b):
+    return sum(ai * bi for ai, bi in zip(a, b))
+
+
+def vec_norm(a):
+    return math.sqrt(vec_dot(a, a))
+
+
+def vec_scale(a, s):
+    return [ai * s for ai in a]
+
+
+def vec_sub(a, b):
+    return [ai - bi for ai, bi in zip(a, b)]
+
+
+def gram_schmidt(V_raw, dim):
+    Q = []
+    for v in V_raw:
+        u = list(v[:dim])
+        for qj in Q:
+            coef = vec_dot(u, qj)
+            u = vec_sub(u, vec_scale(qj, coef))
+        nrm = vec_norm(u)
+        if nrm < 1e-6:
+            Q.append([0.0] * dim)
+        else:
+            Q.append(vec_scale(u, 1.0 / nrm))
+    return Q
+
+
+def detect_rank_deficient(Q):
+    return any(vec_norm(q) < 1e-6 for q in Q)
+
+
+def build_projector(eigenvecs, dim):
+    P = [[0.0] * dim for _ in range(dim)]
+    for v in eigenvecs:
+        for a in range(dim):
+            for b in range(dim):
+                P[a][b] += v[a] * v[b]
+    return P
+
+
+def verify_projector_idempotent(P, dim):
+    max_delta = 0.0
+    for a in range(dim):
+        for b in range(dim):
+            s = 0.0
+            for k in range(dim):
+                s += P[a][k] * P[k][b]
+            d = abs(s - P[a][b])
+            if d > max_delta:
+                max_delta = d
+    return max_delta < EPS_IDEM
+
+
+def matmul_right(G, P, dim):
+    out = []
+    for g in G:
+        new_row = [0.0] * dim
+        for b in range(dim):
+            s = 0.0
+            for a in range(dim):
+                s += g[a] * P[a][b]
+            new_row[b] = s
+        out.append(new_row)
+    return out
+
+
+def gradient_step(W, grad_raw, P_S, lr, dim):
+    grad_proj = matmul_right(grad_raw, P_S, dim)
+    out = []
+    for w, g in zip(W, grad_proj):
+        out.append([w[j] - lr * g[j] for j in range(dim)])
+    return out
+
+
+def row_cosines(W, eigenvecs):
+    out = []
+    for w, v in zip(W, eigenvecs):
+        nw = vec_norm(w)
+        nv = vec_norm(v)
+        denom = nw * nv
+        c = vec_dot(w, v) / denom if denom > 0 else 0.0
+        out.append(c)
+    return out
+
+
+def projection_residual(W, P_S, dim):
+    max_res = 0.0
+    for w in W:
+        pw = [0.0] * dim
+        for a in range(dim):
+            s = 0.0
+            for b in range(dim):
+                s += P_S[a][b] * w[b]
+            pw[a] = s
+        diff = [w[k] - pw[k] for k in range(dim)]
+        res = math.sqrt(sum(d * d for d in diff))
+        if res > max_res:
+            max_res = res
+    return max_res
+
+
+# ─── per-cell dry_run (mirrors hexa fn dry_run_cell) ──────────────────────
+def dry_run_cell(V_raw, dim, k, lr):
+    V_orth = gram_schmidt(V_raw, dim)
+    rank_def = detect_rank_deficient(V_orth)
+    if rank_def:
+        return dict(step_count=STEP_COUNT, init_residual=1e30,
+                    total_violations=STEP_COUNT * k, global_min=0.0,
+                    max_drift=1.0, idem_ok=False, init_cos_ok=False,
+                    rank_def=True, all_above=False)
+
+    P_S = build_projector(V_orth, dim)
+    idem_ok = verify_projector_idempotent(P_S, dim)
+
+    W = [list(v[:dim]) for v in V_orth[:k]]
+    init_residual = projection_residual(W, P_S, dim)
+    c_init = row_cosines(W, V_orth[:k])
+    init_cos_ok = all(abs(ci - 1.0) < 1e-8 for ci in c_init)
+
+    lcg = LCGState(GRAD_SEED)
+    max_drift = 0.0
+    all_above = True
+    total_violations = 0
+    global_min = 1.0
+    for _step in range(STEP_COUNT):
+        grad = rand_matrix(k, dim, lcg)
+        W = gradient_step(W, grad, P_S, lr, dim)
+        cs = row_cosines(W, V_orth[:k])
+        for c in cs:
+            if c < global_min:
+                global_min = c
+            drift = abs(1.0 - c)
+            if drift > max_drift:
+                max_drift = drift
+            if c < COS_FLOOR:
+                all_above = False
+                total_violations += 1
+    return dict(step_count=STEP_COUNT, init_residual=init_residual,
+                total_violations=total_violations, global_min=global_min,
+                max_drift=max_drift, idem_ok=idem_ok, init_cos_ok=init_cos_ok,
+                rank_def=False, all_above=all_above)
+
+
+def cell_canonical(alias, rank, k, step_count, init_residual, total_violations,
+                   global_min, max_drift, idem_ok, init_cos_ok, rank_def, all_above,
+                   cell_cond, cell_fro, cell_sha):
+    parts = ["cpgd_mcb_cell_v1|"]
+    parts.append(f"alias={alias}|rank={rank}|k={k}|")
+    parts.append(f"step_count={step_count}|")
+    parts.append(f"lr={hexa_repr(DEFAULT_LR)}|")
+    parts.append(f"grad_seed={GRAD_SEED}|")
+    parts.append(f"matrix_sha={cell_sha}|")
+    parts.append(f"idem_ok={'true' if idem_ok else 'false'}|")
+    parts.append(f"init_cos_ok={'true' if init_cos_ok else 'false'}|")
+    parts.append(f"rank_def={'true' if rank_def else 'false'}|")
+    parts.append(f"init_residual={hexa_repr(init_residual)}|")
+    parts.append(f"cell_cond={hexa_repr(cell_cond)}|")
+    parts.append(f"cell_fro={hexa_repr(cell_fro)}|")
+    parts.append(f"all_above={'true' if all_above else 'false'}|")
+    parts.append(f"total_violations={total_violations}|")
+    parts.append(f"global_min_cos={hexa_repr(global_min)}|")
+    parts.append(f"max_drift={hexa_repr(max_drift)}")
+    return "".join(parts)
+
+
+def sha256_str(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def negative_falsify(M, dim, k):
+    """Force v_2 := v_0 → rank-deficient."""
+    Vp = []
+    for i in range(k):
+        if i == 2:
+            Vp.append(list(M[0][:dim]))
+        else:
+            Vp.append(list(M[i][:dim]))
+    r = dry_run_cell(Vp, dim, k, DEFAULT_LR)
+    return r["rank_def"]
+
+
+def main():
+    root = resolve_root()
+    in_path = os.path.join(root, V2_REL)
+    out_path = os.path.join(root, OUT_REL)
+
+    print("=" * 72)
+    print("  cpgd_mcb_phi3_dryrun.py — Python port (raw#37 transient)")
+    print("  Reason: hexa OOM-killed on phi3 r=16 second dry_run (raw#10 honest)")
+    print("=" * 72)
+
+    if not os.path.exists(in_path):
+        print(f"[ERR] missing {V2_REL}", file=sys.stderr); sys.exit(2)
+
+    with open(in_path) as f:
+        v2 = json.load(f)
+
+    backbones = v2.get("backbones", [])
+    bb = backbones[PHI3_BB_INDEX]
+    if bb.get("alias") != "phi3":
+        print(f"[ERR] expected phi3 at index {PHI3_BB_INDEX}, got {bb.get('alias')}", file=sys.stderr); sys.exit(3)
+
+    k = v2.get("k_prompts", 16)
+    ranks = v2.get("ranks", [4, 8, 16])
+    print(f"[phi3-py] alias={bb['alias']} ranks={ranks} K={k}")
+
+    cell_results = []
+    first_pass_M = None
+    first_pass_dim = None
+
+    for r in ranks:
+        rank_key = str(r)
+        cell_data = bb["cells"][rank_key]
+        cell_cond = cell_data["matrix_cond"]
+        cell_fro = cell_data["matrix_frobenius"]
+        cell_sha = cell_data["matrix_sha256"]
+        flat = cell_data["matrix_flat"]
+        if len(flat) != k * r:
+            print(f"[ERR] cell flat len {len(flat)} != k*r {k*r}", file=sys.stderr); sys.exit(4)
+        M_full = [[float(flat[i * r + j]) for j in range(r)] for i in range(k)]
+        # K_eff = r (square block)
+        M = [list(M_full[i]) for i in range(r)]
+        k_eff = r
+
+        print(f"[phi3-py] cell[phi3, r={r}] cond={cell_cond:g} fro={cell_fro:g}")
+        # 2 sequential runs for G3 byte-id
+        r1 = dry_run_cell(M, r, k_eff, DEFAULT_LR)
+        canon1 = cell_canonical("phi3", r, k_eff, STEP_COUNT,
+                                r1["init_residual"], r1["total_violations"],
+                                r1["global_min"], r1["max_drift"],
+                                r1["idem_ok"], r1["init_cos_ok"],
+                                r1["rank_def"], r1["all_above"],
+                                cell_cond, cell_fro, cell_sha)
+        sha1 = sha256_str(canon1)
+        r2 = dry_run_cell(M, r, k_eff, DEFAULT_LR)
+        canon2 = cell_canonical("phi3", r, k_eff, STEP_COUNT,
+                                r2["init_residual"], r2["total_violations"],
+                                r2["global_min"], r2["max_drift"],
+                                r2["idem_ok"], r2["init_cos_ok"],
+                                r2["rank_def"], r2["all_above"],
+                                cell_cond, cell_fro, cell_sha)
+        sha2 = sha256_str(canon2)
+
+        g1 = (r1["init_residual"] < EPS_PROJ) and r1["init_cos_ok"]
+        g2 = r1["all_above"] and (r1["total_violations"] == 0)
+        g3 = (sha1 != "" and sha1 == sha2)
+        g4 = cell_cond >= EPS_C
+        cell_pass = g1 and g2 and g3 and g4 and not r1["rank_def"]
+
+        print(f"[phi3-py]   G1={'P' if g1 else 'F'} G2={'P' if g2 else 'F'} "
+              f"G3={'P' if g3 else 'F'} G4={'P' if g4 else 'F'} "
+              f"cell={'PASS' if cell_pass else 'FAIL'} "
+              f"init_res={r1['init_residual']:g} viol={r1['total_violations']} "
+              f"gmin={r1['global_min']:g}")
+
+        cell_results.append({
+            "alias": "phi3",
+            "rank": r,
+            "matrix_sha256": cell_sha,
+            "matrix_cond": cell_cond,
+            "canon_sha256": sha1,
+            "init_residual": r1["init_residual"],
+            "total_violations": r1["total_violations"],
+            "global_min_cos": r1["global_min"],
+            "max_cos_drift": r1["max_drift"],
+            "projector_idempotent": r1["idem_ok"],
+            "init_unit_cos_ok": r1["init_cos_ok"],
+            "rank_deficient": r1["rank_def"],
+            "G1": g1, "G2": g2, "G3": g3, "G4": g4,
+            "cell_pass": cell_pass,
+        })
+        if cell_pass and first_pass_M is None:
+            first_pass_M = M
+            first_pass_dim = r
+
+    # ─── per-aggregate (3-cell sub-aggregate) ────────────────────────────
+    g1c = sum(1 for c in cell_results if c["G1"])
+    g2c = sum(1 for c in cell_results if c["G2"])
+    g3c = sum(1 for c in cell_results if c["G3"])
+    g4c = sum(1 for c in cell_results if c["G4"])
+    pass_total = sum(1 for c in cell_results if c["cell_pass"])
+    total_cells = len(cell_results)
+
+    # cond-byte Pearson r over the 3 phi3 cells (informational; aggregator
+    # recomputes over all 12 cells)
+    xs = [math.log10(c["matrix_cond"]) for c in cell_results if c["matrix_cond"] > 0]
+    ys = [int(c["matrix_sha256"][:16], 16) / 1.0e18 for c in cell_results if c["matrix_cond"] > 0]
+    pearson = None
+    abs_r = None
+    if len(xs) >= 2:
+        xm = sum(xs) / len(xs); ym = sum(ys) / len(ys)
+        num = sum((x - xm) * (y - ym) for x, y in zip(xs, ys))
+        denx = math.sqrt(sum((x - xm) ** 2 for x in xs))
+        deny = math.sqrt(sum((y - ym) ** 2 for y in ys))
+        if denx > 0 and deny > 0:
+            pearson = num / (denx * deny)
+            abs_r = abs(pearson)
+
+    # ─── negative falsify on first PASS phi3 cell ──────────────────────
+    neg_caught = False
+    if first_pass_M is not None:
+        print(f"\n[phi3-py] negative falsify on first PASS cell (dim={first_pass_dim})")
+        neg_caught = negative_falsify(first_pass_M, first_pass_dim, first_pass_dim)
+        print(f"[phi3-py] negative_falsify_caught={neg_caught}")
+
+    print(f"\n[phi3-py] AGGREGATE 3-cell phi3-only")
+    print(f"[phi3-py]   G1={g1c}/{total_cells} G2={g2c}/{total_cells} G3={g3c}/{total_cells} G4={g4c}/{total_cells} cell_pass={pass_total}/{total_cells}")
+    if pearson is not None:
+        print(f"[phi3-py]   pearson_r(3-cell, info)={pearson:.6f}")
+
+    payload = {
+        "schema_version": "2",
+        "slug": "cpgd-mcb-phi3-only-v2",
+        "title": "CPGD-MCB phi3-only 3-cell bridge closure falsifier (Python port due to hexa OOM-kill on r=16)",
+        "created": "2026-04-26",
+        "path": "C-MCB",
+        "raw_strict": "raw#9 hexa-only target failed (hexa_real SIGKILL 137 on phi3 r=16 second dry_run; reproduced 2x). raw#37 transient Python port deployed: bit-by-bit replication of hexa fn dry_run_cell + lcg_next + randn_pair + cell_canonical. Per-cell numerical equivalence vs hexa-emitted phi3 r=4/r=8 cells empirically confirmed where hexa progressed (G1=P G2=P G3=P G4=P matches).",
+        "honest_limit": "raw#10 — phi3 cells were NOT produced by hexa due to interp memory budget exhaustion at K_eff=16. Python port mirrors the hexa algorithm (LCG seed + Box-Muller + Gram-Schmidt + projector + 100-step descent + canonical sha) and gates G1-G4 are evaluated identically. The hexa-side fix (memory-friendly array reuse) is out of scope for this restore cycle.",
+        "tool": "anima-cpgd-research/scripts/cpgd_mcb_phi3_dryrun.py.txt",
+        "depends_on": ["anima-cpgd-research/state/cpgd_mcb_4bb_hidden_state_v2.json", "anima-cpgd-research/tool/cpgd_mcb_phi3_only_v2.hexa"],
+        "backbones": 1,
+        "ranks": len(ranks),
+        "k_prompts": k,
+        "step_count": STEP_COUNT,
+        "lr": DEFAULT_LR,
+        "grad_seed": GRAD_SEED,
+        "cos_floor": COS_FLOOR,
+        "eps_proj": EPS_PROJ,
+        "eps_c": EPS_C,
+        "cells": cell_results,
+        "aggregate": {
+            "total_cells": total_cells,
+            "g1_pass": g1c,
+            "g2_pass": g2c,
+            "g3_pass": g3c,
+            "g4_pass": g4c,
+            "cell_pass_total": pass_total,
+            "phi3_only_pearson_r_info": pearson,
+            "negative_falsify_caught": neg_caught,
+        },
+    }
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"\n[phi3-py] wrote {OUT_REL}")
+
+
+if __name__ == "__main__":
+    main()

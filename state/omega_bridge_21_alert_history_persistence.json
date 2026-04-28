@@ -1,0 +1,158 @@
+{
+  "cycle": "omega_bridge_21",
+  "axis": "bridge / alert firing event log — append-only history TSV for downstream trend analysis",
+  "timestamp": "2026-04-26T12:18:00Z",
+  "user_email": "mk911tb@proton.me",
+  "title": "atlas_alert_subscriber.hexa — persist FIRED outcomes to state/atlas_alert_history.tsv (append-only)",
+  "summary": "Extend tool/atlas_alert_subscriber.hexa (ω-bridge-17, ω-bridge-19) so that every __ATLAS_ALERT__ FIRED line also appends a structured row to state/atlas_alert_history.tsv. PASS / SKIP outcomes are deliberately not recorded — the file is an event log of firings, suitable for downstream trend analysis (alert rate over time, MTBA per rule, etc.). Schema is TAB-separated with 7 columns: ts (system clock at emit, NOT row ts) / rule / ratio / threshold / last_n / sampled / extra. Adds --no-history flag (skip append, default OFF — history written) and ATLAS_ALERT_HISTORY_TSV env override. Pre-flight seeds the canonical header on first write. Write failures emit __ATLAS_ALERT__ HISTORY_WRITE_FAIL and continue (raw 71 report-only).",
+  "context": {
+    "predecessors": {
+      "omega_bridge_17": "built tool/atlas_alert_subscriber.hexa — JSONL-stream subscriber with warn_ratio + insufficient_ratio rules; emits __ATLAS_ALERT__ FIRED/PASS/SKIP sentinels to stdout",
+      "omega_bridge_19": "added two time-shape rules (consecutive_warn streak + recent_warn_ratio window); each emits its own FIRED sentinel shape",
+      "omega_bridge_14_force_add": "established the pattern of force-adding TSV schema stubs into state/* despite the gitignore wildcard (commit 5e59259b)"
+    },
+    "problem": "Subscriber emits FIRED sentinels to stdout but does not persist them anywhere durable. Operators can grep transcripts after the fact, but there is no structured time-series of 'when did each rule fire, with what parameters' — needed for downstream trend analysis (alert rate over time, MTBA per rule, calibration adjustment via base-rate inspection).",
+    "design_alternatives_considered": [
+      {
+        "option": "A — write a separate JSONL log",
+        "rejected_because": "JSON parsing in shell tooling is heavier than TSV; trend analysis is naturally column-oriented (cut/awk); operators already comfortable with bridge_health_history.tsv format"
+      },
+      {
+        "option": "B — TSV append-only inside the subscriber on FIRE only (CHOSEN)",
+        "chosen_because": "minimal surface, mirrors bridge_health_history.tsv pattern from ω-bridge-14, append-only semantics naturally satisfy raw 77, no inter-tool coupling change (subscriber stays CLI-only)"
+      },
+      {
+        "option": "C — wrap subscriber in a shell script that tees and parses the FIRED lines",
+        "rejected_because": "duplicates information already structured inside the tool, fragile against sentinel format changes (ω-bridge-19 already added two new shapes), pushes complexity outward instead of consolidating it"
+      }
+    ]
+  },
+  "files_modified": [
+    {
+      "path": "/Users/ghost/core/nexus/tool/atlas_alert_subscriber.hexa",
+      "edits": [
+        "header @usage block: documented --no-history flag and ATLAS_ALERT_HISTORY_TSV env",
+        "header sentinels list: added __ATLAS_ALERT__ HISTORY_WRITE_FAIL shape",
+        "header rules section: documented --no-history (default: write)",
+        "DEFAULT_HISTORY_TSV constant + HISTORY_HEADER constant (canonical 2-line header)",
+        "argv parser: --no-history flag handler (sets write_history=false); --help text extended",
+        "ATLAS_ALERT_HISTORY_TSV env resolution after argv parse (env wins over default; --no-history independent of path)",
+        "parallel event_rows array, lockstep with `fired` — each FIRED push records a TAB-separated 6-field row (rule\\tratio\\tthreshold\\tlast_n\\tsampled\\textra) which the writer prepends with system-clock ts at emit time",
+        "consecutive_warn extra encoding: ratio=0.0000 threshold=0 extra='streak=K' (streak is in extra, not ratio)",
+        "recent_warn_ratio extra encoding: last_n=0 extra='window_minutes=M' (window is in extra, not last_n)",
+        "history persistence block (between human summary and sentinel emission): now_iso via `date -u +%Y-%m-%dT%H:%M:%SZ`; pre-flight seeds HISTORY_HEADER if file missing; per-row append_file with try/catch — failure emits __ATLAS_ALERT__ HISTORY_WRITE_FAIL and breaks out of the row loop (raw 71 report-only — does not block sentinel emission)"
+      ]
+    }
+  ],
+  "files_created": [
+    {
+      "path": "/Users/ghost/core/nexus/state/atlas_alert_history.tsv",
+      "purpose": "TSV schema stub (header-only, 0 data rows) — force-added despite state/* gitignore wildcard, mirroring bridge-14's bridge_health_history.tsv pattern",
+      "schema_header": "# atlas_alert_history.tsv — alert firing event log (raw 77 append-only) / # ts<TAB>rule<TAB>ratio<TAB>threshold<TAB>last_n<TAB>sampled<TAB>extra"
+    }
+  ],
+  "schema": {
+    "tsv_columns": [
+      {"name": "ts", "type": "ISO-8601 UTC", "note": "system clock at emit (date -u +%Y-%m-%dT%H:%M:%SZ); NOT the ts of the row that triggered the rule"},
+      {"name": "rule", "type": "enum", "values": ["warn_ratio", "insufficient_ratio", "consecutive_warn", "recent_warn_ratio"]},
+      {"name": "ratio", "type": "dot-decimal 4-sig-fig", "note": "0.0000 for consecutive_warn (streak rule has no ratio)"},
+      {"name": "threshold", "type": "dot-decimal", "note": "0 for consecutive_warn"},
+      {"name": "last_n", "type": "int", "note": "0 for recent_warn_ratio (uses window_minutes instead)"},
+      {"name": "sampled", "type": "int", "note": "actual rows sampled at evaluation time"},
+      {"name": "extra", "type": "string", "note": "consecutive_warn → 'streak=K'; recent_warn_ratio → 'window_minutes=M'; warn_ratio + insufficient_ratio → empty"}
+    ]
+  },
+  "new_flags": [
+    "--no-history  (default OFF; when set, FIRED outcomes are not appended to history TSV)"
+  ],
+  "new_env_vars": [
+    "ATLAS_ALERT_HISTORY_TSV=PATH  (overrides the default state/atlas_alert_history.tsv path)"
+  ],
+  "new_sentinels": [
+    "__ATLAS_ALERT__ HISTORY_WRITE_FAIL path=PATH reason=header_init_failed",
+    "__ATLAS_ALERT__ HISTORY_WRITE_FAIL path=PATH reason=append_failed"
+  ],
+  "edge_cases_handled": {
+    "header_seeded_on_first_write": "if history file does not exist when first FIRE occurs, seed the canonical 2-line header before appending the first row; subsequent invocations append directly",
+    "pass_outcome_no_file_creation": "PASS results in event_rows=[] so the persistence block is bypassed entirely — empty TSV not seeded if there is no firing yet",
+    "skip_outcome_early_return": "SKIP (timeline_missing or no_matching_rows) returns from preflight before reaching the persistence block — neither header seeded nor row appended",
+    "multi_rule_firing_one_row_per_rule": "event_rows tracks each fired rule independently; multiple rules in the same invocation produce multiple rows with the same ts (system clock granularity is 1s)",
+    "no_history_flag_skips_seed_and_append": "--no-history sets write_history=false; the entire persistence block is gated on write_history && len(event_rows) > 0",
+    "env_override_wins_over_default": "if ATLAS_ALERT_HISTORY_TSV is non-empty, history_path = env_history; otherwise DEFAULT_HISTORY_TSV (state/atlas_alert_history.tsv)",
+    "write_failure_report_only": "header init or append failure emits __ATLAS_ALERT__ HISTORY_WRITE_FAIL sentinel and continues — does NOT block sentinel emission of the FIRED rules themselves; ec unchanged",
+    "append_only_never_rewrites": "uses append_file (not write_file) for data rows; existing rows never modified"
+  },
+  "compliance": {
+    "raw_9_hexa_only_suffix": "edited an existing tracked .hexa file; the new TSV stub is the only non-.hexa file (mirrors bridge-14's force-add pattern)",
+    "raw_71_report_only": "tool remains read-only on the timeline; history-write failure emits a sentinel but does not change ec",
+    "raw_73_admissibility": "scope=bridge_anomaly filter unchanged; persistence is purely a side-effect of an already-decided FIRED outcome",
+    "raw_77_append_only": "history TSV is append-only by construction (append_file API + only-on-FIRE gating); existing rows never modified; the timeline JSONL remains read-only",
+    "raw_80_sentinel": "new __ATLAS_ALERT__ HISTORY_WRITE_FAIL shape added (path=... reason=...); existing PASS / SKIP / FIRED shapes untouched",
+    "no_parallel_session_collision": "edited only tool/atlas_alert_subscriber.hexa and force-added state/atlas_alert_history.tsv; did not touch cli/run.hexa, state/atlas_health_timeline.jsonl, bisociation/spectra/g_atlas_composite_v3.json, tool/omega_cycle_atlas_ingest.hexa, n6/*, tool/kick_*.hexa, design/kick/*, .own",
+    "explicit_path_commit": "git add tool/atlas_alert_subscriber.hexa + git add -f state/atlas_alert_history.tsv (no `git add -A`)",
+    "no_anima_commit": "closure JSON written under /Users/ghost/core/anima/state/ but not committed to anima"
+  },
+  "validation": {
+    "fixtures_dir": "/tmp/bridge21_fixtures/",
+    "history_tsv_under_test": "/tmp/bridge21_history.tsv (and /tmp/bridge21_alt_history.tsv for override case)",
+    "fixtures": [
+      {
+        "name": "T1 — FIRE writes one row, header auto-seeded",
+        "fixture": "timeline_warn.jsonl (10 bridge_anomaly rows: 6 WARN + 4 PASS → warn_ratio=0.6 ≥ 0.4 fires)",
+        "expected": "1 data row, schema-correct, with system-clock ts (not row ts)",
+        "observed": "TSV header seeded automatically; 1 row appended: 2026-04-26T12:16:27Z\\twarn_ratio\\t0.6000\\t0.4\\t10\\t10\\t",
+        "pass": true
+      },
+      {
+        "name": "T2 — PASS, no append, no file created",
+        "fixture": "timeline_pass.jsonl (10 PASS rows)",
+        "expected": "no firings → no row append → no file creation (header not seeded)",
+        "observed": "__ATLAS_ALERT__ PASS sampled=10 rules_evaluated=2; ls /tmp/bridge21_history.tsv → No such file or directory",
+        "pass": true
+      },
+      {
+        "name": "T3 — SKIP (timeline_missing), no append",
+        "fixture": "/tmp/nonexistent_timeline.jsonl",
+        "expected": "preflight returns early; no row append",
+        "observed": "__ATLAS_ALERT__ SKIP reason=timeline_missing path=/tmp/nonexistent_timeline.jsonl; ls /tmp/bridge21_history.tsv → No such file or directory",
+        "pass": true
+      },
+      {
+        "name": "T4 — multi-rule firing → multiple rows (one per rule)",
+        "fixture": "timeline_multi_realtime.jsonl (6 PASS + 4 WARN with current real-system ts so window rule sees them in-window)",
+        "command": "HEXA_ARGV='--timeline ... --warn-threshold 0.4 --streak-threshold 3 --window-minutes 60 --quiet'",
+        "expected": "3 fired sentinels, 3 data rows in TSV",
+        "observed": "warn_ratio (ratio=0.4000), consecutive_warn (streak=3 observed=4), recent_warn_ratio (ratio=0.4000 threshold=0.4 window=60 sampled=10) — all 3 rows present in TSV with same ts",
+        "pass": true
+      },
+      {
+        "name": "T5 — --no-history flag, no append even on FIRE",
+        "fixture": "timeline_warn.jsonl (FIRE)",
+        "expected": "FIRED sentinel emits to stdout but TSV not written",
+        "observed": "__ATLAS_ALERT__ FIRED rule=warn_ratio ratio=0.6000 threshold=0.4 last_n=10 sampled=10; ls /tmp/bridge21_history.tsv → No such file or directory",
+        "pass": true
+      },
+      {
+        "name": "T6 — ATLAS_ALERT_HISTORY_TSV env override redirects writes",
+        "fixture": "timeline_warn.jsonl + env ATLAS_ALERT_HISTORY_TSV=/tmp/bridge21_alt_history.tsv",
+        "expected": "row appended to override path; default path untouched",
+        "observed": "/tmp/bridge21_alt_history.tsv received header + 1 row; default state/atlas_alert_history.tsv stub unmodified (0 non-comment lines)",
+        "pass": true
+      }
+    ],
+    "all_pass": true
+  },
+  "operational_notes": {
+    "first_invocation_seeds_default_path": "the force-added stub already has the canonical header, so first FIRE in production appends directly without a header-init step (the pre-flight is mostly relevant for fixture paths that start fresh)",
+    "history_growth_rate": "one row per fired rule per invocation; with default cron cadence (~5min) and rules off-by-default for time-shape, expected steady-state is <1 row/day per environment unless the bridge cluster is actively degrading — long-term the file should remain manageable (<1MB/year typical)",
+    "back_compat": "all existing invocations continue to work; --no-history is opt-in (default writes) so the new behaviour is silently active for all callers; existing FIRED sentinels on stdout unchanged"
+  },
+  "follow_ups": {
+    "future_candidates": [
+      "tool/atlas_alert_history_analyzer.hexa — read TSV, compute MTBA per rule + alert rate per day, emit __ATLAS_ALERT_TREND__ sentinels",
+      "rotation policy: when alert_history.tsv exceeds N MB, archive to state/atlas_alert_history_<yyyymm>.tsv (currently no rotation — append-only forever)",
+      "fingerprint suppression — group consecutive identical alerts by (rule, sampled) within a cooldown window, recording only the first + count",
+      "wire history TSV into a future ω-network cycle that pushes alert events into the cross-repo dashboard"
+    ]
+  }
+}

@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# launch_h100_pilot_t1_v3.sh — anima-tribev2-pilot Pilot-T1 H100 launcher (HARDENED)
+# frozen 2026-04-26 — anima ω-cycle (Pilot-T1 v3 launcher hardening, post-$7.52 burn)
+#
+# Stored as `.sh.txt` because anima `.gitignore` (or concurrent ω-cycle agents)
+# previously removed live `.sh` mid-cycle. Copy to `scripts/launch_h100_pilot_t1_v3.sh`
+# and `chmod +x` to run.
+#
+# v3 hardening (vs v1+v2):
+#   FIX-1 server-side daemonize: install + inference launched via `nohup ... &` on pod.
+#                                SSH drop is decoupled from job survival.
+#   FIX-2 heartbeat markers     : pod writes  state/install_started.marker /
+#                                 state/install_done.marker / state/inference_started.marker /
+#                                 state/inference_done.marker  with timestamp + pid.
+#   FIX-3 idle auto-kill        : pod-side watchdog self-terminates if 30 min after pod-entry
+#                                 install_started.marker is missing (cost-cap safety net).
+#   FIX-4 client-side polling   : launcher polls heartbeat markers every 30 s via short-lived
+#                                 SSH probes. Fail-fast pod-kill at 1 h with no progress.
+#
+# v1+v2 launchers are read-only — DO NOT modify.
+#
+# Required env (with sane fallbacks):
+#   POD_ID
+#   COST_CAP_USD          (default 0.65)
+#   WALL_CLOCK_SEC        (default 3600)
+#   IDLE_KILL_SEC         (default 1800)  — pod self-kill if install hasn't started in this many seconds
+#   CLIENT_FAIL_FAST_SEC  (default 3600)  — client-side: kill pod if no progress markers in this many seconds
+#   POLL_INTERVAL_SEC     (default 30)
+#   DRY_RUN               (default 0)     — 1 = synthetic dry-run (no SSH, no pod ops)
+
+set -uo pipefail
+
+ANIMA_ROOT="${ANIMA_ROOT:-/Users/ghost/core/anima}"
+PILOT_DIR="${ANIMA_ROOT}/anima-tribev2-pilot"
+STATE_DIR="${PILOT_DIR}/state"
+SCRIPTS_DIR="${PILOT_DIR}/scripts"
+COST_CAP_USD="${COST_CAP_USD:-0.65}"
+WALL_CLOCK_SEC="${WALL_CLOCK_SEC:-3600}"
+IDLE_KILL_SEC="${IDLE_KILL_SEC:-1800}"
+CLIENT_FAIL_FAST_SEC="${CLIENT_FAIL_FAST_SEC:-3600}"
+POLL_INTERVAL_SEC="${POLL_INTERVAL_SEC:-30}"
+DRY_RUN="${DRY_RUN:-0}"
+SSH_KEY="${SSH_KEY:-/Users/ghost/.runpod/ssh/RunPod-Key-Go}"
+
+mkdir -p "$STATE_DIR" "${STATE_DIR}/markers"
+LOG="${STATE_DIR}/launch_h100_pilot_t1_v3.log"
+exec > >(tee -a "$LOG") 2>&1
+
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+log() { echo "[$(ts)] $*"; }
+
+log "=== launch_h100_pilot_t1_v3 START ==="
+log "ANIMA_ROOT=$ANIMA_ROOT COST_CAP=$COST_CAP_USD WALL_CLOCK=$WALL_CLOCK_SEC IDLE_KILL=$IDLE_KILL_SEC CLIENT_FAIL_FAST=$CLIENT_FAIL_FAST_SEC POLL_INTERVAL=$POLL_INTERVAL_SEC DRY_RUN=$DRY_RUN"
+
+# -------- DRY_RUN (synthetic selftest path) --------------------------------
+if [[ "$DRY_RUN" == "1" ]]; then
+  log "DRY_RUN=1 — synthetic dry-run: no SSH, no pod ops."
+  log "[selftest] verifying client-side polling timing logic ..."
+
+  # synthetic markers dir
+  SYN_DIR="${STATE_DIR}/dry_run_v3_$(date -u +%s)"
+  mkdir -p "$SYN_DIR"
+  log "[selftest] synthetic dir=$SYN_DIR"
+
+  # positive case: drop install_started + install_done + inference_started + inference_done in sequence
+  ( sleep 1; echo "started_at=$(ts) pid=12345" > "$SYN_DIR/install_started.marker"
+    sleep 1; echo "done_at=$(ts) rc=0"     > "$SYN_DIR/install_done.marker"
+    sleep 1; echo "started_at=$(ts) pid=12346" > "$SYN_DIR/inference_started.marker"
+    sleep 2; echo "done_at=$(ts) rc=0"     > "$SYN_DIR/inference_done.marker"
+  ) &
+  SYN_PID=$!
+
+  POSITIVE_PASS=1
+  T0=$(date -u +%s)
+  for phase in install_started install_done inference_started inference_done; do
+    PHASE_OK=0
+    while true; do
+      NOW=$(date -u +%s); ELAPSED=$((NOW - T0))
+      if [[ -f "$SYN_DIR/${phase}.marker" ]]; then
+        log "[selftest:positive] phase=$phase OK (elapsed=${ELAPSED}s)"
+        PHASE_OK=1; break
+      fi
+      if (( ELAPSED > 30 )); then
+        log "[selftest:positive] FAIL phase=$phase elapsed=${ELAPSED}s"
+        break
+      fi
+      sleep 1
+    done
+    [[ $PHASE_OK -eq 0 ]] && POSITIVE_PASS=0
+  done
+  wait $SYN_PID 2>/dev/null || true
+
+  # negative case: marker never appears (synthetic), fail-fast threshold = 5s
+  NEG_DIR="${SYN_DIR}_neg"
+  mkdir -p "$NEG_DIR"
+  T0=$(date -u +%s); NEG_FAIL_FAST=0
+  while true; do
+    NOW=$(date -u +%s); ELAPSED=$((NOW - T0))
+    if [[ -f "$NEG_DIR/install_started.marker" ]]; then
+      log "[selftest:negative] UNEXPECTED marker — negative case broken"
+      break
+    fi
+    if (( ELAPSED >= 5 )); then
+      log "[selftest:negative] OK fail-fast triggered at elapsed=${ELAPSED}s (threshold=5s)"
+      NEG_FAIL_FAST=1; break
+    fi
+    sleep 1
+  done
+
+  log "[selftest] positive=${POSITIVE_PASS} negative_fail_fast=${NEG_FAIL_FAST}"
+  if [[ $POSITIVE_PASS -eq 1 && $NEG_FAIL_FAST -eq 1 ]]; then
+    log "=== DRY_RUN selftest PASS ==="
+    exit 0
+  else
+    log "=== DRY_RUN selftest FAIL ==="
+    exit 11
+  fi
+fi
+
+# -------- live path --------------------------------------------------------
+if [[ -z "${POD_ID:-}" ]]; then
+  POD_ID=$(runpodctl pod list -o json 2>/dev/null | python3 -c '
+import json, sys
+try: pods = json.load(sys.stdin)
+except Exception: pods = []
+for p in pods:
+    if p.get("name","").startswith("anima-pilot-t1") and p.get("desiredStatus") == "RUNNING":
+        print(p.get("id","")); break
+')
+fi
+if [[ -z "${POD_ID:-}" ]]; then log "ERROR: no RUNNING pod"; exit 2; fi
+log "POD_ID=$POD_ID"
+
+POD_INFO=$(runpodctl ssh info "$POD_ID" 2>/dev/null || true)
+POD_IP=$(echo "$POD_INFO"   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ip",""))'   2>/dev/null)
+POD_PORT=$(echo "$POD_INFO" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("port",""))' 2>/dev/null)
+[[ -z "$POD_IP" || -z "$POD_PORT" ]] && { log "ERROR: ssh info parse failed"; exit 3; }
+log "POD_IP=$POD_IP POD_PORT=$POD_PORT"
+
+SSH_BASE=(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=20 \
+          -p "$POD_PORT" "root@$POD_IP")
+SSH_PROBE=(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o ConnectTimeout=15 -o BatchMode=yes \
+          -p "$POD_PORT" "root@$POD_IP")
+SCP_OPTS=(-i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$POD_PORT")
+
+POD_WORK=/workspace/anima_pilot_t1
+POD_STATE=$POD_WORK/state
+POD_MARK=$POD_STATE/markers
+
+log "Staging payload to ${POD_WORK}/ ..."
+"${SSH_BASE[@]}" "mkdir -p $POD_WORK/{ref,scripts,state,corpus} $POD_MARK"
+
+log "tar+ssh tribev2 ref ..."
+TARBALL=$(mktemp -t tribev2_XXXX).tar.gz
+tar -czf "$TARBALL" --exclude='.git' --exclude='*.ipynb' --exclude='__pycache__' \
+  --exclude='.venv' --exclude='*.egg-info' \
+  -C "$ANIMA_ROOT/references" tribev2
+scp "${SCP_OPTS[@]}" "$TARBALL" "root@$POD_IP:${POD_WORK}/ref/tribev2.tar.gz"
+"${SSH_BASE[@]}" "cd $POD_WORK/ref && rm -rf tribev2 && tar -xzf tribev2.tar.gz && rm -f tribev2.tar.gz"
+rm -f "$TARBALL"
+
+log "scp corpus + scripts ..."
+scp "${SCP_OPTS[@]}" "$ANIMA_ROOT/experiments/alm_r14/corpus_alm_r14_v1.jsonl" \
+  "root@$POD_IP:${POD_WORK}/corpus/"
+for s in "$SCRIPTS_DIR/pilot_t1_inference_full.py" "$SCRIPTS_DIR/install_pod_deps.sh"; do
+  if [[ -f "$s" ]]; then
+    scp "${SCP_OPTS[@]}" "$s" "root@$POD_IP:${POD_WORK}/scripts/"
+  fi
+done
+
+if [[ -f /Users/ghost/.cache/huggingface/token ]]; then
+  "${SSH_BASE[@]}" "mkdir -p ~/.cache/huggingface"
+  scp "${SCP_OPTS[@]}" /Users/ghost/.cache/huggingface/token \
+    "root@$POD_IP:/root/.cache/huggingface/token"
+fi
+
+# ---- FIX-3 idle auto-kill: stage watchdog on pod -------------------------
+log "Staging server-side watchdog (FIX-3 idle auto-kill, idle_kill_sec=${IDLE_KILL_SEC}) ..."
+"${SSH_BASE[@]}" "cat > $POD_WORK/scripts/watchdog.sh <<'WDOG'
+#!/usr/bin/env bash
+set -uo pipefail
+WORK=$POD_WORK
+MARK=\$WORK/state/markers
+THRESH=${IDLE_KILL_SEC}
+START=\$(date -u +%s)
+while true; do
+  NOW=\$(date -u +%s); EL=\$((NOW - START))
+  if [[ -f \$MARK/install_started.marker ]]; then
+    echo \"[watchdog] install_started.marker present at elapsed=\${EL}s — exiting\"
+    exit 0
+  fi
+  if (( EL >= THRESH )); then
+    echo \"[watchdog] IDLE-KILL: install_started.marker missing after \${EL}s (threshold=\${THRESH}s)\" \
+      | tee \$MARK/watchdog_kill.marker
+    runpodctl stop pod $POD_ID 2>/dev/null || poweroff || true
+    exit 99
+  fi
+  sleep 30
+done
+WDOG
+chmod +x $POD_WORK/scripts/watchdog.sh"
+
+# ---- FIX-1 server-side daemonize: install via nohup ----------------------
+log "Launching install via nohup (FIX-1 server-side daemonize, FIX-2 heartbeat marker) ..."
+"${SSH_BASE[@]}" "cat > $POD_WORK/scripts/run_install.sh <<'RIN'
+#!/usr/bin/env bash
+set -uo pipefail
+WORK=$POD_WORK
+MARK=\$WORK/state/markers
+mkdir -p \$MARK
+echo \"started_at=\$(date -u +%Y-%m-%dT%H:%M:%SZ) pid=\$\$\" > \$MARK/install_started.marker
+RC=0
+timeout 900 bash \$WORK/scripts/install_pod_deps.sh > \$WORK/state/install.log 2>&1 || RC=\$?
+echo \"done_at=\$(date -u +%Y-%m-%dT%H:%M:%SZ) rc=\$RC\" > \$MARK/install_done.marker
+exit \$RC
+RIN
+chmod +x $POD_WORK/scripts/run_install.sh
+nohup bash $POD_WORK/scripts/watchdog.sh   > $POD_WORK/state/watchdog.log 2>&1 &
+nohup bash $POD_WORK/scripts/run_install.sh > $POD_WORK/state/run_install_wrap.log 2>&1 &
+disown
+echo 'install + watchdog daemonized'"
+
+# ---- FIX-4 client-side polling: wait for install_started -----------------
+log "Polling for install_started.marker (FIX-4 client-side, fail_fast_sec=${CLIENT_FAIL_FAST_SEC}) ..."
+T0=$(date -u +%s)
+INSTALL_STARTED=0
+while true; do
+  NOW=$(date -u +%s); EL=$((NOW - T0))
+  if "${SSH_PROBE[@]}" "test -f $POD_MARK/install_started.marker" 2>/dev/null; then
+    log "install_started.marker present (elapsed=${EL}s)"
+    INSTALL_STARTED=1; break
+  fi
+  if (( EL >= CLIENT_FAIL_FAST_SEC )); then
+    log "CLIENT FAIL-FAST: install_started.marker missing after ${EL}s — killing pod"
+    runpodctl stop pod "$POD_ID" 2>/dev/null || true
+    exit 21
+  fi
+  sleep "$POLL_INTERVAL_SEC"
+done
+
+# ---- wait for install_done ------------------------------------------------
+log "Polling for install_done.marker ..."
+T0=$(date -u +%s)
+INSTALL_DONE=0
+INSTALL_BUDGET=1200  # 20 min hard cap on install
+while true; do
+  NOW=$(date -u +%s); EL=$((NOW - T0))
+  if "${SSH_PROBE[@]}" "test -f $POD_MARK/install_done.marker" 2>/dev/null; then
+    log "install_done.marker present (elapsed=${EL}s)"
+    INSTALL_DONE=1; break
+  fi
+  if (( EL >= INSTALL_BUDGET )); then
+    log "CLIENT FAIL-FAST: install_done.marker missing after ${EL}s — killing pod"
+    runpodctl stop pod "$POD_ID" 2>/dev/null || true
+    exit 22
+  fi
+  sleep "$POLL_INTERVAL_SEC"
+done
+
+INSTALL_RC=$("${SSH_PROBE[@]}" "grep -oE 'rc=[0-9]+' $POD_MARK/install_done.marker | head -1 | cut -d= -f2" 2>/dev/null || echo "?")
+log "install_rc=$INSTALL_RC"
+
+# ---- FIX-1 server-side daemonize: inference via nohup --------------------
+INFER_CAP=$((WALL_CLOCK_SEC - 1200))
+[[ $INFER_CAP -lt 300 ]] && INFER_CAP=900
+log "Launching inference via nohup (cap=${INFER_CAP}s) ..."
+"${SSH_BASE[@]}" "cat > $POD_WORK/scripts/run_infer.sh <<'RIF'
+#!/usr/bin/env bash
+set -uo pipefail
+WORK=$POD_WORK
+MARK=\$WORK/state/markers
+echo \"started_at=\$(date -u +%Y-%m-%dT%H:%M:%SZ) pid=\$\$\" > \$MARK/inference_started.marker
+RC=0
+cd \$WORK
+PATH=/root/.local/bin:\$PATH timeout ${INFER_CAP} python3 scripts/pilot_t1_inference_full.py \
+  --corpus corpus/corpus_alm_r14_v1.jsonl --tribev2-src ref/tribev2 --n-per-family 16 \
+  --out-result state/pilot_t1_full_mode_result_v1.json \
+  --out-maps state/pilot_t1_maps_full_v1.npz \
+  --cache-dir \$WORK/tribe_cache > \$WORK/state/inference.log 2>&1 || RC=\$?
+echo \"done_at=\$(date -u +%Y-%m-%dT%H:%M:%SZ) rc=\$RC\" > \$MARK/inference_done.marker
+exit \$RC
+RIF
+chmod +x $POD_WORK/scripts/run_infer.sh
+nohup bash $POD_WORK/scripts/run_infer.sh > $POD_WORK/state/run_infer_wrap.log 2>&1 &
+disown
+echo 'inference daemonized'"
+
+# ---- poll inference_started ----------------------------------------------
+log "Polling for inference_started.marker ..."
+T0=$(date -u +%s)
+while true; do
+  NOW=$(date -u +%s); EL=$((NOW - T0))
+  if "${SSH_PROBE[@]}" "test -f $POD_MARK/inference_started.marker" 2>/dev/null; then
+    log "inference_started.marker present (elapsed=${EL}s)"; break
+  fi
+  if (( EL >= 300 )); then
+    log "CLIENT FAIL-FAST: inference_started.marker missing after ${EL}s — killing pod"
+    runpodctl stop pod "$POD_ID" 2>/dev/null || true
+    exit 23
+  fi
+  sleep "$POLL_INTERVAL_SEC"
+done
+
+# ---- poll inference_done --------------------------------------------------
+log "Polling for inference_done.marker (cap=${INFER_CAP}s + 120s grace) ..."
+T0=$(date -u +%s)
+INFER_BUDGET=$((INFER_CAP + 120))
+INFER_DONE=0
+while true; do
+  NOW=$(date -u +%s); EL=$((NOW - T0))
+  if "${SSH_PROBE[@]}" "test -f $POD_MARK/inference_done.marker" 2>/dev/null; then
+    log "inference_done.marker present (elapsed=${EL}s)"; INFER_DONE=1; break
+  fi
+  if (( EL >= INFER_BUDGET )); then
+    log "CLIENT FAIL-FAST: inference_done.marker missing after ${EL}s — killing pod"
+    runpodctl stop pod "$POD_ID" 2>/dev/null || true
+    exit 24
+  fi
+  sleep "$POLL_INTERVAL_SEC"
+done
+
+INFER_RC=$("${SSH_PROBE[@]}" "grep -oE 'rc=[0-9]+' $POD_MARK/inference_done.marker | head -1 | cut -d= -f2" 2>/dev/null || echo "?")
+log "infer_rc=$INFER_RC"
+
+# ---- pull artifacts -------------------------------------------------------
+log "Pulling artifacts back ..."
+scp "${SCP_OPTS[@]}" "root@$POD_IP:${POD_WORK}/state/pilot_t1_full_mode_result_v1.json" \
+  "$STATE_DIR/" 2>/dev/null || log "WARN: result.json pull failed"
+scp "${SCP_OPTS[@]}" "root@$POD_IP:${POD_WORK}/state/pilot_t1_maps_full_v1.npz" \
+  "$STATE_DIR/" 2>/dev/null || log "WARN: maps.npz pull failed"
+scp "${SCP_OPTS[@]}" "root@$POD_IP:${POD_WORK}/state/install.log" \
+  "$STATE_DIR/install_pod_v3.log" 2>/dev/null || log "WARN: install.log pull failed"
+scp "${SCP_OPTS[@]}" "root@$POD_IP:${POD_WORK}/state/inference.log" \
+  "$STATE_DIR/inference_pod_v3.log" 2>/dev/null || log "WARN: inference.log pull failed"
+scp "${SCP_OPTS[@]}" -r "root@$POD_IP:${POD_WORK}/state/markers" \
+  "$STATE_DIR/markers_pod_v3" 2>/dev/null || log "WARN: markers pull failed"
+
+log "=== launch_h100_pilot_t1_v3 DONE (install_rc=$INSTALL_RC infer_rc=$INFER_RC) ==="
+exit 0

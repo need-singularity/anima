@@ -7,7 +7,7 @@
 //   integration-test). Each subcommand thin-wraps a hexa source + delegates ENV.
 //   Mac-local utility, no GPU. Migration #27 (paradigm v11 META-LAYER 1st helper).
 //
-// SUBCOMMANDS
+// SUBCOMMANDS (12 routed via /tmp router + 13th first-class in-hexa)
 //   v11_main list                            list all stack helpers + layer
 //   v11_main run <name> [args...]            run a helper by short name
 //   v11_main battery [hf_id]                 launch battery (default: Mistral)
@@ -20,15 +20,20 @@
 //   v11_main history [hist_dir]              signature_history drift
 //   v11_main smoke                           full pipeline integration test
 //   v11_main help                            help text (default)
+//   v11_main --register-axis <NAME> --evidence <state-json-path>   (13th — D-day chain)
 //
 // USAGE
 //   hexa run tool/anima_v11_main.hexa --selftest
 //   hexa run tool/anima_v11_main.hexa list
 //   hexa run tool/anima_v11_main.hexa smoke
+//   hexa run tool/anima_v11_main.hexa --register-axis EEG-CORR --evidence state/anima_eeg_corr_v1.json
 //
 // raw#9 hexa-only / raw#15 SSOT this file (no Python emit — pure shell delegator)
+// raw#65 idempotent registration (re-register same axis/evidence → no-op + "already registered")
+// raw#66 negative-on-failure trailer
 
 let PLAN_SH = "/tmp/anima_v11_main_router.sh"
+let AXES_REGISTRY_PATH = "state/anima_v11_axes_registry.json"
 
 fn _build_router() {
     let sh = []
@@ -202,18 +207,186 @@ fn cmd_selftest() {
     _build_router()
     println("selftest=ok")
     println("router_emitted=" + PLAN_SH)
-    println("subcommands=12 (list/run/battery/benchmark/gate/matrix/integrate/ortho/rank/history/smoke/help)")
+    println("subcommands=12_routed + 1_first_class (--register-axis) = 13 total")
     println("DONE")
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  13TH SUBCOMMAND: --register-axis <NAME> --evidence <path>
+//  D-day chain landing helper. Validates evidence JSON, ensures axis_index
+//  matches expected, idempotently appends to state/anima_v11_axes_registry.json.
+// ═══════════════════════════════════════════════════════════════════════
+
+fn _str(v) -> string { return str(v) }
+
+fn _fexists(p: string) -> bool {
+    return _str(exec("test -f " + p + " && echo 1 || echo 0")).trim() == "1"
+}
+
+fn _ensure_dir(p: string) {
+    exec("mkdir -p " + p)
+}
+
+fn _now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _expected_axis_index(name: string) -> int {
+    if name == "EEG-CORR" { return 7 }
+    return 0 - 1
+}
+
+fn cmd_register_axis(axis_name: string, evidence_path: string) {
+    println("── anima_v11_main --register-axis ──")
+    println("axis: " + axis_name)
+    println("evidence: " + evidence_path)
+    if axis_name == "" {
+        eprintln("[raw#66] ABORT: --register-axis NAME empty")
+        exit(2)
+    }
+    if evidence_path == "" {
+        eprintln("[raw#66] ABORT: --evidence PATH empty")
+        exit(2)
+    }
+    if !_fexists(evidence_path) {
+        eprintln("[raw#66] ABORT: evidence path not found: " + evidence_path)
+        exit(2)
+    }
+    let blob = read_file(evidence_path)
+    let ev = json_parse(blob)
+    let ev_axis = ev["paradigm_v11_axis"]
+    let ev_axis_str = _str(ev_axis)
+    if ev_axis_str != axis_name {
+        eprintln("[raw#66] ABORT: evidence paradigm_v11_axis=" + ev_axis_str + " does not match registration NAME=" + axis_name)
+        exit(2)
+    }
+    let ev_idx = ev["axis_index"]
+    let want_idx = _expected_axis_index(axis_name)
+    if want_idx >= 0 && ev_idx != want_idx {
+        eprintln("[raw#66] ABORT: evidence axis_index=" + _str(ev_idx) + " does not match expected " + _str(want_idx) + " for axis " + axis_name)
+        exit(2)
+    }
+    let ev_tool = _str(ev["tool"])
+    let ev_classification = _str(ev["classification"])
+    let ev_verdict = _str(ev["verdict"])
+    let ev_pass = ev["pass_count"]
+
+    // Ensure registry parent dir.
+    let mut slash_idx = 0 - 1
+    let mut __i = 0
+    while __i < len(AXES_REGISTRY_PATH) {
+        if AXES_REGISTRY_PATH.substring(__i, __i + 1) == "/" { slash_idx = __i }
+        __i = __i + 1
+    }
+    if slash_idx > 0 {
+        _ensure_dir(AXES_REGISTRY_PATH.substring(0, slash_idx))
+    }
+
+    let mut existing = []
+    let mut already = false
+    if _fexists(AXES_REGISTRY_PATH) {
+        let raw = read_file(AXES_REGISTRY_PATH)
+        let reg = json_parse(raw)
+        let axes = reg["axes"]
+        let s = _str(axes)
+        if s != "null" && s != "" {
+            let mut i = 0
+            while i < len(axes) {
+                let entry = axes[i]
+                let nm = _str(entry["axis"])
+                let ev_p = _str(entry["evidence"])
+                if nm == axis_name && ev_p == evidence_path {
+                    already = true
+                }
+                existing.push(entry)
+                i = i + 1
+            }
+        }
+    }
+
+    if already {
+        println("[raw#65] axis " + axis_name + " already registered with evidence " + evidence_path + " — no-op")
+        println("registry: " + AXES_REGISTRY_PATH)
+        println("DONE")
+        exit(0)
+    }
+
+    // Append new entry. Build JSON manually to keep deterministic ordering.
+    let parts = []
+    parts.push("{\n  \"schema\": \"anima/v11_axes_registry/1\",\n  \"axes\": [")
+    let mut k = 0
+    while k < len(existing) {
+        let e = existing[k]
+        if k > 0 { parts.push(",") }
+        parts.push("\n    {")
+        parts.push("\"axis\": \"")
+        parts.push(_str(e["axis"]))
+        parts.push("\", \"axis_index\": ")
+        parts.push(_str(e["axis_index"]))
+        parts.push(", \"evidence\": \"")
+        parts.push(_str(e["evidence"]))
+        parts.push("\", \"tool\": \"")
+        parts.push(_str(e["tool"]))
+        parts.push("\", \"verdict\": \"")
+        parts.push(_str(e["verdict"]))
+        parts.push("\", \"classification\": \"")
+        parts.push(_str(e["classification"]))
+        parts.push("\", \"pass_count\": ")
+        parts.push(_str(e["pass_count"]))
+        parts.push(", \"registered_utc\": \"")
+        parts.push(_str(e["registered_utc"]))
+        parts.push("\"}")
+        k = k + 1
+    }
+    if len(existing) > 0 { parts.push(",") }
+    parts.push("\n    {")
+    parts.push("\"axis\": \"")
+    parts.push(axis_name)
+    parts.push("\", \"axis_index\": ")
+    parts.push(_str(ev_idx))
+    parts.push(", \"evidence\": \"")
+    parts.push(evidence_path)
+    parts.push("\", \"tool\": \"")
+    parts.push(ev_tool)
+    parts.push("\", \"verdict\": \"")
+    parts.push(ev_verdict)
+    parts.push("\", \"classification\": \"")
+    parts.push(ev_classification)
+    parts.push("\", \"pass_count\": ")
+    parts.push(_str(ev_pass))
+    parts.push(", \"registered_utc\": \"")
+    parts.push(_now_utc())
+    parts.push("\"}")
+    parts.push("\n  ]\n}\n")
+
+    write_file(AXES_REGISTRY_PATH, parts.join(""))
+    println("axis " + axis_name + " registered")
+    println("registry: " + AXES_REGISTRY_PATH)
+    println("axes_total: " + _str(len(existing) + 1))
+    println("DONE")
+    exit(0)
 }
 
 fn main() {
     let av = argv()
     let mut selftest = false
+    let mut register_axis_name = ""
+    let mut evidence_path = ""
     let mut i = 2
     while i < len(av) {
         let a = av[i]
         if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--register-axis" && i + 1 < len(av) {
+            register_axis_name = av[i+1]; i = i + 2; continue
+        }
+        if a == "--evidence" && i + 1 < len(av) {
+            evidence_path = av[i+1]; i = i + 2; continue
+        }
         i = i + 1
+    }
+    if register_axis_name != "" {
+        cmd_register_axis(register_axis_name, evidence_path)
+        exit(0)
     }
     _build_router()
     if selftest { cmd_selftest(); exit(0) }

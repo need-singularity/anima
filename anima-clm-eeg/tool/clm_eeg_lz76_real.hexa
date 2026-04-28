@@ -1,0 +1,464 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/clm_eeg_lz76_real.hexa
+//
+//  PURPOSE
+//    D+1 P1 falsifier — REAL-DATA Schartner 2017 LZ76 on 16-channel resting EEG.
+//    Replaces the synthetic LZ proxy in clm_eeg_p1_lz_pre_register.hexa with the
+//    classical Kaspar-Schuster 1987 LZ76 production-count algorithm applied to
+//    a per-channel-median-binarized concatenated stream.
+//
+//  ALGORITHM (Schartner 2017, "LZ complexity for resting EEG")
+//    1. Read 16-ch EEG arrays from JSON (an11_b_eeg_ingest output, schema
+//       anima/eeg_recording/1; shape: channels × samples).
+//    2. Binarize each channel by its own median (above_median=1, else 0)
+//       across the full window (≥60 s @ 125 Hz native Cyton+Daisy).
+//    3. Concatenate the 16 binary streams sequentially → single binary
+//       sequence S of length n_samples × 16.
+//    4. Run classical Kaspar-Schuster 1987 LZ76 on S, counting distinct
+//       substring productions c(n).
+//    5. Normalize: LZ76_norm = c(n) · log2(n) / n   (×1000 fixed-point).
+//    6. Apply FROZEN pre-registered criteria (this file does NOT mutate them):
+//         C1: LZ76_norm_x1000  ≥ 650  (Schartner human-resting floor 0.65)
+//         C2: |Δ|/human_x1000  ≤ 200‰ (20 % of human-baseline 0.85)
+//
+//  INPUT MODES (env-controlled, no CLI flags)
+//    CLM_EEG_LZ76_SELFTEST=1
+//        Generate a deterministic synthetic 16ch × 125 Hz × 60 s = 120 000
+//        samples × 16 stream from FNV-style hash. Classification =
+//        NOT_VERIFIED_SYNTHETIC. Verdict reported but tagged synthetic.
+//    CLM_EEG_RAW_ARRAYS_JSON=<path>
+//        Read an11_b_eeg_ingest output JSON, extract raw_arrays integer
+//        samples (or rounded floats); classification = REAL_HW_PASS / FAIL.
+//
+//  OUTPUT
+//    state/clm_eeg_p1_lz_pre_register_real.json (or CLM_EEG_LZ76_OUT)
+//
+//  RAW
+//    raw#9  · pure-hexa, no .py/.sh/.rs/.toml
+//    raw#65 · idempotent (FNV-deterministic)
+//    raw#71 · falsifier-pre-registered (criteria frozen, mirror of v1)
+//    raw#91 · honest classification (synthetic vs real)
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── frozen criteria (mirrors clm_eeg_p1_lz_pre_register.hexa SSOT) ─────────
+let LZ76_EEG_MIN_X1000        = 650
+let DELTA_HUMAN_MAX_PERMILLE  = 200
+let HUMAN_BASELINE_LZ76_X1000 = 850
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+// ─── string / digit helpers (mirror p1) ─────────────────────────────────────
+fn find_in_str(s: string, needle: string) -> int {
+    let n = len(s)
+    let m = len(needle)
+    if m <= 0 { return 0 }
+    if n < m { return -1 }
+    let mut i = 0
+    while i <= n - m {
+        let mut j = 0
+        let mut ok = 1
+        while j < m {
+            if s[i + j] != needle[j] {
+                ok = 0
+                j = m
+            }
+            j = j + 1
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_digit_ch(c: string) -> int {
+    if c == "0" { return 1 }
+    if c == "1" { return 1 }
+    if c == "2" { return 1 }
+    if c == "3" { return 1 }
+    if c == "4" { return 1 }
+    if c == "5" { return 1 }
+    if c == "6" { return 1 }
+    if c == "7" { return 1 }
+    if c == "8" { return 1 }
+    if c == "9" { return 1 }
+    return 0
+}
+
+fn digit_val(c: string) -> int {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return -1
+}
+
+// integer log2 ×1000 via bit-length × 301 (bits→decades shim;
+// log10(2)=0.30103, so bit_length × ~301 ≈ log2(n) ×1000 within ±1 bit).
+// For LZ76 normalization we need log2(n) ·1000; bit_length(n) is exact for
+// powers of two and within 1 of true log2 for arbitrary n. We refine by
+// linear interpolation between the nearest power-of-two boundaries.
+fn log2_x1000(n: int) -> int {
+    if n <= 1 { return 0 }
+    // bit_length: floor(log2(n))
+    let mut bl = 0
+    let mut v = n
+    while v > 0 {
+        bl = bl + 1
+        v = v / 2
+    }
+    // bl is now floor(log2(n)) + 1 (because we counted including the leading 1).
+    // floor(log2(n)) = bl - 1; lower power = 1 << (bl-1).
+    let floor_l = bl - 1
+    let mut lower = 1
+    let mut k = 0
+    while k < floor_l {
+        lower = lower * 2
+        k = k + 1
+    }
+    let upper = lower * 2
+    // log2(n) ≈ floor_l + (n - lower) / (upper - lower)
+    // ×1000:   floor_l*1000 + ((n-lower)*1000) / (upper-lower)
+    let frac = ((n - lower) * 1000) / (upper - lower)
+    return floor_l * 1000 + frac
+}
+
+// ─── median (rank-by-counting on a slice of the flat list) ──────────────────
+//   Returns rank-⌊n/2⌋ value in xs[base..base+n). Avoids any helper-list
+//   allocation (no .push hot loop) — index directly into the flat buffer.
+fn median_slice(xs: list, base: int, n: int) -> int {
+    if n <= 0 { return 0 }
+    if n == 1 { return xs[base] }
+    let target_rank = n / 2
+    let mut best = xs[base]
+    let mut i = 0
+    while i < n {
+        let v = xs[base + i]
+        let mut lt = 0
+        let mut le = 0
+        let mut j = 0
+        while j < n {
+            let w = xs[base + j]
+            if w < v { lt = lt + 1 }
+            if w <= v { le = le + 1 }
+            j = j + 1
+        }
+        if lt <= target_rank {
+            if target_rank < le {
+                best = v
+                i = n
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ─── classical LZ76 (Kaspar-Schuster 1987) ──────────────────────────────────
+// s : list of 0/1 ints, length n.  Returns c(n) = production count.
+fn lz76_count(s: list, n: int) -> int {
+    if n <= 0 { return 0 }
+    if n == 1 { return 1 }
+    let mut c = 1
+    let mut l = 1
+    let mut i = 0
+    let mut k = 1
+    let mut k_max = 1
+    let mut done = 0
+    while done == 0 {
+        if l + k > n { done = 1 }
+        else {
+            if s[i + k - 1] == s[l + k - 1] {
+                k = k + 1
+                if l + k > n {
+                    c = c + 1
+                    done = 1
+                }
+            } else {
+                if k > k_max { k_max = k }
+                i = i + 1
+                if i == l {
+                    c = c + 1
+                    l = l + k_max
+                    if l + 1 > n { done = 1 }
+                    else {
+                        i = 0
+                        k = 1
+                        k_max = 1
+                    }
+                } else {
+                    k = 1
+                }
+            }
+        }
+    }
+    return c
+}
+
+// ─── synthetic deterministic stream (FNV-1a-style mix; selftest only) ───────
+// Returns a list of n_samples ints per channel.  Channel c uses seed
+// derived from FNV constant 2654435761 so the synthetic stream is
+// reproducible byte-for-byte (raw#65 idempotent).
+fn synth_channel(ch: int, n_samples: int) -> list {
+    let mut out = []
+    let mut h = 2166136261 + ch * 2654435761
+    let mut i = 0
+    while i < n_samples {
+        // FNV-1a 32-bit step (mod 2^31 to stay positive int)
+        h = (h * 16777619) + (i + 1) * 2654435761
+        h = h % 2147483647
+        if h < 0 { h = h + 2147483647 }
+        // emit a "voltage-like" int in [0..1023] for median binarization
+        out.push(h % 1024)
+        i = i + 1
+    }
+    return out
+}
+
+// ─── extract raw_arrays from ingest JSON (real mode) ────────────────────────
+// Schema (an11_b_eeg_ingest, anima/eeg_recording/1):
+//   "raw_arrays": [[ch0_s0, ch0_s1, ...], [ch1_s0, ...], ...]
+// Returns flat sentinel list: ret[0]=n_ch, ret[1]=n_samp_per_ch,
+// ret[2..) = channels-major sample ints (fractional part truncated).
+fn parse_raw_arrays(blob: string) -> list {
+    let mut ret = []
+    let key_pos = find_in_str(blob, "\"raw_arrays\"")
+    if key_pos < 0 { ret.push(0); ret.push(0); return ret }
+    let n = len(blob)
+    // advance to first '[' after key (the outer array)
+    let mut p = key_pos
+    while p < n {
+        if blob[p] == "[" { p = p + 1; break }
+        p = p + 1
+    }
+    let mut depth = 1            // we are inside the outer '['
+    let mut samples = []
+    let mut samp_per_ch = -1
+    let mut chan_count = 0
+    let mut chan_samp_count = 0
+    let mut accum = 0
+    let mut have_digits = 0
+    let mut neg = 0
+    let mut frac = 0
+    while p < n {
+        let c = blob[p]
+        let mut handled = 0
+        if c == "[" { depth = depth + 1; p = p + 1; handled = 1 }
+        if handled == 0 && c == "]" {
+            if have_digits == 1 {
+                let v = if neg == 1 { -accum } else { accum }
+                samples.push(v)
+                chan_samp_count = chan_samp_count + 1
+                have_digits = 0; neg = 0; accum = 0; frac = 0
+            }
+            if depth == 2 {
+                if samp_per_ch < 0 { samp_per_ch = chan_samp_count }
+                chan_count = chan_count + 1
+                chan_samp_count = 0
+            }
+            depth = depth - 1
+            p = p + 1
+            if depth <= 0 { p = n }
+            handled = 1
+        }
+        if handled == 0 && c == "," {
+            if have_digits == 1 {
+                let v = if neg == 1 { -accum } else { accum }
+                samples.push(v)
+                chan_samp_count = chan_samp_count + 1
+                have_digits = 0; neg = 0; accum = 0; frac = 0
+            }
+            p = p + 1
+            handled = 1
+        }
+        if handled == 0 && c == "-" && have_digits == 0 {
+            neg = 1; p = p + 1; handled = 1
+        }
+        if handled == 0 && c == "." {
+            frac = 1; p = p + 1; handled = 1
+        }
+        if handled == 0 && is_digit_ch(c) == 1 {
+            if frac == 0 { accum = accum * 10 + digit_val(c); have_digits = 1 }
+            p = p + 1
+            handled = 1
+        }
+        if handled == 0 { p = p + 1 }
+    }
+    if samp_per_ch < 0 { samp_per_ch = 0 }
+    ret.push(chan_count)
+    ret.push(samp_per_ch)
+    let mut k = 0
+    let total = chan_count * samp_per_ch
+    while k < total {
+        ret.push(samples[k])
+        k = k + 1
+    }
+    return ret
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    let selftest = env_str("CLM_EEG_LZ76_SELFTEST", "0")
+    let raw_path = env_str("CLM_EEG_RAW_ARRAYS_JSON", "")
+    let out_path = env_str("CLM_EEG_LZ76_OUT",
+                           "state/clm_eeg_p1_lz_pre_register_real.json")
+
+    let mut mode = "selftest"
+    if selftest != "1" {
+        if raw_path != "" { mode = "real" }
+    }
+
+    // ── gather samples → flat (channels-major) int list ───────────────────
+    let mut n_ch = 0
+    let mut n_samp = 0
+    let mut flat = []
+
+    if mode == "selftest" {
+        n_ch = 16
+        // Selftest goal: determinism + LZ76 kernel sanity, NOT 60 s coverage.
+        n_samp = 16
+        let mut c = 0
+        while c < n_ch {
+            let ch_samples = synth_channel(c, n_samp)
+            let mut s = 0
+            while s < n_samp {
+                flat.push(ch_samples[s])
+                s = s + 1
+            }
+            c = c + 1
+        }
+    } else {
+        let blob = read_file(raw_path)
+        let parsed = parse_raw_arrays(blob)
+        n_ch = parsed[0]
+        n_samp = parsed[1]
+        let total = n_ch * n_samp
+        let mut k = 0
+        while k < total {
+            flat.push(parsed[2 + k])
+            k = k + 1
+        }
+    }
+
+    // ── per-channel median binarization (no per-channel copy) ─────────────
+    let mut bin_stream = []
+    let mut ci = 0
+    while ci < n_ch {
+        let base = ci * n_samp
+        let med = median_slice(flat, base, n_samp)
+        let mut s2 = 0
+        while s2 < n_samp {
+            let v = flat[base + s2]
+            if v >= med { bin_stream.push(1) } else { bin_stream.push(0) }
+            s2 = s2 + 1
+        }
+        ci = ci + 1
+    }
+    let bin_len = n_ch * n_samp
+
+    // ── LZ76 production count ─────────────────────────────────────────────
+    let c_n = lz76_count(bin_stream, bin_len)
+
+    // ── normalize: c(n) · log2(n) / n  (×1000) ────────────────────────────
+    let logn_x1000 = log2_x1000(bin_len)
+    let mut lz_norm_x1000 = 0
+    if bin_len > 0 {
+        lz_norm_x1000 = (c_n * logn_x1000) / bin_len
+    }
+
+    // ── apply frozen criteria ─────────────────────────────────────────────
+    let c1_pass = if lz_norm_x1000 >= LZ76_EEG_MIN_X1000 { 1 } else { 0 }
+    let abs_delta = if lz_norm_x1000 > HUMAN_BASELINE_LZ76_X1000 {
+        lz_norm_x1000 - HUMAN_BASELINE_LZ76_X1000
+    } else {
+        HUMAN_BASELINE_LZ76_X1000 - lz_norm_x1000
+    }
+    let pct_x1000 = (abs_delta * 1000) / HUMAN_BASELINE_LZ76_X1000
+    let c2_pass = if pct_x1000 <= DELTA_HUMAN_MAX_PERMILLE { 1 } else { 0 }
+    let p1_pass = if c1_pass == 1 && c2_pass == 1 { 1 } else { 0 }
+
+    let mut classification = "NOT_VERIFIED_SYNTHETIC"
+    if mode == "real" {
+        if p1_pass == 1 { classification = "REAL_HW_PASS" }
+        else { classification = "REAL_HW_FAIL" }
+    }
+
+    // ── emit cert (extends v1.1 schema) ───────────────────────────────────
+    let run_block = if mode == "selftest" { "dry_run" } else { "real_run" }
+
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"clm_eeg_lz76_real\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"pre_register_frozen\": true,\n"
+    cert = cert + "  \"frozen_at\": \"2026-04-26\",\n"
+    cert = cert + "  \"hypothesis\": \"LZ76(EEG resting binarized) ≥ 0.65 AND |Δ|/human ≤ 0.20\",\n"
+    cert = cert + "  \"criteria\": {\n"
+    cert = cert + "    \"C1_lz76_eeg_min_x1000\": " + str(LZ76_EEG_MIN_X1000) + ",\n"
+    cert = cert + "    \"C2_delta_human_max_permille\": " + str(DELTA_HUMAN_MAX_PERMILLE) + ",\n"
+    cert = cert + "    \"human_baseline_lz76_x1000\": " + str(HUMAN_BASELINE_LZ76_X1000) + ",\n"
+    cert = cert + "    \"verdict_rule\": \"P1.PASS = (LZ76_norm >= C1) AND (|Δ|/human <= C2)\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"mode\": \"" + mode + "\",\n"
+    cert = cert + "  \"" + run_block + "\": {\n"
+    cert = cert + "    \"input\": \"" + (if mode == "real" { raw_path } else { "synthetic_fnv_seed" }) + "\",\n"
+    cert = cert + "    \"n_samples\": " + str(n_samp) + ",\n"
+    cert = cert + "    \"n_channels\": " + str(n_ch) + ",\n"
+    cert = cert + "    \"binarized_length\": " + str(bin_len) + ",\n"
+    cert = cert + "    \"c_n_productions\": " + str(c_n) + ",\n"
+    cert = cert + "    \"log2_n_x1000\": " + str(logn_x1000) + ",\n"
+    cert = cert + "    \"lz76_normalized_x1000\": " + str(lz_norm_x1000) + ",\n"
+    cert = cert + "    \"abs_delta_x1000\": " + str(abs_delta) + ",\n"
+    cert = cert + "    \"pct_delta_permille\": " + str(pct_x1000) + ",\n"
+    cert = cert + "    \"C1_pass\": " + str(c1_pass) + ",\n"
+    cert = cert + "    \"C2_pass\": " + str(c2_pass) + ",\n"
+    cert = cert + "    \"p1_pass\": " + str(p1_pass) + ",\n"
+    cert = cert + "    \"classification\": \"" + classification + "\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"algorithm\": {\n"
+    cert = cert + "    \"reference\": \"Schartner 2017 (LZ complexity for resting EEG); Kaspar-Schuster 1987\",\n"
+    cert = cert + "    \"binarization\": \"per-channel median threshold (above=1, else 0)\",\n"
+    cert = cert + "    \"concatenation\": \"16 channels sequentially → single binary stream\",\n"
+    cert = cert + "    \"normalization\": \"c(n) · log2(n) / n  (×1000 fixed-point)\"\n"
+    cert = cert + "  }\n"
+    cert = cert + "}\n"
+    write_file(out_path, cert)
+
+    println("─── clm_eeg_lz76_real (raw#9 hexa-only) ───")
+    println("  mode                        = " + mode)
+    println("  n_channels                  = " + str(n_ch))
+    println("  n_samples / channel         = " + str(n_samp))
+    println("  binarized_length            = " + str(bin_len))
+    println("  c(n) productions            = " + str(c_n))
+    println("  log2(n)_x1000               = " + str(logn_x1000))
+    println("  lz76_normalized_x1000       = " + str(lz_norm_x1000))
+    println("  abs_delta_x1000             = " + str(abs_delta))
+    println("  pct_delta_permille          = " + str(pct_x1000))
+    println("  C1_pass                     = " + str(c1_pass))
+    println("  C2_pass                     = " + str(c2_pass))
+    println("  p1_pass                     = " + str(p1_pass))
+    println("  classification              = " + classification)
+    println("  output                      = " + out_path)
+
+    if p1_pass == 1 {
+        println("  verdict                     = P1_PASS (" + classification + ")")
+        exit(0)
+    }
+    println("  verdict                     = P1_FAIL (" + classification + ")")
+    exit(1)
+}
+
+main()

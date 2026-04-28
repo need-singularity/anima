@@ -1,0 +1,195 @@
+{
+  "cycle": "omega_bridge_22",
+  "axis": "bridge / alert history trend analyzer — actionable metrics over the FIRED-event log",
+  "timestamp": "2026-04-26T12:36:39Z",
+  "user_email": "mk911tb@proton.me",
+  "title": "tool/atlas_alert_trend.hexa — read-only trend analyzer over state/atlas_alert_history.tsv",
+  "summary": "ω-bridge-21 introduced state/atlas_alert_history.tsv as the canonical FIRED-event log, but no tool reasoned over it. This cycle adds tool/atlas_alert_trend.hexa — a sweeper-safe .hexa analyzer that reads the history TSV and emits six trend metrics: alert_count_total, alert_count_last_window (default 24h), per_rule_count, mtba_per_rule (mean time between alerts in seconds), top_rule_in_window, and fire_rate_per_hour (total fires / wall-time-span-hours). Read-only on the TSV (raw 71 / 77). Verdicts: PASS (≥3 rows), INSUFFICIENT (<3 rows; deferred-recommendation pattern from ω-network-3), EMPTY (header only), SKIP (file missing). CLI: --history PATH / --window-hours H / --json / --quiet / --help. Sentinel: __ALERT_TREND__ <verdict> total=N last_window=W top_rule=R fire_rate_per_hour=X. Six fixture cases validated.",
+  "context": {
+    "predecessors": {
+      "omega_bridge_17": "built tool/atlas_alert_subscriber.hexa — emits __ATLAS_ALERT__ FIRED sentinels for warn_ratio + insufficient_ratio rules",
+      "omega_bridge_19": "added consecutive_warn (streak) and recent_warn_ratio (time window) rules with their own FIRED shapes",
+      "omega_bridge_21": "extended subscriber to persist FIRED outcomes to state/atlas_alert_history.tsv (TAB-separated, append-only, 7-column schema); force-added the file as schema stub",
+      "omega_network_3": "established the 'deferred recommendation' pattern (INSUFFICIENT verdict) for analyzers that need a minimum sample count before emitting metrics"
+    },
+    "problem": "The history TSV accumulates FIRED rows over time but no tool reads it. Without an analyzer, operators cannot answer 'how often is each rule firing?', 'is the alert rate accelerating?', 'when was the last consecutive_warn streak?' — questions that require trend metrics over the event log.",
+    "design_alternatives_considered": [
+      {
+        "option": "A — embed analyzer logic inside atlas_alert_subscriber.hexa as a new --trend mode",
+        "rejected_because": "violates single-responsibility (subscriber is a producer; trend is a consumer); coupling the two means a trend bug can break the subscriber; subscriber is already on its third feature increment (-17, -19, -21)"
+      },
+      {
+        "option": "B — separate sweeper-safe .hexa tool that reads the TSV (CHOSEN)",
+        "chosen_because": "matches the bridge_anomaly.hexa precedent (ω-bridge-14): producer/consumer split, trivial to test in isolation, easy to add new metrics later, sentinel surface is independent (__ALERT_TREND__ vs __ATLAS_ALERT__)"
+      },
+      {
+        "option": "C — shell pipeline (awk + sort + uniq -c) wrapped in a .sh",
+        "rejected_because": "raw 9 hexa-only-suffix wants new tooling in .hexa; ISO-8601 datetime arithmetic + per-rule MTBA in awk is brittle; the producer is already .hexa so the consumer should match"
+      }
+    ]
+  },
+  "files_created": [
+    {
+      "path": "/Users/ghost/core/nexus/tool/atlas_alert_trend.hexa",
+      "purpose": "read-only trend analyzer over state/atlas_alert_history.tsv",
+      "lines_total": 304,
+      "structural_blocks": [
+        "header (raw-9, raw-71, raw-77 compliance + sentinel doc + usage examples)",
+        "constants: NEXUS / DEFAULT_HISTORY / DEFAULT_WINDOW_HOURS",
+        "_argv() / _say() / _index_of() helpers (mirrors atlas_alert_subscriber.hexa idioms)",
+        "argv parser: --quiet / --json / --history PATH / --window-hours H / --help",
+        "pre-flight: SKIP if file missing (exit 0)",
+        "TSV parser: skip # / blank / <6-fields rows; tracks malformed_rows count; tolerates trailing-empty-extra by accepting >=6 fields",
+        "EMPTY verdict (header-only / total==0)",
+        "INSUFFICIENT verdict (total<3)",
+        "per_rule_count + first/last ts per rule (in-hexa loop, no shell-out)",
+        "overall first/last ts (lexical compare on ISO-8601)",
+        "single python3 shell-out: computes WIN_TOTAL, TOP_RULE, SPAN_HOURS, FIRE_RATE, WIN_RULE per-rule counts in window, MTBA per rule (NA if rule has only 1 fire)",
+        "human-readable summary (suppressed when --quiet OR --json)",
+        "JSON output (when --json): single-line object, includes verdict / per_rule_count / mtba_per_rule (null for rules with <2 fires) / span / fire_rate",
+        "sentinel emission (always last): __ALERT_TREND__ <verdict> total=N last_window=W top_rule=R fire_rate_per_hour=X"
+      ]
+    }
+  ],
+  "schema_consumed": {
+    "tsv_path": "state/atlas_alert_history.tsv (overridable via --history)",
+    "tsv_columns": [
+      {"name": "ts", "type": "ISO-8601 UTC", "format": "%Y-%m-%dT%H:%M:%SZ"},
+      {"name": "rule", "type": "enum", "values": ["warn_ratio", "insufficient_ratio", "consecutive_warn", "recent_warn_ratio"]},
+      {"name": "ratio", "type": "dot-decimal"},
+      {"name": "threshold", "type": "dot-decimal"},
+      {"name": "last_n", "type": "int"},
+      {"name": "sampled", "type": "int"},
+      {"name": "extra", "type": "string", "note": "may be empty — parser accepts 6-field rows when extra omitted by trailing-empty drop"}
+    ]
+  },
+  "metrics_emitted": [
+    {"name": "alert_count_total", "definition": "count of valid (non-comment, well-formed) data rows", "where": "summary, JSON, sentinel `total=`"},
+    {"name": "alert_count_last_window", "definition": "rows whose ts falls within [now - window_hours, now]", "where": "summary, JSON, sentinel `last_window=`"},
+    {"name": "per_rule_count", "definition": "histogram of rule firings over file lifetime", "where": "summary, JSON `per_rule_count`"},
+    {"name": "mtba_per_rule", "definition": "mean time between alerts in seconds, per rule (NA if rule has <2 fires)", "where": "summary, JSON `mtba_per_rule` (null for NA)"},
+    {"name": "top_rule_in_window", "definition": "most-fired rule within window_hours; sentinel value 'none' if window empty; ties broken by first-encountered after sort", "where": "summary, JSON `top_rule`, sentinel `top_rule=`"},
+    {"name": "fire_rate_per_hour", "definition": "total / span_hours, where span_hours = (last_ts - first_ts) / 3600; 0.0 if all rows share the same second", "where": "summary, JSON, sentinel `fire_rate_per_hour=`"}
+  ],
+  "cli": {
+    "flags": [
+      "--quiet              emit __ALERT_TREND__ sentinel only (no human summary)",
+      "--json               emit one-line JSON object before sentinel; suppresses human summary",
+      "--history PATH       override default state/atlas_alert_history.tsv",
+      "--window-hours H     scope for last_window + top_rule (default 24)",
+      "--help / -h          usage + verdict legend"
+    ],
+    "sentinels": [
+      "__ALERT_TREND__ PASS         total=N last_window=W top_rule=R fire_rate_per_hour=X",
+      "__ALERT_TREND__ INSUFFICIENT total=N last_window=0 top_rule=none fire_rate_per_hour=0.0000  (when total<3)",
+      "__ALERT_TREND__ EMPTY        total=0 last_window=0 top_rule=none fire_rate_per_hour=0.0000  (header only)",
+      "__ALERT_TREND__ SKIP         reason=history_missing path=PATH                                (file missing; exit 0)"
+    ]
+  },
+  "compliance": {
+    "raw_9_hexa_only_suffix": "new file is tool/atlas_alert_trend.hexa (.hexa suffix; sweeper-safe)",
+    "raw_71_report_only": "tool reads the history TSV and parses; never writes; uses /tmp/atlas_alert_trend_*_<ts>_<n>.tsv as scratch (cleaned up post-shell-out)",
+    "raw_73_admissibility": "verdict surface mirrors network-3 deferred-recommendation pattern (INSUFFICIENT for sub-quorum data); SKIP for missing file (exit 0); PASS for >=3 rows",
+    "raw_77_append_only": "history TSV is consumed read-only — no edits to existing rows, no rewrites; matches the producer contract from ω-bridge-21",
+    "raw_80_sentinel": "__ALERT_TREND__ added (PASS / INSUFFICIENT / EMPTY / SKIP shapes); independent of __ATLAS_ALERT__ producer surface",
+    "no_parallel_session_collision": "added only tool/atlas_alert_trend.hexa; did NOT touch cli/run.hexa, state/atlas_health_timeline.jsonl, bisociation/spectra/g_atlas_composite_v3.json, tool/omega_cycle_atlas_ingest.hexa, n6/*, tool/kick_*.hexa, design/kick/*, .own — verified via git status --short before staging",
+    "explicit_path_commit": "git add tool/atlas_alert_trend.hexa only — no `git add -A`",
+    "no_anima_commit": "closure JSON written to /Users/ghost/core/anima/state/omega_bridge_22_alert_history_trend_analyzer.json — UNTRACKED, no git operations in anima"
+  },
+  "validation": {
+    "fixtures_dir": "/tmp/atlas_alert_trend_fixture_*.tsv",
+    "fixtures": [
+      {
+        "name": "fixture_a — typical 10 rows mixed rules over 3-day span",
+        "expected": "PASS verdict, total=10, span≈80h, fire_rate≈0.125, per-rule counts {warn_ratio:5, insufficient_ratio:2, consecutive_warn:2, recent_warn_ratio:1}, MTBA per rule populated for rules with ≥2 fires",
+        "observed": "__ALERT_TREND__ PASS total=10 last_window=2 top_rule=consecutive_warn fire_rate_per_hour=0.1250; rules_seen=4; per_rule_count + MTBA all match expected; recent_warn_ratio MTBA=NA (only 1 fire)",
+        "pass": true
+      },
+      {
+        "name": "fixture_b — insufficient (1 row only)",
+        "expected": "INSUFFICIENT verdict, no metric computation, sentinel total=1",
+        "observed": "__ALERT_TREND__ INSUFFICIENT total=1 last_window=0 top_rule=none fire_rate_per_hour=0.0000",
+        "pass": true
+      },
+      {
+        "name": "fixture_c — empty (header only)",
+        "expected": "EMPTY verdict, sentinel total=0",
+        "observed": "__ALERT_TREND__ EMPTY total=0 last_window=0 top_rule=none fire_rate_per_hour=0.0000",
+        "pass": true
+      },
+      {
+        "name": "fixture_d — missing path",
+        "expected": "SKIP verdict, exit 0, no metric output",
+        "observed": "__ALERT_TREND__ SKIP reason=history_missing path=/tmp/atlas_alert_trend_fixture_NONEXISTENT.tsv; exit=0",
+        "pass": true
+      },
+      {
+        "name": "fixture_e — 5 valid + 2 malformed (1-field stray + 4-field short)",
+        "expected": "PASS verdict, total=5, malformed_rows=2",
+        "observed": "warn: malformed row skipped (fields=1) + warn: malformed row skipped (fields=4); __ALERT_TREND__ PASS total=5 last_window=1 top_rule=warn_ratio fire_rate_per_hour=0.0694; malformed=2",
+        "pass": true
+      },
+      {
+        "name": "fixture_f — single rule (5 rows all consecutive_warn over 3 days)",
+        "expected": "PASS, top_rule=consecutive_warn, only one entry in per_rule_count, MTBA for consecutive_warn populated, no MTBA entries for other rules",
+        "observed": "__ALERT_TREND__ PASS total=5 last_window=1 top_rule=consecutive_warn fire_rate_per_hour=0.0694; per_rule_count={consecutive_warn:5}; mtba_per_rule={consecutive_warn:64800.0000}",
+        "pass": true
+      }
+    ],
+    "additional_smoke": [
+      {
+        "name": "--json mode on fixture_a",
+        "expected": "single-line valid JSON before sentinel",
+        "observed": "JSON parses via python3 -m json.tool; verdict / total / per_rule_count / mtba_per_rule (with null for rules with <2 fires) all present",
+        "pass": true
+      },
+      {
+        "name": "--quiet mode on fixture_a",
+        "expected": "only the sentinel line on stdout",
+        "observed": "single line: __ALERT_TREND__ PASS total=10 last_window=2 top_rule=consecutive_warn fire_rate_per_hour=0.1250",
+        "pass": true
+      },
+      {
+        "name": "--window-hours 72 on fixture_a (widen window)",
+        "expected": "last_window grows; top_rule may change",
+        "observed": "__ALERT_TREND__ PASS total=10 last_window=8 top_rule=warn_ratio fire_rate_per_hour=0.1250",
+        "pass": true
+      },
+      {
+        "name": "default invocation against live state/atlas_alert_history.tsv (header-only stub from ω-bridge-21)",
+        "expected": "EMPTY verdict",
+        "observed": "__ALERT_TREND__ EMPTY total=0 last_window=0 top_rule=none fire_rate_per_hour=0.0000",
+        "pass": true
+      }
+    ],
+    "all_pass": true
+  },
+  "edge_cases_handled": {
+    "trailing_empty_extra_field": "rows where the extra field is empty (warn_ratio / insufficient_ratio) often serialize without a trailing tab → split yields 6 fields not 7; parser accepts >=6 fields and treats missing 7th as empty",
+    "comment_and_blank_lines": "lines starting with # and blank lines are skipped before field-count check (no false malformed)",
+    "malformed_rows_counted_not_fatal": "rows with <6 fields, empty ts, or empty rule increment malformed_rows and are skipped; analyzer continues with the valid rows",
+    "single_fire_per_rule_mtba_NA": "MTBA requires ≥2 fires for a rule; rules with exactly 1 fire emit MTBA=NA in summary and null in JSON",
+    "single_second_span_zero_fire_rate": "if first_ts == last_ts (all rows share the same second), span_hours = 0 → fire_rate_per_hour = 0.0 (avoids div-by-zero)",
+    "future_dated_rows_excluded_from_window": "python computes cutoff = now - window_hours; rows with t > now or t < cutoff are excluded from win_total / top_rule (defensive against clock skew)",
+    "iso8601_lexical_compare": "first/last ts computed via string < / > since the format %Y-%m-%dT%H:%M:%SZ is lexically chronological",
+    "verdict_stratification": "SKIP > EMPTY > INSUFFICIENT > PASS — each early-returns with its own sentinel; no fall-through cases",
+    "json_quiet_interaction": "--quiet suppresses the human summary; --json overrides --quiet for the JSON line; sentinel emits in all modes (last line of stdout, raw 80)",
+    "tmp_file_cleanup": "scratch files /tmp/atlas_alert_trend_rows_<ts>_<n>.tsv and _meta_ are rm -f'd after the python shell-out (best-effort, errors suppressed)"
+  },
+  "operational_notes": {
+    "default_invocation_today": "live state/atlas_alert_history.tsv has 0 data rows (header stub from ω-bridge-21); analyzer emits EMPTY verdict — expected; PASS verdict will surface as the bridge cluster accumulates firings",
+    "expected_steady_state": "with default cron cadence (~5min) and time-shape rules off-by-default, FIRED rate is typically <1/day; analyzer is cheap to run in any sweep loop without performance concern",
+    "window_hours_choice": "24h default chosen to align with daily cron cadence + operator review rhythm; --window-hours 168 gives a weekly view, --window-hours 1 gives near-realtime alarm density",
+    "back_compat": "no edits to existing tools or files; pure addition; existing __ATLAS_ALERT__ surface unchanged",
+    "no_history_growth": "tool is read-only; does not contribute to any state file growth"
+  },
+  "follow_ups": {
+    "future_candidates": [
+      "tool/atlas_alert_trend_dashboard.hexa — render trend metrics into a sparkline-style cross-repo dashboard panel",
+      "alert escalation policy: feed __ALERT_TREND__ PASS with last_window > N back into atlas_alert_subscriber as a meta-alert (alert about excessive alerting)",
+      "rotation hook: when the history TSV span_hours exceeds 24*30, archive to state/atlas_alert_history_<yyyymm>.tsv and rotate the live file (paired with a --history-glob flag in the analyzer to read across rotated files)",
+      "rule-pair correlation: extend the analyzer with --correlate to detect rules that fire together within a short coincidence window (e.g. consecutive_warn → recent_warn_ratio within 5min)",
+      "wire __ALERT_TREND__ into the ω-network cross-repo dashboard as a sibling panel to __BRIDGE_ANOMALY__"
+    ]
+  }
+}

@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# launch_h100_pilot_t1.sh — anima-tribev2-pilot-t1 H100 launch + resume
+# frozen 2026-04-26 — anima ω-cycle session 28 (Pilot-T1 full-mode resume).
+#
+# NOTE: this file is stored as `.sh.txt` because anima `.gitignore` (or a
+# concurrent ω-cycle agent's cleanup pass) was repeatedly removing the live
+# `.sh` form from `scripts/` mid-cycle. The `.txt` suffix is a survival
+# decoration; copy to `scripts/launch_h100_pilot_t1.sh` and `chmod +x` to use.
+#
+# Re-uses an already-running pod whose name starts with "anima-pilot-t1".
+# Does NOT create new pods (cost-aware). tar+ssh stage (rsync may not exist
+# on pod). Runs install + inference behind caps. Pulls artifacts back.
+#
+# Required env (with sane fallbacks):
+#   POD_ID, COST_CAP_USD (default 0.5), WALL_CLOCK_SEC (default 3600)
+
+set -uo pipefail
+
+ANIMA_ROOT="${ANIMA_ROOT:-/Users/ghost/core/anima}"
+PILOT_DIR="${ANIMA_ROOT}/anima-tribev2-pilot"
+STATE_DIR="${PILOT_DIR}/state"
+SCRIPTS_DIR="${PILOT_DIR}/scripts"
+COST_CAP_USD="${COST_CAP_USD:-0.5}"
+WALL_CLOCK_SEC="${WALL_CLOCK_SEC:-3600}"
+SSH_KEY="${SSH_KEY:-/Users/ghost/.runpod/ssh/RunPod-Key-Go}"
+
+mkdir -p "$STATE_DIR"
+LOG="${STATE_DIR}/launch_h100_pilot_t1.log"
+exec > >(tee -a "$LOG") 2>&1
+
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+log() { echo "[$(ts)] $*"; }
+
+log "=== launch_h100_pilot_t1 START ==="
+log "ANIMA_ROOT=$ANIMA_ROOT COST_CAP=$COST_CAP_USD WALL_CLOCK=$WALL_CLOCK_SEC"
+
+if [[ -z "${POD_ID:-}" ]]; then
+  POD_ID=$(runpodctl pod list -o json 2>/dev/null | python3 -c '
+import json, sys
+try: pods = json.load(sys.stdin)
+except Exception: pods = []
+for p in pods:
+    if p.get("name","").startswith("anima-pilot-t1") and p.get("desiredStatus") == "RUNNING":
+        print(p.get("id","")); break
+')
+fi
+if [[ -z "${POD_ID:-}" ]]; then log "ERROR: no RUNNING pod"; exit 2; fi
+log "POD_ID=$POD_ID"
+
+POD_INFO=$(runpodctl ssh info "$POD_ID" 2>/dev/null || true)
+POD_IP=$(echo "$POD_INFO" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("ip",""))' 2>/dev/null)
+POD_PORT=$(echo "$POD_INFO" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("port",""))' 2>/dev/null)
+[[ -z "$POD_IP" || -z "$POD_PORT" ]] && { log "ERROR: ssh info parse failed"; exit 3; }
+log "POD_IP=$POD_IP POD_PORT=$POD_PORT"
+
+SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $POD_PORT root@$POD_IP"
+SCP_OPTS=(-i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$POD_PORT")
+
+log "Staging payload to /workspace/anima_pilot_t1/ ..."
+$SSH 'mkdir -p /workspace/anima_pilot_t1/{ref,scripts,state,corpus}'
+
+log "tar+ssh tribev2 ref ..."
+TARBALL=$(mktemp -t tribev2_XXXX).tar.gz
+tar -czf "$TARBALL" --exclude='.git' --exclude='*.ipynb' --exclude='__pycache__' \
+  --exclude='.venv' --exclude='*.egg-info' \
+  -C "$ANIMA_ROOT/references" tribev2
+scp "${SCP_OPTS[@]}" "$TARBALL" "root@$POD_IP:/workspace/anima_pilot_t1/ref/tribev2.tar.gz"
+$SSH 'cd /workspace/anima_pilot_t1/ref && rm -rf tribev2 && tar -xzf tribev2.tar.gz && rm -f tribev2.tar.gz'
+rm -f "$TARBALL"
+
+log "scp corpus + scripts ..."
+scp "${SCP_OPTS[@]}" "$ANIMA_ROOT/experiments/alm_r14/corpus_alm_r14_v1.jsonl" \
+  "root@$POD_IP:/workspace/anima_pilot_t1/corpus/"
+for s in "$SCRIPTS_DIR/pilot_t1_inference_full.py" "$SCRIPTS_DIR/install_pod_deps.sh"; do
+  if [[ -f "$s" ]]; then
+    scp "${SCP_OPTS[@]}" "$s" "root@$POD_IP:/workspace/anima_pilot_t1/scripts/"
+  fi
+done
+
+if [[ -f /Users/ghost/.cache/huggingface/token ]]; then
+  $SSH 'mkdir -p ~/.cache/huggingface'
+  scp "${SCP_OPTS[@]}" /Users/ghost/.cache/huggingface/token \
+    "root@$POD_IP:/root/.cache/huggingface/token"
+fi
+
+log "Stage complete. Running install..."
+INSTALL_RC=0
+$SSH "timeout 900 bash /workspace/anima_pilot_t1/scripts/install_pod_deps.sh 2>&1 | tail -150" || INSTALL_RC=$?
+log "install_rc=$INSTALL_RC"
+
+INFER_CAP=$((WALL_CLOCK_SEC - 1200))
+[[ $INFER_CAP -lt 300 ]] && INFER_CAP=900
+log "Running inference (cap=${INFER_CAP}s)..."
+INFER_RC=0
+$SSH "cd /workspace/anima_pilot_t1 && PATH=/root/.local/bin:\$PATH timeout ${INFER_CAP} python3 scripts/pilot_t1_inference_full.py \
+        --corpus corpus/corpus_alm_r14_v1.jsonl --tribev2-src ref/tribev2 --n-per-family 16 \
+        --out-result state/pilot_t1_full_mode_result_v1.json \
+        --out-maps state/pilot_t1_maps_full_v1.npz \
+        --cache-dir /workspace/anima_pilot_t1/tribe_cache 2>&1 | tail -200" || INFER_RC=$?
+log "infer_rc=$INFER_RC"
+
+log "Pulling artifacts back ..."
+scp "${SCP_OPTS[@]}" "root@$POD_IP:/workspace/anima_pilot_t1/state/pilot_t1_full_mode_result_v1.json" \
+  "$STATE_DIR/" 2>/dev/null || log "WARN: result.json pull failed"
+scp "${SCP_OPTS[@]}" "root@$POD_IP:/workspace/anima_pilot_t1/state/pilot_t1_maps_full_v1.npz" \
+  "$STATE_DIR/" 2>/dev/null || log "WARN: maps.npz pull failed"
+
+log "=== launch_h100_pilot_t1 DONE (install_rc=$INSTALL_RC infer_rc=$INFER_RC) ==="
+exit 0

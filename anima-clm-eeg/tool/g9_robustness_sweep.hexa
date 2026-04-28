@@ -1,0 +1,339 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/g9_robustness_sweep.hexa
+//
+//  PURPOSE
+//    G9 robustness sweep — soft↔hard 재분류 perturbation 16 시나리오 (2^4)
+//    각 시나리오에서 G9 verdict (PASS/FAIL) 와 cascade_max 측정.
+//    invariance ≥ 80% (12+/16) 시 G9_ROBUST 판정.
+//
+//    sister of:
+//      anima-clm-eeg/tool/g9_dag_cascade_analyzer.hexa  (baseline, read-only)
+//
+//    perturbation space:
+//      4 edges (4←0, 4←1, 4←2, 4←3) 의 hardness bit 를 0/1 로 sweep.
+//      adjacency 는 불변 (sparse canonical), hardness 만 16-cell sweep.
+//      hardness 변동은 직접 verdict 에 영향 없음 (analyzer 는 edge_count +
+//      cascade_max 만 검사) — 그래서 invariance=100% 가 expected.
+//      이를 직접 측정해 "robustness 가 hardness-axis 에 대해 invariant" 임을
+//      empirical 하게 fix.
+//
+//    falsifier (--falsify 또는 G9_FALSIFY=1):
+//      모든 edge 의 source row 를 단일 column j=0 으로 collapse.
+//      즉 PV11 4 edge 를 모두 4←0 으로 바꿔 cascade_impact_of(0)=4.
+//      cascade_max=4 > 2 → G9_FAIL 16/16. invariance 는 100% 지만
+//      verdict 변동 detect (PASS→FAIL) 으로 falsifier 작동 증명.
+//
+//  USAGE
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run \
+//      anima-clm-eeg/tool/g9_robustness_sweep.hexa
+//
+//    Falsifier:
+//      G9_FALSIFY=1 HEXA_RESOLVER_NO_REROUTE=1 hexa run \
+//        anima-clm-eeg/tool/g9_robustness_sweep.hexa
+//
+//  OUTPUT
+//    state/g9_robustness_sweep.json  (or G9_SWEEP_OUT)
+//
+//  ENV
+//    G9_SWEEP_OUT  output JSON path
+//    G9_FALSIFY    when "1": collapse all 4 edges to column 0 (cascade=4)
+//
+//  RAW
+//    raw#9 · hexa-only · deterministic · LLM=none · pure-aggregator
+// ════════════════════════════════════════════════════════════════════════════
+
+let M32 = 4294967296
+let FNV_PRIME = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+let N = 5
+
+let EDGE_BUDGET = 7
+let CASCADE_BUDGET = 2
+
+let SCENARIOS = 16
+let INVARIANCE_THRESHOLD = 80
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+fn env_int(key: string, default_val: int) -> int {
+    let s = env(key)
+    if s == "" { return default_val }
+    if s == "1" { return 1 }
+    if s == "0" { return 0 }
+    return default_val
+}
+
+// ─── fingerprint (FNV-style) ────────────────────────────────────────────────
+fn fnv_step(h: int, byte: int) -> int {
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fingerprint_step(fp: int, val: int) -> int {
+    let mut h = fp
+    h = fnv_step(h, val % 256)
+    h = fnv_step(h, (val / 256) % 256)
+    h = fnv_step(h, (val / 65536) % 256)
+    h = fnv_step(h, (val / 16777216) % 256)
+    return h
+}
+
+// ─── adjacency (canonical sparse OR falsifier collapse) ─────────────────────
+fn build_adjacency(falsify_mode: int) -> [int] {
+    let mut a = [
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+    ]
+    if falsify_mode == 1 {
+        // Collapse falsifier: keep 4 outgoing edges from PV11 but collapse
+        // them all into column 0 (HCI).  Self-loop on row 4 col 0 is "1"
+        // counted once — we use parallel-edge convention: just one edge,
+        // but cascade_impact_of(0) gets all 4 by virtue of column sum
+        // including the original entries.  For deterministic semantics we
+        // place 4 distinct edges from rows {1,2,3,4} (not 0) into column 0.
+        a[1 * N + 0] = 1
+        a[2 * N + 0] = 1
+        a[3 * N + 0] = 1
+        a[4 * N + 0] = 1
+        return a
+    }
+    // canonical sparse: row 4 (PV11) depends on rows 0..3
+    a[4 * N + 0] = 1
+    a[4 * N + 1] = 1
+    a[4 * N + 2] = 1
+    a[4 * N + 3] = 1
+    return a
+}
+
+// Build hardness for scenario `s` ∈ [0..15], where bit k of s sets the
+// hardness of the k-th canonical edge (k=0 → 4←0, k=1 → 4←1, etc.).
+// In falsify_mode: same encoding applied to collapsed edges in row order.
+fn build_hardness_for(s: int, falsify_mode: int) -> [int] {
+    let mut h = [
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+    ]
+    let b0 = s % 2
+    let b1 = (s / 2) % 2
+    let b2 = (s / 4) % 2
+    let b3 = (s / 8) % 2
+    if falsify_mode == 1 {
+        h[1 * N + 0] = b0
+        h[2 * N + 0] = b1
+        h[3 * N + 0] = b2
+        h[4 * N + 0] = b3
+        return h
+    }
+    h[4 * N + 0] = b0
+    h[4 * N + 1] = b1
+    h[4 * N + 2] = b2
+    h[4 * N + 3] = b3
+    return h
+}
+
+// ─── graph metrics ─────────────────────────────────────────────────────────
+fn count_edges(a: [int]) -> int {
+    let mut total = 0
+    let mut i = 0
+    while i < N {
+        let mut j = 0
+        while j < N {
+            total = total + a[i * N + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return total
+}
+
+fn count_hard_edges(h: [int]) -> int {
+    let mut total = 0
+    let mut i = 0
+    while i < N {
+        let mut j = 0
+        while j < N {
+            total = total + h[i * N + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return total
+}
+
+fn cascade_impact_of(a: [int], j: int) -> int {
+    let mut total = 0
+    let mut i = 0
+    while i < N {
+        if i != j {
+            total = total + a[i * N + j]
+        }
+        i = i + 1
+    }
+    return total
+}
+
+fn cascade_max_of(a: [int]) -> int {
+    let c0 = cascade_impact_of(a, 0)
+    let c1 = cascade_impact_of(a, 1)
+    let c2 = cascade_impact_of(a, 2)
+    let c3 = cascade_impact_of(a, 3)
+    let c4 = cascade_impact_of(a, 4)
+    let mut m = c0
+    if c1 > m { m = c1 }
+    if c2 > m { m = c2 }
+    if c3 > m { m = c3 }
+    if c4 > m { m = c4 }
+    return m
+}
+
+// ─── scenario evaluator ─────────────────────────────────────────────────────
+// returns g9_pass (0|1) for scenario s under falsify_mode.
+fn eval_scenario_pass(s: int, falsify_mode: int) -> int {
+    let a = build_adjacency(falsify_mode)
+    let h = build_hardness_for(s, falsify_mode)
+    let ec = count_edges(a)
+    let cmax = cascade_max_of(a)
+    let edge_pass = if ec <= EDGE_BUDGET { 1 } else { 0 }
+    let cascade_pass = if cmax <= CASCADE_BUDGET { 1 } else { 0 }
+    if edge_pass == 1 {
+        if cascade_pass == 1 { return 1 }
+    }
+    return 0
+}
+
+fn eval_scenario_cmax(s: int, falsify_mode: int) -> int {
+    let a = build_adjacency(falsify_mode)
+    return cascade_max_of(a)
+}
+
+fn eval_scenario_hardcount(s: int, falsify_mode: int) -> int {
+    let h = build_hardness_for(s, falsify_mode)
+    return count_hard_edges(h)
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+fn main() {
+    let out_path = env_str("G9_SWEEP_OUT", "state/g9_robustness_sweep.json")
+    let falsify_mode = env_int("G9_FALSIFY", 0)
+
+    // baseline reference (canonical scenario s=10 → b0=0 b1=1 b2=0 b3=1 …
+    // we instead anchor to the canonical b0=0,b1=0,b2=1,b3=1 encoding which
+    // matches the analyzer's hardness layout; that is s = 0+0+4+8 = 12).
+    let baseline_s = 12
+    let baseline_pass = eval_scenario_pass(baseline_s, 0)
+
+    // sweep
+    let mut pass_count = 0
+    let mut fail_count = 0
+    let mut s = 0
+    let mut per_scenario = "[\n"
+    let mut fp = FNV_OFFSET_BASIS
+    fp = fingerprint_step(fp, falsify_mode)
+    fp = fingerprint_step(fp, EDGE_BUDGET)
+    fp = fingerprint_step(fp, CASCADE_BUDGET)
+    while s < SCENARIOS {
+        let p = eval_scenario_pass(s, falsify_mode)
+        let cmax = eval_scenario_cmax(s, falsify_mode)
+        let hc = eval_scenario_hardcount(s, falsify_mode)
+        if p == 1 { pass_count = pass_count + 1 } else { fail_count = fail_count + 1 }
+        fp = fingerprint_step(fp, s)
+        fp = fingerprint_step(fp, p)
+        fp = fingerprint_step(fp, cmax)
+        fp = fingerprint_step(fp, hc)
+        per_scenario = per_scenario + "    {\"s\": " + str(s)
+        per_scenario = per_scenario + ", \"hard_count\": " + str(hc)
+        per_scenario = per_scenario + ", \"cascade_max\": " + str(cmax)
+        per_scenario = per_scenario + ", \"g9_pass\": " + str(p) + "}"
+        if s < SCENARIOS - 1 { per_scenario = per_scenario + "," }
+        per_scenario = per_scenario + "\n"
+        s = s + 1
+    }
+    per_scenario = per_scenario + "  ]"
+
+    // invariance: fraction of scenarios matching baseline_pass
+    let mut matching = 0
+    let mut s2 = 0
+    while s2 < SCENARIOS {
+        let p2 = eval_scenario_pass(s2, falsify_mode)
+        if p2 == baseline_pass { matching = matching + 1 }
+        s2 = s2 + 1
+    }
+    let invariance_pct = (matching * 100) / SCENARIOS
+    let robust = if invariance_pct >= INVARIANCE_THRESHOLD { 1 } else { 0 }
+
+    // verdict label
+    let mut verdict = "G9_ROBUST"
+    if robust == 0 {
+        if invariance_pct >= 50 { verdict = "G9_AMBIGUOUS" } else { verdict = "G9_FRAGILE" }
+    }
+
+    fp = fingerprint_step(fp, baseline_s)
+    fp = fingerprint_step(fp, baseline_pass)
+    fp = fingerprint_step(fp, pass_count)
+    fp = fingerprint_step(fp, fail_count)
+    fp = fingerprint_step(fp, matching)
+    fp = fingerprint_step(fp, invariance_pct)
+    fp = fingerprint_step(fp, robust)
+
+    // ── emit cert ──────────────────────────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"g9_robustness_sweep\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"gate\": \"G9-robustness\",\n"
+    cert = cert + "  \"sister\": \"g9_dag_cascade_analyzer\",\n"
+    cert = cert + "  \"falsify_mode\": " + str(falsify_mode) + ",\n"
+    cert = cert + "  \"scenarios\": " + str(SCENARIOS) + ",\n"
+    cert = cert + "  \"baseline_s\": " + str(baseline_s) + ",\n"
+    cert = cert + "  \"baseline_pass\": " + str(baseline_pass) + ",\n"
+    cert = cert + "  \"budgets\": {\"edge_max\": " + str(EDGE_BUDGET) + ", \"cascade_max\": " + str(CASCADE_BUDGET) + "},\n"
+    cert = cert + "  \"invariance_threshold_pct\": " + str(INVARIANCE_THRESHOLD) + ",\n"
+    cert = cert + "  \"per_scenario\": " + per_scenario + ",\n"
+    cert = cert + "  \"pass_count\": " + str(pass_count) + ",\n"
+    cert = cert + "  \"fail_count\": " + str(fail_count) + ",\n"
+    cert = cert + "  \"matching_baseline\": " + str(matching) + ",\n"
+    cert = cert + "  \"invariance_pct\": " + str(invariance_pct) + ",\n"
+    cert = cert + "  \"robust\": " + str(robust) + ",\n"
+    cert = cert + "  \"verdict\": \"" + verdict + "\",\n"
+    cert = cert + "  \"fingerprint\": " + str(fp) + ",\n"
+    cert = cert + "  \"note\": \"hardness-axis sweep of 4 canonical edges; adjacency invariant; falsify_mode=1 collapses edges to column 0 (cascade=4) to demonstrate non-hardness perturbation flips verdict.\"\n"
+    cert = cert + "}\n"
+    write_file(out_path, cert)
+
+    println("─── g9_robustness_sweep (raw#9 hexa-only) ───")
+    println("  falsify_mode           = " + str(falsify_mode))
+    println("  scenarios              = " + str(SCENARIOS))
+    println("  baseline_s             = " + str(baseline_s) + "  (canonical hardness 0,0,1,1)")
+    println("  baseline_pass          = " + str(baseline_pass))
+    println("  pass_count             = " + str(pass_count))
+    println("  fail_count             = " + str(fail_count))
+    println("  matching_baseline      = " + str(matching) + " / " + str(SCENARIOS))
+    println("  invariance_pct         = " + str(invariance_pct) + "  (threshold " + str(INVARIANCE_THRESHOLD) + ")")
+    println("  robust                 = " + str(robust))
+    println("  verdict                = " + verdict)
+    println("  fingerprint            = " + str(fp))
+    println("  output                 = " + out_path)
+
+    if robust == 1 {
+        exit(0)
+    }
+    exit(1)
+}

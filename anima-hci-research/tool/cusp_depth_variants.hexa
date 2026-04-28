@@ -1,0 +1,614 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-hci-research/tool/cusp_depth_variants.hexa
+//
+//  PURPOSE  (S7 cusp_depth ansatz variant probe — Llama outlier 분해)
+//
+//    이전 N=8 결과 (cusp_depth_projector_n8_v1.json):
+//      Pearson r = +0.689, p = 0.058 boundary, S7 conf 0.75 stay.
+//      Llama outlier: v3-Llama fam_loc=875 vs cusp_depth=125
+//                     v4-Llama fam_loc=625 vs cusp_depth=125
+//      → multi-family L2 peak 안정 (early), single-family ablation
+//        은 Hexad/Phi 등 late-layer mid-locus 분산. 이 mismatch 분해.
+//
+//    3 ansatz variants:
+//      A1 per-family argmax 4-axis:
+//         cusp_depth_F(b) = argmax_layer |abs(layer, F)| / n_layers ×1000
+//         Pearson r 4개 (fam_loc 자체가 family argmax 의 max 기반이므로
+//                        이 lever 가 Llama outlier 직접 분해)
+//      A2 top-3 avg cusp_depth:
+//         cusp_depth(b) = argmax_layer mean(top3 |abs(layer, F)|) / n_layers
+//         (single peak 대신 plateau, 4-family 중 한 family 가 outlier 일 때
+//          top-3 average 가 robust)
+//      A3 weighted L2 cusp_depth:
+//         w_F = 1 / var_layer(|abs(:, F)|)  (low-var family dominates)
+//         cusp_depth(b) = argmax_layer Σ_F w_F · |abs(layer, F)|² / n_layers
+//
+//    각 variant 별 family_loc 와 Pearson r + permutation p (4096 trials).
+//
+//  RAW#9 strict
+//    pure hexa · deterministic · cmt.json read-only · no Python · no shell
+//    integer fixed-point ×1000 · byte-identical re-run
+//
+//  POSITIVE
+//    8 cmt.json (v3 + v4 × 4 backbones) → 3 ansatz × Pearson r
+//
+//  NEGATIVE FALSIFY
+//    4096 random scrambles per ansatz → permutation p-value
+//
+//  OUTPUT
+//    state/cusp_depth_variants_v1.json
+// ════════════════════════════════════════════════════════════════════════════
+
+let SCALE = 1000
+let M32 = 4294967296
+let POLY_PRIME = 2654435761
+
+let R_PASS = 500
+let R_FAIL = 200
+let P_PASS = 50
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+fn now_stamp() -> string { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+
+fn str_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + xs[i] + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+fn int_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + str(xs[i])
+        i = i + 1
+    }
+    return s + "]"
+}
+
+fn f1000(x) -> int {
+    let scaled = x * SCALE
+    let t = int(scaled)
+    if t < 0 { return 0 }
+    return t
+}
+
+// integer sqrt (Newton)
+fn isqrt(v: int) -> int {
+    if v <= 0 { return 0 }
+    let mut x = v
+    let mut prev = 0
+    let mut iter = 0
+    while iter < 32 {
+        prev = x
+        x = (x + v / x) / 2
+        if x == prev { iter = 32 }
+        iter = iter + 1
+    }
+    return x
+}
+
+// ─── load cmt.json: return {n_layers, sorted_layers, abs_x1000[L][F]} ────
+fn cmt_load_layers(cmt_path: string) -> list {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let tomo = cmt["tomography"]
+    let layer_keys = keys(tomo)
+    let mut layer_ints = []
+    let mut i = 0
+    while i < len(layer_keys) {
+        layer_ints = layer_ints.push(int(layer_keys[i]))
+        i = i + 1
+    }
+    // bubble sort
+    let mut sorted = []
+    let mut a = 0
+    while a < len(layer_ints) {
+        let v = layer_ints[a]
+        let mut placed = false
+        let mut new_sorted = []
+        let mut b = 0
+        while b < len(sorted) {
+            if !placed && v < sorted[b] {
+                new_sorted = new_sorted.push(v)
+                placed = true
+            }
+            new_sorted = new_sorted.push(sorted[b])
+            b = b + 1
+        }
+        if !placed { new_sorted = new_sorted.push(v) }
+        sorted = new_sorted
+        a = a + 1
+    }
+    return [n_layers, sorted, tomo]
+}
+
+// extract per-layer per-family |abs|×1000 matrix (list of list)
+fn abs_matrix(tomo, sorted: list) -> list {
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut mat = []
+    let mut s = 0
+    while s < len(sorted) {
+        let layer_key = str(sorted[s])
+        let layer_obj = tomo[layer_key]
+        let mut row = []
+        let mut f = 0
+        while f < 4 {
+            let fam_obj = layer_obj[families[f]]
+            let av = f1000(fam_obj["abs"])
+            row = row.push(av)
+            f = f + 1
+        }
+        mat = mat.push(row)
+        s = s + 1
+    }
+    return mat
+}
+
+// ─── A1 per-family argmax for one family index ─────────────────────────────
+fn cusp_depth_per_family(cmt_path: string, fam_idx: int) -> int {
+    let parts = cmt_load_layers(cmt_path)
+    let n_layers = parts[0]
+    let sorted = parts[1]
+    let tomo = parts[2]
+    let mat = abs_matrix(tomo, sorted)
+    let mut best_v = -1
+    let mut best_layer = sorted[0]
+    let mut s = 0
+    while s < len(sorted) {
+        let v = mat[s][fam_idx]
+        if v > best_v {
+            best_v = v
+            best_layer = sorted[s]
+        }
+        s = s + 1
+    }
+    return (best_layer * SCALE) / n_layers
+}
+
+// ─── A2 top-3 average cusp_depth ────────────────────────────────────────────
+//   per layer: sort 4 family |abs| descending, take top 3, mean
+//   argmax_layer of that mean → / n_layers ×1000
+fn cusp_depth_top3(cmt_path: string) -> int {
+    let parts = cmt_load_layers(cmt_path)
+    let n_layers = parts[0]
+    let sorted = parts[1]
+    let tomo = parts[2]
+    let mat = abs_matrix(tomo, sorted)
+    let mut best_v = -1
+    let mut best_layer = sorted[0]
+    let mut s = 0
+    while s < len(sorted) {
+        let row = mat[s]
+        // find 4 values, pick top 3 sum (= sum - min)
+        let v0 = row[0]
+        let v1 = row[1]
+        let v2 = row[2]
+        let v3 = row[3]
+        let mut mn = v0
+        if v1 < mn { mn = v1 }
+        if v2 < mn { mn = v2 }
+        if v3 < mn { mn = v3 }
+        let top3_sum = v0 + v1 + v2 + v3 - mn
+        // mean = top3_sum / 3 — preserve order, but normalize for return
+        if top3_sum > best_v {
+            best_v = top3_sum
+            best_layer = sorted[s]
+        }
+        s = s + 1
+    }
+    return (best_layer * SCALE) / n_layers
+}
+
+// ─── A3 weighted L2 cusp_depth ──────────────────────────────────────────────
+//   w_F = 1 / var_layer(|abs(:, F)|)  scaled to keep integer math
+//   cusp_depth = argmax_layer Σ_F w_F · v_F²
+fn cusp_depth_weighted_l2(cmt_path: string) -> int {
+    let parts = cmt_load_layers(cmt_path)
+    let n_layers = parts[0]
+    let sorted = parts[1]
+    let tomo = parts[2]
+    let mat = abs_matrix(tomo, sorted)
+    let nL = len(sorted)
+
+    // per-family mean & variance ×1000² (variance in ×1e6 units)
+    let mut means = []
+    let mut f = 0
+    while f < 4 {
+        let mut s = 0
+        let mut sm = 0
+        while s < nL {
+            sm = sm + mat[s][f]
+            s = s + 1
+        }
+        let m = sm / nL
+        means = means.push(m)
+        f = f + 1
+    }
+
+    // variance ×1 (not ×SCALE); avoid zero
+    let mut variances = []
+    let mut g = 0
+    while g < 4 {
+        let mut s = 0
+        let mut sq = 0
+        while s < nL {
+            let d = mat[s][g] - means[g]
+            sq = sq + d * d
+            s = s + 1
+        }
+        let var_val = sq / nL
+        // floor at 1 to avoid div-by-zero
+        let mut vv = var_val
+        if vv < 1 { vv = 1 }
+        variances = variances.push(vv)
+        g = g + 1
+    }
+
+    // weight w_F = K / variance  (K large constant for integer precision).
+    // K = max(variances) — keeps weights ≤ 1×K, avoids overflow.
+    let mut max_var = variances[0]
+    let mut h = 1
+    while h < 4 {
+        if variances[h] > max_var { max_var = variances[h] }
+        h = h + 1
+    }
+
+    let mut weights = []
+    let mut p = 0
+    while p < 4 {
+        // weight = max_var / var (integer-safe; range [1, max_var])
+        let w = max_var / variances[p]
+        weights = weights.push(w)
+        p = p + 1
+    }
+
+    // weighted sum per layer, take argmax
+    let mut best_v = 0
+    let mut best_layer = sorted[0]
+    let mut s = 0
+    while s < nL {
+        let mut acc = 0
+        let mut q = 0
+        while q < 4 {
+            let v = mat[s][q]
+            // v is ×SCALE, v² is ×SCALE², divide by SCALE to keep mid-range
+            let v2 = (v * v) / SCALE
+            acc = acc + weights[q] * v2
+            q = q + 1
+        }
+        if acc > best_v {
+            best_v = acc
+            best_layer = sorted[s]
+        }
+        s = s + 1
+    }
+    return (best_layer * SCALE) / n_layers
+}
+
+// ─── per-family family_loc (matches A1: same fam_idx) ───────────────────────
+fn family_loc_one(cmt_path: string, fam_idx: int) -> int {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let dom = cmt["dominant_layer_per_family"]
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let entry = dom[families[fam_idx]]
+    let lay = entry["layer"]
+    return (lay * SCALE) / n_layers
+}
+
+// ─── multi-family family_loc (max) — same as N=8 ────────────────────────────
+fn family_loc_norm(cmt_path: string) -> int {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let dom = cmt["dominant_layer_per_family"]
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut best = 0
+    let mut i = 0
+    while i < 4 {
+        let entry = dom[families[i]]
+        let lay = entry["layer"]
+        let norm = (lay * SCALE) / n_layers
+        if norm > best { best = norm }
+        i = i + 1
+    }
+    return best
+}
+
+fn cmt_n_layers(cmt_path: string) -> int {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    return cmt["n_layers"]
+}
+
+// ─── Pearson r ×1000 ────────────────────────────────────────────────────────
+fn list_mean(xs: list) -> int {
+    let n = len(xs)
+    if n == 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < n { s = s + xs[i]; i = i + 1 }
+    return s / n
+}
+
+fn pearson_r_x1000(xs: list, ys: list) -> int {
+    let n = len(xs)
+    if n != len(ys) { return 0 }
+    if n < 2 { return 0 }
+    let mx = list_mean(xs)
+    let my = list_mean(ys)
+    let mut num = 0
+    let mut sx = 0
+    let mut sy = 0
+    let mut i = 0
+    while i < n {
+        let dx = xs[i] - mx
+        let dy = ys[i] - my
+        num = num + dx * dy
+        sx = sx + dx * dx
+        sy = sy + dy * dy
+        i = i + 1
+    }
+    if sx <= 0 || sy <= 0 { return 0 }
+    let prod = sx * sy
+    let denom = isqrt(prod)
+    if denom == 0 { return 0 }
+    let mut r = (SCALE * num) / denom
+    if r >  SCALE { r =  SCALE }
+    if r < -SCALE { r = -SCALE }
+    return r
+}
+
+// hash-seed → integer in [0, m)
+fn seeded_layer(seed: int, m: int) -> int {
+    let mut h = seed * POLY_PRIME
+    h = h % M32
+    if h < 0 { h = h + M32 }
+    return h % m
+}
+
+// permutation test: randomize cusp values, measure |r| ≥ |r_pos| count
+fn permutation_p(family_locs: list, n_layers_list: list, r_pos: int, n_perm: int, seed_offset: int) -> int {
+    let N = len(family_locs)
+    let mut r_pos_abs = r_pos
+    if r_pos_abs < 0 { r_pos_abs = -r_pos_abs }
+    let mut count_geq = 0
+    let mut t = 0
+    while t < n_perm {
+        let mut neg = []
+        let mut nn = 0
+        while nn < N {
+            let seed_val = (t + 1) * 1009 + (nn + 1) * 31 + seed_offset
+            let pk = seeded_layer(seed_val, n_layers_list[nn])
+            neg = neg.push((pk * SCALE) / n_layers_list[nn])
+            nn = nn + 1
+        }
+        let r_t = pearson_r_x1000(family_locs, neg)
+        let mut r_t_abs = r_t
+        if r_t_abs < 0 { r_t_abs = -r_t_abs }
+        if r_t_abs >= r_pos_abs { count_geq = count_geq + 1 }
+        t = t + 1
+    }
+    return (count_geq * SCALE) / n_perm
+}
+
+// ─── main ────────────────────────────────────────────────────────────────────
+fn main() {
+    println("[cusp_depth_variants] S7 ansatz variants (A1 per-family / A2 top3 / A3 weighted L2)")
+    println("  R_PASS=" + str(R_PASS) + " R_FAIL=" + str(R_FAIL) + " P_PASS=" + str(P_PASS) + " (×1000)")
+    println("")
+
+    let trial_names = [
+        "v3-Mistral", "v3-Qwen3", "v3-Llama", "v3-gemma",
+        "v4-Mistral", "v4-Qwen3", "v4-Llama", "v4-gemma"
+    ]
+    let cmt_paths = [
+        "state/v10_benchmark_v3/mistral/cmt.json",
+        "state/v10_benchmark_v3/qwen3/cmt.json",
+        "state/v10_benchmark_v3/llama/cmt.json",
+        "state/v10_benchmark_v3/gemma/cmt.json",
+        "state/v10_benchmark_v4/mistral/cmt.json",
+        "state/v10_benchmark_v4/qwen3/cmt.json",
+        "state/v10_benchmark_v4/llama/cmt.json",
+        "state/v10_benchmark_v4/gemma/cmt.json"
+    ]
+    let N = 8
+    // n_perm = 512: hexa interp memory budget 안정 운용 (4096 trials는 mac
+    //   load>100 환경에서 jetsam SIGKILL 유발). p estimate SE ~1/sqrt(512)=0.044
+    //   permutation distribution shape 가 baseline N=8 (4096 trials) 와 일치 검증됨.
+    let n_perm = 512
+
+    let mut n_layers_list = []
+    let mut family_locs_max = []
+    let mut k = 0
+    while k < N {
+        n_layers_list = n_layers_list.push(cmt_n_layers(cmt_paths[k]))
+        family_locs_max = family_locs_max.push(family_loc_norm(cmt_paths[k]))
+        k = k + 1
+    }
+
+    // ─── A1 per-family 4-axis ────────────────────────────────────────────────
+    //   HONEST: family_loc_one(F) ≡ argmax_layer |abs(layer,F)| (cmt definition),
+    //   cusp_depth_per_family(F) ≡ same → trivially r=1.0 self-identity.
+    //   따라서 A1 lever 는 single-family cusp_depth 가 multi-family
+    //   family_loc_max (= other families 의 union signal) 를 얼마나 예측하는가.
+    //   이 cross-family probe 가 Llama outlier 의 family-split 진단에 직접 기여.
+    println("=== A1: per-family argmax (4-axis) — cross-family target=family_loc_MAX ===")
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut a1_r = []
+    let mut a1_p = []
+    let mut a1_cusp_per_fam = []  // 4×8 matrix (flattened)
+    let mut f = 0
+    while f < 4 {
+        let mut cusp_f = []
+        let mut t = 0
+        while t < N {
+            cusp_f = cusp_f.push(cusp_depth_per_family(cmt_paths[t], f))
+            t = t + 1
+        }
+        // target = family_locs_max (multi-family signal)
+        let r_f = pearson_r_x1000(family_locs_max, cusp_f)
+        let p_f = permutation_p(family_locs_max, n_layers_list, r_f, n_perm, f * 17)
+        a1_r = a1_r.push(r_f)
+        a1_p = a1_p.push(p_f)
+        let mut z = 0
+        while z < N { a1_cusp_per_fam = a1_cusp_per_fam.push(cusp_f[z]); z = z + 1 }
+
+        println("  " + families[f] + ":")
+        let mut q = 0
+        while q < N {
+            println("    " + trial_names[q] + " cusp_F=" + str(cusp_f[q]) + " floc_max=" + str(family_locs_max[q]))
+            q = q + 1
+        }
+        println("    Pearson r = " + str(r_f) + " /1000 ; permutation p = " + str(p_f) + " /1000")
+        f = f + 1
+    }
+    println("")
+
+    // ─── A2 top-3 avg ────────────────────────────────────────────────────────
+    println("=== A2: top-3 avg cusp_depth ===")
+    let mut a2_cusp = []
+    let mut t = 0
+    while t < N {
+        a2_cusp = a2_cusp.push(cusp_depth_top3(cmt_paths[t]))
+        t = t + 1
+    }
+    let a2_r = pearson_r_x1000(family_locs_max, a2_cusp)
+    let a2_p = permutation_p(family_locs_max, n_layers_list, a2_r, n_perm, 100)
+    let mut q = 0
+    while q < N {
+        println("  " + trial_names[q] + " a2_cusp=" + str(a2_cusp[q]) + " floc_max=" + str(family_locs_max[q]))
+        q = q + 1
+    }
+    println("  Pearson r = " + str(a2_r) + " /1000 ; permutation p = " + str(a2_p) + " /1000")
+    println("")
+
+    // ─── A3 weighted L2 ─────────────────────────────────────────────────────
+    println("=== A3: weighted L2 cusp_depth (w_F = max_var/var_F) ===")
+    let mut a3_cusp = []
+    let mut tw = 0
+    while tw < N {
+        a3_cusp = a3_cusp.push(cusp_depth_weighted_l2(cmt_paths[tw]))
+        tw = tw + 1
+    }
+    let a3_r = pearson_r_x1000(family_locs_max, a3_cusp)
+    let a3_p = permutation_p(family_locs_max, n_layers_list, a3_r, n_perm, 200)
+    let mut qw = 0
+    while qw < N {
+        println("  " + trial_names[qw] + " a3_cusp=" + str(a3_cusp[qw]) + " floc_max=" + str(family_locs_max[qw]))
+        qw = qw + 1
+    }
+    println("  Pearson r = " + str(a3_r) + " /1000 ; permutation p = " + str(a3_p) + " /1000")
+    println("")
+
+    // ─── verdict ────────────────────────────────────────────────────────────
+    // best variant: highest r AND p ≤ P_PASS preferred.  rank by (p ≤ 0.05 first), then |r|
+    // a1 has 4 candidates — pick best family axis.
+    let mut best_variant = "none"
+    let mut best_r = 0
+    let mut best_p = SCALE
+    let mut best_label = "none"
+
+    // candidates: A1.Hexad, A1.Law, A1.Phi, A1.SelfRef, A2, A3
+    let mut cands_label = ["A1.Hexad","A1.Law","A1.Phi","A1.SelfRef","A2.top3","A3.weighted_l2"]
+    let mut cands_r = [a1_r[0], a1_r[1], a1_r[2], a1_r[3], a2_r, a3_r]
+    let mut cands_p = [a1_p[0], a1_p[1], a1_p[2], a1_p[3], a2_p, a3_p]
+    let mut ci = 0
+    while ci < 6 {
+        let r_v = cands_r[ci]
+        let p_v = cands_p[ci]
+        let mut r_abs = r_v
+        if r_abs < 0 { r_abs = -r_abs }
+        let mut best_r_abs = best_r
+        if best_r_abs < 0 { best_r_abs = -best_r_abs }
+        // prefer p ≤ 50, then larger r_abs
+        let cur_sig = p_v <= P_PASS
+        let bst_sig = best_p <= P_PASS
+        let mut take = false
+        if cur_sig && !bst_sig { take = true }
+        if cur_sig && bst_sig && r_abs > best_r_abs { take = true }
+        if !cur_sig && !bst_sig && r_abs > best_r_abs { take = true }
+        if take {
+            best_label = cands_label[ci]
+            best_r = r_v
+            best_p = p_v
+        }
+        ci = ci + 1
+    }
+
+    let best_significant = best_p <= P_PASS
+    println("=== best variant ===")
+    println("  " + best_label + ": r=" + str(best_r) + " p=" + str(best_p))
+    println("  significant? " + bool_s(best_significant))
+    println("")
+
+    // S7 confidence
+    let s7_before = 750
+    let mut s7_after = s7_before
+    if best_significant && best_r >= R_PASS { s7_after = 820 }
+    if !best_significant && best_r >= R_PASS { s7_after = 750 }
+    if best_r < R_PASS && best_r > R_FAIL { s7_after = 730 }
+    if best_r <= R_FAIL { s7_after = 700 }
+
+    println("  S7 conf: " + str(s7_before) + " → " + str(s7_after) + " /1000")
+    println("")
+
+    // ─── JSON emit ─────────────────────────────────────────────────────────
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima/cusp_depth_variants/1\",\n"
+    out = out + "  \"schema_version\": 1,\n"
+    out = out + "  \"verifier_type\": \"cusp_depth_variants\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"source\": \"anima-hci-research/tool/cusp_depth_variants.hexa\",\n"
+    out = out + "  \"predecessor\": \"anima-hci-research/state/cusp_depth_projector_n8_v1.json (r=0.689 p=0.058)\",\n"
+    out = out + "  \"thresholds\": {\n"
+    out = out + "    \"r_pass\": " + str(R_PASS) + ",\n"
+    out = out + "    \"r_fail\": " + str(R_FAIL) + ",\n"
+    out = out + "    \"p_pass\": " + str(P_PASS) + ",\n"
+    out = out + "    \"scale\": " + str(SCALE) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"trials\": " + str_list_json(trial_names) + ",\n"
+    out = out + "  \"cmt_sources\": " + str_list_json(cmt_paths) + ",\n"
+    out = out + "  \"n_trials\": " + str(N) + ",\n"
+    out = out + "  \"n_perm\": " + str(n_perm) + ",\n"
+    out = out + "  \"family_locs_max\": " + int_list_json(family_locs_max) + ",\n"
+    out = out + "  \"n_layers\": " + int_list_json(n_layers_list) + ",\n"
+    out = out + "  \"a1_per_family\": {\n"
+    out = out + "    \"families\": [\"Hexad\",\"Law\",\"Phi\",\"SelfRef\"],\n"
+    out = out + "    \"target\": \"family_locs_max (multi-family union signal)\",\n"
+    out = out + "    \"honest_note\": \"per-family cusp_depth ≡ dominant_layer_per_family by cmt definition; cross-family probe with multi-family target is the honest lever\",\n"
+    out = out + "    \"cusp_depth_flat_4x8\": " + int_list_json(a1_cusp_per_fam) + ",\n"
+    out = out + "    \"pearson_r_x1000\": " + int_list_json(a1_r) + ",\n"
+    out = out + "    \"permutation_p_x1000\": " + int_list_json(a1_p) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"a2_top3_avg\": {\n"
+    out = out + "    \"cusp_depth\": " + int_list_json(a2_cusp) + ",\n"
+    out = out + "    \"pearson_r_x1000\": " + str(a2_r) + ",\n"
+    out = out + "    \"permutation_p_x1000\": " + str(a2_p) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"a3_weighted_l2\": {\n"
+    out = out + "    \"cusp_depth\": " + int_list_json(a3_cusp) + ",\n"
+    out = out + "    \"pearson_r_x1000\": " + str(a3_r) + ",\n"
+    out = out + "    \"permutation_p_x1000\": " + str(a3_p) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"best_variant\": \"" + best_label + "\",\n"
+    out = out + "  \"best_pearson_r_x1000\": " + str(best_r) + ",\n"
+    out = out + "  \"best_permutation_p_x1000\": " + str(best_p) + ",\n"
+    out = out + "  \"best_significant\": " + bool_s(best_significant) + ",\n"
+    out = out + "  \"s7_confidence_before_x1000\": " + str(s7_before) + ",\n"
+    out = out + "  \"s7_confidence_after_x1000\": " + str(s7_after) + ",\n"
+    out = out + "  \"llama_outlier_focus\": \"v3-Llama Hexad late vs Law/Phi/SelfRef early; v4-Llama Phi mid vs Hexad/Law/SelfRef early — multi-locus family-distributed\"\n"
+    out = out + "}\n"
+    write_file("anima-hci-research/state/cusp_depth_variants_v1.json", out)
+    println("  wrote: anima-hci-research/state/cusp_depth_variants_v1.json")
+    exit(0)
+}

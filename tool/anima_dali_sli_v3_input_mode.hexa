@@ -1,0 +1,670 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  tool/anima_dali_sli_v3_input_mode.hexa
+//
+//  PURPOSE  (Mk.XII v2 §4 v2.1 update — input mode activation)
+//
+//    CONTEXT
+//      이전 cycle (#42 dali_sli_v2_redesign):
+//        ALL_MODES_PASS_GREEN, **late mode 만 evidence (1/3 coverage)**.
+//        eligible_modes=1 (late) / passing_modes=1.
+//        input mode (0..50) 와 early mode (51..500) 는 size<2 → NOT_ELIGIBLE.
+//      .roadmap progression:
+//        S7 N=12 small backbones (qwen25_15b + gemma2_2b) input mode 산출.
+//        S7 N=11 추가 (llama32_1b) → input mode 3 datapoint 확보.
+//      이번 cycle 목표:
+//        4-bb late + 3-bb input → mode coverage 1/3 → 2/3 (input + late) 활성화.
+//        N=7 backbone (large 4 + small 3). 임무 명세 N=11 의 의도: 8 (large+small
+//        통합 후보 풀) + 3 (input 활성). raw#10 honest: 가용 cmt.json 정확히
+//        7 (large-4: Mistral/Qwen3/Llama-8B/gemma2-9b + small-3: qwen25_15b/
+//        gemma2_2b/llama32_1b). 임무 명세의 N=11 은 가설적 상한이며 본 cycle 은
+//        7-bb actual 로 진행 후 mode coverage 2/3 검증.
+//
+//    REDESIGN HYPOTHESIS (v3)
+//      v2 metric architecture (intra-DALI / intra-SLI / intra-COUPLED) 그대로 유지.
+//      변경점: backbone pool 확장 (4→7) → input mode size 0 → 3.
+//      DALI v3 (intra-input):
+//        small backbone family_loc 0..50 normalized → mode 0.
+//        intra_dali = SCALE - max_pair |L_loc(b1)-L_loc(b2)|. small bbs 모두
+//        family_loc=0 이면 intra_dali=1000 (perfect locus invariance).
+//      SLI v3 (intra-input):
+//        cusp_depth 동일하게 layer 0 → norm=0. intra_sli CV 측정.
+//      COUPLED v3:
+//        isqrt(intra_dali * intra_sli).
+//
+//    Mk.XII §4 v2.1 update impact
+//      v2 ELIGIBLE (1/3 coverage, late only) → v3 ELIGIBLE (2/3 coverage,
+//      input + late). early mode 는 여전히 size<2 (Qwen3 family_loc=111 단독,
+//      Llama-8B cusp_depth=125 단독) → 3/3 coverage 는 후속 cycle.
+//
+//  RAW#9
+//    pure hexa · deterministic · cmt.json read-only · no Python · no destructive
+//    integer fixed-point ×1000 · byte-identical re-run (mod timestamp).
+//    참고: anima_cmt.hexa 가 이미 raw#9 + raw#37 transient emit 으로 cmt.json
+//    생성. 본 tool 은 cmt.json 7 file read-only consume, hexa-only 측정.
+//
+//  POSITIVE SELFTEST
+//    7 backbone real cmt.json reuse:
+//      Mistral (n=32, peak=28, fl=875, cd=875)         — late
+//      Qwen3   (n=36, peak=4,  fl=111, cd=111)         — early
+//      Llama-8B(n=32, peak=4,  fl=625, cd=125)         — fl:late, cd:early
+//      gemma2-9b(n=42,peak=36, fl=857, cd=857)         — late
+//      qwen25-1.5B(n=28,peak=0,fl=0,   cd=0)           — input
+//      gemma2-2B  (n=26,peak=0,fl=0,   cd=0)           — input
+//      Llama-3.2-1B(n=16,peak=0,fl=0,  cd=0)           — input
+//    mode 그룹화:
+//      mode 0 (input  0..50)   : [qwen25_15b, gemma2_2b, llama32_1b] (size 3)
+//      mode 1 (early 51..500)  : fl=[Qwen3] cd=[Qwen3, Llama-8B]    (fl_size 1)
+//      mode 2 (late 501..1000) : fl=[Mistral, Llama-8B, gemma2-9b]  cd=[Mistral, gemma2-9b] (size 3/2)
+//
+//  NEGATIVE FALSIFY
+//    intra-mode jitter (input mode 표적: small backbone +400 → mode 1 으로 강제).
+//    기대: mode 0 size 가 3→2 로 감소하지만 intra_dali 도 fail (단일 outlier 가
+//    other size-2 와 멀어짐). 추가 trial: late jitter (기존 v2 패턴).
+//
+//  OUTPUT
+//    anima-clm-eeg/state/dali_sli_v3_input_mode_v1.json
+// ════════════════════════════════════════════════════════════════════════════
+
+let SCALE = 1000
+
+// mode boundaries (×1000 normalized layer position)
+let MODE0_HI = 50
+let MODE1_HI = 500
+
+// intra-mode gates (×1000)
+let INTRA_DALI_PASS = 700
+let INTRA_SLI_PASS  = 600
+let INTRA_COUPLED_PASS = 600
+
+let MODE_WEIGHTED_GATE = 500
+let MODE_MIN_SIZE = 2
+let NEG_FAIL_GATE = 500
+
+fn bool_s(b: bool) -> string { if b { return "true" } else { return "false" } }
+fn now_stamp() -> string { return exec("date +%Y-%m-%dT%H:%M:%S").trim() }
+
+fn str_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + xs[i] + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+fn int_list_json(xs: list) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(xs) {
+        if i > 0 { s = s + "," }
+        s = s + str(xs[i])
+        i = i + 1
+    }
+    return s + "]"
+}
+
+fn f1000(x) -> int {
+    let scaled = x * SCALE
+    let t = int(scaled)
+    if t < 0 { return 0 }
+    return t
+}
+
+fn isqrt(v: int) -> int {
+    if v <= 0 { return 0 }
+    let mut x = v
+    let mut prev = 0
+    let mut iter = 0
+    while iter < 32 {
+        prev = x
+        x = (x + v / x) / 2
+        if x == prev { iter = 32 }
+        iter = iter + 1
+    }
+    return x
+}
+
+fn abs_int(v: int) -> int {
+    if v < 0 { return -v }
+    return v
+}
+
+// ─── parse cmt.json ───────────────────────────────────────────────────────
+fn read_cusp_depth(cmt_path: string) -> list {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let tomo = cmt["tomography"]
+    let layer_keys = keys(tomo)
+
+    let mut layer_ints = []
+    let mut i = 0
+    while i < len(layer_keys) {
+        layer_ints = layer_ints.push(int(layer_keys[i]))
+        i = i + 1
+    }
+    let mut sorted = []
+    let mut a = 0
+    while a < len(layer_ints) {
+        let v = layer_ints[a]
+        let mut placed = false
+        let mut new_sorted = []
+        let mut b = 0
+        while b < len(sorted) {
+            if !placed && v < sorted[b] {
+                new_sorted = new_sorted.push(v)
+                placed = true
+            }
+            new_sorted = new_sorted.push(sorted[b])
+            b = b + 1
+        }
+        if !placed { new_sorted = new_sorted.push(v) }
+        sorted = new_sorted
+        a = a + 1
+    }
+
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut best_layer = sorted[0]
+    let mut best_l2 = -1
+    let mut s = 0
+    while s < len(sorted) {
+        let layer_key = str(sorted[s])
+        let layer_obj = tomo[layer_key]
+        let mut sum_sq = 0
+        let mut f = 0
+        while f < 4 {
+            let fam_obj = layer_obj[families[f]]
+            let abs_v = fam_obj["abs"]
+            let av = f1000(abs_v)
+            sum_sq = sum_sq + av * av
+            f = f + 1
+        }
+        let l2 = isqrt(sum_sq)
+        if l2 > best_l2 {
+            best_l2 = l2
+            best_layer = sorted[s]
+        }
+        s = s + 1
+    }
+    let cusp_x1000 = (best_layer * SCALE) / n_layers
+    let mut out = []
+    out = out.push(n_layers)
+    out = out.push(best_layer)
+    out = out.push(cusp_x1000)
+    return out
+}
+
+fn family_loc_norm(cmt_path: string) -> int {
+    let raw = read_file(cmt_path)
+    let cmt = json_parse(raw)
+    let n_layers = cmt["n_layers"]
+    let dom = cmt["dominant_layer_per_family"]
+    let families = ["Hexad", "Law", "Phi", "SelfRef"]
+    let mut best = 0
+    let mut i = 0
+    while i < 4 {
+        let entry = dom[families[i]]
+        let lay = entry["layer"]
+        let norm = (lay * SCALE) / n_layers
+        if norm > best { best = norm }
+        i = i + 1
+    }
+    return best
+}
+
+// ─── mode classifier ──────────────────────────────────────────────────────
+fn classify_mode(norm: int) -> int {
+    if norm <= MODE0_HI { return 0 }
+    if norm <= MODE1_HI { return 1 }
+    return 2
+}
+
+fn mode_label(m: int) -> string {
+    if m == 0 { return "input" }
+    if m == 1 { return "early" }
+    return "late"
+}
+
+fn subset_by_mode(values: list, modes: list, target_mode: int) -> list {
+    let mut out = []
+    let mut i = 0
+    while i < len(values) {
+        if modes[i] == target_mode {
+            out = out.push(values[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn subset_names_by_mode(names: list, modes: list, target_mode: int) -> list {
+    let mut out = []
+    let mut i = 0
+    while i < len(names) {
+        if modes[i] == target_mode {
+            out = out.push(names[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// intra-mode DALI: pair-wise within mode (family_loc)
+fn intra_dali_min(family_locs_subset: list) -> int {
+    let n = len(family_locs_subset)
+    if n < 2 { return SCALE }
+    let mut min_dali = SCALE
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            let d = abs_int(family_locs_subset[i] - family_locs_subset[j])
+            let dali = SCALE - d
+            if dali < min_dali { min_dali = dali }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return min_dali
+}
+
+fn list_mean(xs: list) -> int {
+    let n = len(xs)
+    if n == 0 { return 0 }
+    let mut s = 0
+    let mut i = 0
+    while i < n { s = s + xs[i]; i = i + 1 }
+    return s / n
+}
+
+// intra-mode SLI: cusp_depth CV within mode
+//   Special case: mean=0 (모든 cusp_depth=0, input mode small bbs) → CV undefined.
+//   v3 정의: mean=0 AND std=0 → SLI=SCALE (perfect coherence, layer 0 collapse).
+//                mean=0 AND std>0 → SLI=0 (impossible if all 0, sentinel).
+fn intra_sli(cusp_subset: list) -> int {
+    let n = len(cusp_subset)
+    if n < 2 { return SCALE }
+    let m = list_mean(cusp_subset)
+    let mut sum_sq_dev = 0
+    let mut i = 0
+    while i < n {
+        let dv = cusp_subset[i] - m
+        sum_sq_dev = sum_sq_dev + dv * dv
+        i = i + 1
+    }
+    let var = sum_sq_dev / n
+    let std = isqrt(var)
+    if m == 0 {
+        if std == 0 { return SCALE }
+        return 0
+    }
+    let cv_x1000 = (std * SCALE) / m
+    let mut sli = SCALE - cv_x1000
+    if sli < 0 { sli = 0 }
+    if sli > SCALE { sli = SCALE }
+    return sli
+}
+
+fn coupled_metric(d: int, s: int) -> int {
+    if d <= 0 || s <= 0 { return 0 }
+    let prod = d * s
+    return isqrt(prod)
+}
+
+fn weighted_score(d: int, s: int, c: int) -> int {
+    return (400 * d + 400 * s + 200 * c) / SCALE
+}
+
+fn eval_mode(family_locs: list, cusp_depths: list, modes_fl: list, modes_cd: list, target_mode: int) -> list {
+    let fl_sub = subset_by_mode(family_locs, modes_fl, target_mode)
+    let cd_sub = subset_by_mode(cusp_depths, modes_cd, target_mode)
+    let size_fl = len(fl_sub)
+    let size_cd = len(cd_sub)
+    let eligible = (size_fl >= MODE_MIN_SIZE) && (size_cd >= MODE_MIN_SIZE)
+    let mut intra_d = SCALE
+    let mut intra_s = SCALE
+    if eligible {
+        intra_d = intra_dali_min(fl_sub)
+        intra_s = intra_sli(cd_sub)
+    }
+    let intra_c = coupled_metric(intra_d, intra_s)
+    let ws = weighted_score(intra_d, intra_s, intra_c)
+    let mut pass_flag = 0
+    if eligible {
+        let d_ok = intra_d >= INTRA_DALI_PASS
+        let s_ok = intra_s >= INTRA_SLI_PASS
+        let c_ok = intra_c >= INTRA_COUPLED_PASS
+        if d_ok && s_ok && c_ok { pass_flag = 1 }
+    }
+    let mut out = []
+    out = out.push(size_fl)
+    out = out.push(size_cd)
+    out = out.push(intra_d)
+    out = out.push(intra_s)
+    out = out.push(intra_c)
+    out = out.push(ws)
+    out = out.push(pass_flag)
+    let mut elig = 0
+    if eligible { elig = 1 }
+    out = out.push(elig)
+    return out
+}
+
+fn classify_overall(elig_count: int, pass_count: int) -> string {
+    if elig_count == 0 { return "NO_ELIGIBLE_MODE" }
+    if pass_count == elig_count { return "ALL_MODES_PASS_GREEN" }
+    if pass_count > 0 { return "PARTIAL_AMBER" }
+    return "ALL_MODES_FAIL_RED"
+}
+
+fn outlier_jitter(target_idx: int, base: list, amount: int) -> list {
+    let mut out = []
+    let mut i = 0
+    while i < len(base) {
+        if i == target_idx {
+            let mut v = base[i] + amount
+            if v < 0 { v = 0 }
+            if v > SCALE { v = SCALE }
+            out = out.push(v)
+        } else {
+            out = out.push(base[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    println("[anima_dali_sli_v3_input_mode] Mk.XII v2 §4 v2.1 input mode activation")
+    println("  hypothesis: mode coverage 1/3 (late only) -> 2/3 (input + late)")
+    println("  intra DALI gate >=" + str(INTRA_DALI_PASS) + " · intra SLI gate >=" + str(INTRA_SLI_PASS) + " · COUPLED >=" + str(INTRA_COUPLED_PASS))
+    println("  mode_min_size=" + str(MODE_MIN_SIZE))
+    println("")
+
+    let backbone_names = [
+        "Mistral", "Qwen3", "Llama-8B", "gemma2-9b",
+        "qwen25-1.5B", "gemma2-2B", "Llama-3.2-1B"
+    ]
+    let cmt_paths = [
+        "state/v10_benchmark_v4/mistral/cmt.json",
+        "state/v10_benchmark_v4/qwen3/cmt.json",
+        "state/v10_benchmark_v4/llama/cmt.json",
+        "state/v10_benchmark_v4/gemma/cmt.json",
+        "state/s7_n12_4bb/qwen25_15b/cmt.json",
+        "state/s7_n12_4bb/gemma2_2b/cmt.json",
+        "state/s7_n11_4bb/llama32_1b/cmt.json"
+    ]
+    let n_bb = 7
+
+    // ─── 1. ingest cmt.json ────────────────────────────────────────────────
+    let mut cusp_depths = []
+    let mut family_locs = []
+    let mut n_layers_list = []
+    let mut peak_layers = []
+    let mut n = 0
+    while n < n_bb {
+        let cd = read_cusp_depth(cmt_paths[n])
+        n_layers_list = n_layers_list.push(cd[0])
+        peak_layers = peak_layers.push(cd[1])
+        cusp_depths = cusp_depths.push(cd[2])
+        family_locs = family_locs.push(family_loc_norm(cmt_paths[n]))
+        n = n + 1
+    }
+
+    // ─── 2. mode classification ─────────────────────────────────────────────
+    let mut modes_fl = []
+    let mut modes_cd = []
+    let mut k = 0
+    while k < n_bb {
+        modes_fl = modes_fl.push(classify_mode(family_locs[k]))
+        modes_cd = modes_cd.push(classify_mode(cusp_depths[k]))
+        k = k + 1
+    }
+
+    println("=== positive (7 real cmt.json) — mode classification ===")
+    let mut ki = 0
+    while ki < n_bb {
+        let line = "  " + backbone_names[ki]
+                 + ": family_loc=" + str(family_locs[ki]) + " mode_fl=" + mode_label(modes_fl[ki])
+                 + " | cusp_depth=" + str(cusp_depths[ki]) + " mode_cd=" + mode_label(modes_cd[ki])
+        println(line)
+        ki = ki + 1
+    }
+    println("")
+
+    // ─── 3. evaluate each of 3 modes ─────────────────────────────────────────
+    let mode_labels = ["input", "early", "late"]
+    let mut mode_results = []
+    let mut elig_count = 0
+    let mut pass_count = 0
+    let mut m = 0
+    while m < 3 {
+        let r = eval_mode(family_locs, cusp_depths, modes_fl, modes_cd, m)
+        mode_results = mode_results.push(r)
+        if r[7] == 1 { elig_count = elig_count + 1 }
+        if r[6] == 1 { pass_count = pass_count + 1 }
+        let names_fl = subset_names_by_mode(backbone_names, modes_fl, m)
+        let names_cd = subset_names_by_mode(backbone_names, modes_cd, m)
+        println("=== mode " + str(m) + " (" + mode_labels[m] + ") ===")
+        println("  fl_size=" + str(r[0]) + " names_fl=" + str_list_json(names_fl))
+        println("  cd_size=" + str(r[1]) + " names_cd=" + str_list_json(names_cd))
+        println("  intra_dali=" + str(r[2]) + " intra_sli=" + str(r[3]) + " intra_coupled=" + str(r[4]))
+        println("  weighted_score=" + str(r[5]) + " intra_pass=" + bool_s(r[6] == 1) + " eligible=" + bool_s(r[7] == 1))
+        m = m + 1
+    }
+    println("")
+
+    let overall = classify_overall(elig_count, pass_count)
+    let positive_pass = (overall == "ALL_MODES_PASS_GREEN")
+    let mode_coverage_num = elig_count
+    let mode_coverage_den = 3
+
+    println("=== overall positive verdict ===")
+    println("  eligible_modes=" + str(elig_count) + " passing_modes=" + str(pass_count))
+    println("  mode_coverage=" + str(mode_coverage_num) + "/" + str(mode_coverage_den))
+    println("  verdict=" + overall)
+    println("")
+
+    // ─── 4. negative falsify: jitter intra-mode backbone (input + late stress) ─
+    let n_neg_trials = n_bb
+    let neg_jitter_amount = 400
+    let mut neg_fail_count = 0
+    let mut neg_first_overall = ""
+    let mut neg_results_list = []
+    let mut neg_valid_count = 0
+
+    let mut nt = 0
+    while nt < n_neg_trials {
+        let base_mode_fl = modes_fl[nt]
+        let base_mode_cd = modes_cd[nt]
+        let base_fl_subset = subset_by_mode(family_locs, modes_fl, base_mode_fl)
+        let base_cd_subset = subset_by_mode(cusp_depths, modes_cd, base_mode_cd)
+        let base_eligible = (len(base_fl_subset) >= MODE_MIN_SIZE) && (len(base_cd_subset) >= MODE_MIN_SIZE)
+
+        let neg_fl = outlier_jitter(nt, family_locs, neg_jitter_amount)
+        let neg_cd = outlier_jitter(nt, cusp_depths, neg_jitter_amount)
+        let mut neg_modes_fl = []
+        let mut neg_modes_cd = []
+        let mut nki = 0
+        while nki < n_bb {
+            neg_modes_fl = neg_modes_fl.push(classify_mode(neg_fl[nki]))
+            neg_modes_cd = neg_modes_cd.push(classify_mode(neg_cd[nki]))
+            nki = nki + 1
+        }
+        let mut n_elig = 0
+        let mut n_pass = 0
+        let mut nm = 0
+        while nm < 3 {
+            let nr = eval_mode(neg_fl, neg_cd, neg_modes_fl, neg_modes_cd, nm)
+            if nr[7] == 1 { n_elig = n_elig + 1 }
+            if nr[6] == 1 { n_pass = n_pass + 1 }
+            nm = nm + 1
+        }
+        let n_overall = classify_overall(n_elig, n_pass)
+        if nt == 0 { neg_first_overall = n_overall }
+        if base_eligible {
+            neg_valid_count = neg_valid_count + 1
+            if n_overall != "ALL_MODES_PASS_GREEN" { neg_fail_count = neg_fail_count + 1 }
+        }
+        let mut tag = ""
+        if base_eligible { tag = "[valid] " } else { tag = "[trivial] " }
+        neg_results_list = neg_results_list.push(tag + n_overall)
+        nt = nt + 1
+    }
+    let mut neg_fail_rate = 0
+    if neg_valid_count > 0 { neg_fail_rate = (neg_fail_count * SCALE) / neg_valid_count }
+    let neg_detects = neg_valid_count > 0 && neg_fail_rate >= NEG_FAIL_GATE
+
+    println("=== negative falsify (intra-mode jitter ±" + str(neg_jitter_amount) + ", N=" + str(n_neg_trials) + ") ===")
+    let mut nri = 0
+    while nri < len(neg_results_list) {
+        println("  jitter=" + backbone_names[nri] + " → " + neg_results_list[nri])
+        nri = nri + 1
+    }
+    println("  valid_trials=" + str(neg_valid_count) + " FAIL count=" + str(neg_fail_count) + " rate=" + str(neg_fail_rate) + "/1000")
+    println("  jitter discriminates (FAIL rate >= " + str(NEG_FAIL_GATE) + "): " + bool_s(neg_detects))
+    println("")
+
+    // ─── 5. byte-identical re-run check (deterministic gate) ─────────────────
+    //   intra_dali / intra_sli / intra_coupled / weighted_score are deterministic
+    //   integer functions of cmt.json content. Re-execute mode evaluators twice
+    //   and compare bytewise (per-mode tuple equality).
+    let mut byte_ident = true
+    let mut bi = 0
+    while bi < 3 {
+        let r1 = eval_mode(family_locs, cusp_depths, modes_fl, modes_cd, bi)
+        let r2 = eval_mode(family_locs, cusp_depths, modes_fl, modes_cd, bi)
+        let mut z = 0
+        while z < len(r1) {
+            if r1[z] != r2[z] { byte_ident = false }
+            z = z + 1
+        }
+        bi = bi + 1
+    }
+    println("  byte_identical_rerun=" + bool_s(byte_ident))
+    println("")
+
+    // ─── 6. Mk.XII §4 v2.1 chain integration eligibility ─────────────────────
+    let mut elig_class = "NOT_ELIGIBLE"
+    if positive_pass && neg_detects { elig_class = "ELIGIBLE" }
+    if !positive_pass && pass_count > 0 && neg_detects { elig_class = "PARTIAL_ELIGIBLE" }
+
+    let coverage_2_3 = (elig_count >= 2)
+    let coverage_3_3 = (elig_count >= 3)
+
+    println("=== Mk.XII §4 v2.1 chain integration eligibility ===")
+    println("  positive ALL_PASS: " + bool_s(positive_pass))
+    println("  partial mode pass: " + bool_s(pass_count > 0 && pass_count < elig_count))
+    println("  negative discriminates: " + bool_s(neg_detects))
+    println("  mode_coverage_>=2/3: " + bool_s(coverage_2_3))
+    println("  mode_coverage_3/3: " + bool_s(coverage_3_3))
+    println("  eligibility_class: " + elig_class)
+    println("")
+
+    // ─── 7. JSON emit ────────────────────────────────────────────────────────
+    let mut out = "{\n"
+    out = out + "  \"schema\": \"anima/dali_sli_v3_input_mode/1\",\n"
+    out = out + "  \"schema_version\": 1,\n"
+    out = out + "  \"verifier_type\": \"dali_sli_v3_input_mode\",\n"
+    out = out + "  \"version\": \"v1\",\n"
+    out = out + "  \"generated\": \"" + now_stamp() + "\",\n"
+    out = out + "  \"source\": \"tool/anima_dali_sli_v3_input_mode.hexa\",\n"
+    out = out + "  \"design\": {\n"
+    out = out + "    \"hypothesis\": \"input mode activation via 3 small backbone datapoint (qwen25-1.5B + gemma2-2B + Llama-3.2-1B) → mode coverage 1/3 (late) → 2/3 (input+late)\",\n"
+    out = out + "    \"mode_boundaries\": \"input=[0," + str(MODE0_HI) + "] early=[" + str(MODE0_HI+1) + "," + str(MODE1_HI) + "] late=[" + str(MODE1_HI+1) + "," + str(SCALE) + "]\",\n"
+    out = out + "    \"intra_dali_formula\": \"min over intra-mode pairs of SCALE - |L_loc(b1)-L_loc(b2)|\",\n"
+    out = out + "    \"intra_sli_formula\": \"SCALE - (std(cusp_depth)*SCALE / mean(cusp_depth)) over intra-mode subset; mean=0 AND std=0 → SCALE; mean=0 AND std>0 → 0\",\n"
+    out = out + "    \"intra_coupled_formula\": \"isqrt(intra_dali * intra_sli)\",\n"
+    out = out + "    \"weighted_score_formula\": \"(400*intra_dali + 400*intra_sli + 200*intra_coupled) / 1000\",\n"
+    out = out + "    \"per_mode_pass\": \"intra_dali>=" + str(INTRA_DALI_PASS) + " AND intra_sli>=" + str(INTRA_SLI_PASS) + " AND intra_coupled>=" + str(INTRA_COUPLED_PASS) + "\",\n"
+    out = out + "    \"mode_min_size\": " + str(MODE_MIN_SIZE) + ",\n"
+    out = out + "    \"overall_classification\": \"ALL_MODES_PASS_GREEN | PARTIAL_AMBER | ALL_MODES_FAIL_RED | NO_ELIGIBLE_MODE\",\n"
+    out = out + "    \"raw10_actual_n\": 7,\n"
+    out = out + "    \"raw10_mission_spec_n\": 11,\n"
+    out = out + "    \"raw10_n_gap_note\": \"임무 N=11 = 가설적 상한 (large 4 + small 3 + 추가 candidate 4). 가용 cmt.json 정확히 7. 본 cycle 7-bb actual.\"\n"
+    out = out + "  },\n"
+    out = out + "  \"thresholds\": {\n"
+    out = out + "    \"intra_dali_pass\": " + str(INTRA_DALI_PASS) + ",\n"
+    out = out + "    \"intra_sli_pass\": " + str(INTRA_SLI_PASS) + ",\n"
+    out = out + "    \"intra_coupled_pass\": " + str(INTRA_COUPLED_PASS) + ",\n"
+    out = out + "    \"mode_weighted_gate\": " + str(MODE_WEIGHTED_GATE) + ",\n"
+    out = out + "    \"mode_min_size\": " + str(MODE_MIN_SIZE) + ",\n"
+    out = out + "    \"neg_fail_gate_x1000\": " + str(NEG_FAIL_GATE) + ",\n"
+    out = out + "    \"scale\": " + str(SCALE) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"backbones\": " + str_list_json(backbone_names) + ",\n"
+    out = out + "  \"cmt_sources\": " + str_list_json(cmt_paths) + ",\n"
+    out = out + "  \"n_backbones_actual\": " + str(n_bb) + ",\n"
+    out = out + "  \"positive\": {\n"
+    out = out + "    \"n_layers\": " + int_list_json(n_layers_list) + ",\n"
+    out = out + "    \"peak_layers\": " + int_list_json(peak_layers) + ",\n"
+    out = out + "    \"cusp_depth_x1000\": " + int_list_json(cusp_depths) + ",\n"
+    out = out + "    \"family_loc_x1000\": " + int_list_json(family_locs) + ",\n"
+    out = out + "    \"modes_family_loc\": " + int_list_json(modes_fl) + ",\n"
+    out = out + "    \"modes_cusp_depth\": " + int_list_json(modes_cd) + ",\n"
+    out = out + "    \"per_mode\": [\n"
+    let mut mi = 0
+    while mi < 3 {
+        let r = mode_results[mi]
+        let names_fl = subset_names_by_mode(backbone_names, modes_fl, mi)
+        let names_cd = subset_names_by_mode(backbone_names, modes_cd, mi)
+        out = out + "      {\n"
+        out = out + "        \"mode\": " + str(mi) + ",\n"
+        out = out + "        \"label\": \"" + mode_labels[mi] + "\",\n"
+        out = out + "        \"fl_size\": " + str(r[0]) + ",\n"
+        out = out + "        \"cd_size\": " + str(r[1]) + ",\n"
+        out = out + "        \"names_fl\": " + str_list_json(names_fl) + ",\n"
+        out = out + "        \"names_cd\": " + str_list_json(names_cd) + ",\n"
+        out = out + "        \"intra_dali_x1000\": " + str(r[2]) + ",\n"
+        out = out + "        \"intra_sli_x1000\": " + str(r[3]) + ",\n"
+        out = out + "        \"intra_coupled_x1000\": " + str(r[4]) + ",\n"
+        out = out + "        \"weighted_score_x1000\": " + str(r[5]) + ",\n"
+        out = out + "        \"intra_pass\": " + bool_s(r[6] == 1) + ",\n"
+        out = out + "        \"eligible\": " + bool_s(r[7] == 1) + "\n"
+        out = out + "      }"
+        if mi < 2 { out = out + "," }
+        out = out + "\n"
+        mi = mi + 1
+    }
+    out = out + "    ],\n"
+    out = out + "    \"eligible_modes\": " + str(elig_count) + ",\n"
+    out = out + "    \"passing_modes\": " + str(pass_count) + ",\n"
+    out = out + "    \"mode_coverage\": \"" + str(mode_coverage_num) + "/" + str(mode_coverage_den) + "\",\n"
+    out = out + "    \"overall_verdict\": \"" + overall + "\",\n"
+    out = out + "    \"positive_pass\": " + bool_s(positive_pass) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"negative\": {\n"
+    out = out + "    \"strategy\": \"intra-mode jitter ±" + str(neg_jitter_amount) + " (family_loc + cusp_depth) per backbone — stresses input + late intra-DALI/SLI\",\n"
+    out = out + "    \"n_trials\": " + str(n_neg_trials) + ",\n"
+    out = out + "    \"valid_trials\": " + str(neg_valid_count) + ",\n"
+    out = out + "    \"per_trial_outcomes\": " + str_list_json(neg_results_list) + ",\n"
+    out = out + "    \"first_trial_overall\": \"" + neg_first_overall + "\",\n"
+    out = out + "    \"fail_count\": " + str(neg_fail_count) + ",\n"
+    out = out + "    \"fail_rate_x1000\": " + str(neg_fail_rate) + ",\n"
+    out = out + "    \"detects_outlier\": " + bool_s(neg_detects) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"byte_identical\": {\n"
+    out = out + "    \"per_mode_double_eval_match\": " + bool_s(byte_ident) + ",\n"
+    out = out + "    \"note\": \"deterministic integer-fixed-point: bit-exact across re-runs (mod timestamp).\"\n"
+    out = out + "  },\n"
+    out = out + "  \"mk_xii_v2_1_eligibility\": {\n"
+    out = out + "    \"positive_all_modes_pass\": " + bool_s(positive_pass) + ",\n"
+    out = out + "    \"partial_mode_pass\": " + bool_s(pass_count > 0 && pass_count < elig_count) + ",\n"
+    out = out + "    \"negative_discriminates\": " + bool_s(neg_detects) + ",\n"
+    out = out + "    \"mode_coverage_2_of_3\": " + bool_s(coverage_2_3) + ",\n"
+    out = out + "    \"mode_coverage_3_of_3\": " + bool_s(coverage_3_3) + ",\n"
+    out = out + "    \"eligibility_class\": \"" + elig_class + "\",\n"
+    out = out + "    \"v2_to_v3_progression\": \"v2: 1/3 (late only) → v3: " + str(mode_coverage_num) + "/3\"\n"
+    out = out + "  },\n"
+    out = out + "  \"raw10_honest\": \"7-bb actual (large 4 v4 + small 3 input). 임무 N=11 명세는 가설적 상한 — 가용 cmt.json 7개로 진행. input mode CV=0 case 는 mean=0 AND std=0 collapse 처리 (SLI=SCALE perfect coherence). early mode 는 여전히 fl_size=1 (Qwen3 단독) → eligible 진입 못함. 3/3 coverage 는 후속 cycle (early datapoint 추가 필요).\",\n"
+    out = out + "  \"cross_validate\": \".roadmap #145 (CMT backbone-conditional depth divergence) / state/dali_sli_coupled_v1.json (prior JOINT_FAIL) / state/dali_sli_weighted_vote_v1.json (prior NOT_ELIGIBLE) / anima-clm-eeg/state/dali_sli_v2_redesign_v1.json (prior 1/3 ALL_MODES_PASS_GREEN late only)\"\n"
+    out = out + "}\n"
+    write_file("anima-clm-eeg/state/dali_sli_v3_input_mode_v1.json", out)
+    println("  wrote: anima-clm-eeg/state/dali_sli_v3_input_mode_v1.json")
+
+    let mk_xii_eligible = positive_pass && neg_detects && coverage_2_3
+    if mk_xii_eligible { exit(0) }
+    exit(1)
+}

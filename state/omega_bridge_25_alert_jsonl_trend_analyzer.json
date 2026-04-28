@@ -1,0 +1,218 @@
+{
+  "cycle": "omega_bridge_25",
+  "axis": "bridge / JSONL alert trend analyzer — schema-evolution-tolerant counterpart to bridge-22 over the JSONL sibling",
+  "timestamp": "2026-04-26T14:19:45Z",
+  "user_email": "mk911tb@proton.me",
+  "title": "tool/atlas_alert_jsonl_trend.hexa — read-only trend analyzer over state/atlas_alert_history.jsonl with extra_field_distribution + scope_distribution",
+  "summary": "ω-bridge-22 (commit 7d8fc8fa) shipped tool/atlas_alert_trend.hexa over the TSV history. ω-bridge-23 (commit 8e145470) added a JSONL sibling at state/atlas_alert_history.jsonl with the same per-rule rows under a `scope` discriminator. This cycle adds tool/atlas_alert_jsonl_trend.hexa — a sweeper-safe .hexa analyzer that consumes the JSONL sibling for downstream tooling that prefers JSON over TSV, with two JSONL-only conveniences enabled by the richer payload format: (7) extra_field_distribution — per-rule histogram of the `extra` field values (e.g. consecutive_warn fires K=2 mostly, but K=5 spikes weekly); and (8) scope_distribution — count rows by scope (forward-compat for future cycles emitting other scopes into the same JSONL beyond atlas_alert). Schema-evolution tolerance: rows with ADDITIONAL fields beyond the documented schema are accepted; rows MISSING expected fields default safely (rule='unknown', etc). Sentinel: __ALERT_JSONL_TREND__ <PASS|INSUFFICIENT|EMPTY|SKIP> total=N last_window=W top_rule=R fire_rate_per_hour=X. CLI: --history PATH / --window-hours H / --filter-scope NAME / --json / --quiet / --help. 8 fixture cases validated.",
+  "context": {
+    "predecessors": {
+      "omega_bridge_17": "built tool/atlas_alert_subscriber.hexa — emits __ATLAS_ALERT__ FIRED sentinels for warn_ratio + insufficient_ratio rules",
+      "omega_bridge_19": "added consecutive_warn (streak) and recent_warn_ratio (time window) rules with rule-specific extra= fields (streak=K / window_minutes=M)",
+      "omega_bridge_21": "extended subscriber to persist FIRED outcomes to state/atlas_alert_history.tsv (TAB-separated, append-only, 7-column schema)",
+      "omega_bridge_22": "tool/atlas_alert_trend.hexa — analyzer over the TSV history with 6 metrics (alert_count_total, alert_count_last_window, per_rule_count, mtba_per_rule, top_rule_in_window, fire_rate_per_hour); commit 7d8fc8fa",
+      "omega_bridge_23_24": "(commit 8e145470) — Part A added JSONL sibling state/atlas_alert_history.jsonl with `scope=atlas_alert` discriminator and rule-specific extra= fields preserved per row; Part B added per-rule cooldown dedup (orthogonal to bridge-25)"
+    },
+    "problem": "The JSONL sibling exists for downstream consumers that prefer one-object-per-line JSON over TSV (richer payloads, easier schema evolution, friendlier to jq / Python / shell-line pipelines), but no tool reasons over the JSONL. ω-bridge-22's analyzer is hardcoded to TSV and split('\\t'); reusing it would require a TSV-shaped projection (loss of fidelity on extra= field structure). Worse, the TSV analyzer would break the moment a future cycle adds an 8th column or a new rule field — the JSONL format was specifically chosen to absorb this kind of evolution without parser breakage.",
+    "design_alternatives_considered": [
+      {
+        "option": "A — extend tool/atlas_alert_trend.hexa with a --jsonl flag",
+        "rejected_because": "the two parsers share little code (TSV split is field-positional; JSONL parse is keyed) and the verdict surface mostly overlaps but the metrics extra_field_distribution + scope_distribution are JSONL-specific. Mixing them in one tool means a TSV regression could break JSONL or vice versa, and the sentinel name would have to be conditional. Producer/consumer split honored by ω-bridge-22 deserves the same split here."
+      },
+      {
+        "option": "B — separate sweeper-safe .hexa tool over the JSONL with its own sentinel (CHOSEN)",
+        "chosen_because": "matches the bridge-22 precedent exactly (read-only consumer, single-purpose, sweeper-safe, distinct sentinel surface __ALERT_JSONL_TREND__). Lets the two analyzers evolve independently — bridge-22 stays simple over TSV, bridge-25 owns the schema-evolution surface for JSONL. Adds JSONL-only metrics that the TSV format can't cleanly express."
+      },
+      {
+        "option": "C — replace bridge-22 with a JSONL-only analyzer and deprecate the TSV path",
+        "rejected_because": "the TSV is still the canonical 'simple to grep / awk' surface; bridge-21 force-added it as schema stub and operators may have shell habits around it. ω-bridge-23 deliberately made the JSONL a SIBLING (not replacement) with independent failure handling — the analyzer surface should mirror that."
+      },
+      {
+        "option": "D — pure-hexa JSON parser (no python shell-out)",
+        "rejected_because": "hexa lacks a stdlib json.loads (only ad-hoc parse_int_field-style extractors used in lhc_opendata_bridge.hexa). Hand-rolling JSON tokenization for nested escapes / unicode would be 100+ lines of fragile code that python solves in 1 line (json.loads). bridge-22 already established the single-shell-out pattern (one python3 call) for time math; same pattern extends to JSON parse."
+      }
+    ]
+  },
+  "files_created": [
+    {
+      "path": "/Users/ghost/core/nexus/tool/atlas_alert_jsonl_trend.hexa",
+      "purpose": "read-only trend analyzer over state/atlas_alert_history.jsonl with schema-evolution tolerance and JSONL-specific metrics",
+      "lines_total": 348,
+      "structural_blocks": [
+        "header (raw-9, raw-71, raw-77 compliance + sentinel doc + usage examples)",
+        "constants: NEXUS / DEFAULT_HISTORY / DEFAULT_WINDOW_HOURS / DEFAULT_FILTER_SCOPE",
+        "_argv() / _say() / _index_of() helpers (mirror atlas_alert_trend.hexa idioms)",
+        "argv parser: --quiet / --json / --history PATH / --window-hours H / --filter-scope NAME / --help",
+        "pre-flight: SKIP if file missing (exit 0, sentinel emitted)",
+        "raw-content load (read_file) → /tmp/<ts>.jsonl scratch (avoids shell-quoting JSON content)",
+        "single python3 shell-out: json.loads per line, schema-evolution defaults, scope filter, computes TOTAL/MALFORMED/MISSING_RECOVERED/SCOPE/VERDICT/RULE/WIN_*/SPAN_HOURS/FIRE_RATE/MTBA/EXTRA structured key=value lines",
+        "early-exit on EMPTY / INSUFFICIENT verdicts (with scope_distribution emitted in EMPTY case for forward-compat visibility)",
+        "PASS path: human-readable summary (suppressed when --quiet OR --json), warn forwarding for malformed lines",
+        "JSON output (when --json): nested extra_field_distribution {rule: {extra_value: count}} + flat scope_distribution {scope: count}",
+        "sentinel emission (always last): __ALERT_JSONL_TREND__ <verdict> total=N last_window=W top_rule=R fire_rate_per_hour=X"
+      ]
+    }
+  ],
+  "schema_consumed": {
+    "jsonl_path": "state/atlas_alert_history.jsonl (overridable via --history)",
+    "jsonl_row_shape": {
+      "ts": "ISO-8601 UTC %Y-%m-%dT%H:%M:%SZ",
+      "scope": "atlas_alert (default; future cycles may emit other scopes into the same file)",
+      "rule": "warn_ratio | insufficient_ratio | consecutive_warn | recent_warn_ratio (or future)",
+      "ratio": "float (0.0 if not applicable, e.g. consecutive_warn)",
+      "threshold": "float or int",
+      "last_n": "int",
+      "sampled": "int",
+      "extra": "string — empty for warn_ratio/insufficient_ratio; 'streak=K' for consecutive_warn; 'window_minutes=M' for recent_warn_ratio; future rules may add new shapes"
+    },
+    "schema_evolution_policy": "extra fields ignored (forward-compat); missing fields default to safe sentinels (rule='unknown', scope='unknown', extra=''); rows with bad JSON or non-object payload counted as malformed and skipped without aborting the analysis"
+  },
+  "metrics_emitted": [
+    {"name": "alert_count_total", "definition": "count of valid scope-matched rows", "where": "summary, JSON `total`, sentinel `total=`"},
+    {"name": "alert_count_last_window", "definition": "scope-matched rows whose ts falls within [now - window_hours, now]", "where": "summary, JSON `alert_count_last_window`, sentinel `last_window=`"},
+    {"name": "per_rule_count", "definition": "histogram of rule firings over file lifetime (scope-matched)", "where": "summary, JSON `per_rule_count`"},
+    {"name": "mtba_per_rule", "definition": "mean time between alerts in seconds, per rule (NA if rule has <2 fires)", "where": "summary, JSON `mtba_per_rule` (null for NA)"},
+    {"name": "top_rule_in_window", "definition": "most-fired rule within window_hours; sentinel 'none' if window empty; ties broken by sorted-name first-encountered", "where": "summary, JSON `top_rule`, sentinel `top_rule=`"},
+    {"name": "fire_rate_per_hour", "definition": "total / span_hours, where span_hours = (last_ts - first_ts) / 3600; 0.0 if all rows share the same second", "where": "summary, JSON `fire_rate_per_hour`, sentinel `fire_rate_per_hour=`"},
+    {"name": "extra_field_distribution", "definition": "(NEW for bridge-25) per-rule histogram of non-empty `extra` field values; lets ops see e.g. consecutive_warn fires streak=2 mostly but streak=5 spikes; empty-extra rows omitted from this surface (no signal)", "where": "summary `extra_field_distribution:` block, JSON `extra_field_distribution` nested object {rule: {extra_value: count}}"},
+    {"name": "scope_distribution", "definition": "(NEW for bridge-25) histogram of scopes seen across ALL rows pre-filter; surfaces forward-compat insight when the JSONL accumulates rows from cycles other than atlas_alert; emitted in EMPTY verdict too (so operators see why their scope filter zeroed)", "where": "summary `scope_distribution:` block, JSON `scope_distribution` flat object {scope: count}"}
+  ],
+  "cli": {
+    "flags": [
+      "--quiet               emit __ALERT_JSONL_TREND__ sentinel only (no human summary)",
+      "--json                emit one-line JSON object before sentinel; suppresses human summary",
+      "--history PATH        override default state/atlas_alert_history.jsonl",
+      "--window-hours H      scope for last_window + top_rule (default 24)",
+      "--filter-scope NAME   only count rows with this scope (default atlas_alert; scope_distribution still shows pre-filter counts)",
+      "--help / -h           usage + verdict legend"
+    ],
+    "sentinels": [
+      "__ALERT_JSONL_TREND__ PASS         total=N last_window=W top_rule=R fire_rate_per_hour=X",
+      "__ALERT_JSONL_TREND__ INSUFFICIENT total=N last_window=0 top_rule=none fire_rate_per_hour=0.0000  (when scope-matched <3)",
+      "__ALERT_JSONL_TREND__ EMPTY        total=0 last_window=0 top_rule=none fire_rate_per_hour=0.0000  (no scope-matched data rows)",
+      "__ALERT_JSONL_TREND__ SKIP         reason=history_missing path=PATH                                (file missing; exit 0)"
+    ]
+  },
+  "compliance": {
+    "raw_9_hexa_only_suffix": "new file is tool/atlas_alert_jsonl_trend.hexa (.hexa suffix; sweeper-safe)",
+    "raw_71_report_only": "tool reads the history JSONL and parses; never writes; uses /tmp/atlas_alert_jsonl_trend_in_<ts>.jsonl as scratch (cleaned up post-shell-out)",
+    "raw_73_admissibility": "verdict surface mirrors network-3 deferred-recommendation pattern (INSUFFICIENT for sub-quorum data); SKIP for missing file (exit 0); PASS for >=3 scope-matched rows",
+    "raw_77_append_only": "JSONL consumed read-only; producer contract from ω-bridge-23 preserved (scope=atlas_alert discriminator + JSON-per-line); no writes, no rewrites; concurrent appender tolerated (read_file is single fs syscall snapshot)",
+    "raw_77_state_alert_history_jsonl_readonly": "explicitly READ-ONLY on state/atlas_alert_history.jsonl per task constraint",
+    "raw_80_sentinel": "__ALERT_JSONL_TREND__ added (PASS / INSUFFICIENT / EMPTY / SKIP shapes); independent of __ALERT_TREND__ (TSV analyzer) and __ATLAS_ALERT__ (producer)",
+    "no_parallel_session_collision": "added only tool/atlas_alert_jsonl_trend.hexa; did NOT touch cli/run.hexa, state/atlas_health_timeline.jsonl, bisociation/spectra/g_atlas_composite_v3.json, tool/omega_cycle_atlas_ingest.hexa, n6/*, tool/kick_*.hexa, design/kick/*, .own — verified via git status --short before staging",
+    "explicit_path_commit": "git add tool/atlas_alert_jsonl_trend.hexa only — no `git add -A`",
+    "no_anima_commit": "closure JSON written to /Users/ghost/core/anima/state/omega_bridge_25_alert_jsonl_trend_analyzer.json — UNTRACKED, no git operations in anima",
+    "history_ops_pinned_sha": "no history rewrite; predecessor SHAs pinned (bridge-22=7d8fc8fa, bridge-23+24=8e145470, current HEAD nexus=8e145470 at task start, pinned-or-later met)",
+    "hexa_interp_direct": "validation runs invoked /Users/ghost/core/hexa-lang/build/hexa_interp directly (with HEXA_LOCAL=1 to bypass the darwin landing routing); not the /Users/ghost/core/hexa-lang/hexa wrapper"
+  },
+  "validation": {
+    "fixtures_dir": "/tmp/atlas_alert_jsonl_fixture_*.jsonl",
+    "fixtures": [
+      {
+        "name": "fixture_a — typical 10 rows mixed rules over 3-day span",
+        "expected": "PASS verdict, total=10, span≈67h, fire_rate≈0.15, per-rule counts {warn_ratio:5, insufficient_ratio:2, consecutive_warn:2, recent_warn_ratio:1}, MTBA per rule populated for rules with ≥2 fires, extra_field_distribution surfaces consecutive_warn streak values + recent_warn_ratio window_minutes",
+        "observed": "__ALERT_JSONL_TREND__ PASS total=10 last_window=10 top_rule=warn_ratio fire_rate_per_hour=0.1481; per_rule_count={warn_ratio:5, insufficient_ratio:2, consecutive_warn:2, recent_warn_ratio:1}; MTBA all match; extra_field_distribution shows consecutive_warn::streak=2, consecutive_warn::streak=3, recent_warn_ratio::window_minutes=15",
+        "pass": true
+      },
+      {
+        "name": "fixture_b — insufficient (1 row only)",
+        "expected": "INSUFFICIENT verdict, sentinel total=1",
+        "observed": "__ALERT_JSONL_TREND__ INSUFFICIENT total=1 last_window=0 top_rule=none fire_rate_per_hour=0.0000",
+        "pass": true
+      },
+      {
+        "name": "fixture_c — empty file (zero bytes)",
+        "expected": "EMPTY verdict, sentinel total=0",
+        "observed": "__ALERT_JSONL_TREND__ EMPTY total=0 last_window=0 top_rule=none fire_rate_per_hour=0.0000",
+        "pass": true
+      },
+      {
+        "name": "fixture_d — missing path",
+        "expected": "SKIP verdict, exit 0, no metric output",
+        "observed": "__ALERT_JSONL_TREND__ SKIP reason=history_missing path=/tmp/atlas_alert_jsonl_fixture_NONEXISTENT.jsonl",
+        "pass": true
+      },
+      {
+        "name": "fixture_e — 5 valid + 2 malformed JSON (1 plain text, 1 unclosed brace)",
+        "expected": "PASS verdict, total=5, malformed=2, both bad lines warned",
+        "observed": "warn: malformed JSON skipped: this is not json at all; warn: malformed JSON skipped: {\"this is\": \"broken json with no closing; __ALERT_JSONL_TREND__ PASS total=5 last_window=5 top_rule=warn_ratio fire_rate_per_hour=1.2500; malformed=2",
+        "pass": true
+      },
+      {
+        "name": "fixture_f — 5 rows all consecutive_warn with extra=streak=2/3/2/2/5",
+        "expected": "PASS verdict, extra_field_distribution shows {streak=2: 3, streak=3: 1, streak=5: 1}",
+        "observed": "__ALERT_JSONL_TREND__ PASS total=5 last_window=5 top_rule=consecutive_warn fire_rate_per_hour=1.2500; extra_field_distribution {consecutive_warn::streak=2 = 3, consecutive_warn::streak=3 = 1, consecutive_warn::streak=5 = 1} — exact match to spec",
+        "pass": true
+      },
+      {
+        "name": "fixture_g — mixed scope (3 atlas_alert + 2 future_unknown); test default + --filter-scope future_unknown",
+        "expected": "default scope filter counts 3 atlas_alert rows (PASS); --filter-scope future_unknown counts only the 2 future rows (INSUFFICIENT since <3); scope_distribution shows both pre-filter counts",
+        "observed": "default: PASS total=3 last_window=3 top_rule=warn_ratio; scope_distribution {atlas_alert:3, future_unknown:2}. --filter-scope future_unknown: INSUFFICIENT total=2 last_window=0 top_rule=none fire_rate_per_hour=0.0000",
+        "pass": true
+      },
+      {
+        "name": "fixture_h — rows with extra unknown JSON fields (severity, host, trace_id, operator)",
+        "expected": "parser ignores unknowns, doesn't crash; valid rows counted normally",
+        "observed": "PASS total=4 last_window=4 top_rule=warn_ratio fire_rate_per_hour=1.3333; per_rule_count and MTBA correct; extra_field_distribution surfaces consecutive_warn::streak=2 only (other rows have empty extra)",
+        "pass": true
+      }
+    ],
+    "additional_smoke": [
+      {
+        "name": "--json mode on fixture_f produces valid JSON parseable by python3 -m json.tool",
+        "expected": "single-line valid JSON before sentinel; nested extra_field_distribution; flat scope_distribution",
+        "observed": "JSON validates; nested {\"consecutive_warn\":{\"streak=2\":3,\"streak=3\":1,\"streak=5\":1}} renders correctly; sentinel follows on its own line",
+        "pass": true
+      },
+      {
+        "name": "default invocation against live state/atlas_alert_history.jsonl (not yet emitted in production)",
+        "expected": "SKIP verdict (file does not yet exist; bridge-23 producer will create on first FIRED event)",
+        "observed": "__ALERT_JSONL_TREND__ SKIP reason=history_missing path=/Users/ghost/core/nexus/state/atlas_alert_history.jsonl",
+        "pass": true
+      },
+      {
+        "name": "--help mode",
+        "expected": "usage + flag descriptions + verdict legend",
+        "observed": "all 5 flags documented + 4 verdicts listed; exits without sentinel emission",
+        "pass": true
+      }
+    ],
+    "all_pass": true,
+    "fixture_count": 8
+  },
+  "edge_cases_handled": {
+    "schema_evolution_extra_fields": "rows with unknown additional JSON fields (severity, host, trace_id, etc) are silently accepted — only ts/scope/rule/extra are read; future cycles can extend the row shape without breaking this parser",
+    "schema_evolution_missing_fields": "rows missing ts → counted as malformed (cannot place on timeline); rows missing rule/scope → defaulted to 'unknown' and missing_field_recovered counter incremented (forward-compat soft landing rather than hard reject)",
+    "malformed_json_lines": "lines that fail json.loads are counted in malformed and printed as warnings (truncated to 120 chars) on stderr; analyzer continues with remaining valid rows",
+    "non_object_json": "JSON that parses but isn't a dict (e.g. arrays, strings, numbers as top-level) counted as malformed and skipped",
+    "empty_lines": "blank lines silently skipped (no warning, no malformed count)",
+    "scope_filter_default_atlas_alert": "default scope=atlas_alert protects against bridge-23's discriminator pattern being hijacked by future cycles emitting other scopes into the same file",
+    "scope_distribution_pre_filter": "scope_distribution is computed BEFORE the scope filter, so operators see the full picture (e.g. 'I filtered for atlas_alert and got 0 rows but the file has 50 rows scoped future_unknown')",
+    "extra_field_dist_skips_empty": "rows with extra='' do not appear in extra_field_distribution surface (no signal in 'all-empty for this rule' — would be noise); rules with all-empty extra show '(no rules with non-empty extra)' in human summary",
+    "single_fire_per_rule_mtba_NA": "MTBA requires ≥2 fires for a rule; rules with exactly 1 fire emit MTBA=NA in summary and null in JSON — same as bridge-22",
+    "single_second_span_zero_fire_rate": "if first_ts == last_ts (all rows same second), span_hours=0 → fire_rate_per_hour=0.0 (avoids div-by-zero)",
+    "future_dated_rows_excluded_from_window": "python computes cutoff = now - window_hours; rows with t > now or t < cutoff excluded from win_total / top_rule (defensive against clock skew)",
+    "verdict_stratification": "SKIP > EMPTY > INSUFFICIENT > PASS; each early-returns with its own sentinel; EMPTY case still emits scope_distribution (helps diagnose 'why did my filter zero')",
+    "json_quiet_interaction": "--quiet suppresses human summary AND warning forwarding; --json suppresses human summary; sentinel emits last in all modes (raw 80)",
+    "tmp_file_cleanup": "scratch /tmp/atlas_alert_jsonl_trend_in_<ts>.jsonl rm -f'd after python shell-out (best-effort, errors suppressed)",
+    "raw_content_isolated_from_shell": "JSONL content can contain arbitrary quote/backslash patterns; we write it to a tmp file rather than embedding in the python -c heredoc, so shell quoting cannot corrupt the input"
+  },
+  "operational_notes": {
+    "default_invocation_today": "live state/atlas_alert_history.jsonl does not yet exist (bridge-23 producer creates on first FIRED event; no firings in production yet); analyzer emits SKIP — expected. PASS verdict will surface as the bridge cluster accumulates firings.",
+    "expected_steady_state": "with bridge-24's per-rule cooldown dedup, JSONL accretion is even slower than TSV-only emission used to be; analyzer cost is dominated by the single python3 shell-out (~50ms cold) and is cheap to run in any sweep loop",
+    "filter_scope_evolution": "if a future cycle reuses the JSONL with scope='other_thing', bridge-25 default invocation (--filter-scope atlas_alert) ignores them by design; ops can run with --filter-scope other_thing to get a separate trend view; scope_distribution surfaces both",
+    "back_compat": "no edits to existing tools or files; pure addition; existing __ALERT_TREND__ (bridge-22), __ATLAS_ALERT__ (bridge-17/19), and __BRIDGE_ANOMALY__ surfaces unchanged",
+    "no_history_growth": "tool is read-only; does not contribute to any state file growth"
+  },
+  "follow_ups": {
+    "future_candidates": [
+      "tool/atlas_alert_dual_trend.hexa — meta-analyzer that reads both __ALERT_TREND__ and __ALERT_JSONL_TREND__ sentinels and reconciles them (TSV vs JSONL drift detection — would catch a producer bug where one sibling is updated but not the other)",
+      "extra_field_anomaly: detect when extra_field_distribution histogram shifts (e.g. consecutive_warn used to fire streak=2 90% of the time but suddenly streak=5 dominates → escalation signal)",
+      "wire __ALERT_JSONL_TREND__ into the ω-network cross-repo dashboard alongside __ALERT_TREND__ (same row, two columns: TSV vs JSONL)",
+      "tool/atlas_alert_jsonl_to_parquet.hexa — when the JSONL grows beyond N rows, materialize a parquet file for efficient long-window analytics (analyzer would gain --parquet flag to read either)",
+      "scope_aware fire_rate: compute fire_rate per scope (currently fire_rate uses scope-filtered total; could surface per-scope rates simultaneously)",
+      "rotation hook: paired with bridge-22 follow-up — when JSONL exceeds size threshold, archive to state/atlas_alert_history_<yyyymm>.jsonl and rotate; --history-glob flag to read across rotated files"
+    ]
+  }
+}

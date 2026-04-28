@@ -1,0 +1,342 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/g9_adjacency_sweep.hexa
+//
+//  PURPOSE
+//    G9 adjacency-axis robustness sweep — DAG 구조 자체에 1-bit-flip
+//    Hamming-1 perturbation 을 가해 G9 verdict 변동률을 측정.
+//    sister 인 g9_robustness_sweep.hexa 가 hardness axis 만 측정하므로
+//    (analyzer 가 hardness 를 verdict 에 반영하지 않아 100% trivial),
+//    이 도구는 진짜 weakest-evidence-link — adjacency 변동에 대한
+//    G9 invariance 를 fix 한다.
+//
+//    perturbation space (frozen):
+//      5x5 adjacency 의 strict upper-triangle (i<j, diagonal 제외)
+//      10 bit pos: (0,1),(0,2),(0,3),(0,4),(1,2),(1,3),(1,4),(2,3),(2,4),(3,4).
+//      각 perturbation = canonical sparse baseline (row 4 cols 0..3 = 1)
+//      에 upper-tri 1 bit 를 ON (Hamming-1 distance).
+//      acyclic 보존 (i<j → DAG 유지).
+//
+//    G9 frozen criteria (analyzer 동일):
+//      A.  edge_count          ≤ 7
+//      B.  cascade_max_impact  ≤ 2
+//
+//    invariance criterion: ≥ 80% (8+/10) baseline verdict 와 일치 → ROBUST
+//
+//    falsifier (--falsify 또는 G9_ADD_ALL=1):
+//      모든 10 upper-tri bit 동시 ON (= complete acyclic DAG,
+//      edge_count = 4 + 10 = 14 > 7).  10/10 FAIL 으로 verdict 변동
+//      detect (PASS→FAIL) 으로 falsifier 작동 증명.
+//
+//  USAGE
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run \
+//      anima-clm-eeg/tool/g9_adjacency_sweep.hexa
+//
+//    Falsifier:
+//      G9_ADD_ALL=1 HEXA_RESOLVER_NO_REROUTE=1 hexa run \
+//        anima-clm-eeg/tool/g9_adjacency_sweep.hexa
+//
+//  OUTPUT
+//    state/g9_adjacency_sweep_v1.json  (or G9_ADJ_OUT)
+//
+//  ENV
+//    G9_ADJ_OUT   output JSON path
+//    G9_ADD_ALL   when "1": baseline 위에 upper-tri 모든 bit 추가 (negative)
+//
+//  RAW
+//    raw#9 · hexa-only · deterministic · LLM=none · pure-aggregator
+// ════════════════════════════════════════════════════════════════════════════
+
+let M32 = 4294967296
+let FNV_PRIME = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+let N = 5
+
+let EDGE_BUDGET = 7
+let CASCADE_BUDGET = 2
+
+let SCENARIOS = 10
+let INVARIANCE_THRESHOLD = 80
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+fn env_int(key: string, default_val: int) -> int {
+    let s = env(key)
+    if s == "" { return default_val }
+    if s == "1" { return 1 }
+    if s == "0" { return 0 }
+    return default_val
+}
+
+// ─── fingerprint (FNV-style) ────────────────────────────────────────────────
+fn fnv_step(h: int, byte: int) -> int {
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fingerprint_step(fp: int, val: int) -> int {
+    let mut h = fp
+    h = fnv_step(h, val % 256)
+    h = fnv_step(h, (val / 256) % 256)
+    h = fnv_step(h, (val / 65536) % 256)
+    h = fnv_step(h, (val / 16777216) % 256)
+    return h
+}
+
+// ─── upper-triangle bit position table ─────────────────────────────────────
+// Frozen 10 positions in deterministic (i,j) order with i<j.
+// idx: 0  1  2  3  4  5  6  7  8  9
+// (i): 0  0  0  0  1  1  1  2  2  3
+// (j): 1  2  3  4  2  3  4  3  4  4
+fn ut_i(idx: int) -> int {
+    if idx == 0 { return 0 }
+    if idx == 1 { return 0 }
+    if idx == 2 { return 0 }
+    if idx == 3 { return 0 }
+    if idx == 4 { return 1 }
+    if idx == 5 { return 1 }
+    if idx == 6 { return 1 }
+    if idx == 7 { return 2 }
+    if idx == 8 { return 2 }
+    if idx == 9 { return 3 }
+    return -1
+}
+
+fn ut_j(idx: int) -> int {
+    if idx == 0 { return 1 }
+    if idx == 1 { return 2 }
+    if idx == 2 { return 3 }
+    if idx == 3 { return 4 }
+    if idx == 4 { return 2 }
+    if idx == 5 { return 3 }
+    if idx == 6 { return 4 }
+    if idx == 7 { return 3 }
+    if idx == 8 { return 4 }
+    if idx == 9 { return 4 }
+    return -1
+}
+
+// ─── adjacency builders ────────────────────────────────────────────────────
+// Canonical sparse baseline (Mk.XII proposal): row 4 cols 0..3 = 1.
+fn build_baseline() -> [int] {
+    let mut a = [
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+    ]
+    a[4 * N + 0] = 1
+    a[4 * N + 1] = 1
+    a[4 * N + 2] = 1
+    a[4 * N + 3] = 1
+    return a
+}
+
+// Hamming-1 perturbation: baseline + single upper-tri bit ON at idx.
+fn build_adj_h1(idx: int) -> [int] {
+    let mut a = build_baseline()
+    let i = ut_i(idx)
+    let j = ut_j(idx)
+    a[i * N + j] = 1
+    return a
+}
+
+// Add-all falsifier: baseline + all 10 upper-tri bits ON.
+fn build_adj_all() -> [int] {
+    let mut a = build_baseline()
+    let mut k = 0
+    while k < SCENARIOS {
+        let i = ut_i(k)
+        let j = ut_j(k)
+        a[i * N + j] = 1
+        k = k + 1
+    }
+    return a
+}
+
+// ─── graph metrics ─────────────────────────────────────────────────────────
+fn count_edges(a: [int]) -> int {
+    let mut total = 0
+    let mut i = 0
+    while i < N {
+        let mut j = 0
+        while j < N {
+            total = total + a[i * N + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return total
+}
+
+fn cascade_impact_of(a: [int], j: int) -> int {
+    let mut total = 0
+    let mut i = 0
+    while i < N {
+        if i != j {
+            total = total + a[i * N + j]
+        }
+        i = i + 1
+    }
+    return total
+}
+
+fn cascade_max_of(a: [int]) -> int {
+    let c0 = cascade_impact_of(a, 0)
+    let c1 = cascade_impact_of(a, 1)
+    let c2 = cascade_impact_of(a, 2)
+    let c3 = cascade_impact_of(a, 3)
+    let c4 = cascade_impact_of(a, 4)
+    let mut m = c0
+    if c1 > m { m = c1 }
+    if c2 > m { m = c2 }
+    if c3 > m { m = c3 }
+    if c4 > m { m = c4 }
+    return m
+}
+
+fn g9_pass_of(a: [int]) -> int {
+    let ec = count_edges(a)
+    let cmax = cascade_max_of(a)
+    let edge_pass = if ec <= EDGE_BUDGET { 1 } else { 0 }
+    let cascade_pass = if cmax <= CASCADE_BUDGET { 1 } else { 0 }
+    if edge_pass == 1 {
+        if cascade_pass == 1 { return 1 }
+    }
+    return 0
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+fn main() {
+    let out_path = env_str("G9_ADJ_OUT", "state/g9_adjacency_sweep_v1.json")
+    let add_all = env_int("G9_ADD_ALL", 0)
+
+    // baseline reference verdict
+    let a_base = build_baseline()
+    let baseline_edges = count_edges(a_base)
+    let baseline_cmax = cascade_max_of(a_base)
+    let baseline_pass = g9_pass_of(a_base)
+
+    // sweep across 10 hamming-1 perturbations (or single add-all in falsifier)
+    let mut pass_count = 0
+    let mut fail_count = 0
+    let mut matching = 0
+    let mut s = 0
+    let mut per_scenario = "[\n"
+    let mut fp = FNV_OFFSET_BASIS
+    fp = fingerprint_step(fp, add_all)
+    fp = fingerprint_step(fp, EDGE_BUDGET)
+    fp = fingerprint_step(fp, CASCADE_BUDGET)
+    fp = fingerprint_step(fp, baseline_pass)
+
+    while s < SCENARIOS {
+        let i = ut_i(s)
+        let j = ut_j(s)
+        // In add_all mode, every scenario uses the all-edges-on adjacency,
+        // so the per-bit detail still records WHICH bit was the marginal
+        // contribution under a hamming-1 framing — but the verdict comes
+        // from the fully-saturated DAG.
+        let a = if add_all == 1 { build_adj_all() } else { build_adj_h1(s) }
+        let ec = count_edges(a)
+        let cmax = cascade_max_of(a)
+        let p = g9_pass_of(a)
+        if p == 1 { pass_count = pass_count + 1 } else { fail_count = fail_count + 1 }
+        if p == baseline_pass { matching = matching + 1 }
+
+        fp = fingerprint_step(fp, s)
+        fp = fingerprint_step(fp, i)
+        fp = fingerprint_step(fp, j)
+        fp = fingerprint_step(fp, ec)
+        fp = fingerprint_step(fp, cmax)
+        fp = fingerprint_step(fp, p)
+
+        per_scenario = per_scenario + "    {\"s\": " + str(s)
+        per_scenario = per_scenario + ", \"i\": " + str(i)
+        per_scenario = per_scenario + ", \"j\": " + str(j)
+        per_scenario = per_scenario + ", \"edge_count\": " + str(ec)
+        per_scenario = per_scenario + ", \"cascade_max\": " + str(cmax)
+        per_scenario = per_scenario + ", \"g9_pass\": " + str(p) + "}"
+        if s < SCENARIOS - 1 { per_scenario = per_scenario + "," }
+        per_scenario = per_scenario + "\n"
+        s = s + 1
+    }
+    per_scenario = per_scenario + "  ]"
+
+    let invariance_pct = (matching * 100) / SCENARIOS
+    let robust = if invariance_pct >= INVARIANCE_THRESHOLD { 1 } else { 0 }
+
+    let mut verdict = "G9_ADJ_ROBUST"
+    if robust == 0 {
+        if invariance_pct >= 50 { verdict = "G9_ADJ_AMBIGUOUS" } else { verdict = "G9_ADJ_FRAGILE" }
+    }
+
+    fp = fingerprint_step(fp, baseline_edges)
+    fp = fingerprint_step(fp, baseline_cmax)
+    fp = fingerprint_step(fp, pass_count)
+    fp = fingerprint_step(fp, fail_count)
+    fp = fingerprint_step(fp, matching)
+    fp = fingerprint_step(fp, invariance_pct)
+    fp = fingerprint_step(fp, robust)
+
+    // ── emit cert ──────────────────────────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"g9_adjacency_sweep\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"gate\": \"G9-adjacency\",\n"
+    cert = cert + "  \"sister\": \"g9_dag_cascade_analyzer\",\n"
+    cert = cert + "  \"axis\": \"adjacency-upper-triangle-hamming-1\",\n"
+    cert = cert + "  \"add_all_mode\": " + str(add_all) + ",\n"
+    cert = cert + "  \"scenarios\": " + str(SCENARIOS) + ",\n"
+    cert = cert + "  \"baseline_edge_count\": " + str(baseline_edges) + ",\n"
+    cert = cert + "  \"baseline_cascade_max\": " + str(baseline_cmax) + ",\n"
+    cert = cert + "  \"baseline_pass\": " + str(baseline_pass) + ",\n"
+    cert = cert + "  \"budgets\": {\"edge_max\": " + str(EDGE_BUDGET) + ", \"cascade_max\": " + str(CASCADE_BUDGET) + "},\n"
+    cert = cert + "  \"invariance_threshold_pct\": " + str(INVARIANCE_THRESHOLD) + ",\n"
+    cert = cert + "  \"per_scenario\": " + per_scenario + ",\n"
+    cert = cert + "  \"pass_count\": " + str(pass_count) + ",\n"
+    cert = cert + "  \"fail_count\": " + str(fail_count) + ",\n"
+    cert = cert + "  \"matching_baseline\": " + str(matching) + ",\n"
+    cert = cert + "  \"invariance_pct\": " + str(invariance_pct) + ",\n"
+    cert = cert + "  \"robust\": " + str(robust) + ",\n"
+    cert = cert + "  \"verdict\": \"" + verdict + "\",\n"
+    cert = cert + "  \"fingerprint\": " + str(fp) + ",\n"
+    cert = cert + "  \"note\": \"Hamming-1 single-bit-flip sweep over 10 strict upper-triangle adjacency positions; baseline = canonical sparse Mk.XII DAG (row 4 cols 0..3); add_all_mode=1 saturates upper triangle (edge_count=14) to demonstrate adjacency-axis verdict flip.\"\n"
+    cert = cert + "}\n"
+    write_file(out_path, cert)
+
+    println("─── g9_adjacency_sweep (raw#9 hexa-only) ───")
+    println("  add_all_mode           = " + str(add_all))
+    println("  scenarios              = " + str(SCENARIOS))
+    println("  baseline_edge_count    = " + str(baseline_edges))
+    println("  baseline_cascade_max   = " + str(baseline_cmax))
+    println("  baseline_pass          = " + str(baseline_pass))
+    println("  pass_count             = " + str(pass_count))
+    println("  fail_count             = " + str(fail_count))
+    println("  matching_baseline      = " + str(matching) + " / " + str(SCENARIOS))
+    println("  invariance_pct         = " + str(invariance_pct) + "  (threshold " + str(INVARIANCE_THRESHOLD) + ")")
+    println("  robust                 = " + str(robust))
+    println("  verdict                = " + verdict)
+    println("  fingerprint            = " + str(fp))
+    println("  output                 = " + out_path)
+
+    if robust == 1 {
+        exit(0)
+    }
+    exit(1)
+}
+
+main()
+

@@ -1,0 +1,256 @@
+// tool/anima_cmt_v2.hexa — CMT v2 with MLP-only sub-module ablation (raw#9 hexa-only).
+//
+// PURPOSE
+//   axis 100 (axis 99 follow-up) — fix CMT scale-saturation bug discovered at
+//   Mk.XII v2 Phase 3a (#237). 12B+ models (Mistral-Nemo-12B, gemma-2-9b) showed
+//   rel=1.000 SATURATED at every layer×family cell when using v1 whole-layer
+//   zero-ablation: ablating an entire transformer block at scale collapses the
+//   final hidden state toward zero, making rel = ||Y_full - Y_abl|| / ||Y_full||
+//   degenerate at unity (uninformative).
+//
+// FIX
+//   v2 hooks only the MLP sub-module (layer.mlp) instead of the whole layer.
+//   The attention path remains intact, so the residual stream still carries
+//   useful signal even when one MLP block is zeroed. This decouples ablation
+//   magnitude from total residual norm and restores informative rel ∈ (0,1).
+//
+//   Plus a scale-invariant absolute metric: dY_norm = abs(dY) / sqrt(h_dim)
+//   reported alongside the original abs/rel for cross-scale comparability.
+//
+// HYPOTHESES (frozen pre-measurement)
+//   HCSF-A SCALE_NORM        : magnitude renormalization alone restores rel<1
+//   HCSF-B HID_DIM_BOUND     : MLP-only sub-module ablation also required
+//   HCSF-C ARTIFACT_OF_HYBRID: gemma-2-9b hybrid attention has separate cause
+//
+// USAGE
+//   ANIMA_BASE=mistralai/Mistral-Nemo-Base-2407 \
+//   ANIMA_OUTPUT=/workspace/out/cmt_v2.json \
+//   hexa run tool/anima_cmt_v2.hexa
+//
+//   Selftest:
+//   hexa run tool/anima_cmt_v2.hexa --selftest
+//
+// ENV (same as v1, plus)
+//   ANIMA_ABLATE_TARGET   "mlp" (default v2) | "layer" (v1 fallback)
+//
+// raw#9 hexa-only / raw#37 transient emit / raw#15 SSOT this file
+// raw#10 honest: see README anti-pattern audit.
+//   - MLP-only ablation is one fix; attention-only ablation would also work.
+//   - rel < 1.0 informative is necessary but not sufficient for cross-scale
+//     comparability — std/mean of rel distribution is the real test.
+//   - N=2 (Mistral-Nemo + gemma) for 12B+ verification, generalize cautiously.
+
+let HELPER_PATH = "/tmp/anima_cmt_v2_helper.hexa_tmp"
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# Anima CMT v2 helper — emitted by tool/anima_cmt_v2.hexa\n")
+    parts.push("# raw#37 transient. axis 100 fix for scale-saturation (#237).\n")
+    parts.push("import json, os, sys, time\n")
+    parts.push("import numpy as np\n")
+    parts.push("import torch\n")
+    parts.push("from transformers import AutoModelForCausalLM, AutoTokenizer\n\n")
+
+    parts.push("_h = '/workspace/.hf_token'\n")
+    parts.push("if os.path.exists(_h):\n")
+    parts.push("    with open(_h) as f: t = f.read().strip()\n")
+    parts.push("    if t:\n")
+    parts.push("        os.environ['HF_TOKEN'] = t\n")
+    parts.push("        os.environ['HUGGING_FACE_HUB_TOKEN'] = t\n\n")
+
+    parts.push("BASE_MODEL = os.environ.get('ANIMA_BASE', 'mistralai/Mistral-7B-v0.3')\n")
+    parts.push("OUTPUT = os.environ.get('ANIMA_OUTPUT', '/workspace/out/cmt_v2.json')\n")
+    parts.push("N_PROBES = int(os.environ.get('ANIMA_N_PROBES', '16'))\n")
+    parts.push("LAYER_STRIDE = int(os.environ.get('ANIMA_LAYER_STRIDE', '4'))\n")
+    parts.push("HID_TRUNC = int(os.environ.get('ANIMA_HID_TRUNC', '128'))\n")
+    parts.push("RNG_SEED = int(os.environ.get('ANIMA_SEED', '42'))\n")
+    parts.push("ABLATE_TARGET = os.environ.get('ANIMA_ABLATE_TARGET', 'mlp')  # 'mlp' (v2 default) | 'layer' (v1 fallback)\n\n")
+
+    parts.push("PROMPTS = [\n")
+    parts.push("    'Define hexad as a six-fold integration:',\n")
+    parts.push("    'Six modules form a hexagonal architecture when:',\n")
+    parts.push("    'A balanced six-component system:',\n")
+    parts.push("    'Hexad symmetry refers to:',\n")
+    parts.push("    'Logical implication law: if A then:',\n")
+    parts.push("    'Sequential rule application proceeds:',\n")
+    parts.push("    'Closure under inference requires:',\n")
+    parts.push("    'A formal proof system is closed when:',\n")
+    parts.push("    'Integrated information measures partition independence:',\n")
+    parts.push("    'Phi quantifies irreducibility of system:',\n")
+    parts.push("    'Information integration is maximized when:',\n")
+    parts.push("    'A whole greater than sum of parts:',\n")
+    parts.push("    'Self-reference emerges when system observes:',\n")
+    parts.push("    'Recursive meta-cognition models:',\n")
+    parts.push("    'A self-aware system represents itself by:',\n")
+    parts.push("    'Strange loops in cognition arise from:',\n")
+    parts.push("][:N_PROBES]\n\n")
+
+    parts.push("FAMILIES = ['Hexad','Law','Phi','SelfRef']\n\n")
+
+    parts.push("os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)\n")
+    parts.push("print(f'[cmt_v2] base={BASE_MODEL} probes={N_PROBES} layer_stride={LAYER_STRIDE} target={ABLATE_TARGET}', flush=True)\n")
+    parts.push("t0 = time.time()\n")
+    parts.push("tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)\n")
+    parts.push("if tok.pad_token is None: tok.pad_token = tok.eos_token\n")
+    parts.push("mdl = AutoModelForCausalLM.from_pretrained(BASE_MODEL, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map='auto', output_hidden_states=True)\n")
+    parts.push("mdl.eval()\n")
+    parts.push("print(f'[cmt_v2] loaded {time.time()-t0:.1f}s', flush=True)\n\n")
+
+    parts.push("cfg = mdl.config\n")
+    parts.push("n_layers = getattr(cfg, 'num_hidden_layers', getattr(cfg, 'n_layer', 32))\n")
+    parts.push("h_dim = getattr(cfg, 'hidden_size', getattr(cfg, 'd_model', 4096))\n")
+    parts.push("h_sqrt = float(np.sqrt(h_dim))\n")
+    parts.push("print(f'[cmt_v2] n_layers={n_layers} h_dim={h_dim} h_sqrt={h_sqrt:.2f}', flush=True)\n\n")
+
+    parts.push("rng = np.random.default_rng(RNG_SEED)\n")
+    parts.push("family_axes = {}\n")
+    parts.push("for fam in FAMILIES:\n")
+    parts.push("    seed = abs(hash(fam)) % (2**31)\n")
+    parts.push("    r = np.random.default_rng(seed)\n")
+    parts.push("    A = r.standard_normal((h_dim, HID_TRUNC)).astype(np.float32)\n")
+    parts.push("    A /= np.linalg.norm(A, axis=0, keepdims=True) + 1e-9\n")
+    parts.push("    family_axes[fam] = A\n\n")
+
+    parts.push("def byte_weighted_mean(hidden, attn_mask):\n")
+    parts.push("    weights = attn_mask.float()\n")
+    parts.push("    w_sum = weights.sum(dim=1, keepdim=True).clamp(min=1.0)\n")
+    parts.push("    return ((hidden * weights.unsqueeze(-1)).sum(dim=1) / w_sum).float().cpu().numpy()\n\n")
+
+    parts.push("def project_family(h_vec):\n")
+    parts.push("    out = {}\n")
+    parts.push("    for fam, A in family_axes.items():\n")
+    parts.push("        proj = h_vec @ A\n")
+    parts.push("        out[fam] = float(np.linalg.norm(proj, axis=1).mean())\n")
+    parts.push("    return out\n\n")
+
+    parts.push("Y_full = {fam: np.zeros(N_PROBES, dtype=np.float32) for fam in FAMILIES}\n")
+    parts.push("for i, p in enumerate(PROMPTS):\n")
+    parts.push("    inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("    with torch.no_grad():\n")
+    parts.push("        out = mdl(**inp, output_hidden_states=True)\n")
+    parts.push("    h = byte_weighted_mean(out.hidden_states[-1], inp['attention_mask'])\n")
+    parts.push("    proj = project_family(h)\n")
+    parts.push("    for fam in FAMILIES: Y_full[fam][i] = proj[fam]\n")
+    parts.push("    if (i+1) % 4 == 0:\n")
+    parts.push("        print(f'[cmt_v2] baseline {i+1}/{N_PROBES}', flush=True)\n\n")
+
+    parts.push("layer_modules = None\n")
+    parts.push("for path in ['model.layers','transformer.h','gpt_neox.layers','model.transformer.h']:\n")
+    parts.push("    try:\n")
+    parts.push("        obj = mdl\n")
+    parts.push("        for part in path.split('.'): obj = getattr(obj, part)\n")
+    parts.push("        if len(obj) >= n_layers - 2:\n")
+    parts.push("            layer_modules = obj; print(f'[cmt_v2] layers found at {path} (count={len(obj)})', flush=True); break\n")
+    parts.push("    except (AttributeError, TypeError): continue\n")
+    parts.push("if layer_modules is None:\n")
+    parts.push("    print('[cmt_v2] FATAL: layer modules not found, aborting', flush=True); sys.exit(1)\n\n")
+
+    parts.push("def get_ablate_target(layer):\n")
+    parts.push("    if ABLATE_TARGET == 'layer':\n")
+    parts.push("        return layer\n")
+    parts.push("    # MLP sub-module discovery — covers Mistral, Qwen2/3, Llama, gemma-2 naming\n")
+    parts.push("    for name in ['mlp','feed_forward','ffn','feedforward','feed_forward_layer']:\n")
+    parts.push("        if hasattr(layer, name):\n")
+    parts.push("            return getattr(layer, name)\n")
+    parts.push("    print(f'[cmt_v2] WARN: no MLP sub-module on layer, fallback to whole layer', flush=True)\n")
+    parts.push("    return layer\n\n")
+
+    parts.push("scan_layers = list(range(0, n_layers, LAYER_STRIDE))\n")
+    parts.push("print(f'[cmt_v2] scanning {len(scan_layers)} layers: {scan_layers}', flush=True)\n\n")
+
+    parts.push("tomography = {}\n")
+    parts.push("for layer_idx in scan_layers:\n")
+    parts.push("    layer = layer_modules[layer_idx]\n")
+    parts.push("    target = get_ablate_target(layer)\n")
+    parts.push("    def zero_hook(module, inp, out):\n")
+    parts.push("        if isinstance(out, tuple): return (torch.zeros_like(out[0]),) + out[1:]\n")
+    parts.push("        return torch.zeros_like(out)\n")
+    parts.push("    handle = target.register_forward_hook(zero_hook)\n")
+    parts.push("    Y_abl = {fam: np.zeros(N_PROBES, dtype=np.float32) for fam in FAMILIES}\n")
+    parts.push("    try:\n")
+    parts.push("        for i, p in enumerate(PROMPTS):\n")
+    parts.push("            inp = tok(p, return_tensors='pt').to(mdl.device)\n")
+    parts.push("            with torch.no_grad():\n")
+    parts.push("                out = mdl(**inp, output_hidden_states=True)\n")
+    parts.push("            h = byte_weighted_mean(out.hidden_states[-1], inp['attention_mask'])\n")
+    parts.push("            proj = project_family(h)\n")
+    parts.push("            for fam in FAMILIES: Y_abl[fam][i] = proj[fam]\n")
+    parts.push("    finally:\n")
+    parts.push("        handle.remove()\n")
+    parts.push("    dY = {}\n")
+    parts.push("    for fam in FAMILIES:\n")
+    parts.push("        delta = float(np.mean(np.abs(Y_full[fam] - Y_abl[fam])))\n")
+    parts.push("        denom = float(np.mean(np.abs(Y_full[fam]))) + 1e-9\n")
+    parts.push("        rel = delta / denom\n")
+    parts.push("        # scale-invariant magnitude metric\n")
+    parts.push("        norm_dy = delta / h_sqrt\n")
+    parts.push("        dY[fam] = {'abs':round(delta,6),'rel':round(rel,6),'norm_dy':round(norm_dy,8)}\n")
+    parts.push("    tomography[str(layer_idx)] = dY\n")
+    parts.push("    print(f'[cmt_v2] layer {layer_idx}: ' + ' '.join(f'{f}={dY[f][\"rel\"]:.3f}' for f in FAMILIES), flush=True)\n\n")
+
+    parts.push("dominant = {}\n")
+    parts.push("for fam in FAMILIES:\n")
+    parts.push("    best_layer = max(tomography.keys(), key=lambda L: tomography[L][fam]['rel'])\n")
+    parts.push("    dominant[fam] = {'layer':int(best_layer),'rel':tomography[best_layer][fam]['rel']}\n\n")
+
+    parts.push("# Saturation diagnostic — count layers where rel >= 0.99 (uninformative regime)\n")
+    parts.push("sat_count = 0; total_cells = 0\n")
+    parts.push("rel_min = 1.0; rel_max = 0.0; rel_sum = 0.0\n")
+    parts.push("for L in tomography:\n")
+    parts.push("    for fam in FAMILIES:\n")
+    parts.push("        r = tomography[L][fam]['rel']\n")
+    parts.push("        total_cells += 1\n")
+    parts.push("        if r >= 0.99: sat_count += 1\n")
+    parts.push("        if r < rel_min: rel_min = r\n")
+    parts.push("        if r > rel_max: rel_max = r\n")
+    parts.push("        rel_sum += r\n")
+    parts.push("rel_mean = rel_sum / max(1,total_cells)\n")
+    parts.push("sat_frac = sat_count / max(1,total_cells)\n")
+    parts.push("informative = sat_frac < 0.5  # >50% saturated cells = uninformative regime\n\n")
+
+    parts.push("gate_pass = all(dominant[fam]['rel'] >= 0.05 for fam in FAMILIES) and informative\n\n")
+
+    parts.push("summary = {'schema':'anima/cmt/2','backbone':BASE_MODEL,\n")
+    parts.push("    'n_probes':N_PROBES,'n_layers':n_layers,'layer_stride':LAYER_STRIDE,\n")
+    parts.push("    'hidden_truncated':HID_TRUNC,'h_dim':h_dim,'h_sqrt':round(h_sqrt,4),\n")
+    parts.push("    'ablate_target':ABLATE_TARGET,'families':FAMILIES,\n")
+    parts.push("    'tomography':tomography,'dominant_layer_per_family':dominant,\n")
+    parts.push("    'rel_distribution':{'min':round(rel_min,6),'max':round(rel_max,6),'mean':round(rel_mean,6),\n")
+    parts.push("        'saturation_count':sat_count,'total_cells':total_cells,'saturation_frac':round(sat_frac,4),\n")
+    parts.push("        'informative':informative},\n")
+    parts.push("    'gate_PASS':gate_pass,\n")
+    parts.push("    'elapsed_sec':round(time.time()-t0,1),\n")
+    parts.push("    'ts':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}\n")
+    parts.push("with open(OUTPUT,'w') as f: json.dump(summary, f, indent=2)\n")
+    parts.push("print(f'[cmt_v2] DONE saturation_frac={sat_frac:.3f} informative={informative} dominant=' + ' '.join(f'{f}@L{dominant[f][\"layer\"]}({dominant[f][\"rel\"]:.3f})' for f in FAMILIES) + f' gate={\"PASS\" if gate_pass else \"FAIL\"} -> {OUTPUT}', flush=True)\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn cmd_selftest() {
+    println("── anima_cmt_v2 selftest ──")
+    _write_helper()
+    println("selftest=ok")
+    println("helper_emitted=" + HELPER_PATH)
+    println("axis=100 fix: MLP-only sub-module ablation + scale-invariant norm_dy + saturation diagnostic")
+    println("hypotheses=HCSF-A_SCALE_NORM HCSF-B_HID_DIM_BOUND HCSF-C_ARTIFACT_OF_HYBRID")
+    println("DONE")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        i = i + 1
+    }
+    if selftest { cmd_selftest(); exit(0) }
+    _write_helper()
+    println("emitted=" + HELPER_PATH)
+    println("DONE")
+}
+
+main()

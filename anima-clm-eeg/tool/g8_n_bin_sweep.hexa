@@ -1,0 +1,461 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  anima-clm-eeg/tool/g8_n_bin_sweep.hexa
+//
+//  PURPOSE
+//    G8 transversality N_BIN scaling sweep — extension of
+//    `anima-clm-eeg/tool/g8_transversal_mi_matrix.hexa` (frozen N_BIN=2 SSOT).
+//
+//    Quantifies whether the G8 PASS verdict is **stable across discretization
+//    granularity** by sweeping N_BIN ∈ {2, 4, 8, 16} (4 levels) and remeasuring
+//    the C(5,2)=10 pairwise mutual information at every level.
+//
+//    raw#10 honest caveat addressed: "N_BIN=2 binary may hide fine-grained
+//    sub-region high-MI" → this tool exposes any such hidden coupling.
+//
+//  VERDICT (frozen, this file IS the SSOT for N_BIN-stability)
+//    G8_STABLE   — ALL 4 levels PASS (forall level forall pair MI ≤ 0.1 bit)
+//                  ⇒ G8 binary verdict is granularity-independent.
+//    G8_FRAGILE  — ANY level fails (≥1 pair MI > 0.1 bit)
+//                  ⇒ binary discretization concealed structural coupling
+//                  ⇒ N_BIN=2 SSOT must be re-justified or replaced.
+//
+//  METHOD
+//    Reuses identical FNV-32 9-round avalanche surrogate generator + 5
+//    well-spaced offsets from the frozen SSOT.  Only N_BIN varies.
+//    N_TRIAL = 4096 (joint cells at N_BIN=16: 256 ⇒ ~16 trials/cell, sufficient
+//    for Miller-Madow bias correction to dominate residual finite-sample noise).
+//
+//  OUTPUT
+//    state/g8_n_bin_sweep_v1.json
+//
+//  ENV
+//    G8_SWEEP_OUT  output JSON path (default state/g8_n_bin_sweep_v1.json)
+//    G8_SWEEP_MODE "positive" (default) | "negative"
+//
+//  USAGE
+//    HEXA_RESOLVER_NO_REROUTE=1 hexa run \
+//        anima-clm-eeg/tool/g8_n_bin_sweep.hexa
+//
+//  RAW
+//    raw#9 · hexa-only · deterministic · LLM=none · GPU=none · pre-register-frozen
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── frozen criteria ────────────────────────────────────────────────────────
+let MI_MAX_X1000     = 100        // 0.1 bit threshold (×1000 fixed-point)
+let N_TRIAL          = 4096       // trials per falsifier (≥ 16 trials/cell at N_BIN=16)
+let SCORE_RANGE      = 1000       // score scale [0, 999]
+
+// FNV-32 constants (identical to g8_transversal_mi_matrix.hexa SSOT)
+let M32              = 4294967296
+let FNV_PRIME        = 16777619
+let FNV_OFFSET_BASIS = 2166136261
+
+// 5 offsets — identical to SSOT (well-spaced 32-bit primes)
+let OFF_FA1 =  179424673
+let OFF_FA2 =  573259433
+let OFF_FA3 =  961748941
+let OFF_FB  = 1500450271
+let OFF_FC  = 1908264799
+
+// ─── env helpers ────────────────────────────────────────────────────────────
+fn env_str(key: string, default_val: string) -> string {
+    let s = env(key)
+    if s == "" { return default_val }
+    return s
+}
+
+// ─── FNV step ───────────────────────────────────────────────────────────────
+fn fnv_step(h: int, byte: int) -> int {
+    let mut x = (h + byte) % M32
+    if x < 0 { x = x + M32 }
+    x = (x * FNV_PRIME) % M32
+    if x < 0 { x = x + M32 }
+    return x
+}
+
+fn fnv_mix_int(seed: int, val: int) -> int {
+    let mut h = seed
+    h = fnv_step(h, val % 256)
+    h = fnv_step(h, (val / 256) % 256)
+    h = fnv_step(h, (val / 65536) % 256)
+    h = fnv_step(h, (val / 16777216) % 256)
+    return h
+}
+
+// 9-round FNV avalanche surrogate (byte-identical to SSOT surrogate_score)
+fn surrogate_score(offset: int, t: int, k: int) -> int {
+    let mut h = FNV_OFFSET_BASIS
+    let golden = 2654435761
+    h = fnv_mix_int(h, offset)
+    h = fnv_mix_int(h, t * golden)
+    h = fnv_mix_int(h, offset * 31)
+    h = fnv_mix_int(h, t)
+    h = fnv_mix_int(h, h)
+    h = fnv_mix_int(h, offset + t * 7919)
+    h = fnv_mix_int(h, t * golden + offset)
+    h = fnv_mix_int(h, k)
+    h = fnv_mix_int(h, h * golden)
+    let r = h % SCORE_RANGE
+    if r < 0 { return r + SCORE_RANGE }
+    return r
+}
+
+// Map score → bin index 0..n_bin-1, parametric on n_bin (NOT a global).
+fn score_to_bin_n(score: int, n_bin: int) -> int {
+    let mut b = (score * n_bin) / SCORE_RANGE
+    if b < 0 { b = 0 }
+    if b >= n_bin { b = n_bin - 1 }
+    return b
+}
+
+// ─── log₂ table (identical to SSOT) ─────────────────────────────────────────
+fn ln_x1000_for_1_plus_x(x_x1000: int) -> int {
+    let mut term_num = x_x1000
+    let mut sum = 0
+    let mut k = 1
+    let mut sign = 1
+    while k <= 12 {
+        let t = term_num / k
+        if sign == 1 { sum = sum + t } else { sum = sum - t }
+        term_num = (term_num * x_x1000) / 1000
+        sign = -sign
+        k = k + 1
+    }
+    return sum
+}
+
+fn ln2_x1000() -> int { return 693 }
+
+fn log2_x1000(n: int) -> int {
+    if n <= 0 { return 0 }
+    if n == 1 { return 0 }
+    let mut k = 0
+    let mut p2 = 1
+    while p2 * 2 <= n {
+        p2 = p2 * 2
+        k = k + 1
+    }
+    let r = n - p2
+    let x_x1000 = (r * 1000) / p2
+    let ln_1px = ln_x1000_for_1_plus_x(x_x1000)
+    let ln_n = k * ln2_x1000() + ln_1px
+    let log2 = (ln_n * 1000) / ln2_x1000()
+    return log2
+}
+
+// ─── histograms parametric in n_bin ─────────────────────────────────────────
+fn build_hist_1d_n(offset: int, k_couple: int, n_bin: int) -> list {
+    let mut h = []
+    let mut i = 0
+    while i < n_bin {
+        h.push(0)
+        i = i + 1
+    }
+    let mut t = 0
+    while t < N_TRIAL {
+        let s = surrogate_score(offset, t, k_couple)
+        let b = score_to_bin_n(s, n_bin)
+        h[b] = h[b] + 1
+        t = t + 1
+    }
+    return h
+}
+
+fn build_hist_2d_n(offset_x: int, offset_y: int, k_couple_x: int, k_couple_y: int, n_bin: int) -> list {
+    let mut h = []
+    let mut i = 0
+    let total_cells = n_bin * n_bin
+    while i < total_cells {
+        h.push(0)
+        i = i + 1
+    }
+    let mut t = 0
+    while t < N_TRIAL {
+        let sx = surrogate_score(offset_x, t, k_couple_x)
+        let sy = surrogate_score(offset_y, t, k_couple_y)
+        let bx = score_to_bin_n(sx, n_bin)
+        let by = score_to_bin_n(sy, n_bin)
+        let idx = bx * n_bin + by
+        h[idx] = h[idx] + 1
+        t = t + 1
+    }
+    return h
+}
+
+// Shannon entropy ×1000 with Miller-Madow correction (identical to SSOT).
+fn entropy_x1000_from_hist(hist: list, total: int) -> int {
+    if total <= 0 { return 0 }
+    let logN = log2_x1000(total)
+    let mut acc = 0
+    let mut k_nonempty = 0
+    let n = len(hist)
+    let mut i = 0
+    while i < n {
+        let c = hist[i]
+        if c > 0 {
+            let logc = log2_x1000(c)
+            acc = acc + c * (logN - logc)
+            k_nonempty = k_nonempty + 1
+        }
+        i = i + 1
+    }
+    let h_naive = acc / total
+    let mm_correction = ((k_nonempty - 1) * 721) / total
+    return h_naive + mm_correction
+}
+
+// ─── falsifier descriptors (identical to SSOT) ──────────────────────────────
+fn falsifier_offset(idx: int, mode_negative: int) -> int {
+    if idx == 0 { return OFF_FA1 }
+    if idx == 1 { return OFF_FA2 }
+    if idx == 2 { return OFF_FA3 }
+    if idx == 3 { return OFF_FB }
+    if mode_negative == 1 { return OFF_FA1 }
+    return OFF_FC
+}
+
+fn falsifier_couple(idx: int, mode_negative: int) -> int {
+    return 0
+}
+
+fn falsifier_name(idx: int) -> string {
+    if idx == 0 { return "F_A1_P1_LZ" }
+    if idx == 1 { return "F_A2_P2_TLR" }
+    if idx == 2 { return "F_A3_P3_GCG" }
+    if idx == 3 { return "F_B_HCI_5FALS" }
+    return "F_C_CPGD_G"
+}
+
+fn level_n_bin(level_idx: int) -> int {
+    if level_idx == 0 { return 2 }
+    if level_idx == 1 { return 4 }
+    if level_idx == 2 { return 8 }
+    return 16
+}
+
+// ─── per-level measurement ──────────────────────────────────────────────────
+//   Returns a flat list of length 13:
+//     [n_bin, max_mi_x1000, violations, level_pass, mi[0..9]]
+fn measure_level(n_bin: int, mode_negative: int) -> list {
+    let mut h_marg = []
+    let mut i = 0
+    while i < 5 {
+        let off = falsifier_offset(i, mode_negative)
+        let cpl = falsifier_couple(i, mode_negative)
+        let hist1d = build_hist_1d_n(off, cpl, n_bin)
+        let h = entropy_x1000_from_hist(hist1d, N_TRIAL)
+        h_marg.push(h)
+        i = i + 1
+    }
+
+    let mut mi_list = []
+    let mut max_mi = 0
+    let mut violations = 0
+    let mut a = 0
+    while a < 5 {
+        let mut b = a + 1
+        while b < 5 {
+            let off_a = falsifier_offset(a, mode_negative)
+            let off_b = falsifier_offset(b, mode_negative)
+            let cpl_a = falsifier_couple(a, mode_negative)
+            let cpl_b = falsifier_couple(b, mode_negative)
+            let joint = build_hist_2d_n(off_a, off_b, cpl_a, cpl_b, n_bin)
+            let h_xy = entropy_x1000_from_hist(joint, N_TRIAL)
+            let h_x = h_marg[a]
+            let h_y = h_marg[b]
+            let mut mi = h_x + h_y - h_xy
+            if mi < 0 { mi = 0 }
+            mi_list.push(mi)
+            if mi > MI_MAX_X1000 { violations = violations + 1 }
+            if mi > max_mi { max_mi = mi }
+            b = b + 1
+        }
+        a = a + 1
+    }
+
+    let level_pass = if violations == 0 { 1 } else { 0 }
+    let mut out = []
+    out.push(n_bin)
+    out.push(max_mi)
+    out.push(violations)
+    out.push(level_pass)
+    let mut p = 0
+    while p < len(mi_list) {
+        out.push(mi_list[p])
+        p = p + 1
+    }
+    return out
+}
+
+// ─── main ───────────────────────────────────────────────────────────────────
+fn main() {
+    let mode_env = env_str("G8_SWEEP_MODE", "positive")
+    let out_path = env_str("G8_SWEEP_OUT", "anima-clm-eeg/state/g8_n_bin_sweep_v1.json")
+
+    let mode_negative = if mode_env == "negative" { 1 } else { 0 }
+    let mode_label = if mode_negative == 1 { "negative_falsify" } else { "positive_independence" }
+
+    // Sweep N_BIN ∈ {2, 4, 8, 16}
+    let mut level_results = []        // per-level flat 13-list
+    let mut level_n_bins  = []
+    let mut level_max_mi  = []
+    let mut level_viol    = []
+    let mut level_pass    = []
+    let mut total_violations = 0
+    let mut overall_max_mi = 0
+    let mut overall_max_level = -1
+    let mut all_pass = 1
+
+    let mut lv = 0
+    while lv < 4 {
+        let nb = level_n_bin(lv)
+        let r = measure_level(nb, mode_negative)
+        level_results.push(r)
+        level_n_bins.push(r[0])
+        level_max_mi.push(r[1])
+        level_viol.push(r[2])
+        level_pass.push(r[3])
+        total_violations = total_violations + r[2]
+        if r[1] > overall_max_mi {
+            overall_max_mi = r[1]
+            overall_max_level = lv
+        }
+        if r[3] == 0 { all_pass = 0 }
+        lv = lv + 1
+    }
+
+    // Overall verdict
+    let g8_stable = if all_pass == 1 { 1 } else { 0 }
+
+    // Pair labels (a,b) order — same iteration as measure_level
+    let mut pair_a = []
+    let mut pair_b = []
+    let mut a2 = 0
+    while a2 < 5 {
+        let mut b2 = a2 + 1
+        while b2 < 5 {
+            pair_a.push(a2)
+            pair_b.push(b2)
+            b2 = b2 + 1
+        }
+        a2 = a2 + 1
+    }
+
+    // Fingerprint
+    let mut fp = FNV_OFFSET_BASIS
+    fp = fnv_mix_int(fp, mode_negative)
+    fp = fnv_mix_int(fp, N_TRIAL)
+    fp = fnv_mix_int(fp, MI_MAX_X1000)
+    let mut lv2 = 0
+    while lv2 < 4 {
+        let r = level_results[lv2]
+        let mut q = 0
+        while q < len(r) {
+            fp = fnv_mix_int(fp, r[q])
+            q = q + 1
+        }
+        lv2 = lv2 + 1
+    }
+
+    // ── emit cert ──────────────────────────────────────────────────────────
+    let mut cert = "{\n"
+    cert = cert + "  \"tool\": \"g8_n_bin_sweep\",\n"
+    cert = cert + "  \"version\": \"v1\",\n"
+    cert = cert + "  \"raw_rank\": 9,\n"
+    cert = cert + "  \"hexa_only\": true,\n"
+    cert = cert + "  \"deterministic\": true,\n"
+    cert = cert + "  \"llm\": \"none\",\n"
+    cert = cert + "  \"gpu\": \"none\",\n"
+    cert = cert + "  \"pre_register_frozen\": true,\n"
+    cert = cert + "  \"frozen_at\": \"2026-04-26\",\n"
+    cert = cert + "  \"hypothesis\": \"G8 binary verdict is N_BIN-granularity-independent (fine-grained MI ≤ 0.1 bit at every level)\",\n"
+    cert = cert + "  \"depends_on\": \"anima-clm-eeg/tool/g8_transversal_mi_matrix.hexa\",\n"
+    cert = cert + "  \"criteria\": {\n"
+    cert = cert + "    \"mi_max_x1000\": " + str(MI_MAX_X1000) + ",\n"
+    cert = cert + "    \"n_trial\": " + str(N_TRIAL) + ",\n"
+    cert = cert + "    \"score_range\": " + str(SCORE_RANGE) + ",\n"
+    cert = cert + "    \"n_bin_levels\": [2, 4, 8, 16],\n"
+    cert = cert + "    \"verdict_rule\": \"G8_STABLE = forall level forall pair (MI_x1000 <= mi_max_x1000)\"\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"mode\": \"" + mode_label + "\",\n"
+    cert = cert + "  \"levels\": [\n"
+    let mut lv3 = 0
+    while lv3 < 4 {
+        let r = level_results[lv3]
+        cert = cert + "    {\n"
+        cert = cert + "      \"n_bin\": " + str(r[0]) + ",\n"
+        cert = cert + "      \"max_mi_x1000\": " + str(r[1]) + ",\n"
+        cert = cert + "      \"violation_count\": " + str(r[2]) + ",\n"
+        cert = cert + "      \"level_pass\": " + str(r[3]) + ",\n"
+        cert = cert + "      \"pairs\": [\n"
+        let mut k = 0
+        let np = len(pair_a)
+        while k < np {
+            let ai = pair_a[k]
+            let bi = pair_b[k]
+            let mi = r[4 + k]
+            let v = if mi > MI_MAX_X1000 { 1 } else { 0 }
+            cert = cert + "        {\"a\": \"" + falsifier_name(ai) + "\", \"b\": \"" + falsifier_name(bi) + "\", \"MI_x1000\": " + str(mi) + ", \"violation\": " + str(v) + "}"
+            if k < np - 1 { cert = cert + "," }
+            cert = cert + "\n"
+            k = k + 1
+        }
+        cert = cert + "      ]\n"
+        cert = cert + "    }"
+        if lv3 < 3 { cert = cert + "," }
+        cert = cert + "\n"
+        lv3 = lv3 + 1
+    }
+    cert = cert + "  ],\n"
+    cert = cert + "  \"summary\": {\n"
+    cert = cert + "    \"overall_max_mi_x1000\": " + str(overall_max_mi) + ",\n"
+    cert = cert + "    \"overall_max_level_idx\": " + str(overall_max_level) + ",\n"
+    cert = cert + "    \"total_violations\": " + str(total_violations) + ",\n"
+    cert = cert + "    \"all_levels_pass\": " + str(all_pass) + ",\n"
+    cert = cert + "    \"g8_stable\": " + str(g8_stable) + ",\n"
+    cert = cert + "    \"fingerprint\": " + str(fp) + "\n"
+    cert = cert + "  },\n"
+    cert = cert + "  \"note\": \"Surrogate FNV-deterministic measurement. Validates that G8 PASS verdict (frozen N_BIN=2 SSOT) is granularity-independent. Real-falsifier N_BIN sweep is the post-arrival prerequisite for declaring G8_STABLE_REAL.\"\n"
+    cert = cert + "}\n"
+    write_file(out_path, cert)
+
+    // Console emit
+    println("─── g8_n_bin_sweep (raw#9 hexa-only) ───")
+    println("  mode                = " + mode_label)
+    println("  N_TRIAL             = " + str(N_TRIAL))
+    println("  MI_MAX_X1000        = " + str(MI_MAX_X1000))
+    println("  N_BIN levels        = {2, 4, 8, 16}")
+    let mut lv4 = 0
+    while lv4 < 4 {
+        let r = level_results[lv4]
+        let pass_str = if r[3] == 1 { "PASS" } else { "FAIL" }
+        println("  ── N_BIN=" + str(r[0]) + " ──")
+        println("     max_mi_x1000   = " + str(r[1]))
+        println("     violations     = " + str(r[2]) + " / 10")
+        println("     level_verdict  = " + pass_str)
+        let mut k = 0
+        let np = len(pair_a)
+        while k < np {
+            let ai = pair_a[k]
+            let bi = pair_b[k]
+            let mi = r[4 + k]
+            let viol_str = if mi > MI_MAX_X1000 { " VIOLATION" } else { "" }
+            println("       " + falsifier_name(ai) + " ⊥ " + falsifier_name(bi) + "  MI_x1000=" + str(mi) + viol_str)
+            k = k + 1
+        }
+        lv4 = lv4 + 1
+    }
+    println("  ── overall ──")
+    println("  total_violations    = " + str(total_violations) + " / 40")
+    println("  overall_max_mi      = " + str(overall_max_mi) + " (level idx=" + str(overall_max_level) + ")")
+    println("  g8_stable           = " + str(g8_stable))
+    println("  fingerprint         = " + str(fp))
+    println("  output              = " + out_path)
+
+    if g8_stable == 1 {
+        println("  verdict             = G8_STABLE")
+        exit(0)
+    }
+    println("  verdict             = G8_FRAGILE")
+    exit(1)
+}

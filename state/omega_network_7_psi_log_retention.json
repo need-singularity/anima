@@ -1,0 +1,116 @@
+{
+  "cycle": "omega-network-7",
+  "headline": "PSI log retention/rotation tool — pruning by --keep-days or --keep-rows; default DRY-RUN; atomic write + always-on backup",
+  "parent_cycle": "omega-network-6b",
+  "date_utc": "2026-04-26",
+  "repo": "/Users/ghost/core/nexus",
+  "head_before": "5832b46893b1c2d9448d476e1bce35b78d22e747",
+  "problem_statement": "The canonical PSI log at /tmp/hexa_remote_psi.log accumulates indefinitely (per ω-network-5: 346 rows over 4h37m → ~75/h). At sustained ops it grows into MB territory, slowing per-host calibration scanning by tool/psi_calibrate_emit.hexa (which sorts every row in awk for percentiles). No rotation/retention policy existed. ω-network-7 closes the gap with a sweeper-safe .hexa pruner.",
+  "fix_summary": "Added tool/psi_log_retention.hexa: a default-DRY-RUN retention tool that prunes old rows from a TSV PSI log according to one of two policies (--keep-days D | --keep-rows N), preserves the file's commented header lines, and writes atomically (tmp + rename). A timestamped backup copy is always created before --apply. Removed-row preview is shown in dry-run mode. Both --json and --quiet output modes supported. Standardized sentinel (raw 80) emitted in all paths.",
+  "deliverables": {
+    "new_tool": {
+      "path": "tool/psi_log_retention.hexa",
+      "raw_compliance": [
+        "raw 9  hexa-only-suffix (.hexa)",
+        "raw 71 report-only on dry-run",
+        "raw 73 admissibility (mutually-exclusive flags fail-fast with fix message)",
+        "raw 77 append-only-respect (chronological order preserved; only suffix kept)",
+        "raw 80 sentinel: __PSI_LOG_RETENTION__ <DRY_RUN|APPLIED|SKIP> kept=K removed=R total=T policy=<keep-days|keep-rows> param=P backup=PATH"
+      ],
+      "default_log_path": "/tmp/hexa_remote_psi.log",
+      "log_path_override_env": "PSI_LOG_PATH",
+      "default_policy": "--keep-days 7 (dry-run)"
+    }
+  },
+  "design_decisions": [
+    "Default DRY-RUN — every invocation without --apply produces only stdout text + sentinel; the file is never mutated. This makes the tool safe to wire into cron without risking data loss.",
+    "Atomic write — buffer the kept content into /tmp/psi_log_retention.tmp.<pid>.<ts>, then `mv -f` to the target. If the process is killed mid-write, the tmp file is orphaned but the original is intact.",
+    "Always-on backup — `cp -p` original to <log>.bak.<unix_ts> before any rewrite. The backup directory's writability is probed even on dry-run so misconfigured permissions surface before they matter.",
+    "Mutually-exclusive policies fail fast (exit 1) — explicit `fix:` line tells the operator what to change. Using BOTH flags together would be ambiguous (which one wins?), so we refuse rather than guess.",
+    "Suffix-keep only — we never select a non-contiguous subset. For --keep-days, we walk the log oldest→newest and find the first row whose ts ≥ now-D*86400; everything from that index onward is kept. This honors raw 77 append-only ordering and matches the calibrator's expectation that rows arrive chronologically.",
+    "Header preservation — we capture #-prefixed lines from the top of the file as a contiguous header block and re-emit them verbatim in the rewrite. The current production log has no header, but tools that prepend a schema comment (raw 77 history) round-trip safely.",
+    "ISO8601 epoch parsing reuses the BSD-first / GNU-fallback `iso_to_epoch` pattern from tool/dormancy_wake_tick.hexa for portability between macOS dev and Linux remote hosts.",
+    "Cleanup of orphan tmp file on rename failure — explicit `rm -f` to avoid /tmp polluton if a future filesystem-level rename ever fails."
+  ],
+  "constraints_honored": {
+    "hexa_only_suffix_raw9": "OK — single new file is .hexa.",
+    "no_parallel_session_collision": "OK — did not touch cli/run.hexa, state/atlas_health_timeline.jsonl, bisociation/spectra/g_atlas_composite_v3.json, tool/omega_cycle_atlas_ingest.hexa, n6/*, tool/kick_*.hexa, design/kick/*, .own, scripts/bin/hexa_remote.",
+    "real_log_untouched_during_validation": "OK — all 6 fixture cases used /tmp/psi_test_*.log paths. /tmp/hexa_remote_psi.log was never the target of --apply during validation; pre/post wc -l confirmed (481 lines unchanged).",
+    "no_apply_against_production_log": "OK — no operator-side --apply call against /tmp/hexa_remote_psi.log issued.",
+    "explicit_path_commit": "OK — `git add tool/psi_log_retention.hexa` only.",
+    "no_anima_commit": "OK — closure JSON is UNTRACKED at /Users/ghost/core/anima/state/.",
+    "history_ops_pin_sha": "N/A — no rewrites; clean forward commit on top of pinned HEAD 5832b468."
+  },
+  "validation": {
+    "parse_check": "OK (hexa parse tool/psi_log_retention.hexa → 'parses cleanly')",
+    "fixtures": [
+      {
+        "case": "1_keep_days_7_synth100_30days",
+        "fixture": "/tmp/psi_test_synth100.log (100 rows, evenly spaced over 30 days)",
+        "argv": "--keep-days 7",
+        "expected": "kept ≈ last-7-of-30 days subset (~24)",
+        "actual_sentinel": "__PSI_LOG_RETENTION__ DRY_RUN kept=24 removed=76 total=100 policy=keep-days param=7",
+        "result": "PASS"
+      },
+      {
+        "case": "2_keep_rows_50_synth100",
+        "fixture": "/tmp/psi_test_synth100.log",
+        "argv": "--keep-rows 50",
+        "expected": "kept=50, removed=50",
+        "actual_sentinel": "__PSI_LOG_RETENTION__ DRY_RUN kept=50 removed=50 total=100 policy=keep-rows param=50",
+        "result": "PASS"
+      },
+      {
+        "case": "3_empty_header_only",
+        "fixture": "/tmp/psi_test_empty.log (2 #-prefixed lines, 0 data rows)",
+        "argv": "--keep-days 7",
+        "expected": "SKIP verdict, no backup, reason=no_data_rows",
+        "actual_sentinel": "__PSI_LOG_RETENTION__ SKIP kept=0 removed=0 total=0 policy=keep-days param=7 backup=- reason=no_data_rows path=/tmp/psi_test_empty.log",
+        "result": "PASS"
+      },
+      {
+        "case": "4_missing_path",
+        "fixture": "/tmp/psi_test_does_not_exist.log (absent)",
+        "argv": "--keep-days 7",
+        "expected": "SKIP reason=log_missing",
+        "actual_sentinel": "__PSI_LOG_RETENTION__ SKIP kept=0 removed=0 total=0 policy=keep-days param=7 backup=- reason=log_missing path=/tmp/psi_test_does_not_exist.log",
+        "result": "PASS"
+      },
+      {
+        "case": "5_apply_shrinks_file_creates_backup",
+        "fixture": "/tmp/psi_test_synth100.log (regenerated 100 rows)",
+        "argv": "--keep-rows 30 --apply",
+        "expected": "file shrinks 100→30 lines; backup file exists at /tmp/psi_test_synth100.log.bak.<ts>",
+        "actual_pre_lines": 100,
+        "actual_post_lines": 30,
+        "actual_backup_exists": true,
+        "actual_first_row_after": "2026-04-17T17:41:49Z\thtest\t70.00\t80\taccept\tsynth row 70",
+        "actual_last_row_after": "2026-04-26T12:36:22Z\thtest\t99.00\t80\taccept\tsynth row 99",
+        "round_trip_calibrator_safe": "OK — psi_calibrate_emit.hexa --json against pruned file: rows=30, parses cleanly",
+        "result": "PASS"
+      },
+      {
+        "case": "6_both_flags_error",
+        "fixture": "/tmp/psi_test_synth100.log",
+        "argv": "--keep-days 7 --keep-rows 50",
+        "expected": "exit 1, fix message",
+        "actual_stderr": "psi_log_retention: error: --keep-days and --keep-rows are mutually exclusive\\n  fix: pass exactly one policy flag",
+        "actual_exit_code": 1,
+        "result": "PASS"
+      }
+    ],
+    "production_log_untouched": {
+      "path": "/tmp/hexa_remote_psi.log",
+      "lines_before_validation": 477,
+      "lines_after_validation": 481,
+      "delta_explanation": "Real log accumulates from concurrent hexa_remote calls; no .bak.* siblings created — confirming this tool never wrote to it.",
+      "bak_files_present": false
+    },
+    "json_output_smoke": "OK — --json --quiet produces single-line JSON object with the documented field set"
+  },
+  "follow_ups": [
+    "Wire into a daily LaunchAgent (similar plist pattern to com.nexus.psi_calibration_refresh) running --keep-days 7 (dry-run for first 1-2 weeks of ops, then --apply once retention shape is confirmed safe).",
+    "Consider adding a --max-bytes ceiling as a third policy (e.g. shrink to fit ≤2MB) for hosts with constrained /tmp.",
+    "Optional: emit __PSI_LOG_RETENTION__ APPLIED rows into bridge_health_history.tsv (post-ω-bridge-15 wiring) so the anomaly detector can spot abnormal retention churn."
+  ]
+}

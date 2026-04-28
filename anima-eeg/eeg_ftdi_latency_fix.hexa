@@ -1,0 +1,367 @@
+// anima-eeg/eeg_ftdi_latency_fix.hexa
+// raw#9 hexa-only · raw#10 honest · raw#11 snake_case · raw#12 silent-error-ban
+// raw#15 no-hardcode · raw#34 no-backup-files · raw#37 transient-helper-in-/tmp
+// raw#66 ai-native error trailer · raw#80 sentinel · raw#82 darwin-native marker
+// raw#85 escalation-audit (sudo invocation paired with stderr audit line)
+//
+// PURPOSE
+//   Detect FTDI driver path on macOS and (optionally) reduce LatencyTimer
+//   from the default 16 ms to 1 ms — required for low-latency BCI capture
+//   with OpenBCI Cyton+Daisy via the FTDI Dongle.
+//
+//   SUGGEST-ONLY by default (--detect). Any actual write requires --apply,
+//   which invokes sudo /usr/libexec/PlistBuddy on the Intel-kext plist path.
+//   Apple Silicon DriverKit path cannot be tuned this way; standalone FTDI
+//   VCP installer is needed (link surfaced; never auto-downloaded).
+//
+// USAGE
+//   hexa run anima-eeg/eeg_ftdi_latency_fix.hexa --detect           (default)
+//   hexa run anima-eeg/eeg_ftdi_latency_fix.hexa --apply --target-ms 1
+//   hexa run anima-eeg/eeg_ftdi_latency_fix.hexa --selftest
+//
+//  @resolver-bypass(reason="darwin-native: invokes uname/ioreg/kextstat/
+//                   PlistBuddy/sudo on a macOS host. None of these exist on
+//                   linux pods; external dispatch yields silent no-op. Local
+//                   Darwin exec is the only viable route.")
+
+let SCHEMA              = "anima-eeg/eeg_ftdi_latency_fix/1"
+let HELPER_PATH         = "/tmp/anima_eeg_ftdi_latency_fix_helper.hexa_tmp"
+
+// @const ftdi_intel_kext_plist : canonical Intel-era FTDI VCP kext Info.plist
+let FTDI_INTEL_KEXT_PLIST = "/Library/Extensions/FTDIUSBSerialDriver.kext/Contents/Info.plist"
+// @const ftdi_intel_kext_plist_legacy : legacy /System/Library location
+let FTDI_INTEL_KEXT_PLIST_LEGACY = "/System/Library/Extensions/FTDIUSBSerialDriver.kext/Contents/Info.plist"
+// @const ftdi_vcp_url : standalone VCP driver download (do NOT auto-download)
+let FTDI_VCP_URL        = "https://ftdichip.com/drivers/vcp-drivers/"
+// @const default_target_latency_ms : LatencyTimer target in ms (1 = lowest)
+let DEFAULT_TARGET_MS   = 1
+let DEFAULT_FACTORY_MS  = 16
+
+// ════════════════════════════════════════════════════════════════════
+// Helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _emit_trailer(slug: string, detail: string, fix: string) {
+    eprintln("reason: " + slug + ": " + detail)
+    eprintln("fix: " + fix)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Helper python emitter (raw#37 transient)
+// ════════════════════════════════════════════════════════════════════
+
+fn _write_helper() {
+    let parts = []
+    parts.push("#!/usr/bin/env python3\n")
+    parts.push("# anima-eeg eeg_ftdi_latency_fix helper — emitted by\n")
+    parts.push("# anima-eeg/eeg_ftdi_latency_fix.hexa (raw#37 transient).\n")
+    parts.push("import argparse, os, platform, plistlib, subprocess, sys\n\n")
+
+    parts.push("PLIST_PATH        = '" + FTDI_INTEL_KEXT_PLIST + "'\n")
+    parts.push("PLIST_PATH_LEGACY = '" + FTDI_INTEL_KEXT_PLIST_LEGACY + "'\n")
+    parts.push("VCP_URL           = '" + FTDI_VCP_URL + "'\n\n")
+
+    parts.push("def emit_trailer(slug, detail, fix):\n")
+    parts.push("    sys.stderr.write(f'reason: {slug}: {detail}\\n')\n")
+    parts.push("    sys.stderr.write(f'fix: {fix}\\n')\n\n")
+
+    parts.push("def find_plist():\n")
+    parts.push("    for p in (PLIST_PATH, PLIST_PATH_LEGACY):\n")
+    parts.push("        if os.path.exists(p): return p\n")
+    parts.push("    return ''\n\n")
+
+    parts.push("def probe_driverkit():\n")
+    parts.push("    info = {'ioreg_ftdi_match': False, 'kext_loaded': False, 'kext_names': []}\n")
+    parts.push("    try:\n")
+    parts.push("        r = subprocess.run(['ioreg', '-c', 'IOUSBHostInterface'],\n")
+    parts.push("                           capture_output=True, text=True, timeout=15)\n")
+    parts.push("        info['ioreg_ftdi_match'] = ('FTDI' in r.stdout) or ('ftdi' in r.stdout)\n")
+    parts.push("    except Exception as exc:\n")
+    parts.push("        info['ioreg_err'] = repr(exc)\n")
+    parts.push("    try:\n")
+    parts.push("        r = subprocess.run(['kextstat'], capture_output=True, text=True, timeout=15)\n")
+    parts.push("        for line in r.stdout.splitlines():\n")
+    parts.push("            if 'ftdi' in line.lower():\n")
+    parts.push("                info['kext_loaded'] = True\n")
+    parts.push("                info['kext_names'].append(line.strip())\n")
+    parts.push("    except Exception as exc:\n")
+    parts.push("        info['kextstat_err'] = repr(exc)\n")
+    parts.push("    return info\n\n")
+
+    parts.push("def read_plist_latencies(plist_path):\n")
+    parts.push("    \"\"\"Walk IOKitPersonalities and collect every LatencyTimer key found.\n")
+    parts.push("    Returns list of (personality_name, key_path, value).\n")
+    parts.push("    raw#15: do not hardcode personality name; FTDI ships several variants\n")
+    parts.push("    (FT232R, FT2232C, FT2232H, FT4232H, FT232H, ...) each as its own\n")
+    parts.push("    sub-dict under IOKitPersonalities.\n")
+    parts.push("    \"\"\"\n")
+    parts.push("    if not os.path.exists(plist_path): return []\n")
+    parts.push("    try:\n")
+    parts.push("        with open(plist_path, 'rb') as f: doc = plistlib.load(f)\n")
+    parts.push("    except Exception as exc:\n")
+    parts.push("        emit_trailer('plist-parse-failed',\n")
+    parts.push("                     f'{plist_path}: {exc!r}',\n")
+    parts.push("                     '1) verify plist file integrity  2) re-install FTDI VCP from ' + VCP_URL)\n")
+    parts.push("        return []\n")
+    parts.push("    out = []\n")
+    parts.push("    pers = doc.get('IOKitPersonalities', {}) or {}\n")
+    parts.push("    for pname, pbody in pers.items():\n")
+    parts.push("        if not isinstance(pbody, dict): continue\n")
+    parts.push("        # Direct key\n")
+    parts.push("        if 'LatencyTimer' in pbody:\n")
+    parts.push("            out.append((pname, f'IOKitPersonalities:{pname}:LatencyTimer', pbody['LatencyTimer']))\n")
+    parts.push("        # Nested under ConfigData\n")
+    parts.push("        cfg = pbody.get('ConfigData')\n")
+    parts.push("        if isinstance(cfg, dict) and 'LatencyTimer' in cfg:\n")
+    parts.push("            out.append((pname, f'IOKitPersonalities:{pname}:ConfigData:LatencyTimer', cfg['LatencyTimer']))\n")
+    parts.push("    return out\n\n")
+
+    parts.push("def cmd_detect(args):\n")
+    parts.push("    if platform.system() != 'Darwin':\n")
+    parts.push("        emit_trailer('wrong-platform',\n")
+    parts.push("                     f'platform.system()={platform.system()!r}; this tool is darwin-only',\n")
+    parts.push("                     '1) run on macOS host')\n")
+    parts.push("        print('__FTDI_LATENCY_FIX_RESULT__ FAIL path=NONE latency_ms=-1')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    print('platform=Darwin')\n")
+    parts.push("    print('arch=' + platform.machine())\n")
+    parts.push("    dk = probe_driverkit()\n")
+    parts.push("    print('ioreg_ftdi_match=' + str(dk['ioreg_ftdi_match']))\n")
+    parts.push("    print('kext_loaded=' + str(dk['kext_loaded']))\n")
+    parts.push("    for n in dk['kext_names']:\n")
+    parts.push("        print('kext_line=' + n[:200])\n")
+    parts.push("    plist_path = find_plist()\n")
+    parts.push("    if not plist_path:\n")
+    parts.push("        # DriverKit-only host (typical Apple Silicon modern macOS)\n")
+    parts.push("        print('plist_path=NONE')\n")
+    parts.push("        print('driver_path=DRIVERKIT_BUILTIN')\n")
+    parts.push("        print('vcp_url=' + VCP_URL)\n")
+    parts.push("        sys.stderr.write('note: built-in DriverKit FTDI driver active. '\n")
+    parts.push("                         'LatencyTimer adjustment requires installing FTDI VCP standalone '\n")
+    parts.push("                         'from ' + VCP_URL + ' (DO NOT auto-download).\\n')\n")
+    parts.push("        print('__FTDI_LATENCY_FIX_RESULT__ NEEDS_VCP_INSTALL path=DRIVERKIT_BUILTIN latency_ms=-1')\n")
+    parts.push("        sys.exit(0)\n")
+    parts.push("    print('plist_path=' + plist_path)\n")
+    parts.push("    print('driver_path=INTEL_KEXT')\n")
+    parts.push("    entries = read_plist_latencies(plist_path)\n")
+    parts.push("    if not entries:\n")
+    parts.push("        emit_trailer('no-latency-keys',\n")
+    parts.push("                     f'{plist_path} has no IOKitPersonalities[*].(ConfigData.)?LatencyTimer key',\n")
+    parts.push("                     '1) verify FTDI VCP version  2) re-install from ' + VCP_URL)\n")
+    parts.push("        print(f'__FTDI_LATENCY_FIX_RESULT__ FAIL path={plist_path} latency_ms=-1')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    min_v = None\n")
+    parts.push("    for (pname, kpath, val) in entries:\n")
+    parts.push("        try: ival = int(val)\n")
+    parts.push("        except Exception: ival = -1\n")
+    parts.push("        print(f'latency_entry={kpath}={ival}')\n")
+    parts.push("        if min_v is None or (ival >= 0 and ival < min_v): min_v = ival\n")
+    parts.push("    cur = min_v if min_v is not None else -1\n")
+    parts.push("    print(f'current_min_latency_ms={cur}')\n")
+    parts.push("    print(f'__FTDI_LATENCY_FIX_RESULT__ DETECTED path={plist_path} latency_ms={cur}')\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("def cmd_apply(args):\n")
+    parts.push("    if platform.system() != 'Darwin':\n")
+    parts.push("        emit_trailer('wrong-platform',\n")
+    parts.push("                     f'platform.system()={platform.system()!r}; this tool is darwin-only',\n")
+    parts.push("                     '1) run on macOS host')\n")
+    parts.push("        print('__FTDI_LATENCY_FIX_RESULT__ FAIL path=NONE latency_ms=-1')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    plist_path = find_plist()\n")
+    parts.push("    if not plist_path:\n")
+    parts.push("        emit_trailer('vcp-not-installed',\n")
+    parts.push("                     'no Intel-kext FTDI VCP plist found; DriverKit-only host cannot be tuned this way',\n")
+    parts.push("                     '1) install FTDI VCP standalone from ' + VCP_URL + '  '\n")
+    parts.push("                     '2) reboot  3) re-run --apply')\n")
+    parts.push("        print('__FTDI_LATENCY_FIX_RESULT__ NEEDS_VCP_INSTALL path=DRIVERKIT_BUILTIN latency_ms=-1')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    entries = read_plist_latencies(plist_path)\n")
+    parts.push("    if not entries:\n")
+    parts.push("        emit_trailer('no-latency-keys',\n")
+    parts.push("                     f'{plist_path} has no LatencyTimer keys to update',\n")
+    parts.push("                     '1) re-install FTDI VCP from ' + VCP_URL)\n")
+    parts.push("        print(f'__FTDI_LATENCY_FIX_RESULT__ FAIL path={plist_path} latency_ms=-1')\n")
+    parts.push("        sys.exit(2)\n")
+    parts.push("    target = int(args.target_ms)\n")
+    parts.push("    # raw#85 escalation-audit: explicit stderr audit before any sudo\n")
+    parts.push("    sys.stderr.write(\n")
+    parts.push("        f'[raw#85 escalation-audit] sudo PlistBuddy required: target plist={plist_path} '\n")
+    parts.push("        f'updating {len(entries)} LatencyTimer key(s) -> {target} ms. '\n")
+    parts.push("        f'Reason: lower-latency required for OpenBCI Cyton+Daisy 16ch BCI capture; '\n")
+    parts.push("        f'factory default 16 ms causes serial buffering > 1 sample window.\\n')\n")
+    parts.push("    any_change = False\n")
+    parts.push("    for (pname, kpath, val) in entries:\n")
+    parts.push("        try: cur = int(val)\n")
+    parts.push("        except Exception: cur = -1\n")
+    parts.push("        if cur == target:\n")
+    parts.push("            print(f'unchanged_entry={kpath} (already {target})')\n")
+    parts.push("            continue\n")
+    parts.push("        cmd = ['sudo', '/usr/libexec/PlistBuddy', '-c',\n")
+    parts.push("               f'Set :{kpath} {target}', plist_path]\n")
+    parts.push("        sys.stderr.write('[raw#85 escalation-audit] exec: ' + ' '.join(cmd) + '\\n')\n")
+    parts.push("        if args.dry_run:\n")
+    parts.push("            print(f'dry_run_set={kpath} {cur} -> {target}')\n")
+    parts.push("            any_change = True\n")
+    parts.push("            continue\n")
+    parts.push("        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)\n")
+    parts.push("        if r.returncode != 0:\n")
+    parts.push("            emit_trailer('plistbuddy-set-failed',\n")
+    parts.push("                         f'{kpath}: rc={r.returncode} stderr={r.stderr.strip()[:200]}',\n")
+    parts.push("                         '1) verify SIP / kext signing posture  '\n")
+    parts.push("                         '2) try with --dry-run first  '\n")
+    parts.push("                         '3) consider FTDI VCP re-install from ' + VCP_URL)\n")
+    parts.push("            print(f'__FTDI_LATENCY_FIX_RESULT__ FAIL path={plist_path} latency_ms={cur}')\n")
+    parts.push("            sys.exit(2)\n")
+    parts.push("        print(f'applied_set={kpath} {cur} -> {target}')\n")
+    parts.push("        any_change = True\n")
+    parts.push("    verdict = 'APPLIED' if any_change else 'UNCHANGED'\n")
+    parts.push("    print(f'__FTDI_LATENCY_FIX_RESULT__ {verdict} path={plist_path} latency_ms={target}')\n")
+    parts.push("    sys.exit(0)\n\n")
+
+    parts.push("def cmd_selftest(args):\n")
+    parts.push("    print('schema=anima-eeg/eeg_ftdi_latency_fix/1')\n")
+    parts.push("    print('platform=' + platform.system())\n")
+    parts.push("    print('plist_present=' + str(bool(find_plist())))\n")
+    parts.push("    print('selftest=ok')\n")
+    parts.push("    print('DONE')\n\n")
+
+    parts.push("def main():\n")
+    parts.push("    p = argparse.ArgumentParser()\n")
+    parts.push("    sub = p.add_subparsers(dest='cmd', required=True)\n")
+    parts.push("    sub.add_parser('selftest')\n")
+    parts.push("    sub.add_parser('detect')\n")
+    parts.push("    a = sub.add_parser('apply')\n")
+    parts.push("    a.add_argument('--target-ms', dest='target_ms', type=int, default=" + to_string(DEFAULT_TARGET_MS) + ")\n")
+    parts.push("    a.add_argument('--dry-run', dest='dry_run', action='store_true')\n")
+    parts.push("    args = p.parse_args()\n")
+    parts.push("    if args.cmd == 'selftest': cmd_selftest(args)\n")
+    parts.push("    elif args.cmd == 'detect': cmd_detect(args)\n")
+    parts.push("    elif args.cmd == 'apply': cmd_apply(args)\n")
+    parts.push("    else: sys.exit(2)\n\n")
+    parts.push("if __name__ == '__main__': main()\n")
+
+    write_file(HELPER_PATH, parts.join(""))
+}
+
+fn _run_helper(args: string) -> list {
+    let cmd = "python3 " + HELPER_PATH + " " + args
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]).trim(), to_int(r[1])]
+}
+
+// ════════════════════════════════════════════════════════════════════
+// CLI
+// ════════════════════════════════════════════════════════════════════
+
+fn _print_usage() {
+    eprintln("usage: hexa run anima-eeg/eeg_ftdi_latency_fix.hexa [--detect|--apply] [--target-ms <n>]")
+    eprintln("       hexa run anima-eeg/eeg_ftdi_latency_fix.hexa --selftest")
+    eprintln("flags:")
+    eprintln("  --detect          read-only probe (default)")
+    eprintln("  --apply           write LatencyTimer (requires sudo)")
+    eprintln("  --target-ms <n>   target latency in ms (default 1)")
+    eprintln("  --dry-run         used with --apply: print PlistBuddy cmds without exec")
+    eprintln("  --selftest        helper parse + plist presence, no sudo")
+    eprintln("  --help            this message")
+}
+
+fn main() {
+    let av = argv()
+    let mut selftest = false
+    let mut want_apply = false
+    let mut want_detect = false
+    let mut want_help = false
+    let mut dry_run = false
+    let mut target_ms = DEFAULT_TARGET_MS
+
+    // argv layout under hexa-strict: av[0..1] are interp/exe path slots; user
+    // args begin at index 2 (mirrors tool/anima_runpod_orchestrator.hexa).
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest"  { selftest = true; i = i + 1; continue }
+        if a == "--detect"    { want_detect = true; i = i + 1; continue }
+        if a == "--apply"     { want_apply = true; i = i + 1; continue }
+        if a == "--dry-run"   { dry_run = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" { want_help = true; i = i + 1; continue }
+        if a == "--target-ms" {
+            if (i + 1) >= len(av) {
+                _emit_trailer("missing-arg-value",
+                              "--target-ms requires an integer (e.g. 1)",
+                              "1) re-run with --target-ms 1")
+                exit(2)
+            }
+            target_ms = to_int(av[i + 1]); i = i + 2; continue
+        }
+        _emit_trailer("unknown-arg",
+                      "unrecognized argument: " + a,
+                      "1) re-run with --help to see flags  2) drop the unknown arg")
+        _print_usage()
+        exit(2)
+    }
+
+    if want_help {
+        _print_usage()
+        exit(0)
+    }
+
+    if want_apply && want_detect {
+        _emit_trailer("flag-conflict",
+                      "--detect and --apply are mutually exclusive",
+                      "1) pick one  2) re-run")
+        exit(2)
+    }
+
+    _write_helper()
+
+    if selftest {
+        println("== eeg_ftdi_latency_fix selftest ==")
+        let r = _run_helper("selftest")
+        println(r[0])
+        if r[1] != 0 { eprintln("selftest FAILED rc=" + to_string(r[1])); exit(1) }
+        if _kv_lookup(r[0], "selftest") != "ok" {
+            _emit_trailer("selftest-marker-missing",
+                          "helper did not emit selftest=ok",
+                          "1) check /tmp/anima_eeg_ftdi_latency_fix_helper.hexa_tmp parse  2) re-run")
+            exit(1)
+        }
+        println("selftest: OK")
+        exit(0)
+    }
+
+    if want_apply {
+        let mut a = "apply --target-ms " + to_string(target_ms)
+        if dry_run { a = a + " --dry-run" }
+        let r = _run_helper(a)
+        println(r[0])
+        exit(r[1])
+    }
+
+    // default: --detect (read-only)
+    let r = _run_helper("detect")
+    println(r[0])
+    exit(r[1])
+}
+// hexa-strict auto-invokes fn main() — do not call main() explicitly.

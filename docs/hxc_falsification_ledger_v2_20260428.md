@@ -237,6 +237,35 @@ Next-cycle frontier candidates (Phase 12 forward design, anchored to ad3f9442):
 
 ---
 
+## 6.2 Algorithm-internal F-A9 family addendum (2026-04-28 post-v2-freeze cumulative)
+
+**Honest C3 disclosure**: this section is appended post-v2-freeze (commit `10be9102` anima / `6bb460a0e` hive) as a cumulative integration of F-A9 family falsifiers (algorithm-internal F-Ax-N style, distinct from ledger-wide cycle-level F1..F10). F-A9-3 was preregistered at A9 module landing (Phase 9 P1 agent `aafff73d`) but only fired with sufficient evidence at this cycle. F-A9-5 is a NEW falsifier registered + fired in the same measurement cycle (raw 91 C3 timing disclosure: pre-registration 시점 = measurement 시점, classified as "FIRED-PREREGISTER" lifecycle).
+
+| F-ID | Claim | Falsifier (verdict commit/agent) | Measurement | Retire-status | Axis class | Anchor commit |
+|---|---|---|---|:---:|---|---|
+| **F-A9-3** | A9 BPE encode latency ≤ 50ms/KB on production text-heavy corpora | `ad42ff55` (anima full-A9 measurement) | alm_r13 250r 314163B encode 728985ms = 2321ms/KB = 46.4× over threshold; super-linear in N (100r→14.5s, 250r→730s = 50× ratio for 2.5× rows ⇒ projection 980KB = 8000-12000s); root cause _count_byte_pairs O(P) linear-scan dedupe per merge × O(N) pairs × O(V) merges = O(V*N*P) actual vs O(V*N) advertised; 60-70% algorithmic / 30-40% interpreter | **FIRED** (prior preregister Phase 9 P1; promoted to FIRED on 2026-04-28 evidence) | algorithm-internal (latency axis) | `ad42ff55` measurement + `1fb765ea1` raw 137 strengthening + this v2 addendum |
+| **F-A9-5** | A9 chain-amortize delta < 0.50pp on N≥4 production-chain corpus measurements | `ad42ff55` (anima full-A9 measurement) | 5/5 corpora delta_pp = 0.0 (registry.jsonl 34793B / atlas_convergence 147645B / format_witness 5582B / alm_r13 100r / alm_r13 250r); chain variants A1+A8+A12 / A1+A4+A12 / A1+A8+A12+A14 / A1+A7+A4+A12 — A9-ON byte output IDENTICAL to A9-OFF; structural family (A4/A7/A8/A12/A13/A14) saturates vocabulary surface BEFORE A9 sees stream | **FIRED-PREREGISTER** (registered + fired same cycle) | algorithm-internal (chain-amortize axis) | `ad42ff55` measurement + this v2 addendum (raw 91 C3 disclosure on registration timing) |
+
+**A9 retirement path consequence**: F-A9-3 + F-A9-5 jointly retire A9 from raw 137 80% closure roadmap as load-bearing slot. A9 module retains raw 65+68 idempotency contract + selftest 19.4% reference value but EXITS production-chain text-heavy class slot. Replacement candidate = **A20 schema-aware BPE** (a45778db PASS 1+2 LIVE 4/4 selftest, schema_tokens=8, sym-count -63%; PASS 3+4 in-flight ~280 LoC remaining). A20 vs A9 differential = generic byte-pair (A9, post-A1 → no-op) vs schema-aware (A20, structural-token pre-seed + literal-residue split) — A20 sidesteps F-A9-5 chain-amortize saturation by operating on TWO orthogonal vocabulary sources visible to schema-header parse but invisible to byte-level structural-strip.
+
+**a444457a D1+D3 conservative-bound retraction**: prior `a444457a` ledger D1 ("anima/hive/nexus --no-A9 conservative bound; full-A9 yields HIGHER %") and D3 ("anima -0.79pp due to A9 disable") were FALSIFIED by `ad42ff55` 5/5 0pp measurement. raw 91 honest C3 retraction: airgenome rig_trend_history 85.20% chain (A1,A8,A12,A13,A14,A16,A9) + hexa-lang aot_cache_gc 87.56% chain (same) — A9 listed but A14+A16 are LOAD-BEARING per Phase 10 P0 ledger; A9 fires 0 merges in production chain context EVEN ON HIGH-% files. This retraction propagates to:
+- 6-repo aggregate INTERP 49.10% (anchor `a42b3f3e`) — UNCHANGED post-correction (prior claim was conservative bound + correction; corrected value = same 49.10%)
+- raw 137 80% target gap = 30.90pp INTERP (UNCHANGED) / 17.41pp AOT-aware (`2fb55d01` 62.59% lineage, separate axis)
+- A9 RETIRED ⇒ closure path = A16 (LIVE) + A17 AOT (post-F10) + A18 AOT (post-F10) + A19 cross-file (LIVE) + **A20 priority-promoted** + A22 forward-spec
+
+**Cross-link to F-A20 family** (a45778db tick 1 design preregister + this addendum forward-spec):
+| F-ID | Claim | Pre-reg | Status |
+|---|---|---|---|
+| F-A20-1 | schema-token reuse < 5 across files (LOAD-BEARING test) | a45778db tick 1 | preregistered |
+| F-A20-2 | round-trip not byte-eq | a45778db tick 1 | preregistered |
+| F-A20-3 | chain-amortize delta < 0.50pp on N≥4 (A9 F-A9-5 mirror) | a45778db tick 1 | preregistered |
+| F-A20-4 | encode latency > 50ms/KB (A9 F-A9-3 mirror) | a45778db tick 1 | preregistered |
+| **F-A20-5 NEW** | production-chain post-A12 standalone vs in-chain delta < 1pp (chain-amortize NEW axis) | this addendum | **NEW preregister** (verdict pending a45778db PASS 3+4 LIVE FIRE) |
+
+**Cumulative F-ID count post-2026-04-28-A9-retirement**: F1..F10 (cycle-level retired) + F-A17-1/3/4 (A17 algorithm-internal) + F-A18-1/3 (A18 algorithm-internal; F-A18-3 RETIRED post-AOT, F-A18-1 TRIPPED in-flight) + F-A19-5/6 (A19 algorithm-internal; F-A19-6 NEW from nexus 96 measurement) + **F-A9-3 FIRED + F-A9-5 FIRED** (this addendum) + **F-A20-1..5 preregistered** (F-A20-5 NEW this addendum) = 14+ retired/fired + 5 preregistered forward-spec falsifiers across algorithm-internal + cycle-level axes.
+
+---
+
 ## 7. Cross-references
 
 - **v1 ledger (predecessor)**: `state/format_witness/2026-04-28_falsification_ledger.jsonl` (commit `33e8466d`, 7 entries)
@@ -251,6 +280,10 @@ Next-cycle frontier candidates (Phase 12 forward design, anchored to ad3f9442):
 - **A16 LIVE FIRE 4-corpus**: `state/format_witness/2026-04-28_phase10_p0_a16_live_fire.jsonl` (F8 source)
 - **A16 b85 LIVE FIRE**: `state/format_witness/2026-04-28_phase10_p0_a16_b85_live_fire.jsonl` (F7 retire)
 - **Post-bug-fix sweep**: `state/format_witness/2026-04-28_post_bug_fixes_full_sweep.jsonl` (49.10% aggregate)
+- **A9 full measurement (F-A9-3/F-A9-5 source)**: `state/format_witness/2026-04-28_anima_full_a9_measurement.jsonl` (13 rows; ad42ff55 verdict; 5/5 corpora 0pp chain-amortize)
+- **A9 retirement + A20 priority shift**: `docs/hxc_a9_retirement_a20_priority_shift_20260428.md` + witness `state/format_witness/2026-04-28_a9_retirement_a20_priority_shift.jsonl`
+- **A20 design (a45778db tick 1)**: `docs/hxc_phase11_a20_design_20260428.md` (4 falsifiers preregistered; PASS 3+4 in-flight)
+- **AOT-aware 6-repo full sweep**: `state/format_witness/2026-04-28_aot_aware_6repo_full_sweep.jsonl` (62.59% AOT-aware aggregate; 17.41pp gap post-AOT)
 
 ---
 

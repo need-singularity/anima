@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+# ANIMA-NOTE: this file is `.py.txt` because anima `.gitignore` blocks all
+# `*.py` (raw#37 transient policy + auto-cleanup). To execute:
+#   cp anima-cpgd-research/scripts/s7_4backbone_cmt_forward.py.txt /tmp/s7_4backbone_cmt_forward.py
+#   /private/tmp/cpgd_phi3_venv/bin/python /tmp/s7_4backbone_cmt_forward.py
+# The `.py.txt` is the canonical source-of-truth artifact; `.py` is ephemeral.
+"""
+anima-cpgd-research/scripts/s7_4backbone_cmt_forward.py(.txt)
+
+S7 cusp_depth N=12-16 extension — 4 small-backbone fresh CMT forward.
+
+Generates `cmt.json` for each of (default) 4 backbones using the same
+schema as `state/v10_benchmark_v3/{backbone}/cmt.json`, so they can be
+appended to the existing N=8 trial set used by
+`anima-hci-research/tool/cusp_depth_projector_n8.hexa`.
+
+Backbones (ordered by mac-MPS friendliness):
+  1. Qwen/Qwen2.5-1.5B          — 1.5B, fast (mac MPS OK)
+  2. google/gemma-2-2b          — 2B, mac MPS OK (no HF gate as of 2026-04)
+  3. microsoft/Phi-3.5-mini-instruct  — 3.8B, mac MPS borderline
+  4. meta-llama/Llama-3.2-3B    — 3B, HF gated (skip if not authorized)
+
+Schema (matches `tool/anima_cmt.hexa` emit, simplified for fresh forward):
+  {
+    "schema": "anima/cmt/1",
+    "backbone": "<HF id>",
+    "n_probes": 8,
+    "n_layers": <int>,
+    "layer_stride": 4,
+    "tomography": {
+       "<L>": { "Hexad":{"abs":..,"rel":..}, "Law":{...}, "Phi":{...}, "SelfRef":{...} },
+       ...
+    },
+    "dominant_layer_per_family": { "Hexad":{"layer":int,"rel":float}, ... },
+    ...
+  }
+
+Output base dir: state/s7_n12_4bb/<short_name>/cmt.json
+                                      ^                ^
+                                      qwen25_15b / gemma2_2b / phi35_mini / llama32_3b
+
+Determinism:
+  torch.manual_seed(20260426); numpy seed 20260426; eval(); no_grad.
+  dtype fp32 (mac MPS); CPU fallback if MPS hits OOM.
+
+Cost:  $0 mac local (or $1-3 GPU if memory-killed).
+
+raw#37 transient (Python wrapper). The hexa consumer is
+`anima-hci-research/tool/cusp_depth_projector_n12.hexa` (sibling, raw#9).
+"""
+
+import hashlib
+import json
+import os
+import sys
+import time
+import traceback
+
+import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+SEED = 20260426
+N_PROBES = 8
+LAYER_STRIDE = 4
+HID_TRUNC = 128
+
+# 8-prompt set (subset of canonical 16, 2 per family x 4 families = 8)
+PROMPTS = [
+    "Define hexad as a six-fold integration:",
+    "Six modules form a hexagonal architecture when:",
+    "Logical implication law: if A then:",
+    "Sequential rule application proceeds:",
+    "Integrated information measures partition independence:",
+    "Phi quantifies irreducibility of system:",
+    "Self-reference emerges when system observes:",
+    "Recursive meta-cognition models:",
+]
+
+FAMILIES = ["Hexad", "Law", "Phi", "SelfRef"]
+
+
+# --- backbones (HF id, short_name, gated_flag) -------------------------------
+BACKBONES = [
+    ("Qwen/Qwen2.5-1.5B",                  "qwen25_15b",   False),
+    ("google/gemma-2-2b",                  "gemma2_2b",    False),
+    ("microsoft/Phi-3.5-mini-instruct",    "phi35_mini",   False),
+    ("meta-llama/Llama-3.2-3B",            "llama32_3b",   True),
+]
+
+OUT_BASE = os.path.join(
+    os.environ.get("ANIMA_REPO", "/Users/ghost/core/anima"),
+    "state", "s7_n12_4bb",
+)
+
+
+def get_layer_modules(mdl, n_layers):
+    for path in ["model.layers", "transformer.h", "gpt_neox.layers", "model.transformer.h"]:
+        try:
+            obj = mdl
+            for part in path.split("."):
+                obj = getattr(obj, part)
+            if hasattr(obj, "__len__") and len(obj) >= n_layers - 2:
+                return obj, path
+        except (AttributeError, TypeError):
+            continue
+    return None, None
+
+
+def byte_weighted_mean(hidden, attn_mask):
+    weights = attn_mask.float()
+    w_sum = weights.sum(dim=1, keepdim=True).clamp(min=1.0)
+    return ((hidden * weights.unsqueeze(-1)).sum(dim=1) / w_sum).float().cpu().numpy()
+
+
+def make_family_axes(h_dim, hid_trunc):
+    family_axes = {}
+    for fam in FAMILIES:
+        seed = abs(hash(fam)) % (2 ** 31)
+        r = np.random.default_rng(seed)
+        A = r.standard_normal((h_dim, hid_trunc)).astype(np.float32)
+        A /= np.linalg.norm(A, axis=0, keepdims=True) + 1e-9
+        family_axes[fam] = A
+    return family_axes
+
+
+def project_family(h_vec, family_axes):
+    out = {}
+    for fam, A in family_axes.items():
+        proj = h_vec @ A
+        out[fam] = float(np.linalg.norm(proj, axis=1).mean())
+    return out
+
+
+def cmt_forward(backbone, short_name, device):
+    print(f"\n=== {short_name} ({backbone}) device={device} ===", flush=True)
+    t0 = time.time()
+    tok = AutoTokenizer.from_pretrained(backbone, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    dtype = torch.float32  # MPS prefers fp32; fp16 also OK on small models
+    mdl = AutoModelForCausalLM.from_pretrained(
+        backbone, trust_remote_code=True, torch_dtype=dtype,
+        output_hidden_states=True, low_cpu_mem_usage=True,
+    )
+    mdl.to(device)
+    mdl.eval()
+    print(f"  loaded {time.time()-t0:.1f}s", flush=True)
+
+    cfg = mdl.config
+    n_layers = getattr(cfg, "num_hidden_layers", getattr(cfg, "n_layer", 32))
+    h_dim = getattr(cfg, "hidden_size", getattr(cfg, "d_model", 4096))
+    print(f"  n_layers={n_layers} h_dim={h_dim}", flush=True)
+
+    family_axes = make_family_axes(h_dim, HID_TRUNC)
+
+    # Baseline forward
+    Y_full = {fam: np.zeros(N_PROBES, dtype=np.float32) for fam in FAMILIES}
+    for i, p in enumerate(PROMPTS):
+        inp = tok(p, return_tensors="pt").to(device)
+        with torch.no_grad():
+            out = mdl(**inp, output_hidden_states=True)
+        h = byte_weighted_mean(out.hidden_states[-1], inp["attention_mask"])
+        proj = project_family(h, family_axes)
+        for fam in FAMILIES:
+            Y_full[fam][i] = proj[fam]
+    print(f"  baseline done {time.time()-t0:.1f}s", flush=True)
+
+    layer_modules, layer_path = get_layer_modules(mdl, n_layers)
+    if layer_modules is None:
+        raise RuntimeError(f"layer modules not found for {backbone}")
+    print(f"  layers found at {layer_path} (count={len(layer_modules)})", flush=True)
+
+    scan_layers = list(range(0, n_layers, LAYER_STRIDE))
+    print(f"  scanning {len(scan_layers)} layers: {scan_layers}", flush=True)
+
+    tomography = {}
+    for layer_idx in scan_layers:
+        layer = layer_modules[layer_idx]
+
+        def zero_hook(module, inp, out):
+            if isinstance(out, tuple):
+                return (torch.zeros_like(out[0]),) + out[1:]
+            return torch.zeros_like(out)
+
+        handle = layer.register_forward_hook(zero_hook)
+        Y_abl = {fam: np.zeros(N_PROBES, dtype=np.float32) for fam in FAMILIES}
+        try:
+            for i, p in enumerate(PROMPTS):
+                inp = tok(p, return_tensors="pt").to(device)
+                with torch.no_grad():
+                    out = mdl(**inp, output_hidden_states=True)
+                h = byte_weighted_mean(out.hidden_states[-1], inp["attention_mask"])
+                proj = project_family(h, family_axes)
+                for fam in FAMILIES:
+                    Y_abl[fam][i] = proj[fam]
+        finally:
+            handle.remove()
+        dY = {}
+        for fam in FAMILIES:
+            delta = float(np.mean(np.abs(Y_full[fam] - Y_abl[fam])))
+            rel = delta / (float(np.mean(np.abs(Y_full[fam]))) + 1e-9)
+            dY[fam] = {"abs": round(delta, 4), "rel": round(rel, 4)}
+        tomography[str(layer_idx)] = dY
+        line = " ".join(f"{f}={dY[f]['rel']:.3f}" for f in FAMILIES)
+        print(f"  layer {layer_idx:>3d}: {line}", flush=True)
+
+    dominant = {}
+    for fam in FAMILIES:
+        best_layer = max(tomography.keys(), key=lambda L: tomography[L][fam]["rel"])
+        dominant[fam] = {"layer": int(best_layer), "rel": tomography[best_layer][fam]["rel"]}
+    gate_pass = all(dominant[fam]["rel"] >= 0.05 for fam in FAMILIES)
+
+    summary = {
+        "schema": "anima/cmt/1",
+        "backbone": backbone,
+        "short_name": short_name,
+        "n_probes": N_PROBES,
+        "n_layers": n_layers,
+        "layer_stride": LAYER_STRIDE,
+        "hidden_truncated": HID_TRUNC,
+        "families": FAMILIES,
+        "tomography": tomography,
+        "dominant_layer_per_family": dominant,
+        "gate_PASS": gate_pass,
+        "elapsed_sec": round(time.time() - t0, 1),
+        "device": str(device),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    out_dir = os.path.join(OUT_BASE, short_name)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "cmt.json")
+    with open(out_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"  wrote {out_path} (elapsed {summary['elapsed_sec']}s)", flush=True)
+
+    # Free memory
+    del mdl, tok
+    if device == "mps":
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+    return out_path, summary
+
+
+def main():
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    # device selection
+    if torch.backends.mps.is_available():
+        device = "mps"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+
+    skip_only = os.environ.get("ANIMA_S7_BACKBONES", "")
+    target_short = set(s.strip() for s in skip_only.split(",") if s.strip())
+
+    results = []
+    for backbone, short_name, gated in BACKBONES:
+        if target_short and short_name not in target_short:
+            print(f"[skip] {short_name} not in ANIMA_S7_BACKBONES filter", flush=True)
+            continue
+        try:
+            path, summary = cmt_forward(backbone, short_name, device)
+            results.append({"short_name": short_name, "path": path, "n_layers": summary["n_layers"], "ok": True})
+        except Exception as e:
+            err_kind = type(e).__name__
+            err_msg = str(e)
+            results.append({"short_name": short_name, "path": None, "ok": False, "error": err_kind + ": " + err_msg[:300], "gated": gated})
+            print(f"[ERROR] {short_name}: {err_kind}: {err_msg[:300]}", flush=True)
+            if "401" in err_msg or "gated" in err_msg.lower() or "access" in err_msg.lower():
+                print(f"  -> {short_name} likely HF gate not approved; will be skipped in N>=12", flush=True)
+
+    print("\n=== SUMMARY ===", flush=True)
+    for r in results:
+        print(f"  {r['short_name']}: ok={r['ok']} {'path=' + str(r.get('path')) if r['ok'] else 'err=' + r.get('error', '?')}", flush=True)
+
+    n_ok = sum(1 for r in results if r["ok"])
+    print(f"\n{n_ok}/{len(results)} backbones generated cmt.json", flush=True)
+
+
+if __name__ == "__main__":
+    main()
