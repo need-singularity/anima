@@ -107,4 +107,23 @@ Now-orthogonal to Law 64 v6:
 
 ---
 
-**Status**: F1_CYCLE_4_LAW_64_V6_FINAL_MANIFEST_LIVE — cycle 4 closed at universal alignment principle.
+## §9. T9a stochastic extension — Law 64 v7 CANDIDATE (commit `4f4192de`)
+
+First test beyond v6 deterministic scope: Conway B3/S23 + Bernoulli(p=0.05) i.i.d. bit-flip noise.
+
+| N_TRAIN | ca_acc | mk_acc | adv | noise ceiling = 950 |
+|---|---|---|---|---|
+| 50 | 948 | 938 | +10 | both below ceiling (sample-noise) |
+| 200 | 946 | 946 | 0 | both AT ceiling |
+| 1000 | 948 | 948 | 0 | both AT ceiling |
+| 5000 | 949 | 949 | 0 | both AT ceiling |
+
+**Verdict**: H1_SUPPORTED — alignment principle EXTENDS to stochastic substrates. Both CA(5) and shared-P-9 saturate to 949/1000 (within 1/1000 of 950 noise ceiling).
+
+**v7 candidate statement**: "Matched-context translation-invariant Markov saturates substrates of the form (deterministic CA + i.i.d. emission noise) up to the entropy of the noise channel. Shared-P-9 learns the convolved P(noisy_next | ctx) directly and emits the same forced argmax as the CA oracle; both clamp identically at the ceiling."
+
+Open beyond v7: correlated/structured noise, non-symmetric flip probabilities, non-i.i.d. emission, multiplicative noise. None tested.
+
+---
+
+**Status**: F1_CYCLE_4_LAW_64_V7_CANDIDATE_STOCHASTIC_EXTENSION_LIVE — cycle 4 + v7 candidate registered.
