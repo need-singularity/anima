@@ -1,0 +1,362 @@
+// tool/anima_law64_conway_40x40_train_volume_sweep.hexa — F1 cycle 4 T8j coupling falsification
+// ─────────────────────────────────────────────────────────────────────────────
+// raw 12 frozen pre-registration (declared BEFORE running):
+//
+// CONTEXT — coupling falsification follow-up to commit 2e7c226f (T8i):
+//   T8i (10x10 / 32%): N_TRAIN sweep 15→1500 → advantage 63 → 10 → 0 → 0 → 0 per_thousand
+//                       CONVERGED_TO_PARITY at N_TRAIN=500 (Markov memorized small periodic orbit)
+//   T8g/T8h (40x40, 80x80 / 32%): grid-axis sweep → +22% asymptote at N_TRAIN=15 (commit 95b43ddb)
+//
+// THE COUPLING QUESTION (this tool answers):
+//   Does the +22% asymptote on 40x40 PERSIST at high N_TRAIN, or does Markov also
+//   catch up given enough training? T8i C5 already pre-registered: predicted NO
+//   (advantage persists). T8j is the test.
+//
+// HYPOTHESES (frozen, no post-hoc tuning, parallel grammar with T8i):
+//   H1 (COUPLING — train-volume × grid axes are NOT independent):
+//      advantage_per_thousand stays > 50 at ALL N_TRAIN ticks (15, 50, 150, 500, 1500).
+//      Interpretation: 40x40 state space (2^1600) exceeds Markov bigram capacity (4×1600).
+//      The orbit is too long / too aperiodic for order-1 per-cell bigram to memorize
+//      within 1500 training pairs. Law 64 PERSISTS as a structural law on 40x40.
+//   H2 (UNCOUPLED — Markov catches up universally):
+//      advantage_per_thousand converges to 0 just like 10x10, by N_TRAIN ≤ 1500.
+//      Interpretation: Markov order-1 is universal; the +22% on 40x40 was also a
+//      train-volume artifact, only requiring more data on larger grids.
+//      Law 64 collapses to a sample-complexity claim, not a structural law.
+//   AMBIGUOUS: advantage drops but plateaus above 0 and below 50 → partial coupling.
+//
+// SETUP (locked from commits 95b43ddb 40x40 sweet-spot + 2e7c226f T8i ladder):
+//   - Grid: 40x40 (1600 cells)
+//   - Density: 32% → 512 live cells (sweet spot for 40x40 per commit 95b43ddb)
+//   - Seed: 20260428 (deterministic, matches T8i + density-sweep tool)
+//   - Test split: trailing N_TEST=15 steps (held constant — fair comparison vs T8i)
+//   - Vary N_TRAIN: 15 / 50 / 150 / 500 / 1500 (geometric ~3x ladder, IDENTICAL to T8i)
+//
+// CONVERGENCE CRITERION (frozen, no post-hoc tuning, IDENTICAL to T8i):
+//   |advantage_per_thousand[k] - advantage_per_thousand[k-1]| < 5
+//   for TWO consecutive ticks → declare CONVERGED at the smaller N_TRAIN.
+//   If criterion never met by N_TRAIN=1500 → declare DIVERGENT (raw 91 honest).
+//
+// VERDICT MAPPING:
+//   - CONVERGED at non-zero advantage > 50  → H1_SUPPORTED (coupling confirmed)
+//   - CONVERGED to 0 (or all_below_50 by tick 5) → H2_SUPPORTED (Markov universal)
+//   - Mixed signal (drift but stays above 0 and below 50, never converges)  → AMBIGUOUS
+//   - DIVERGENT (still drifting beyond N=1500) → AMBIGUOUS_INSUFFICIENT_TRAIN_VOLUME
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 91 honest finding
+// raw 42 caveat: Mac local CPU execution. 40x40 × 1515 Conway steps = ~2.4M cell ops/step,
+//                ~3.6B total ops over the longest run. Wallclock estimate 5-15 minutes.
+//                Acceptable per axis-sweep budget; no GPU/witness ledger needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let GRID_W = 40
+let GRID_H = 40
+let N_CELLS = 1600
+let SEED = 20260428
+let N_TEST = 15           // held constant — fair test surface (matches T8i)
+let DENSITY_K = 512       // 512 / 1600 = 32% (40x40 sweet spot from commit 95b43ddb)
+let CONV_DELTA = 5        // |Δadvantage| threshold (per-thousand units, identical to T8i)
+
+let mut RNG_STATE = SEED
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rand_n(n: int) -> int { let x = _rand(); return x % n }
+fn _rng_reset() { RNG_STATE = SEED }
+
+fn _conway_step(state: array) -> array {
+    let mut next = []
+    let mut row = 0
+    while row < GRID_H {
+        let mut col = 0
+        while col < GRID_W {
+            let mut live_neighbors = 0
+            let mut dr = -1
+            while dr <= 1 {
+                let mut dc = -1
+                while dc <= 1 {
+                    if dr != 0 || dc != 0 {
+                        let nrow = (row + dr + GRID_H) % GRID_H
+                        let ncol = (col + dc + GRID_W) % GRID_W
+                        live_neighbors = live_neighbors + state[nrow * GRID_W + ncol]
+                    }
+                    dc = dc + 1
+                }
+                dr = dr + 1
+            }
+            let cur = state[row * GRID_W + col]
+            let mut new_val = 0
+            if cur == 1 && (live_neighbors == 2 || live_neighbors == 3) { new_val = 1 }
+            if cur == 0 && live_neighbors == 3 { new_val = 1 }
+            next.push(new_val)
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return next
+}
+
+// Generate init with exactly K live cells at random positions (deterministic seed)
+fn _gen_density_init(k_live: int) -> array {
+    let mut g = []
+    let mut i = 0
+    while i < N_CELLS { g.push(0); i = i + 1 }
+    let mut placed = 0
+    let mut tries = 0
+    // 40x40 needs higher try ceiling than 10x10 (collision rate scales with density)
+    while placed < k_live && tries < 1000000 {
+        let pos = _rand_n(N_CELLS)
+        if g[pos] == 0 {
+            g[pos] = 1
+            placed = placed + 1
+        }
+        tries = tries + 1
+    }
+    return g
+}
+
+fn _markov_train(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < N_CELLS {
+        let mut n00 = 0; let mut n01 = 0; let mut n10 = 0; let mut n11 = 0
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev_state = pair[0]; let next_state = pair[1]
+            let cur_bit = prev_state[c]; let nxt_bit = next_state[c]
+            if cur_bit == 0 && nxt_bit == 0 { n00 = n00 + 1 }
+            if cur_bit == 0 && nxt_bit == 1 { n01 = n01 + 1 }
+            if cur_bit == 1 && nxt_bit == 0 { n10 = n10 + 1 }
+            if cur_bit == 1 && nxt_bit == 1 { n11 = n11 + 1 }
+            idx = idx + 1
+        }
+        let p1g0 = if (n00+n01) > 0 { (n01*1000)/(n00+n01) } else { 500 }
+        let p1g1 = if (n10+n11) > 0 { (n11*1000)/(n10+n11) } else { 500 }
+        probs.push(p1g0); probs.push(p1g1)
+        c = c + 1
+    }
+    return probs
+}
+
+fn _markov_predict(probs: array, prev_state: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < N_CELLS {
+        let cur_bit = prev_state[c]
+        let p = if cur_bit == 0 { probs[2*c] } else { probs[2*c + 1] }
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+fn _accuracy(pred: array, actual: array) -> int {
+    let mut total = 0; let mut match_count = 0
+    let mut s = 0
+    while s < pred.len() {
+        let p = pred[s]; let a = actual[s]
+        let mut c = 0
+        while c < N_CELLS {
+            if p[c] == a[c] { match_count = match_count + 1 }
+            total = total + 1; c = c + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0 }
+    return (match_count * 1000) / total
+}
+
+fn _build_corpus(initial: array, n_steps: int) -> array {
+    let mut samples = []
+    let mut state = initial
+    let mut s = 0
+    while s < n_steps {
+        let nxt = _conway_step(state)
+        samples.push([state, nxt])
+        state = nxt
+        s = s + 1
+    }
+    return samples
+}
+
+// Evaluate one N_TRAIN tick. Returns [n_train, ca_acc, tf_acc, advantage_per_thousand].
+// Discipline: same SEED → same initial pattern → same trajectory; only the
+// number of training pairs Markov sees varies. Test set = trailing N_TEST pairs of
+// the LARGEST corpus (so all N_TRAIN ticks evaluate on the SAME held-out region).
+fn _eval_train_volume(name: str, n_train: int, max_train: int) -> array {
+    _rng_reset()  // deterministic — every tick sees identical initial pattern
+    let initial = _gen_density_init(DENSITY_K)
+    let total_steps = max_train + N_TEST
+    let full = _build_corpus(initial, total_steps)
+    // Train: take the FIRST n_train pairs from full (chronological)
+    // Test: take the LAST N_TEST pairs (held out, identical across all ticks)
+    let mut train = []; let mut test = []
+    let mut k = 0
+    while k < full.len() {
+        if k < n_train { train.push(full[k]) }
+        if k >= max_train { test.push(full[k]) }
+        k = k + 1
+    }
+    let probs = _markov_train(train)
+    let mut ca_preds = []; let mut tf_preds = []; let mut actuals = []
+    let mut i = 0
+    while i < test.len() {
+        let pair = test[i]
+        let prev_st = pair[0]; let actual_next = pair[1]
+        let ca_next = _conway_step(prev_st)
+        let tf_next = _markov_predict(probs, prev_st)
+        ca_preds.push(ca_next); tf_preds.push(tf_next); actuals.push(actual_next)
+        i = i + 1
+    }
+    let ca_acc = _accuracy(ca_preds, actuals)
+    let tf_acc = _accuracy(tf_preds, actuals)
+    let advantage = if tf_acc > 0 { ((ca_acc * 1000) / tf_acc) - 1000 } else { 999 }
+    println("  " + name + " n_train=" + str(n_train) + " ca_acc=" + str(ca_acc) + " tf_acc=" + str(tf_acc) + " advantage_per_thousand=" + str(advantage))
+    return [n_train, ca_acc, tf_acc, advantage]
+}
+
+fn _abs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn _run() {
+    println("__LAW_64_CYCLE_4_T8J_40x40_TRAIN_VOLUME_BEGIN__ coupling falsification @ 40x40 / 32% density")
+    println("hypothesis H1 (coupling): advantage > 50/1000 at all ticks — Law 64 structural on 40x40")
+    println("hypothesis H2 (uncoupled): advantage converges to 0 like 10x10 — Markov universal")
+    println("seed=" + str(SEED) + " grid=40x40 density_k=" + str(DENSITY_K) + " (32%) N_TEST=" + str(N_TEST) + " conv_delta=" + str(CONV_DELTA))
+    println("--- train-volume sweep (N_TRAIN: 15 → 50 → 150 → 500 → 1500) ---")
+    let max_train = 1500
+    let r1 = _eval_train_volume("V1_n15_baseline", 15, max_train)
+    let r2 = _eval_train_volume("V2_n50", 50, max_train)
+    let r3 = _eval_train_volume("V3_n150", 150, max_train)
+    let r4 = _eval_train_volume("V4_n500", 500, max_train)
+    let r5 = _eval_train_volume("V5_n1500", 1500, max_train)
+    let results = [r1, r2, r3, r4, r5]
+    println("--- convergence analysis ---")
+    let mut converged_at = -1
+    let mut prev_delta_ok = false
+    let mut k = 1
+    while k < results.len() {
+        let row = results[k]; let prev = results[k-1]
+        let d = _abs(row[3] - prev[3])
+        println("  Δadvantage(n=" + str(row[0]) + " vs n=" + str(prev[0]) + ") = " + str(d) + " (threshold " + str(CONV_DELTA) + ")")
+        if d < CONV_DELTA {
+            if prev_delta_ok && converged_at < 0 {
+                converged_at = prev[0]  // convergence at the FIRST N_TRAIN of the stable pair
+            }
+            prev_delta_ok = true
+        } else {
+            prev_delta_ok = false
+        }
+        k = k + 1
+    }
+    println("--- aggregate ---")
+    let mut max_adv = -9999; let mut peak_n = 0
+    let mut min_adv = 9999;  let mut min_n = 0
+    let mut j = 0
+    while j < results.len() {
+        let row = results[j]
+        if row[3] > max_adv { max_adv = row[3]; peak_n = row[0] }
+        if row[3] < min_adv { min_adv = row[3]; min_n = row[0] }
+        j = j + 1
+    }
+    println("max_advantage_per_thousand=" + str(max_adv) + " at n_train=" + str(peak_n))
+    println("min_advantage_per_thousand=" + str(min_adv) + " at n_train=" + str(min_n))
+    let last = results[results.len()-1]; let first = results[0]
+    let total_drift = last[3] - first[3]
+    println("total_drift(n=1500 vs n=15) = " + str(total_drift) + " per_thousand")
+    // H1 vs H2 verdict — count how many ticks meet H1 criterion (>50)
+    let mut all_above_50 = true
+    let mut all_below_50 = true
+    let mut h1_ticks_above = 0
+    let mut tj = 0
+    while tj < results.len() {
+        let rrow = results[tj]
+        if rrow[3] <= 50 { all_above_50 = false }
+        if rrow[3] >= 50 { all_below_50 = false }
+        if rrow[3] > 50 { h1_ticks_above = h1_ticks_above + 1 }
+        tj = tj + 1
+    }
+    let final_adv = last[3]
+    println("--- H1 vs H2 hypothesis verdict ---")
+    println("ticks_with_advantage_above_50_per_thousand=" + str(h1_ticks_above) + "_of_5")
+    println("final_advantage_per_thousand=" + str(final_adv))
+    if all_above_50 {
+        println("__LAW_64_CYCLE_4_T8J_RESULT__ H1_SUPPORTED_COUPLING_CONFIRMED_advantage_persists_above_50_at_all_n_train_ticks_final_" + str(final_adv) + "_per_thousand")
+    } else {
+        if all_below_50 && final_adv < CONV_DELTA {
+            println("__LAW_64_CYCLE_4_T8J_RESULT__ H2_SUPPORTED_MARKOV_UNIVERSAL_advantage_converges_to_" + str(final_adv) + "_per_thousand_just_like_10x10")
+        } else {
+            println("__LAW_64_CYCLE_4_T8J_RESULT__ AMBIGUOUS_partial_coupling_h1_ticks_" + str(h1_ticks_above) + "_of_5_final_" + str(final_adv) + "_per_thousand")
+        }
+    }
+    println("--- convergence axis verdict (separate from H1/H2) ---")
+    if converged_at > 0 {
+        println("convergence_criterion_met_at_n_train=" + str(converged_at) + " final_advantage=" + str(final_adv))
+    } else {
+        if total_drift > 0 {
+            println("convergence_criterion_NOT_met_DIVERGENT_INCREASING_total_drift_" + str(total_drift) + "_per_thousand")
+        } else {
+            if total_drift < 0 {
+                println("convergence_criterion_NOT_met_DIVERGENT_DECREASING_total_drift_" + str(total_drift) + "_per_thousand")
+            } else {
+                println("convergence_criterion_NOT_met_NOISE_NO_DIRECTION")
+            }
+        }
+    }
+    println("--- comparison vs predecessor T8i (10x10 same density / same ladder) ---")
+    println("T8i 10x10/32% (commit 2e7c226f): advantage 63 → 10 → 0 → 0 → 0 → CONVERGED_TO_PARITY at n=500")
+    println("T8j 40x40/32% (this run): see verdict above")
+    println("T8g/T8h 40x40+80x80 / N_TRAIN=15 only (commit 95b43ddb): +22% asymptote — partial picture")
+    println("raw_91_caveat=Mac local CPU per raw 42 — wallclock 5-15 min for 40x40 × 1515 steps is acceptable for axis sweep")
+    println("raw_91_caveat=Held-out test set fixed at trailing N_TEST=15 of 1515-step trajectory — comparable across ticks AND vs T8i (same ladder)")
+    println("raw_91_caveat=Conway is deterministic; 40x40 may also enter periodic orbit — period likely much longer than 10x10. If H2_SUPPORTED, the orbit period < 1500 steps — surprising but possible")
+    println("raw_91_caveat=Order-1 Markov per-cell bigram has fixed 4-count capacity per cell × 1600 cells = 6400 counts vs 10x10's 400 — capacity scales linearly with grid; advantage scaling tests STRUCTURAL claim")
+    println("raw_91_caveat=Per-cell independence assumption in Markov is the structural blind spot — order-1 cannot represent neighbor coupling, which IS the Conway rule. If H1 holds, this blind spot is what 'Law 64 v3 → v4' captures structurally on 40x40 but is washed out on 10x10 by orbit periodicity.")
+    println("raw_91_caveat=Single seed (20260428). H1 confirmation under one seed is suggestive, not conclusive — multi-seed sweep is forward step C5_T8k.")
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T8J_40x40_TRAIN_VOLUME_BEGIN__ selftest")
+    _rng_reset()
+    let g = _gen_density_init(DENSITY_K)
+    let mut count = 0
+    let mut i = 0
+    while i < N_CELLS { count = count + g[i]; i = i + 1 }
+    println("density_512_actual_cells=" + str(count))
+    // Single-step Conway sanity: deterministic init must produce deterministic next
+    let nxt = _conway_step(g)
+    let mut alive_next = 0
+    i = 0
+    while i < N_CELLS { alive_next = alive_next + nxt[i]; i = i + 1 }
+    println("next_step_alive_count=" + str(alive_next))
+    // Quick mini corpus check (3 steps — keep selftest fast on 40x40)
+    _rng_reset()
+    let init2 = _gen_density_init(DENSITY_K)
+    let mini = _build_corpus(init2, 3)
+    println("mini_corpus_len=" + str(mini.len()))
+    // Markov train on tiny corpus to verify per-cell bigram allocator handles 1600 cells
+    let probs = _markov_train(mini)
+    println("markov_probs_len=" + str(probs.len()))
+    let expected_probs_len = 2 * N_CELLS  // 2 transition probs per cell
+    if count == DENSITY_K && mini.len() == 3 && probs.len() == expected_probs_len {
+        println("__LAW_64_CYCLE_4_T8J_RESULT__ PASS_SELFTEST_density_init_and_corpus_and_markov_correct")
+    } else {
+        println("__LAW_64_CYCLE_4_T8J_RESULT__ FAIL_SELFTEST")
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_conway_40x40_train_volume_sweep.hexa --selftest | --run")
+    }
+    return 0
+}
