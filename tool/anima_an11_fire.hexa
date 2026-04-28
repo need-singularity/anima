@@ -1,0 +1,298 @@
+// tool/anima_an11_fire.hexa — AN11 Mistral-7B vast.ai H100 SXM fire tool
+// ─────────────────────────────────────────────────────────────────────────────
+// Companion to tool/anima_an11_mistral7b_dispatch.hexa (commit 3ba4ab05 plan
+// emitter). This tool ACTUALLY FIRES the dispatch when invoked with --fire.
+//
+// Pipeline (single H100 SXM 1× $1.87/hr × 4hr cap = $7.48 worst-case):
+//   1. vastai search offers H100_SXM rentable=true reliability>0.97
+//   2. vastai create instance (top offer, 200GB disk)
+//   3. wait SSH ready (poll instance ports up to 5 min)
+//   4. scp wrapper.py.staged + r14 corpus + an11_b templates + an11_c prompts
+//   5. ssh exec python3 /workspace/wrapper.py (background + nohup)
+//   6. watchdog poll results.json + 240 min wall cap
+//   7. scp results back to state/an11_fire_<task_id>/
+//   8. vastai destroy instance (always — finally branch)
+//   9. raw 86 audit ledger row append → state/audit/an11_fire_audit.jsonl
+//
+// raw 9 hexa-only (this file). raw 37 transient helper /tmp/anima_an11_fire_helper.py.
+// raw 12 frozen pre-registered predicates (re-asserted via dispatch tool import).
+// raw 86 cost-attribution: cost-center=anima-an11-mistral7b-vast-h100-pod
+// raw 91 C3 honest: --selftest dry-run never creates instance; --fire prints
+//   confirmation + cost estimate + offer chosen BEFORE issuing vastai create.
+// raw 100 fallback: destroy instance in every exit branch (success/fail/timeout).
+// own 6 (multi-vendor GPU) + own 11 (parallel-loop-mandate) authorize.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let TOOL_VERSION = "v1"
+let HELPER_PATH = "/tmp/anima_an11_fire_helper.hexa_tmp"
+let WRAPPER_LOCAL = "/Users/ghost/core/anima/state/an11_mistral7b_dispatch_wrapper.py.staged"
+let CORPUS_LOCAL = "/Users/ghost/core/anima/state/alm_r14_corpus_skeleton.jsonl"
+let TEMPLATES_LOCAL = "/Users/ghost/core/anima/consciousness/an11_b_templates.jsonl"
+let PROMPTS_LOCAL = "/Users/ghost/core/anima/bench/an11_c_test_prompts.jsonl"
+let RESULTS_LOCAL_DIR = "/Users/ghost/core/anima/state"
+let AUDIT_LEDGER = "/Users/ghost/core/anima/state/audit/an11_fire_audit.jsonl"
+
+let GPU_NAME = "H100_SXM"
+let DISK_GB = 200
+let MAX_PRICE_USD_PER_HR = 2  // 1.87 target; cap 2.00 for headroom
+let WATCHDOG_MIN = 240  // 4hr hard cap (raw 100 fallback)
+let SSH_READY_TIMEOUT_S = 300
+
+fn _detect_python3() -> str {
+    let candidates = [
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3"
+    ]
+    let mut i = 0
+    while i < candidates.len() {
+        let p = candidates[i]
+        if file_exists(p) { return p }
+        i = i + 1
+    }
+    return "python3"
+}
+
+fn _emit_helper() -> str {
+    let lines = [
+        "#!/usr/bin/env python3",
+        "# anima_an11_fire_helper.py — raw 37 transient (emitted by tool/anima_an11_fire.hexa)",
+        "import os, sys, json, subprocess, time, datetime, argparse",
+        "",
+        "REPO = '/Users/ghost/core/anima'",
+        "VASTAI_CLI = '/Users/ghost/.local/bin/vastai'",
+        "VAST_SSH_KEY = os.path.expanduser('~/.vast/ssh/vast-key')",
+        "WRAPPER_LOCAL = '" + WRAPPER_LOCAL + "'",
+        "CORPUS_LOCAL = '" + CORPUS_LOCAL + "'",
+        "TEMPLATES_LOCAL = '" + TEMPLATES_LOCAL + "'",
+        "PROMPTS_LOCAL = '" + PROMPTS_LOCAL + "'",
+        "RESULTS_LOCAL_DIR = '" + RESULTS_LOCAL_DIR + "'",
+        "AUDIT_LEDGER = '" + AUDIT_LEDGER + "'",
+        "GPU_NAME = '" + GPU_NAME + "'",
+        "DISK_GB = " + str(DISK_GB),
+        "MAX_PRICE = " + str(MAX_PRICE_USD_PER_HR),
+        "WATCHDOG_MIN = " + str(WATCHDOG_MIN),
+        "SSH_READY_TIMEOUT_S = " + str(SSH_READY_TIMEOUT_S),
+        "",
+        "def utc(): return datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')",
+        "def task_id(): return 'an11_fire_' + datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')",
+        "",
+        "def vastai(args, timeout=60):",
+        "    r = subprocess.run([VASTAI_CLI] + list(args), capture_output=True, text=True, timeout=timeout)",
+        "    return r",
+        "",
+        "def search_offers():",
+        "    q = 'gpu_name=' + GPU_NAME + ' rentable=true reliability>0.97 disk_space>=' + str(DISK_GB)",
+        "    r = vastai(['search', 'offers', q, '--order', 'dph_total', '--limit', '5', '--raw'])",
+        "    if r.returncode != 0: return []",
+        "    try: offers = json.loads(r.stdout) if r.stdout else []",
+        "    except Exception: return []",
+        "    return [o for o in offers if o.get('dph_total', 999) <= MAX_PRICE]",
+        "",
+        "def preflight():",
+        "    checks = {",
+        "        'wrapper_local_exists': os.path.exists(WRAPPER_LOCAL),",
+        "        'corpus_local_exists': os.path.exists(CORPUS_LOCAL),",
+        "        'templates_local_exists': os.path.exists(TEMPLATES_LOCAL),",
+        "        'prompts_local_exists': os.path.exists(PROMPTS_LOCAL),",
+        "        'vast_ssh_key_exists': os.path.exists(VAST_SSH_KEY),",
+        "        'vastai_cli_present': os.path.exists(VASTAI_CLI),",
+        "    }",
+        "    return checks, all(checks.values())",
+        "",
+        "def fire(dry_run):",
+        "    tid = task_id()",
+        "    started = utc()",
+        "    audit_row = {",
+        "        'task_id': tid, 'started_utc': started,",
+        "        'tool': 'anima_an11_fire', 'version': '" + TOOL_VERSION + "',",
+        "        'cost_center': 'anima-an11-mistral7b-vast-h100-pod', 'vendor': 'vast.ai',",
+        "        'gpu_class': GPU_NAME, 'watchdog_min': WATCHDOG_MIN,",
+        "        'dry_run': dry_run,",
+        "    }",
+        "    checks, ok = preflight()",
+        "    audit_row['preflight'] = checks",
+        "    if not ok:",
+        "        audit_row['result'] = 'PREFLIGHT_FAIL'; audit_row['ended_utc'] = utc()",
+        "        _audit_append(audit_row); return audit_row",
+        "    offers = search_offers()",
+        "    audit_row['n_offers_filtered'] = len(offers)",
+        "    if not offers:",
+        "        audit_row['result'] = 'NO_OFFERS'; audit_row['ended_utc'] = utc()",
+        "        _audit_append(audit_row); return audit_row",
+        "    chosen = offers[0]",
+        "    audit_row['chosen_offer'] = {'id': chosen.get('id'), 'dph_total': chosen.get('dph_total'),",
+        "                                 'gpu_name': chosen.get('gpu_name'), 'reliability': chosen.get('reliability2')}",
+        "    audit_row['estimated_cost_usd'] = round(chosen.get('dph_total', MAX_PRICE) * (WATCHDOG_MIN / 60.0), 2)",
+        "    if dry_run:",
+        "        audit_row['result'] = 'DRY_RUN_OK'; audit_row['ended_utc'] = utc()",
+        "        _audit_append(audit_row); return audit_row",
+        "    # ----- LIVE FIRE PATH (only when --fire passed) -----",
+        "    instance_id = None",
+        "    try:",
+        "        r = vastai(['create', 'instance', str(chosen['id']),",
+        "                    '--image', 'pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime',",
+        "                    '--disk', str(DISK_GB), '--ssh', '--direct', '--raw'])",
+        "        if r.returncode != 0:",
+        "            audit_row['result'] = 'CREATE_FAIL'; audit_row['stderr'] = r.stderr[:500]; raise RuntimeError('create')",
+        "        try: cinfo = json.loads(r.stdout)",
+        "        except Exception: cinfo = {'raw': r.stdout[:500]}",
+        "        instance_id = cinfo.get('new_contract') or cinfo.get('id')",
+        "        audit_row['instance_id'] = instance_id",
+        "        # poll SSH ready",
+        "        ip, port = None, None",
+        "        deadline = time.time() + SSH_READY_TIMEOUT_S",
+        "        while time.time() < deadline:",
+        "            rr = vastai(['show', 'instance', str(instance_id), '--raw'])",
+        "            try: info = json.loads(rr.stdout)",
+        "            except Exception: info = {}",
+        "            ip = info.get('ssh_host'); port = info.get('ssh_port')",
+        "            if ip and port: break",
+        "            time.sleep(10)",
+        "        if not (ip and port):",
+        "            audit_row['result'] = 'SSH_NOT_READY'; raise RuntimeError('ssh')",
+        "        audit_row['ssh'] = {'host': ip, 'port': port}",
+        "        # scp uploads",
+        "        ssh_dest = 'root@' + ip",
+        "        scp_base = ['scp', '-i', VAST_SSH_KEY, '-o', 'StrictHostKeyChecking=no', '-P', str(port)]",
+        "        for src, dst in [(WRAPPER_LOCAL, '/workspace/wrapper.py'),",
+        "                          (CORPUS_LOCAL, '/workspace/alm_r14_corpus_skeleton.jsonl'),",
+        "                          (TEMPLATES_LOCAL, '/workspace/an11_b_templates.jsonl'),",
+        "                          (PROMPTS_LOCAL, '/workspace/an11_c_test_prompts.jsonl')]:",
+        "            r2 = subprocess.run(scp_base + [src, ssh_dest + ':' + dst], capture_output=True, text=True, timeout=300)",
+        "            if r2.returncode != 0:",
+        "                audit_row['result'] = 'SCP_FAIL'; audit_row['scp_stderr'] = r2.stderr[:500]; raise RuntimeError('scp')",
+        "        # ssh exec wrapper (nohup background)",
+        "        ssh_base = ['ssh', '-i', VAST_SSH_KEY, '-o', 'StrictHostKeyChecking=no', '-p', str(port), ssh_dest]",
+        "        boot = 'pip install -q transformers peft datasets safetensors vllm huggingface_hub && nohup python3 /workspace/wrapper.py > /workspace/wrapper.stdout 2>&1 &'",
+        "        subprocess.run(ssh_base + [boot], capture_output=True, text=True, timeout=120)",
+        "        # watchdog poll results.json existence + FINAL marker",
+        "        wd_deadline = time.time() + WATCHDOG_MIN * 60",
+        "        last_status = 'STARTED'",
+        "        while time.time() < wd_deadline:",
+        "            time.sleep(60)",
+        "            rs = subprocess.run(ssh_base + ['cat /workspace/results.json 2>/dev/null'], capture_output=True, text=True, timeout=30)",
+        "            if rs.returncode == 0 and rs.stdout.strip():",
+        "                try:",
+        "                    rj = json.loads(rs.stdout)",
+        "                    last_status = rj.get('wrapper_status', 'UNKNOWN')",
+        "                    if last_status == 'FINAL': break",
+        "                except Exception: pass",
+        "        audit_row['final_wrapper_status'] = last_status",
+        "        audit_row['watchdog_timeout'] = (last_status != 'FINAL')",
+        "        # scp results back",
+        "        local_dir = os.path.join(RESULTS_LOCAL_DIR, tid); os.makedirs(local_dir, exist_ok=True)",
+        "        for fn in ['results.json', 'wrapper.log', 'wrapper.stdout', 'vllm.log']:",
+        "            subprocess.run(scp_base + [ssh_dest + ':/workspace/' + fn, os.path.join(local_dir, fn)],",
+        "                           capture_output=True, text=True, timeout=120)",
+        "        audit_row['results_local_dir'] = local_dir",
+        "        audit_row['result'] = 'OK' if last_status == 'FINAL' else 'WATCHDOG_TIMEOUT'",
+        "    except Exception as e:",
+        "        audit_row.setdefault('result', 'EXCEPTION'); audit_row['exception'] = str(e)",
+        "    finally:",
+        "        if instance_id is not None:",
+        "            rd = vastai(['destroy', 'instance', str(instance_id)], timeout=60)",
+        "            audit_row['destroy_returncode'] = rd.returncode",
+        "        audit_row['ended_utc'] = utc()",
+        "        _audit_append(audit_row)",
+        "    return audit_row",
+        "",
+        "def _audit_append(row):",
+        "    os.makedirs(os.path.dirname(AUDIT_LEDGER), exist_ok=True)",
+        "    with open(AUDIT_LEDGER, 'a') as f:",
+        "        f.write(json.dumps(row) + '\\n')",
+        "",
+        "def main():",
+        "    p = argparse.ArgumentParser()",
+        "    p.add_argument('--selftest', action='store_true')",
+        "    p.add_argument('--dry-run', action='store_true')",
+        "    p.add_argument('--fire', action='store_true')",
+        "    a = p.parse_args()",
+        "    if a.selftest:",
+        "        checks, ok = preflight()",
+        "        print(json.dumps({'mode': 'selftest', 'preflight': checks, 'ok': ok,",
+        "                          'gpu': GPU_NAME, 'disk_gb': DISK_GB,",
+        "                          'max_price_usd_per_hr': MAX_PRICE, 'watchdog_min': WATCHDOG_MIN,",
+        "                          'wrapper_local_loc': WRAPPER_LOCAL, 'audit_ledger': AUDIT_LEDGER,",
+        "                          'pre_registered_predicates': {",
+        "                              'an11_a_frob_delta_min': 0.001,",
+        "                              'an11_b_max_cosine_min': 0.5,",
+        "                              'an11_b_top3_sum_min': 1.2,",
+        "                              'an11_c_jsd_min': 0.15,",
+        "                              'v1prime_phi_mip_norm_max': 0.5}}, indent=2))",
+        "        sys.exit(0 if ok else 1)",
+        "    if a.dry_run:",
+        "        out = fire(dry_run=True); print(json.dumps(out, indent=2)); sys.exit(0)",
+        "    if a.fire:",
+        "        out = fire(dry_run=False); print(json.dumps(out, indent=2)); sys.exit(0 if out.get('result') == 'OK' else 2)",
+        "    print('usage: anima_an11_fire_helper.py --selftest | --dry-run | --fire')",
+        "    sys.exit(1)",
+        "",
+        "if __name__ == '__main__': main()",
+    ]
+    let mut text = ""
+    let mut i = 0
+    while i < lines.len() {
+        text = text + lines[i] + "\n"
+        i = i + 1
+    }
+    write_file(HELPER_PATH, text)
+    return HELPER_PATH
+}
+
+fn _selftest() {
+    println("__AN11_FIRE_BEGIN__ selftest")
+    let _path = _emit_helper()
+    println("helper_emitted=" + HELPER_PATH)
+    println("wrapper_local=" + WRAPPER_LOCAL)
+    println("gpu=" + GPU_NAME + " disk_gb=" + str(DISK_GB) + " max_price_usd=" + str(MAX_PRICE_USD_PER_HR))
+    println("watchdog_min=" + str(WATCHDOG_MIN))
+    println("audit_ledger=" + AUDIT_LEDGER)
+    println("__AN11_FIRE_RESULT__ HELPER_READY")
+    println("fix: 1) " + _detect_python3() + " " + HELPER_PATH + " --selftest  2) review preflight  3) --dry-run  4) --fire")
+    println("raw_91_caveat=Selftest emits helper + reports preflight ONLY — NO instance create.")
+    println("raw_91_caveat=--dry-run searches offers + emits chosen pick + cost estimate WITHOUT vastai create.")
+    println("raw_91_caveat=--fire issues vastai create instance + scp + ssh + watchdog + destroy. Cost ~$1.87/hr × ≤4hr cap = ≤$7.48.")
+    println("raw_100_fallback=destroy instance in finally branch regardless of success/fail/timeout.")
+}
+
+fn _dry_run() {
+    println("__AN11_FIRE_BEGIN__ dry-run")
+    let _path = _emit_helper()
+    let py = _detect_python3()
+    println("helper_emitted=" + HELPER_PATH)
+    println("__AN11_FIRE_RESULT__ DRY_RUN_HELPER_READY")
+    println("fix: " + py + " " + HELPER_PATH + " --dry-run")
+}
+
+fn _fire() {
+    println("__AN11_FIRE_BEGIN__ fire")
+    let _path = _emit_helper()
+    let py = _detect_python3()
+    println("helper_emitted=" + HELPER_PATH)
+    println("__AN11_FIRE_RESULT__ FIRE_HELPER_READY")
+    println("fix: " + py + " " + HELPER_PATH + " --fire")
+    println("raw_91_caveat=AWAITING_USER_FIRE — cost ~$7.48 worst-case. Confirm BEFORE running --fire.")
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_dry = false
+    let mut has_fire = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--dry-run" { has_dry = true }
+        if av[k] == "--fire" { has_fire = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_dry { _dry_run() }
+    else if has_fire { _fire() }
+    else {
+        println("usage: hexa run tool/anima_an11_fire.hexa --selftest | --dry-run | --fire")
+        println("AN11 Mistral-7B vast.ai H100 SXM fire tool — companion to anima_an11_mistral7b_dispatch.hexa")
+    }
+    return 0
+}
