@@ -1,0 +1,476 @@
+// tool/anima_law64_wolfram_rule_sweep.hexa — F1 cycle 4 T8p Wolfram rule sweep
+// ─────────────────────────────────────────────────────────────────────────────
+// Q (open after T8n): is rule-110's persistent CA(5)-vs-Markov advantage
+// (commits 53c711eb + 1bd4b7e0) UNIQUE to rule-110, or does it generalize
+// across ALL class-3/4 chaotic Wolfram elementary rules?
+//
+// CONTEXT:
+//   - Law 64 v5 (T8n): "Markov-saturation is SUBSTRATE-CONDITIONAL"
+//     Conway: Markov o1 saturates by N=500 (parity baseline).
+//     Rule-110: Markov o1 does NOT saturate even at N=1500
+//              (single_cell adv ≈ +501, density_32pct adv ≈ +686).
+//   - OPEN: is rule-110 SPECIAL (Turing-complete, class-4 universality), or
+//           does this hold for ALL chaotic rules?
+//
+// SUBSTRATE: Wolfram elementary 1D CA, length=128 toroidal, 4 rules:
+//   - rule  30: Wolfram class-3 chaos (used in random number generation,
+//                Mathematica's `Random` for decades; pseudo-random columns)
+//   - rule  90: Wolfram class-3, ADDITIVE LINEAR (XOR of left+right neighbors,
+//                generates Sierpinski triangle from single-cell init)
+//   - rule 110: Wolfram class-4, TURING-COMPLETE (T8n baseline; persistent gap)
+//   - rule 184: Wolfram class-2, traffic-flow (density-conserving particle
+//                model; expected SATURABLE — control rule)
+//
+// CA(5) ORACLE: 5-cell window subsumes elementary 3-cell rule for ALL 4 rules.
+// CA(5) prediction = direct evaluation of the true 3-cell rule = perfect ceiling.
+// Markov o1: P(next_cell | cell self-bit), per-cell bigram (identical to T8n).
+//
+// PRE-REGISTERED HYPOTHESES (raw 12 frozen, declared BEFORE running):
+//   H1 (CLASS-CONDITIONAL UNIVERSALITY):
+//     rules 30, 90, 110 (class-3/4) all show max_advantage > +200/1000 at
+//     N_TRAIN=1500 (across both inits); rule 184 (class-2) saturates to
+//     max_advantage < +50/1000 at N=1500.
+//     → Law 64 v6: "Markov-saturation tracks Wolfram class. Class-3/4 (chaos
+//       + complexity) substrates DO NOT saturate Markov o1 at any N_TRAIN
+//       tested; class-1/2 (fixed/periodic/traffic) substrates DO saturate."
+//   H2 (RULE-110-SPECIFIC):
+//     only rule 110 shows max_advantage > +200 at N=1500; rules 30, 90, 184
+//     all saturate to < +50.
+//     → Law 64 v5 NARROWED: rule-110's gap is universality-driven, not class-
+//       driven. Other chaotic rules saturate.
+//   H3 (CHAOS-SPECIFIC):
+//     rules 30, 110 (chaos) persist (max_adv > +200 at N=1500); rules 90, 184
+//     (additive/traffic — both have closed-form structure) saturate (< +50).
+//     → Law 64 v5 RESTRUCTURED: "Markov-saturation tracks ALGEBRAIC CLOSURE,
+//       not Wolfram class. Algebraically-closed rules (linear additive,
+//       conservation-law) saturate; non-algebraic chaos doesn't."
+//
+// VERDICT MAPPING (frozen, no post-hoc tuning):
+//   For each rule r, max_adv_r_n1500 = max(adv_single_n1500, adv_density_n1500)
+//   PERSIST(r) := max_adv_r_n1500 > 200
+//   SATURATE(r) := max_adv_r_n1500 < 50
+//   AMBIG(r) := neither (50 ≤ max_adv ≤ 200)
+//
+//   if PERSIST(30) && PERSIST(90) && PERSIST(110) && SATURATE(184):
+//     verdict = H1_SUPPORTED → Law 64 v6 class-conditional
+//   elif !PERSIST(30) && !PERSIST(90) && PERSIST(110) && !PERSIST(184):
+//     verdict = H2_SUPPORTED → rule-110-specific
+//   elif PERSIST(30) && !PERSIST(90) && PERSIST(110) && !PERSIST(184):
+//     verdict = H3_SUPPORTED → algebraic-closure split
+//   else:
+//     verdict = MIXED → pattern doesn't match any pre-reg; report raw, no v6.
+//
+// SETUP:
+//   - Length: 128 (toroidal 1D), identical to T8n
+//   - SEED: 20260428 (canonical Law 64 cycle-4 seed)
+//   - N_TEST: 15 (held constant, identical to T8n)
+//   - N_TRAIN ladder: 15 / 500 / 1500 (compressed from T8n's 5-step ladder
+//                     for sweep efficiency: 4 rules × 3 N × 2 inits = 24 cells)
+//   - Per-cell wallclock similar to T8n (~5-15s); total ~6 min Mac CPU.
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 91 honest finding
+// raw 42 caveat: Mac local CPU, single seed, single density placement.
+// raw 91 caveat: 3-N ladder (vs T8n's 5-N) reduces drift-shape resolution; we
+//                report adv_n15, adv_n500, adv_n1500 only. Verdict uses n1500.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let LEN = 128
+let SEED = 20260428
+let N_TEST = 15
+let K_LIVE = 41   // ~32% of 128
+
+let mut RNG_STATE = SEED
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rand_n(n: int) -> int { let x = _rand(); return x % n }
+fn _rng_reset() { RNG_STATE = SEED }
+
+// ── parameterized elementary CA step (toroidal) ─────────────────────────────
+// rule_num ∈ [0,255]; pattern index = 4*l + 2*c + r ∈ [0,7]; bit at position
+// pidx of byte rule_num gives next-state value for center cell.
+fn _ca_step(state: array, rule_num: int) -> array {
+    let mut next = []
+    let mut i = 0
+    while i < LEN {
+        let li = (i + LEN - 1) % LEN
+        let ri = (i + 1) % LEN
+        let l = state[li]; let c = state[i]; let r = state[ri]
+        let pidx = 4*l + 2*c + r
+        let bit = (rule_num / (1 << pidx)) % 2
+        next.push(bit)
+        i = i + 1
+    }
+    return next
+}
+
+// CA(5) oracle: subsumes 3-cell elementary rule = direct evaluation = perfect
+fn _ca5_predict(prev: array, rule_num: int) -> array {
+    return _ca_step(prev, rule_num)
+}
+
+// ── inits ───────────────────────────────────────────────────────────────────
+fn _init_single_cell() -> array {
+    let mut g = []
+    let mut i = 0
+    while i < LEN { g.push(0); i = i + 1 }
+    g[LEN / 2] = 1
+    return g
+}
+
+fn _init_density() -> array {
+    let mut g = []
+    let mut i = 0
+    while i < LEN { g.push(0); i = i + 1 }
+    let mut placed = 0
+    let mut tries = 0
+    while placed < K_LIVE && tries < 10000 {
+        let pos = _rand_n(LEN)
+        if g[pos] == 0 { g[pos] = 1; placed = placed + 1 }
+        tries = tries + 1
+    }
+    return g
+}
+
+// ── Markov order-1: P(next_cell | self) per-cell bigram (identical to T8n) ──
+fn _markov_train(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < LEN {
+        let mut n00 = 0; let mut n01 = 0; let mut n10 = 0; let mut n11 = 0
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev_state = pair[0]; let next_state = pair[1]
+            let cur_bit = prev_state[c]; let nxt_bit = next_state[c]
+            if cur_bit == 0 && nxt_bit == 0 { n00 = n00 + 1 }
+            if cur_bit == 0 && nxt_bit == 1 { n01 = n01 + 1 }
+            if cur_bit == 1 && nxt_bit == 0 { n10 = n10 + 1 }
+            if cur_bit == 1 && nxt_bit == 1 { n11 = n11 + 1 }
+            idx = idx + 1
+        }
+        let p1g0 = if (n00+n01) > 0 { (n01*1000)/(n00+n01) } else { 500 }
+        let p1g1 = if (n10+n11) > 0 { (n11*1000)/(n10+n11) } else { 500 }
+        probs.push(p1g0); probs.push(p1g1)
+        c = c + 1
+    }
+    return probs
+}
+
+fn _markov_predict(probs: array, prev_state: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < LEN {
+        let cur_bit = prev_state[c]
+        let p = if cur_bit == 0 { probs[2*c] } else { probs[2*c + 1] }
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+// ── accuracy + corpus ───────────────────────────────────────────────────────
+fn _accuracy(pred: array, actual: array) -> int {
+    let mut total = 0; let mut match_count = 0
+    let mut s = 0
+    while s < pred.len() {
+        let p = pred[s]; let a = actual[s]
+        let mut c = 0
+        while c < LEN {
+            if p[c] == a[c] { match_count = match_count + 1 }
+            total = total + 1; c = c + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0 }
+    return (match_count * 1000) / total
+}
+
+fn _build_corpus(initial: array, n_steps: int, rule_num: int) -> array {
+    let mut samples = []
+    let mut state = initial
+    let mut s = 0
+    while s < n_steps {
+        let nxt = _ca_step(state, rule_num)
+        samples.push([state, nxt])
+        state = nxt
+        s = s + 1
+    }
+    return samples
+}
+
+// ── single (rule, init, n_train) evaluation ─────────────────────────────────
+fn _eval(rule_num: int, init_name: str, n_train: int, max_train: int, init_state: array) -> array {
+    let total_steps = max_train + N_TEST
+    let full = _build_corpus(init_state, total_steps, rule_num)
+    let mut train = []; let mut test = []
+    let mut k = 0
+    while k < full.len() {
+        if k < n_train { train.push(full[k]) }
+        if k >= max_train { test.push(full[k]) }
+        k = k + 1
+    }
+    let probs = _markov_train(train)
+    let mut ca_preds = []; let mut tf_preds = []; let mut actuals = []
+    let mut i = 0
+    while i < test.len() {
+        let pair = test[i]
+        let prev_st = pair[0]; let actual_next = pair[1]
+        ca_preds.push(_ca5_predict(prev_st, rule_num))
+        tf_preds.push(_markov_predict(probs, prev_st))
+        actuals.push(actual_next)
+        i = i + 1
+    }
+    let ca_acc = _accuracy(ca_preds, actuals)
+    let tf_acc = _accuracy(tf_preds, actuals)
+    let advantage = if tf_acc > 0 { ((ca_acc * 1000) / tf_acc) - 1000 } else { 999 }
+    println("  rule=" + str(rule_num) + " init=" + init_name + " n_train=" + str(n_train) + " ca_acc=" + str(ca_acc) + " tf_acc=" + str(tf_acc) + " advantage_per_thousand=" + str(advantage))
+    return [n_train, ca_acc, tf_acc, advantage]
+}
+
+fn _run_rule(rule_num: int) -> array {
+    println("=== rule=" + str(rule_num) + " ===")
+
+    // Init A: single-cell deterministic
+    _rng_reset()
+    let init_a = _init_single_cell()
+
+    // Init B: density 32% (deterministic via SEED)
+    _rng_reset()
+    let init_b = _init_density()
+
+    let max_train = 1500
+    println("  -- init=single_cell --")
+    let a15   = _eval(rule_num, "single_cell",   15,   max_train, init_a)
+    let a500  = _eval(rule_num, "single_cell",   500,  max_train, init_a)
+    let a1500 = _eval(rule_num, "single_cell",   1500, max_train, init_a)
+    println("  -- init=density_32pct --")
+    let b15   = _eval(rule_num, "density_32pct", 15,   max_train, init_b)
+    let b500  = _eval(rule_num, "density_32pct", 500,  max_train, init_b)
+    let b1500 = _eval(rule_num, "density_32pct", 1500, max_train, init_b)
+
+    let adv_a_n1500 = a1500[3]; let adv_b_n1500 = b1500[3]
+    let max_adv_n1500 = if adv_a_n1500 > adv_b_n1500 { adv_a_n1500 } else { adv_b_n1500 }
+    println("  rule=" + str(rule_num) + " max_adv_n1500=" + str(max_adv_n1500) + " (single=" + str(adv_a_n1500) + " density=" + str(adv_b_n1500) + ")")
+    return [rule_num, a15, a500, a1500, b15, b500, b1500, max_adv_n1500]
+}
+
+fn _classify(max_adv_n1500: int) -> str {
+    if max_adv_n1500 > 200 { return "PERSIST" }
+    if max_adv_n1500 < 50  { return "SATURATE" }
+    return "AMBIG"
+}
+
+fn _run() {
+    println("__LAW_64_CYCLE_4_T8P_WOLFRAM_RULE_SWEEP_BEGIN__ 4 elementary rules × 3 N_TRAIN × 2 inits")
+    println("hypothesis H1 (class-conditional): {30,90,110}=PERSIST(>200) AND 184=SATURATE(<50) → Law 64 v6 class-conditional")
+    println("hypothesis H2 (rule-110-specific): only 110=PERSIST; 30, 90, 184 all SATURATE → rule-110 universality unique")
+    println("hypothesis H3 (algebraic-closure):  {30,110}=PERSIST AND {90,184}=SATURATE → algebraic-closure split")
+    println("seed=" + str(SEED) + " len=" + str(LEN) + " N_TEST=" + str(N_TEST) + " k_live_density=" + str(K_LIVE))
+    println("rules=[30,90,110,184] N_TRAIN_ladder=[15,500,1500]")
+
+    let r30  = _run_rule(30)
+    let r90  = _run_rule(90)
+    let r110 = _run_rule(110)
+    let r184 = _run_rule(184)
+
+    let max_30  = r30[7]
+    let max_90  = r90[7]
+    let max_110 = r110[7]
+    let max_184 = r184[7]
+
+    let cls_30  = _classify(max_30)
+    let cls_90  = _classify(max_90)
+    let cls_110 = _classify(max_110)
+    let cls_184 = _classify(max_184)
+
+    println("--- aggregate ---")
+    println("rule=30  max_adv_n1500=" + str(max_30)  + " classification=" + cls_30)
+    println("rule=90  max_adv_n1500=" + str(max_90)  + " classification=" + cls_90)
+    println("rule=110 max_adv_n1500=" + str(max_110) + " classification=" + cls_110)
+    println("rule=184 max_adv_n1500=" + str(max_184) + " classification=" + cls_184)
+
+    // Verdict mapping (pre-registered, frozen)
+    let mut verdict = "MIXED_pattern_does_not_match_any_pre_registered_hypothesis_report_raw"
+    let mut law_dir = "INCONCLUSIVE_no_v6_emitted"
+
+    let h1_pat = cls_30 == "PERSIST" && cls_90 == "PERSIST" && cls_110 == "PERSIST" && cls_184 == "SATURATE"
+    let h2_pat = cls_30 == "SATURATE" && cls_90 == "SATURATE" && cls_110 == "PERSIST" && cls_184 == "SATURATE"
+    let h3_pat = cls_30 == "PERSIST" && cls_90 == "SATURATE" && cls_110 == "PERSIST" && cls_184 == "SATURATE"
+
+    if h1_pat {
+        verdict = "H1_SUPPORTED_class_conditional_universality_classes_3_4_persist_class_2_saturates"
+        law_dir = "LAW_64_v6_CLASS_CONDITIONAL_MARKOV_SATURATION"
+    }
+    if h2_pat {
+        verdict = "H2_SUPPORTED_rule_110_specific_only_universal_rule_persists_others_saturate"
+        law_dir = "LAW_64_v5_NARROWED_rule_110_universality_unique_property"
+    }
+    if h3_pat {
+        verdict = "H3_SUPPORTED_algebraic_closure_split_chaos_persists_additive_and_traffic_saturate"
+        law_dir = "LAW_64_v5_RESTRUCTURED_algebraic_closure_predicts_saturation_not_wolfram_class"
+    }
+
+    println("--- verdict ---")
+    println("verdict=" + verdict)
+    println("law_64_direction=" + law_dir)
+
+    // If H1 confirmed, emit Law 64 v6 statement candidate inline
+    if h1_pat {
+        println("--- Law 64 v6 statement candidate (H1 confirmed) ---")
+        println("Law_64_v6: Markov-saturation tracks WOLFRAM CLASS on elementary 1D CA. Class-1/2 (fixed/periodic/traffic) substrates saturate Markov o1 by N_TRAIN=1500; class-3/4 (chaos/universality) substrates do NOT saturate. Tested on rules {30 chaos, 90 additive-chaos, 110 universality, 184 traffic} at length=128 toroidal, single seed, two inits.")
+    }
+    if h2_pat {
+        println("--- Law 64 v5-narrowed statement (H2 confirmed) ---")
+        println("Law_64_v5_narrowed: rule-110's persistent CA-vs-Markov gap is Turing-completeness-specific. Other class-3 chaotic rules (30, 90) and traffic (184) all saturate Markov o1 by N_TRAIN=1500. The gap is a SIGNATURE of computational universality, not chaos.")
+    }
+    if h3_pat {
+        println("--- Law 64 v5-restructured statement (H3 confirmed) ---")
+        println("Law_64_v5_restructured: Markov-saturation predicted by ALGEBRAIC CLOSURE, not Wolfram class. Closed-form rules (rule 90 = XOR additive; rule 184 = density conservation) saturate. Non-algebraic chaos (rules 30, 110) does not.")
+    }
+
+    println("__LAW_64_CYCLE_4_T8P_RESULT__ " + verdict)
+
+    // raw 91 honesty triad C1-C5
+    println("raw_91_C1_falsifiable=YES_pre_registered_thresholds_PERSIST_gt_200_SATURATE_lt_50_at_N1500_per_rule")
+    println("raw_91_C2_replicable=YES_seed_" + str(SEED) + "_deterministic_LCG_4_canonical_Wolfram_rules")
+    println("raw_91_C3_no_p_hacking=YES_thresholds_and_3_hypotheses_frozen_in_header_before_run")
+    println("raw_91_C4_data_caveats=length_128_toroidal_2_inits_single_cell_AND_density_32pct_single_seed_single_placement")
+    println("raw_91_C5_negative_result_published=YES_emit_regardless_of_outcome_per_raw_71")
+    println("raw_91_caveat=CA(5) here is 5-cell oracle (subsumes elementary 3-cell rule) — perfect ceiling for ALL 4 rules")
+    println("raw_91_caveat=N_TRAIN ladder compressed to 3 ticks (15/500/1500) vs T8n's 5 ticks; drift-shape resolution reduced")
+    println("raw_91_caveat=Single seed / single density placement / single single_cell placement. Multi-seed sweep is forward step.")
+    println("raw_91_caveat=Tested 4 rules of 256 elementary; class-3/4 sample is rules {30,90,110}, class-2 sample is {184} only. Broader rule sweep is forward step T8q.")
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T8P_WOLFRAM_RULE_SWEEP_BEGIN__ selftest")
+
+    // Verify _ca_step matches rule-110 reference (parallel to T8n selftest):
+    // Pattern at cells 62..66: [0,1,1,0,1] surrounded by zeros → expect [1,1,1,1,1]
+    let mut g110 = []
+    let mut i = 0
+    while i < LEN { g110.push(0); i = i + 1 }
+    g110[62] = 0; g110[63] = 1; g110[64] = 1; g110[65] = 0; g110[66] = 1
+    let n110 = _ca_step(g110, 110)
+    println("rule_110_test_[62..66]_input=[0,1,1,0,1] next=[" + str(n110[62]) + "," + str(n110[63]) + "," + str(n110[64]) + "," + str(n110[65]) + "," + str(n110[66]) + "] (expect [1,1,1,1,1])")
+    let r110_ok = n110[62]==1 && n110[63]==1 && n110[64]==1 && n110[65]==1 && n110[66]==1
+
+    // Verify rule 30: 30 = 0b00011110
+    //   pidx 0(000)→0, 1(001)→1, 2(010)→1, 3(011)→1, 4(100)→1, 5(101)→0, 6(110)→0, 7(111)→0
+    // Single-cell init [...0,1,0...] at cell 64:
+    //   cell 63: l=0,c=0,r=1 → pidx=1 → 1
+    //   cell 64: l=0,c=1,r=0 → pidx=2 → 1
+    //   cell 65: l=1,c=0,r=0 → pidx=4 → 1
+    //   cell 66: l=0,c=0,r=0 → pidx=0 → 0
+    // Expected next at [62..66] = [0,1,1,1,0]
+    _rng_reset()
+    let g30 = _init_single_cell()
+    let n30 = _ca_step(g30, 30)
+    println("rule_30_single_cell_next_[62..66]=[" + str(n30[62]) + "," + str(n30[63]) + "," + str(n30[64]) + "," + str(n30[65]) + "," + str(n30[66]) + "] (expect [0,1,1,1,0])")
+    let r30_ok = n30[62]==0 && n30[63]==1 && n30[64]==1 && n30[65]==1 && n30[66]==0
+
+    // Verify rule 90: 90 = 0b01011010
+    //   pidx 0(000)→0, 1(001)→1, 2(010)→0, 3(011)→1, 4(100)→1, 5(101)→0, 6(110)→1, 7(111)→0
+    //   This is XOR(left, right): next = l XOR r.
+    // Single-cell init at cell 64:
+    //   cell 63: l=0,c=0,r=1 → pidx=1 → 1 (= 0 XOR 1)
+    //   cell 64: l=0,c=1,r=0 → pidx=2 → 0 (= 0 XOR 0)
+    //   cell 65: l=1,c=0,r=0 → pidx=4 → 1 (= 1 XOR 0)
+    // Expected next at [63..65] = [1,0,1]
+    let g90 = _init_single_cell()
+    let n90 = _ca_step(g90, 90)
+    println("rule_90_single_cell_next_[63..65]=[" + str(n90[63]) + "," + str(n90[64]) + "," + str(n90[65]) + "] (expect [1,0,1])")
+    let r90_ok = n90[63]==1 && n90[64]==0 && n90[65]==1
+
+    // Verify rule 184: 184 = 0b10111000
+    //   pidx 0(000)→0, 1(001)→0, 2(010)→0, 3(011)→1, 4(100)→1, 5(101)→1, 6(110)→0, 7(111)→1
+    // Test on a [...0,1,1,0,1,0...] pattern at [62..66] (g184[62..66]=[0,1,1,0,1]):
+    //   cell 62: l=0,c=0,r=1 → pidx=1 → 0
+    //   cell 63: l=0,c=1,r=1 → pidx=3 → 1
+    //   cell 64: l=1,c=1,r=0 → pidx=6 → 0
+    //   cell 65: l=1,c=0,r=1 → pidx=5 → 1
+    //   cell 66: l=0,c=1,r=0 → pidx=2 → 0
+    // Expected next at [62..66] = [0,1,0,1,0]
+    let mut g184 = []
+    let mut j = 0
+    while j < LEN { g184.push(0); j = j + 1 }
+    g184[62] = 0; g184[63] = 1; g184[64] = 1; g184[65] = 0; g184[66] = 1
+    let n184 = _ca_step(g184, 184)
+    println("rule_184_test_[62..66]_input=[0,1,1,0,1] next=[" + str(n184[62]) + "," + str(n184[63]) + "," + str(n184[64]) + "," + str(n184[65]) + "," + str(n184[66]) + "] (expect [0,1,0,1,0])")
+    let r184_ok = n184[62]==0 && n184[63]==1 && n184[64]==0 && n184[65]==1 && n184[66]==0
+
+    // Verify density init still K_LIVE alive
+    _rng_reset()
+    let dn = _init_density()
+    let mut dn_alive = 0
+    let mut k = 0
+    while k < LEN { dn_alive = dn_alive + dn[k]; k = k + 1 }
+    println("density_init_alive=" + str(dn_alive) + " (expect " + str(K_LIVE) + ")")
+
+    // Verify CA(5) oracle = perfect on rule-110 + rule-30 mini corpora
+    _rng_reset()
+    let init_d = _init_density()
+    let mini110 = _build_corpus(init_d, 3, 110)
+    let mini30  = _build_corpus(init_d, 3, 30)
+    let mut ca110_preds = []; let mut act110 = []
+    let mut a = 0
+    while a < mini110.len() {
+        let pair = mini110[a]; let pst = pair[0]; let act = pair[1]
+        ca110_preds.push(_ca5_predict(pst, 110)); act110.push(act)
+        a = a + 1
+    }
+    let ca110_acc = _accuracy(ca110_preds, act110)
+    let mut ca30_preds = []; let mut act30 = []
+    a = 0
+    while a < mini30.len() {
+        let pair = mini30[a]; let pst = pair[0]; let act = pair[1]
+        ca30_preds.push(_ca5_predict(pst, 30)); act30.push(act)
+        a = a + 1
+    }
+    let ca30_acc = _accuracy(ca30_preds, act30)
+    println("ca5_oracle_acc_rule110=" + str(ca110_acc) + " (expect 1000)")
+    println("ca5_oracle_acc_rule30=" + str(ca30_acc) + " (expect 1000)")
+
+    // Verify markov pipeline on rule-30 mini corpus
+    let probs30 = _markov_train(mini30)
+    let pred30 = _markov_predict(probs30, init_d)
+    println("markov_probs_len=" + str(probs30.len()) + " (expect " + str(2*LEN) + ")")
+    println("markov_pred_len=" + str(pred30.len()) + " (expect " + str(LEN) + ")")
+
+    // Verify _classify thresholds
+    let cls_test_persist  = _classify(500)   // > 200 → PERSIST
+    let cls_test_saturate = _classify(20)    // < 50 → SATURATE
+    let cls_test_ambig    = _classify(100)   // 50..200 → AMBIG
+    println("classify_500=" + cls_test_persist + " (expect PERSIST)")
+    println("classify_20=" + cls_test_saturate + " (expect SATURATE)")
+    println("classify_100=" + cls_test_ambig + " (expect AMBIG)")
+    let cls_ok = cls_test_persist == "PERSIST" && cls_test_saturate == "SATURATE" && cls_test_ambig == "AMBIG"
+
+    let ok = r110_ok && r30_ok && r90_ok && r184_ok
+            && dn_alive == K_LIVE
+            && ca110_acc == 1000 && ca30_acc == 1000
+            && probs30.len() == 2*LEN && pred30.len() == LEN
+            && cls_ok
+    if ok {
+        println("__LAW_64_CYCLE_4_T8P_RESULT__ PASS_SELFTEST_4_rules_inits_markov_oracle_classify_correct")
+    } else {
+        println("__LAW_64_CYCLE_4_T8P_RESULT__ FAIL_SELFTEST")
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_wolfram_rule_sweep.hexa --selftest | --run")
+    }
+    return 0
+}
