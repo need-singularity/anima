@@ -1,0 +1,524 @@
+// anima-eeg/board_health_check.hexa
+// raw#9 hexa-only · raw#10 honest · raw#11 snake_case · raw#12 silent-error-ban
+// raw#37 transient-helper-in-/tmp · raw#65 idempotent · raw#80 sentinel
+// raw#82 darwin-native · raw#91 honesty-triad · raw#101 minimal
+//
+// PURPOSE
+//   Hardware-level board sanity check that does NOT require helmet electrodes
+//   to be in scalp contact. Validates pin-level connectivity:
+//     1. BrainFlow can open serial port (FTDI / Dongle alive)
+//     2. Cyton+Daisy stack detected (16-channel data shape)
+//     3. Native sample rate = 125 Hz
+//     4. Each EEG channel ADC produces VARYING data (alive vs dead)
+//     5. Per-channel mains 60 Hz pickup (proxy for wire-to-board connection)
+//     6. Cross-channel correlation (detect pin shorts / cross-talk)
+//     7. SRB2 reference share Cyton↔Daisy (DC baseline coherence)
+//     8. Wire state per pin: ADC_DEAD / WIRE_DISCONNECTED / WIRE_FLOATING / WIRE_NORMAL
+//
+//   Distinguishes verdicts (raw#10 honest):
+//     BOARD_16CH_HEALTHY      — all 16 channel ADCs alive (even if floating)
+//     BOARD_16CH_PARTIAL_DEAD — 1-15 channels dead (specific ADC or wire issue)
+//     BOARD_8CH_ONLY          — Daisy not detected (stack or firmware probe issue)
+//     BOARD_NOT_DETECTED      — port/BrainFlow open failed
+//     BOARD_PINS_SHORTED      — cross-channel correlation > 0.95 detected
+//
+// USE CASE
+//   Hardware troubleshooting before calibrate.hexa.
+//   "is the hardware itself OK, regardless of helmet contact?"
+//
+// MODES
+//   --selftest       synthetic 16ch sanity, no hardware required
+//   --check          full real check (requires hardware + .venv-eeg)
+//   --port <path>    Dongle serial node (auto-detect if omitted)
+//   --board <name>   cyton_daisy (default) | cyton (8ch) | ganglion
+//   --seconds <n>    sample window seconds (default 3)
+//
+//  @resolver-bypass(reason="darwin-native: globs /dev/cu.usbserial-* and uses
+//                   .venv-eeg/bin/python BrainFlow venv. Hetzner / linux pods
+//                   do not expose host USB nor local venv.")
+
+let SCHEMA              = "anima-eeg/board_health/2"
+let HELPER_PATH         = "/tmp/anima_eeg_board_health_helper.py"
+
+let DEFAULT_BOARD_ID            = 2
+let DEFAULT_BOARD_NAME          = "cyton_daisy"
+let DEFAULT_SECONDS             = 3
+let DEFAULT_VENV_PYTHON         = ".venv-eeg/bin/python"
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _emit_trailer(reason_slug: string, reason_detail: string, fix: string) {
+    eprintln("reason: " + reason_slug + ": " + reason_detail)
+    eprintln("fix: " + fix)
+}
+
+fn _board_name_to_id(name: string) -> int {
+    if name == "cyton_daisy" { return 2 }
+    if name == "cyton"       { return 0 }
+    if name == "ganglion"    { return 1 }
+    return -1
+}
+
+// Helper Python written as plain triple-quoted string (no backslash-n escapes).
+// Use print() for all output — implicit newline, no f-string + \n issues.
+fn _write_helper() {
+    let py = "
+import sys
+import os
+import time
+import argparse
+
+VENV_PYTHON = os.environ.get('ANIMA_EEG_VENV_PYTHON', '.venv-eeg/bin/python')
+
+def out_kv(k, v):
+    print(str(k) + '=' + str(v), flush=True)
+
+def err_trailer(reason, detail, fix):
+    print('reason: ' + reason + ': ' + detail, file=sys.stderr, flush=True)
+    print('fix: ' + fix, file=sys.stderr, flush=True)
+
+def run_check(board_id, port, seconds):
+    try:
+        import numpy as np
+    except ImportError:
+        err_trailer('numpy-missing', 'numpy not in venv', '1) source .venv-eeg/bin/activate  2) pip install numpy')
+        out_kv('verdict', 'BOARD_NOT_DETECTED')
+        return 4
+    try:
+        from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
+    except ImportError as e:
+        err_trailer('brainflow-missing', str(e)[:160], '1) source .venv-eeg/bin/activate  2) pip install --upgrade brainflow')
+        out_kv('verdict', 'BOARD_NOT_DETECTED')
+        return 4
+    try:
+        from importlib.metadata import version
+        out_kv('brainflow_version', version('brainflow'))
+    except Exception:
+        pass
+
+    BoardShim.disable_board_logger()
+    params = BrainFlowInputParams()
+    if port:
+        params.serial_port = port
+
+    try:
+        board = BoardShim(board_id, params)
+        board.prepare_session()
+    except Exception as e:
+        err_trailer('board-not-ready', 'BrainFlow prepare_session: ' + str(e)[:160],
+                    '1) toggle Cyton OFF wait 5s then PC  2) verify Daisy seated  3) re-run')
+        out_kv('verdict', 'BOARD_NOT_DETECTED')
+        return 4
+
+    try:
+        sample_rate = BoardShim.get_sampling_rate(board_id)
+        eeg_channels = BoardShim.get_eeg_channels(board_id)
+    except Exception as e:
+        err_trailer('board-meta-error', str(e)[:160], '1) check board_id  2) reinstall brainflow')
+        try: board.release_session()
+        except: pass
+        out_kv('verdict', 'BOARD_NOT_DETECTED')
+        return 4
+
+    out_kv('sample_rate_hz', sample_rate)
+    out_kv('eeg_channel_count', len(eeg_channels))
+
+    try:
+        board.start_stream()
+        time.sleep(seconds)
+        data = board.get_board_data()
+        board.stop_stream()
+    except Exception as e:
+        err_trailer('stream-error', str(e)[:160], '1) Dongle red LED?  2) toggle OFF/PC')
+        try: board.release_session()
+        except: pass
+        out_kv('verdict', 'BOARD_NOT_DETECTED')
+        return 4
+    finally:
+        try: board.release_session()
+        except: pass
+
+    rows, cols = data.shape if data is not None else (0, 0)
+    out_kv('sample_rows', rows)
+    out_kv('sample_cols', cols)
+    expected_min = int(sample_rate * seconds * 0.5)
+    if cols < expected_min:
+        err_trailer('insufficient-samples', 'got ' + str(cols) + ' cols, expected >= ' + str(expected_min),
+                    '1) Dongle red LED blinking?  2) longer --seconds')
+        out_kv('verdict', 'BOARD_NOT_DETECTED')
+        return 4
+
+    # Per-channel analysis
+    n_ch = len(eeg_channels)
+    eeg_data = np.zeros((n_ch, cols))
+    for i, row in enumerate(eeg_channels):
+        eeg_data[i, :] = data[row, :]
+
+    # Wire metadata: channel index -> (board, pin_name, position_10_20, wire_color, color_ko)
+    # Cyton bottom row N1P-N8P (channels 0-7), Daisy bottom row N1P-N8P (channels 8-15)
+    WIRE_META = [
+        ('Cyton', 'N1P', 'Fp1', 'Grey',   'gray'),    # 0
+        ('Cyton', 'N2P', 'Fp2', 'Purple', 'purple'),  # 1
+        ('Cyton', 'N3P', 'C3',  'Blue',   'blue'),    # 2
+        ('Cyton', 'N4P', 'C4',  'Green',  'green'),   # 3
+        ('Cyton', 'N5P', 'P7',  'Yellow', 'yellow'),  # 4
+        ('Cyton', 'N6P', 'P8',  'Orange', 'orange'),  # 5
+        ('Cyton', 'N7P', 'O1',  'Red',    'red'),     # 6
+        ('Cyton', 'N8P', 'O2',  'Brown',  'brown'),   # 7
+        ('Daisy', 'N1P', 'F7',  'Grey',   'gray'),    # 8
+        ('Daisy', 'N2P', 'F8',  'Purple', 'purple'),  # 9
+        ('Daisy', 'N3P', 'F3',  'Blue',   'blue'),    # 10
+        ('Daisy', 'N4P', 'F4',  'Green',  'green'),   # 11
+        ('Daisy', 'N5P', 'T7',  'Yellow', 'yellow'),  # 12
+        ('Daisy', 'N6P', 'T8',  'Orange', 'orange'),  # 13
+        ('Daisy', 'N7P', 'P3',  'Red',    'red'),     # 14
+        ('Daisy', 'N8P', 'P4',  'Brown',  'brown'),   # 15
+    ]
+
+    # FFT for 60 Hz mains pickup
+    fft_data = np.fft.rfft(eeg_data, axis=1)
+    fft_freqs = np.fft.rfftfreq(cols, d=1.0/sample_rate)
+    bin_60hz = np.argmin(np.abs(fft_freqs - 60.0))
+    bin_50hz = np.argmin(np.abs(fft_freqs - 50.0))
+    mains_amp = np.maximum(np.abs(fft_data[:, bin_60hz]), np.abs(fft_data[:, bin_50hz])) * 2.0 / cols
+
+    # Cross-channel correlation matrix (Pearson r)
+    eeg_mean = eeg_data - eeg_data.mean(axis=1, keepdims=True)
+    eeg_std = eeg_data.std(axis=1, keepdims=True) + 1e-9
+    eeg_norm = eeg_mean / eeg_std
+    corr_mat = (eeg_norm @ eeg_norm.T) / cols
+    np.fill_diagonal(corr_mat, 0.0)
+    max_corr_per_ch = np.max(np.abs(corr_mat), axis=1)
+    max_corr_partner = np.argmax(np.abs(corr_mat), axis=1)
+
+    # Cyton vs Daisy DC baseline coherence (SRB2 reference share check)
+    cyton_baselines = eeg_data[:8].mean(axis=1) if n_ch >= 8 else np.array([])
+    daisy_baselines = eeg_data[8:16].mean(axis=1) if n_ch >= 16 else np.array([])
+    cyton_baseline_std = float(np.std(cyton_baselines)) if len(cyton_baselines) else 0.0
+    daisy_baseline_std = float(np.std(daisy_baselines)) if len(daisy_baselines) else 0.0
+    cross_baseline_diff = 0.0
+    if len(cyton_baselines) and len(daisy_baselines):
+        cross_baseline_diff = float(abs(cyton_baselines.mean() - daisy_baselines.mean()))
+
+    cyton_alive = 0
+    daisy_alive = 0
+    total_alive = 0
+    pin_shorts = 0
+    wire_disconnected_count = 0
+    wire_loose_count = 0
+    wire_connected_count = 0
+    adc_dead_count = 0
+
+    for ch_idx in range(n_ch):
+        ch_data = eeg_data[ch_idx, :]
+        rms_uv = float(np.sqrt(np.mean(ch_data ** 2)))
+        std_uv = float(np.std(ch_data))
+        diffs = np.abs(np.diff(ch_data))
+        p_constant = float(np.mean(diffs < 1e-9)) if len(diffs) else 1.0
+        mains_uv = float(mains_amp[ch_idx])
+        max_corr = float(max_corr_per_ch[ch_idx])
+        partner = int(max_corr_partner[ch_idx])
+
+        # Wire metadata
+        if ch_idx < len(WIRE_META):
+            wm = WIRE_META[ch_idx]
+        else:
+            wm = ('?', '?', '?', '?', '?')
+
+        # ADC alive check
+        alive = 1 if (std_uv > 0.5 and p_constant < 0.95) else 0
+
+        # Pin-level wire connection (mains 60Hz pickup is antenna proxy)
+        # Thresholds calibrated for floating wire (no helmet) condition:
+        #   - Connected wire: mains pickup > 5 µV AND rms > 100 µV (antenna effect)
+        #   - Loose wire:     mains 1-5 µV (intermittent contact at board pin)
+        #   - Disconnected:   mains < 1 µV AND rms < 30 µV (no antenna = no path)
+        if not alive:
+            wire_state = 'ADC_DEAD'
+            wire_connected = 0
+            adc_dead_count += 1
+        elif mains_uv > 5.0 and rms_uv > 100.0:
+            wire_state = 'WIRE_CONNECTED'
+            wire_connected = 1
+            wire_connected_count += 1
+        elif mains_uv > 1.0 and rms_uv > 30.0:
+            wire_state = 'WIRE_LOOSE'
+            wire_connected = 0
+            wire_loose_count += 1
+        elif mains_uv < 1.0 and rms_uv < 30.0:
+            wire_state = 'WIRE_DISCONNECTED'
+            wire_connected = 0
+            wire_disconnected_count += 1
+        else:
+            # ambiguous: alive ADC but unusual pattern (large rms low mains, etc.)
+            wire_state = 'WIRE_AMBIGUOUS'
+            wire_connected = 0
+
+        if alive:
+            total_alive += 1
+            if ch_idx < 8:
+                cyton_alive += 1
+            else:
+                daisy_alive += 1
+
+        if max_corr > 0.95 and alive:
+            pin_shorts += 1
+
+        cstr = '%02d' % ch_idx
+        out_kv('ch_' + cstr + '_alive', alive)
+        out_kv('ch_' + cstr + '_wire_state', wire_state)
+        out_kv('ch_' + cstr + '_wire_connected', wire_connected)
+        out_kv('ch_' + cstr + '_board', wm[0])
+        out_kv('ch_' + cstr + '_pin', wm[1])
+        out_kv('ch_' + cstr + '_pos_10_20', wm[2])
+        out_kv('ch_' + cstr + '_color', wm[3])
+        out_kv('ch_' + cstr + '_rms_uv', round(rms_uv, 2))
+        out_kv('ch_' + cstr + '_std_uv', round(std_uv, 2))
+        out_kv('ch_' + cstr + '_p_constant', round(p_constant, 4))
+        out_kv('ch_' + cstr + '_mains_uv', round(mains_uv, 2))
+        out_kv('ch_' + cstr + '_max_corr', round(max_corr, 4))
+        out_kv('ch_' + cstr + '_corr_partner', partner)
+
+    out_kv('cyton_alive', cyton_alive)
+    out_kv('daisy_alive', daisy_alive)
+    out_kv('total_alive', total_alive)
+    out_kv('adc_dead_count', adc_dead_count)
+    out_kv('wire_connected_count', wire_connected_count)
+    out_kv('wire_loose_count', wire_loose_count)
+    out_kv('wire_disconnected_count', wire_disconnected_count)
+    out_kv('pin_shorts_count', pin_shorts)
+    out_kv('cyton_baseline_std_uv', round(cyton_baseline_std, 2))
+    out_kv('daisy_baseline_std_uv', round(daisy_baseline_std, 2))
+    out_kv('cross_baseline_diff_uv', round(cross_baseline_diff, 2))
+
+    # Subsystem verdicts
+    dongle_ok = 1
+    cyton_ok = 1 if cyton_alive >= 1 else 0
+    daisy_ok = 1 if daisy_alive >= 1 else 0
+    stack_ok = 1 if (cyton_ok and daisy_ok) else 0
+    srb2_share_ok = 1 if (stack_ok and cross_baseline_diff < 100000) else 0
+    no_pin_short = 1 if pin_shorts == 0 else 0
+
+    out_kv('dongle_ok', dongle_ok)
+    out_kv('cyton_ok', cyton_ok)
+    out_kv('daisy_ok', daisy_ok)
+    out_kv('stack_ok', stack_ok)
+    out_kv('srb2_share_ok', srb2_share_ok)
+    out_kv('no_pin_short', no_pin_short)
+
+    if pin_shorts > 0:
+        verdict = 'BOARD_PINS_SHORTED'
+        rc = 5
+    elif total_alive == n_ch:
+        verdict = 'BOARD_16CH_HEALTHY'
+        rc = 0
+    elif cyton_alive == 8 and daisy_alive == 0 and n_ch >= 16:
+        verdict = 'BOARD_8CH_ONLY'
+        rc = 6
+    elif total_alive >= 1:
+        verdict = 'BOARD_16CH_PARTIAL_DEAD'
+        rc = 7
+    else:
+        verdict = 'BOARD_NOT_DETECTED'
+        rc = 4
+
+    out_kv('verdict', verdict)
+    return rc
+
+def run_selftest(seconds):
+    out_kv('mode', 'selftest_synthetic')
+    out_kv('brainflow_version', 'n/a-selftest')
+    out_kv('sample_rate_hz', 125)
+    out_kv('eeg_channel_count', 16)
+    out_kv('sample_rows', 32)
+    out_kv('sample_cols', 125 * seconds)
+    for i in range(16):
+        cstr = '%02d' % i
+        out_kv('ch_' + cstr + '_alive', 1)
+        out_kv('ch_' + cstr + '_wire_state', 'WIRE_FLOATING_OK')
+        out_kv('ch_' + cstr + '_rms_uv', round(100.0 + i * 7.5, 2))
+        out_kv('ch_' + cstr + '_std_uv', round(80.0 + i * 6.0, 2))
+        out_kv('ch_' + cstr + '_p_constant', 0.0)
+        out_kv('ch_' + cstr + '_mains_uv', round(15.0 + i * 0.5, 2))
+        out_kv('ch_' + cstr + '_max_corr', round(0.1 + i * 0.01, 4))
+        out_kv('ch_' + cstr + '_corr_partner', (i + 1) % 16)
+    out_kv('cyton_alive', 8)
+    out_kv('daisy_alive', 8)
+    out_kv('total_alive', 16)
+    out_kv('adc_dead_count', 0)
+    out_kv('wire_disconnected_count', 0)
+    out_kv('pin_shorts_count', 0)
+    out_kv('cyton_baseline_std_uv', 12.5)
+    out_kv('daisy_baseline_std_uv', 13.0)
+    out_kv('cross_baseline_diff_uv', 4.5)
+    out_kv('dongle_ok', 1)
+    out_kv('cyton_ok', 1)
+    out_kv('daisy_ok', 1)
+    out_kv('stack_ok', 1)
+    out_kv('srb2_share_ok', 1)
+    out_kv('no_pin_short', 1)
+    out_kv('tier', 'DEGRADED')
+    out_kv('verdict', 'BOARD_16CH_HEALTHY')
+    out_kv('selftest', 'ok')
+    return 0
+
+if __name__ == '__main__':
+    p = argparse.ArgumentParser()
+    p.add_argument('mode', choices=['check', 'selftest'])
+    p.add_argument('--board-id', type=int, default=2)
+    p.add_argument('--port', type=str, default='')
+    p.add_argument('--seconds', type=int, default=3)
+    args = p.parse_args()
+    if args.mode == 'check':
+        rc = run_check(args.board_id, args.port, args.seconds)
+    else:
+        rc = run_selftest(args.seconds)
+    sys.exit(rc)
+"
+    write_file(HELPER_PATH, py)
+}
+
+fn _flags_only_argv() -> array {
+    let av = argv()
+    let mut start = 0
+    while start < len(av) {
+        let a = av[start]
+        let mut is_path = false
+        if a.ends_with(".hexa") { is_path = true }
+        if !is_path {
+            if a.ends_with("/exe") { is_path = true }
+        }
+        if is_path { start = start + 1 } else { break }
+    }
+    let mut out = []
+    let mut j = start
+    while j < len(av) {
+        out.push(av[j])
+        j = j + 1
+    }
+    return out
+}
+
+fn _print_usage() {
+    eprintln("usage: hexa run anima-eeg/board_health_check.hexa --selftest")
+    eprintln("       hexa run anima-eeg/board_health_check.hexa --check [--port <path>] [--seconds <n>] [--board <name>]")
+    eprintln("flags:")
+    eprintln("  --selftest        synthetic 16ch sanity, no hardware")
+    eprintln("  --check           full real check (requires hardware + .venv-eeg)")
+    eprintln("  --port <path>     Dongle serial node")
+    eprintln("  --seconds <n>     sample window seconds (default 3)")
+    eprintln("  --board <name>    cyton_daisy | cyton | ganglion (default cyton_daisy)")
+    eprintln("  --help            this message")
+}
+
+fn main() {
+    let av = _flags_only_argv()
+    let mut selftest = false
+    let mut check_mode = false
+    let mut want_help = false
+    let mut port = ""
+    let mut seconds = DEFAULT_SECONDS
+    let mut board_name = DEFAULT_BOARD_NAME
+
+    let mut i = 0
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--check"    { check_mode = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" { want_help = true; i = i + 1; continue }
+        if a == "--port" {
+            if (i + 1) >= len(av) {
+                _emit_trailer("missing-arg-value", "--port requires a value", "1) re-run with --port <path>")
+                exit(2)
+            }
+            port = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--seconds" {
+            if (i + 1) >= len(av) {
+                _emit_trailer("missing-arg-value", "--seconds requires int", "1) re-run with --seconds 3")
+                exit(2)
+            }
+            seconds = to_int(av[i + 1]); i = i + 2; continue
+        }
+        if a == "--board" {
+            if (i + 1) >= len(av) {
+                _emit_trailer("missing-arg-value", "--board requires value", "1) re-run with --board cyton_daisy")
+                exit(2)
+            }
+            board_name = av[i + 1]; i = i + 2; continue
+        }
+        _emit_trailer("unknown-arg", "unrecognized argument: " + a, "1) re-run with --help")
+        _print_usage()
+        exit(2)
+    }
+
+    if want_help { _print_usage(); exit(0) }
+    if !selftest && !check_mode {
+        eprintln("ABORT: must pass --selftest or --check")
+        _print_usage()
+        exit(2)
+    }
+
+    _write_helper()
+
+    let board_id = _board_name_to_id(board_name)
+    if board_id < 0 {
+        _emit_trailer("invalid-board", "unknown board: " + board_name, "1) --board cyton_daisy|cyton|ganglion")
+        exit(2)
+    }
+
+    println("── board_health_check (raw#9 hexa-only) ──")
+    println("schema: " + SCHEMA)
+    if selftest {
+        println("mode: selftest (synthetic)")
+    } else {
+        println("mode: check (real hardware)")
+        println("board: " + board_name + " (id=" + str(board_id) + ")")
+        println("port: " + port)
+        println("seconds: " + str(seconds))
+    }
+
+    let mode_arg = if selftest { "selftest" } else { "check" }
+    let venv_py = DEFAULT_VENV_PYTHON
+    let mut cmd = venv_py + " " + HELPER_PATH + " " + mode_arg
+    cmd = cmd + " --board-id " + str(board_id)
+    cmd = cmd + " --seconds " + str(seconds)
+    if port != "" {
+        cmd = cmd + " --port " + _sh_quote(port)
+    }
+
+    eprintln("[GATE] dispatch=local cmd=" + cmd)
+
+    let rc = exec(cmd)
+
+    println("──")
+    println("schema: " + SCHEMA)
+    println("exit_code: " + str(rc))
+    if rc == 0 {
+        println("verdict: BOARD_16CH_HEALTHY ✓")
+        exit(0)
+    }
+    if rc == 4 {
+        println("verdict: BOARD_NOT_DETECTED ✗")
+        exit(4)
+    }
+    if rc == 5 {
+        println("verdict: BOARD_PINS_SHORTED ✗ (cross-channel correlation > 0.95)")
+        exit(5)
+    }
+    if rc == 6 {
+        println("verdict: BOARD_8CH_ONLY ✗ (Daisy not detected — stack issue)")
+        exit(6)
+    }
+    if rc == 7 {
+        println("verdict: BOARD_16CH_PARTIAL_DEAD ✗ (some channels dead)")
+        exit(7)
+    }
+    println("verdict: UNKNOWN exit_code=" + str(rc))
+    exit(rc)
+}

@@ -1,0 +1,560 @@
+// anima-eeg/electrode_adjustment_helper.hexa
+// raw#9 hexa-only · raw#10 honest · raw#11 snake_case · raw#12 silent-error-ban
+// raw#37 transient-helper-in-/tmp · raw#65 idempotent · raw#80 sentinel
+// raw#82 darwin-native · raw#91 honesty-triad · raw#101 minimal
+//
+// PURPOSE
+//   Live electrode adjustment helper with 10-20 ASCII map (matches
+//   anima-eeg/README.md hardware section). For each electrode position,
+//   renders state symbol [✓ ⚠ ✗ ⚡] AND emits specific action advice
+//   ("어디 조절 / 어떻게").
+//
+//   Use case: while user is adjusting helmet on head, run --watch mode
+//   to get continuous feedback per-position. Each tick (5s default):
+//     1. Sample 16ch via BrainFlow
+//     2. Per-electrode classification (4 states)
+//     3. Render ASCII 10-20 map with state symbols
+//     4. List action items for non-OK electrodes
+//
+// STATES (per electrode):
+//   OK    [✓]  signal valid, within EEG range OR good wire+scalp contact
+//   LOOSE [⚠]  partial contact OR weak signal — needs more pressure
+//   BAD   [✗]  no scalp contact OR wire disconnected — re-attach
+//   DEAD  [⚡]  ADC chip not responding — board-level issue
+//
+// MODES
+//   --selftest       synthetic 16ch all-OK ASCII render
+//   --check          one-shot real check
+//   --watch          periodic loop (5s tick, Ctrl-C to stop)
+//   --port <path>    Dongle serial node
+//   --board <name>   cyton_daisy (default)
+//   --seconds <n>    sample window per tick (default 3)
+//
+//  @resolver-bypass(reason="darwin-native: globs /dev/cu.usbserial-* and uses
+//                   .venv-eeg/bin/python BrainFlow venv. Hetzner / linux pods
+//                   do not expose host USB nor local venv.")
+
+let SCHEMA              = "anima-eeg/electrode_adjustment/1"
+let HELPER_PATH         = "/tmp/anima_eeg_electrode_adjustment_helper.py"
+
+let DEFAULT_BOARD_ID            = 2
+let DEFAULT_BOARD_NAME          = "cyton_daisy"
+let DEFAULT_SECONDS             = 3
+let DEFAULT_VENV_PYTHON         = ".venv-eeg/bin/python"
+let DEFAULT_WATCH_INTERVAL_SEC  = 5
+
+fn _sh_quote(s: string) -> string {
+    let mut o = "'"
+    o = o + s.replace("'", "'\\''")
+    o = o + "'"
+    return o
+}
+
+fn _emit_trailer(reason_slug: string, reason_detail: string, fix: string) {
+    eprintln("reason: " + reason_slug + ": " + reason_detail)
+    eprintln("fix: " + fix)
+}
+
+fn _board_name_to_id(name: string) -> int {
+    if name == "cyton_daisy" { return 2 }
+    if name == "cyton"       { return 0 }
+    if name == "ganglion"    { return 1 }
+    return -1
+}
+
+// Helper Python: reads BrainFlow + classifies each channel into 4 states
+// based on rms / mains / variance. Emits kv lines with state per position.
+fn _write_helper() {
+    let py = "
+import sys, os, time, argparse
+
+VENV_PYTHON = os.environ.get('ANIMA_EEG_VENV_PYTHON', '.venv-eeg/bin/python')
+
+def out_kv(k, v):
+    print(str(k) + '=' + str(v), flush=True)
+
+def err_trailer(reason, detail, fix):
+    print('reason: ' + reason + ': ' + detail, file=sys.stderr, flush=True)
+    print('fix: ' + fix, file=sys.stderr, flush=True)
+
+WIRE_META = [
+    ('Cyton', 'N1P', 'Fp1', 'Grey'),
+    ('Cyton', 'N2P', 'Fp2', 'Purple'),
+    ('Cyton', 'N3P', 'C3',  'Blue'),
+    ('Cyton', 'N4P', 'C4',  'Green'),
+    ('Cyton', 'N5P', 'P7',  'Yellow'),
+    ('Cyton', 'N6P', 'P8',  'Orange'),
+    ('Cyton', 'N7P', 'O1',  'Red'),
+    ('Cyton', 'N8P', 'O2',  'Brown'),
+    ('Daisy', 'N1P', 'F7',  'Grey'),
+    ('Daisy', 'N2P', 'F8',  'Purple'),
+    ('Daisy', 'N3P', 'F3',  'Blue'),
+    ('Daisy', 'N4P', 'F4',  'Green'),
+    ('Daisy', 'N5P', 'T7',  'Yellow'),
+    ('Daisy', 'N6P', 'T8',  'Orange'),
+    ('Daisy', 'N7P', 'P3',  'Red'),
+    ('Daisy', 'N8P', 'P4',  'Brown'),
+]
+
+# Classification thresholds.
+# helmet=ON: real EEG signal expected 5-50 uV rms; mains < 20 uV (low pickup since on scalp)
+# helmet=OFF: floating wire shows mains > 5 uV (antenna), rms > 100 uV (noise)
+# We use a unified scheme that works for both:
+#   ADC dead: variance ~ 0
+#   WIRE disconnected: rms < 30 AND mains < 1 (no antenna no signal)
+#   Helmet not contacting (BAD): rms > 1000 AND mains > 5 (wire connected but floating)
+#   Helmet loose (LOOSE): rms 50-1000 AND mains 1-20 (partial scalp + some pickup)
+#   Helmet OK: rms 5-50 AND mains < 5 AND p_constant < 0.5 (real EEG)
+
+def classify(rms_uv, std_uv, mains_uv, p_constant):
+    if std_uv < 0.5 or p_constant > 0.95:
+        return 'DEAD', '⚡'
+    if rms_uv < 30 and mains_uv < 1.0:
+        return 'BAD_WIRE_OFF', '✗'
+    if rms_uv > 1000 and mains_uv > 5.0:
+        return 'BAD_NO_SCALP', '✗'
+    if rms_uv > 100 and mains_uv > 1.0:
+        return 'LOOSE', '⚠'
+    if rms_uv >= 5.0 and rms_uv <= 100.0 and mains_uv < 20:
+        return 'OK', '✓'
+    return 'LOOSE', '⚠'
+
+def main_check(board_id, port, seconds):
+    try:
+        import numpy as np
+        from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
+    except ImportError as e:
+        err_trailer('import-missing', str(e)[:160], '1) source .venv-eeg/bin/activate  2) pip install brainflow numpy')
+        out_kv('verdict', 'ABORT')
+        return 4
+
+    BoardShim.disable_board_logger()
+    params = BrainFlowInputParams()
+    if port:
+        params.serial_port = port
+
+    try:
+        board = BoardShim(board_id, params)
+        board.prepare_session()
+    except Exception as e:
+        err_trailer('board-not-ready', str(e)[:160],
+                    '1) toggle Cyton OFF wait 5s then PC  2) verify Daisy seated  3) re-run')
+        out_kv('verdict', 'ABORT')
+        return 4
+
+    try:
+        sample_rate = BoardShim.get_sampling_rate(board_id)
+        eeg_channels = BoardShim.get_eeg_channels(board_id)
+        board.start_stream()
+        time.sleep(seconds)
+        data = board.get_board_data()
+        board.stop_stream()
+    except Exception as e:
+        err_trailer('stream-error', str(e)[:160], '1) Dongle red LED?  2) toggle OFF/PC')
+        try: board.release_session()
+        except: pass
+        out_kv('verdict', 'ABORT')
+        return 4
+    finally:
+        try: board.release_session()
+        except: pass
+
+    rows, cols = data.shape if data is not None else (0, 0)
+    out_kv('sample_rate_hz', sample_rate)
+    out_kv('eeg_channel_count', len(eeg_channels))
+    out_kv('sample_cols', cols)
+
+    if cols < int(sample_rate * seconds * 0.5):
+        err_trailer('insufficient-samples', 'got ' + str(cols), '1) longer --seconds')
+        out_kv('verdict', 'ABORT')
+        return 4
+
+    n_ch = len(eeg_channels)
+    eeg = np.zeros((n_ch, cols))
+    for i, row in enumerate(eeg_channels):
+        eeg[i, :] = data[row, :]
+
+    fft_data = np.fft.rfft(eeg, axis=1)
+    fft_freqs = np.fft.rfftfreq(cols, d=1.0/sample_rate)
+    bin_60 = int(np.argmin(np.abs(fft_freqs - 60.0)))
+    bin_50 = int(np.argmin(np.abs(fft_freqs - 50.0)))
+    mains_amp = np.maximum(np.abs(fft_data[:, bin_60]), np.abs(fft_data[:, bin_50])) * 2.0 / cols
+
+    n_ok = 0
+    n_loose = 0
+    n_bad = 0
+    n_dead = 0
+
+    for ch_idx in range(n_ch):
+        ch = eeg[ch_idx, :]
+        rms = float(np.sqrt(np.mean(ch ** 2)))
+        std = float(np.std(ch))
+        diffs = np.abs(np.diff(ch))
+        p_const = float(np.mean(diffs < 1e-9)) if len(diffs) else 1.0
+        m_uv = float(mains_amp[ch_idx])
+
+        state, sym = classify(rms, std, m_uv, p_const)
+        if state == 'OK':            n_ok += 1
+        elif state == 'LOOSE':       n_loose += 1
+        elif state.startswith('BAD'): n_bad += 1
+        elif state == 'DEAD':        n_dead += 1
+
+        wm = WIRE_META[ch_idx] if ch_idx < len(WIRE_META) else ('?', '?', '?', '?')
+        cstr = '%02d' % ch_idx
+        out_kv('ch_' + cstr + '_state', state)
+        out_kv('ch_' + cstr + '_symbol', sym)
+        out_kv('ch_' + cstr + '_board', wm[0])
+        out_kv('ch_' + cstr + '_pin', wm[1])
+        out_kv('ch_' + cstr + '_pos', wm[2])
+        out_kv('ch_' + cstr + '_color', wm[3])
+        out_kv('ch_' + cstr + '_rms_uv', round(rms, 2))
+        out_kv('ch_' + cstr + '_mains_uv', round(m_uv, 2))
+        out_kv('ch_' + cstr + '_p_constant', round(p_const, 4))
+
+    out_kv('count_ok', n_ok)
+    out_kv('count_loose', n_loose)
+    out_kv('count_bad', n_bad)
+    out_kv('count_dead', n_dead)
+    if n_dead > 0:
+        out_kv('verdict', 'BOARD_ISSUE')
+        return 4
+    if n_ok == n_ch:
+        out_kv('verdict', 'ALL_OK')
+        return 0
+    out_kv('verdict', 'NEEDS_ADJUSTMENT')
+    return 1
+
+def run_selftest():
+    out_kv('mode', 'selftest_synthetic')
+    out_kv('sample_rate_hz', 125)
+    out_kv('eeg_channel_count', 16)
+    out_kv('sample_cols', 375)
+    for ch_idx in range(16):
+        wm = WIRE_META[ch_idx]
+        cstr = '%02d' % ch_idx
+        out_kv('ch_' + cstr + '_state', 'OK')
+        out_kv('ch_' + cstr + '_symbol', '✓')
+        out_kv('ch_' + cstr + '_board', wm[0])
+        out_kv('ch_' + cstr + '_pin', wm[1])
+        out_kv('ch_' + cstr + '_pos', wm[2])
+        out_kv('ch_' + cstr + '_color', wm[3])
+        out_kv('ch_' + cstr + '_rms_uv', round(15.0 + ch_idx, 2))
+        out_kv('ch_' + cstr + '_mains_uv', round(2.0, 2))
+        out_kv('ch_' + cstr + '_p_constant', 0.0)
+    out_kv('count_ok', 16)
+    out_kv('count_loose', 0)
+    out_kv('count_bad', 0)
+    out_kv('count_dead', 0)
+    out_kv('verdict', 'ALL_OK')
+    return 0
+
+if __name__ == '__main__':
+    p = argparse.ArgumentParser()
+    p.add_argument('mode', choices=['check', 'selftest'])
+    p.add_argument('--board-id', type=int, default=2)
+    p.add_argument('--port', type=str, default='')
+    p.add_argument('--seconds', type=int, default=3)
+    args = p.parse_args()
+    if args.mode == 'check':
+        rc = main_check(args.board_id, args.port, args.seconds)
+    else:
+        rc = run_selftest()
+    sys.exit(rc)
+"
+    write_file(HELPER_PATH, py)
+}
+
+fn _flags_only_argv() -> array {
+    let av = argv()
+    let mut start = 0
+    // Skip leading binary/script paths. Across hexa invocation modes:
+    //   - interpreter:  [.../script.hexa, ...flags] OR [script.hexa, ...flags]
+    //   - AOT cache:    [.../.hexa-cache/<hash>/exe, .../exe (duplicate), ...flags]
+    //   - interp wrap:  [.../hexa_interp.real, ./script.hexa, ...flags]
+    // Strategy: skip leading args that start with "/" OR end with .hexa/.real/exe.
+    // Stop at first arg that starts with "-" (a flag).
+    while start < len(av) {
+        let a = av[start]
+        if a.starts_with("-") { break }
+        let mut is_path = false
+        if a.starts_with("/")    { is_path = true }
+        if a.ends_with(".hexa")  { is_path = true }
+        if a.ends_with(".real")  { is_path = true }
+        if a.ends_with("/exe")   { is_path = true }
+        if is_path { start = start + 1 } else { break }
+    }
+    let mut out = []
+    let mut j = start
+    while j < len(av) {
+        out.push(av[j])
+        j = j + 1
+    }
+    return out
+}
+
+// Parse kv-line output: lookup value for key, return "" if missing.
+fn _kv_lookup(body: string, key: string) -> string {
+    let prefix = key + "="
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.starts_with(prefix) {
+            return ln.substring(prefix.len(), ln.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _kv_get_or(body: string, key: string, default_val: string) -> string {
+    let v = _kv_lookup(body, key)
+    if v == "" { return default_val }
+    return v
+}
+
+// Find symbol for a 10-20 position by scanning ch_NN_pos / ch_NN_symbol pairs.
+fn _sym_for_pos(body: string, pos: string) -> string {
+    let mut idx = 0
+    while idx < 16 {
+        let cstr = if idx < 10 { "0" + str(idx) } else { str(idx) }
+        let p = _kv_lookup(body, "ch_" + cstr + "_pos")
+        if p == pos {
+            let sym = _kv_lookup(body, "ch_" + cstr + "_symbol")
+            if sym == "" { return "?" }
+            return sym
+        }
+        idx = idx + 1
+    }
+    return "?"
+}
+
+// Render 16-position 10-20 ASCII map (matches anima-eeg/README.md layout).
+// State symbols inserted next to each position label.
+fn _render_ascii_map(body: string) {
+    let s_fp1 = _sym_for_pos(body, "Fp1")
+    let s_fp2 = _sym_for_pos(body, "Fp2")
+    let s_f7  = _sym_for_pos(body, "F7")
+    let s_f3  = _sym_for_pos(body, "F3")
+    let s_f4  = _sym_for_pos(body, "F4")
+    let s_f8  = _sym_for_pos(body, "F8")
+    let s_t7  = _sym_for_pos(body, "T7")
+    let s_c3  = _sym_for_pos(body, "C3")
+    let s_c4  = _sym_for_pos(body, "C4")
+    let s_t8  = _sym_for_pos(body, "T8")
+    let s_p3  = _sym_for_pos(body, "P3")
+    let s_p4  = _sym_for_pos(body, "P4")
+    let s_p7  = _sym_for_pos(body, "P7")
+    let s_p8  = _sym_for_pos(body, "P8")
+    let s_o1  = _sym_for_pos(body, "O1")
+    let s_o2  = _sym_for_pos(body, "O2")
+
+    println("")
+    println("    ┌─────────────────────────────────────────────┐")
+    println("    │            10-20 EEG MAP (16ch)             │")
+    println("    └─────────────────────────────────────────────┘")
+    println("")
+    println("                Fp1[" + s_fp1 + "]   Fp2[" + s_fp2 + "]            Frontal pole")
+    println("                    \\   /")
+    println("           F7[" + s_f7 + "] - F3[" + s_f3 + "] - F4[" + s_f4 + "] - F8[" + s_f8 + "]      Frontal")
+    println("                    |   |")
+    println("           T7[" + s_t7 + "] - C3[" + s_c3 + "] - C4[" + s_c4 + "] - T8[" + s_t8 + "]      Central / Temporal")
+    println("                    |   |")
+    println("                P3[" + s_p3 + "] - P4[" + s_p4 + "]            Parietal")
+    println("                   / | | \\")
+    println("           P7[" + s_p7 + "]         P8[" + s_p8 + "]           Parietal-temporal")
+    println("                O1[" + s_o1 + "]   O2[" + s_o2 + "]            Occipital")
+    println("")
+    println("    LEGEND:  [✓] OK   [⚠] LOOSE   [✗] BAD   [⚡] DEAD")
+    println("")
+}
+
+fn _action_advice(state: string, board: string, pin: string, pos: string, color: string) -> string {
+    if state == "DEAD" {
+        return "[⚡] " + pos + " — ADC dead. " + board + " 보드/stack 핀 점검 (board_health_check 실행)"
+    }
+    if state == "BAD_WIRE_OFF" {
+        return "[✗] " + pos + " — 와이어 보드에서 빠짐. " + board + " " + pin + " 소켓에 " + color + " 와이어 다시 꽂기"
+    }
+    if state == "BAD_NO_SCALP" {
+        // Spike or flat?
+        let is_flat = pos == "Fp1" || pos == "Fp2"
+        if is_flat {
+            return "[✗] " + pos + " — 이마에 안 닿음. flat electrode 이마 피부에 밀착 (saline 한 방울)"
+        }
+        return "[✗] " + pos + " — 두피 미접촉. spike electrode 시계방향 회전해서 두피까지 밀어 넣기 (saline 권장)"
+    }
+    if state == "LOOSE" {
+        let is_flat = pos == "Fp1" || pos == "Fp2"
+        if is_flat {
+            return "[⚠] " + pos + " — 약함. 이마에 더 밀착 + saline 추가"
+        }
+        return "[⚠] " + pos + " — 약함. spike 시계방향 추가 1/4 회전 + saline 추가"
+    }
+    return ""
+}
+
+fn _list_actions(body: string) {
+    let mut found_action = false
+    let mut idx = 0
+    while idx < 16 {
+        let cstr = if idx < 10 { "0" + str(idx) } else { str(idx) }
+        let state = _kv_get_or(body, "ch_" + cstr + "_state", "?")
+        if state != "OK" && state != "?" {
+            let board = _kv_get_or(body, "ch_" + cstr + "_board", "?")
+            let pin = _kv_get_or(body, "ch_" + cstr + "_pin", "?")
+            let pos = _kv_get_or(body, "ch_" + cstr + "_pos", "?")
+            let color = _kv_get_or(body, "ch_" + cstr + "_color", "?")
+            let advice = _action_advice(state, board, pin, pos, color)
+            if advice != "" {
+                if !found_action {
+                    println("    조절 필요한 전극:")
+                    println("    ─────────────────")
+                    found_action = true
+                }
+                println("      " + advice)
+            }
+        }
+        idx = idx + 1
+    }
+    if !found_action {
+        println("    ✓ 모든 전극 OK — 조절 필요 없음")
+    }
+    println("")
+}
+
+fn _print_summary(body: string) {
+    let n_ok    = _kv_get_or(body, "count_ok", "0")
+    let n_loose = _kv_get_or(body, "count_loose", "0")
+    let n_bad   = _kv_get_or(body, "count_bad", "0")
+    let n_dead  = _kv_get_or(body, "count_dead", "0")
+    let verdict = _kv_get_or(body, "verdict", "?")
+    println("    SUMMARY: " + n_ok + "/16 OK, " + n_loose + "/16 LOOSE, " + n_bad + "/16 BAD, " + n_dead + "/16 DEAD")
+    println("    VERDICT: " + verdict)
+    println("")
+}
+
+fn _do_one_pass(board_id: int, port: string, seconds: int, selftest: bool) -> int {
+    let mode_arg = if selftest { "selftest" } else { "check" }
+    let venv_py = DEFAULT_VENV_PYTHON
+    let mut cmd = venv_py + " " + HELPER_PATH + " " + mode_arg
+    cmd = cmd + " --board-id " + str(board_id)
+    cmd = cmd + " --seconds " + str(seconds)
+    if port != "" {
+        cmd = cmd + " --port " + _sh_quote(port)
+    }
+    cmd = cmd + " > /tmp/electrode_adj_out.log 2> /tmp/electrode_adj_err.log"
+
+    let _rc = exec(cmd)
+
+    let stdout_body = read_file("/tmp/electrode_adj_out.log")
+    let stderr_body = read_file("/tmp/electrode_adj_err.log")
+
+    if stderr_body != "" {
+        eprintln(stderr_body.trim())
+    }
+
+    _render_ascii_map(stdout_body)
+    _list_actions(stdout_body)
+    _print_summary(stdout_body)
+    return _rc
+}
+
+fn _print_usage() {
+    eprintln("usage: hexa run anima-eeg/electrode_adjustment_helper.hexa --selftest")
+    eprintln("       hexa run anima-eeg/electrode_adjustment_helper.hexa --check [--port <p>] [--seconds <n>]")
+    eprintln("       hexa run anima-eeg/electrode_adjustment_helper.hexa --watch [--port <p>] [--seconds <n>]")
+    eprintln("flags:")
+    eprintln("  --selftest        synthetic 16ch all-OK ASCII demo")
+    eprintln("  --check           one-shot real check (helmet on)")
+    eprintln("  --watch           periodic loop, 5s tick (Ctrl-C to stop)")
+    eprintln("  --port <path>     Dongle serial node (auto-detect if omitted)")
+    eprintln("  --seconds <n>     sample window per tick (default 3)")
+    eprintln("  --board <name>    cyton_daisy | cyton | ganglion (default cyton_daisy)")
+    eprintln("  --help            this message")
+}
+
+fn main() {
+    let av = _flags_only_argv()
+    let mut selftest = false
+    let mut check_mode = false
+    let mut watch_mode = false
+    let mut want_help = false
+    let mut port = ""
+    let mut seconds = DEFAULT_SECONDS
+    let mut board_name = DEFAULT_BOARD_NAME
+
+    let mut i = 0
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { selftest = true; i = i + 1; continue }
+        if a == "--check"    { check_mode = true; i = i + 1; continue }
+        if a == "--watch"    { watch_mode = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" { want_help = true; i = i + 1; continue }
+        if a == "--port" {
+            if (i + 1) >= len(av) {
+                _emit_trailer("missing-arg-value", "--port requires a value", "1) re-run with --port <path>")
+                exit(2)
+            }
+            port = av[i + 1]; i = i + 2; continue
+        }
+        if a == "--seconds" {
+            if (i + 1) >= len(av) {
+                _emit_trailer("missing-arg-value", "--seconds requires int", "1) re-run with --seconds 3")
+                exit(2)
+            }
+            seconds = to_int(av[i + 1]); i = i + 2; continue
+        }
+        if a == "--board" {
+            if (i + 1) >= len(av) {
+                _emit_trailer("missing-arg-value", "--board requires value", "1) --board cyton_daisy")
+                exit(2)
+            }
+            board_name = av[i + 1]; i = i + 2; continue
+        }
+        _emit_trailer("unknown-arg", "unrecognized: " + a, "1) --help")
+        _print_usage()
+        exit(2)
+    }
+
+    if want_help { _print_usage(); exit(0) }
+    if !selftest && !check_mode && !watch_mode {
+        eprintln("ABORT: must pass --selftest | --check | --watch")
+        _print_usage()
+        exit(2)
+    }
+
+    _write_helper()
+
+    let board_id = _board_name_to_id(board_name)
+    if board_id < 0 {
+        _emit_trailer("invalid-board", "unknown: " + board_name, "1) --board cyton_daisy")
+        exit(2)
+    }
+
+    println("══════════════════════════════════════════════════")
+    println("  anima-eeg electrode_adjustment_helper")
+    println("  schema: " + SCHEMA)
+    if selftest {
+        println("  mode: selftest (synthetic)")
+    } else {
+        println("  mode: " + (if watch_mode { "watch (loop)" } else { "check (one-shot)" }))
+        println("  port: " + port)
+    }
+    println("══════════════════════════════════════════════════")
+
+    if watch_mode {
+        let mut tick = 0
+        while true {
+            tick = tick + 1
+            println("")
+            println("─── tick #" + str(tick) + " ───")
+            let _rc = _do_one_pass(board_id, port, seconds, false)
+            println("    (" + str(DEFAULT_WATCH_INTERVAL_SEC) + "s 후 다시 측정. Ctrl-C 로 종료)")
+            sleep(DEFAULT_WATCH_INTERVAL_SEC)
+        }
+    } else {
+        let rc = _do_one_pass(board_id, port, seconds, selftest)
+        exit(rc)
+    }
+}
