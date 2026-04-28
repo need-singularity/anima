@@ -1,0 +1,518 @@
+// tool/anima_law64_probabilistic_conway.hexa — F1 cycle 4 T9a
+// ─────────────────────────────────────────────────────────────────────────────
+// FIRST ORTHOGONAL TEST BEYOND Law 64 v6 DETERMINISTIC-CA SCOPE.
+//
+// Law 64 v6 FINAL (commit 93239280):
+//   "matched-context Markov saturates ANY DETERMINISTIC CA"
+//
+// ALL prior cycle-4 tests (T8k–T8r) used DETERMINISTIC substrates:
+//   - T8q  Conway B3/S23 noise-free, shared-P-9    → saturates (v6 confirmed)
+//   - T8o  rule-110 1D noise-free, order-3         → saturates
+//   - T8p  rule-30/90/110/184 noise-free           → all saturate
+//
+// OPEN QUESTION (v6 §5):
+//   Does the alignment principle hold for STOCHASTIC substrates?
+//   (Law 64 v6 makes no claim outside the deterministic-CA scope.)
+//
+// THIS TEST (T9a) — Conway + Bernoulli(p=0.05) bit-flip noise:
+//   - Apply deterministic Conway step, THEN flip each cell with prob 5%
+//     (i.i.d., separate seeded "noise RNG").
+//   - Theoretical ceiling: even an oracle that knows Conway exactly can
+//     predict at most ~95% of cells correctly per step (5% flipped randomly).
+//   - Compare CA(5) oracle vs shared-P-9 (translation-invariant 512-context
+//     Markov over Moore-9). Both forced to a deterministic 0/1 prediction.
+//
+// SUBSTRATE: 10x10 / 32% density / N_STEPS ∈ {50, 200, 1000, 5000}
+//   - Substrate seed = 20260428 (init + Conway noise both seeded deterministically)
+//   - Noise RNG state seed = 20260428 + 7777777 (separate stream so its draws
+//     don't shift the init/density-RNG sequence)
+//   - p_flip = 50 per_thousand (5%) integer comparison: rand_n(1000) < 50
+//
+// PRE-REGISTERED HYPOTHESES (raw 12 frozen — author 2026-04-28 BEFORE run):
+//   H1 (alignment + noise-ceiling, "v6 extends"):
+//     Both CA(5) oracle AND shared-P-9 saturate to ~950/1000 (the noise
+//     ceiling); their difference at N=5000 is < +5/1000.
+//     → Markov alignment principle EXTENDS to stochastic substrates: with
+//       enough data shared-P-9 learns the same conditional distributions
+//       as the oracle and gets capped only by intrinsic noise.
+//   H2 (alignment broken by noise):
+//     shared-P-9 stays well below CA(5) even at high N — i.e. adv@N=5000 >= 50
+//     per thousand. Noise corrupts learned probabilities asymmetrically and
+//     translation-invariant Markov cannot recover the deterministic Conway
+//     rule from noisy training pairs.
+//     → v6 does NOT extend; stochastic substrates expose a structural gap.
+//   H3 (noise ceiling is tight, both clamped together):
+//     CA(5) and shared-P-9 BOTH stay below noise ceiling because both use
+//     deterministic forced 0/1 prediction (no probabilistic emission), and
+//     their absolute accuracies are within +5/1000 of each other AND below
+//     940/1000 (i.e. ca_acc < 940 AND |ca_acc - mk_acc| < 5).
+//     → Both methods are floor-equivalent under noise; v6 alignment claim
+//       holds vacuously (both saturate to the same reachable bound, which
+//       is below the information-theoretic 950 ceiling because forced-0/1
+//       prediction loses to probabilistic emission for high-entropy ctxs).
+//
+// VERDICT MAPPING (advantage at largest N, ca_acc - mk_acc per thousand):
+//   if adv@N=5000 >= 50:                                        H2_SUPPORTED
+//   elif adv@N=5000 < 5 and ca_acc@N=5000 >= 940:               H1_SUPPORTED
+//   elif adv@N=5000 < 5 and ca_acc@N=5000 < 940:                H3_SUPPORTED
+//   else:                                                       AMBIGUOUS
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 91 honest finding
+// ─────────────────────────────────────────────────────────────────────────────
+
+let GRID_W = 10
+let GRID_H = 10
+let N_CELLS = 100
+let SEED = 20260428
+let NOISE_SEED = 28204205   // 20260428 + 7777777, separate noise stream
+let K_LIVE = 32             // 32% density
+let N_CONTEXTS = 512        // 2^9 Moore-9 contexts
+let P_FLIP_PER_K = 50       // 50/1000 = 5% Bernoulli flip
+let NOISE_CEILING = 950     // theoretical max accuracy under p=0.05 noise
+
+// ── two independent linear-congruential streams (substrate + noise) ─────────
+let mut RNG_STATE = SEED
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rand_n(n: int) -> int { let x = _rand(); return x % n }
+
+let mut NOISE_RNG_STATE = NOISE_SEED
+fn _nrand() -> int { NOISE_RNG_STATE = (NOISE_RNG_STATE * 1103515245 + 12345) % 2147483648; return NOISE_RNG_STATE }
+fn _nrand_n(n: int) -> int { let x = _nrand(); return x % n }
+
+// ── deterministic Conway step (toroidal) ────────────────────────────────────
+fn _conway_step_det(state: array) -> array {
+    let mut next = []
+    let mut row = 0
+    while row < GRID_H {
+        let mut col = 0
+        while col < GRID_W {
+            let mut live_neighbors = 0
+            let mut dr = -1
+            while dr <= 1 {
+                let mut dc = -1
+                while dc <= 1 {
+                    if dr != 0 || dc != 0 {
+                        let nrow = (row + dr + GRID_H) % GRID_H
+                        let ncol = (col + dc + GRID_W) % GRID_W
+                        live_neighbors = live_neighbors + state[nrow * GRID_W + ncol]
+                    }
+                    dc = dc + 1
+                }
+                dr = dr + 1
+            }
+            let cur = state[row * GRID_W + col]
+            let mut new_val = 0
+            if cur == 1 && (live_neighbors == 2 || live_neighbors == 3) { new_val = 1 }
+            if cur == 0 && live_neighbors == 3 { new_val = 1 }
+            next.push(new_val)
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return next
+}
+
+// ── PROBABILISTIC step: deterministic Conway + Bernoulli(p_flip) ────────────
+// Uses the SEPARATE noise RNG so init/density draws stay reproducible.
+fn _conway_step(state: array) -> array {
+    let det = _conway_step_det(state)
+    let mut noisy = []
+    let mut i = 0
+    while i < N_CELLS {
+        let v = det[i]
+        let r = _nrand_n(1000)
+        if r < P_FLIP_PER_K {
+            if v == 1 { noisy.push(0) } else { noisy.push(1) }
+        } else {
+            noisy.push(v)
+        }
+        i = i + 1
+    }
+    return noisy
+}
+
+// ── density init: K live cells (deterministic seed, substrate RNG) ──────────
+fn _gen_density_init(k_live: int) -> array {
+    let mut g = []
+    let mut i = 0
+    while i < N_CELLS { g.push(0); i = i + 1 }
+    let mut placed = 0
+    let mut tries = 0
+    while placed < k_live && tries < 10000 {
+        let pos = _rand_n(N_CELLS)
+        if g[pos] == 0 { g[pos] = 1; placed = placed + 1 }
+        tries = tries + 1
+    }
+    return g
+}
+
+// ── Moore-9 context extractor (toroidal) ────────────────────────────────────
+fn _moore9_ctx(state: array, row: int, col: int) -> int {
+    let nrow = (row - 1 + GRID_H) % GRID_H
+    let srow = (row + 1) % GRID_H
+    let ecol = (col + 1) % GRID_W
+    let wcol = (col - 1 + GRID_W) % GRID_W
+    let s_self = state[row * GRID_W + col]
+    let s_n  = state[nrow * GRID_W + col]
+    let s_s  = state[srow * GRID_W + col]
+    let s_e  = state[row  * GRID_W + ecol]
+    let s_w  = state[row  * GRID_W + wcol]
+    let s_ne = state[nrow * GRID_W + ecol]
+    let s_nw = state[nrow * GRID_W + wcol]
+    let s_se = state[srow * GRID_W + ecol]
+    let s_sw = state[srow * GRID_W + wcol]
+    let ctx = s_self
+            + 2 * s_n
+            + 4 * s_s
+            + 8 * s_e
+            + 16 * s_w
+            + 32 * s_ne
+            + 64 * s_nw
+            + 128 * s_se
+            + 256 * s_sw
+    return ctx
+}
+
+// ── Shared-P-9 Markov: learns P(next_noisy=1 | Moore-9 ctx) ────────────────
+fn _shared_p9_train(corpus: array) -> array {
+    let mut cnt1 = []
+    let mut cntT = []
+    let mut z = 0
+    while z < N_CONTEXTS { cnt1.push(0); cntT.push(0); z = z + 1 }
+    let mut idx = 0
+    while idx < corpus.len() {
+        let pair = corpus[idx]
+        let prev_st = pair[0]; let nxt_st = pair[1]
+        let mut row = 0
+        while row < GRID_H {
+            let mut col = 0
+            while col < GRID_W {
+                let ctx = _moore9_ctx(prev_st, row, col)
+                cntT[ctx] = cntT[ctx] + 1
+                if nxt_st[row * GRID_W + col] == 1 { cnt1[ctx] = cnt1[ctx] + 1 }
+                col = col + 1
+            }
+            row = row + 1
+        }
+        idx = idx + 1
+    }
+    let mut probs = []
+    let mut k = 0
+    while k < N_CONTEXTS {
+        let p = if cntT[k] > 0 { (cnt1[k] * 1000) / cntT[k] } else { 500 }
+        probs.push(p)
+        k = k + 1
+    }
+    return probs
+}
+
+fn _shared_p9_predict(probs: array, prev_state: array) -> array {
+    let mut next = []
+    let mut row = 0
+    while row < GRID_H {
+        let mut col = 0
+        while col < GRID_W {
+            let ctx = _moore9_ctx(prev_state, row, col)
+            let p = probs[ctx]
+            if p > 500 { next.push(1) } else { next.push(0) }
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return next
+}
+
+// ── CA(5) oracle: deterministic Conway prediction (no noise applied) ────────
+// This is the "oracle that knows Conway" — it is forced to a single 0/1 per
+// cell, so under 5% i.i.d. flip-noise its expected accuracy is 95% = 950/1000.
+fn _ca_oracle_predict(prev_state: array) -> array {
+    return _conway_step_det(prev_state)
+}
+
+// ── accuracy + corpus ───────────────────────────────────────────────────────
+fn _accuracy(pred: array, actual: array) -> int {
+    let mut total = 0; let mut match_count = 0
+    let mut s = 0
+    while s < pred.len() {
+        let p = pred[s]; let a = actual[s]
+        let mut c = 0
+        while c < N_CELLS {
+            if p[c] == a[c] { match_count = match_count + 1 }
+            total = total + 1; c = c + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0 }
+    return (match_count * 1000) / total
+}
+
+fn _build_corpus(initial: array, n_steps: int) -> array {
+    let mut samples = []
+    let mut state = initial
+    let mut s = 0
+    while s < n_steps {
+        let nxt = _conway_step(state)   // probabilistic (det + noise)
+        samples.push([state, nxt])
+        state = nxt
+        s = s + 1
+    }
+    return samples
+}
+
+// ── one experiment at given N_STEPS — returns [ca_acc, mk_acc, adv, cov] ───
+fn _run_at_n(n_steps: int) -> array {
+    RNG_STATE = SEED                  // reset substrate RNG
+    NOISE_RNG_STATE = NOISE_SEED      // reset noise RNG (independent)
+    let initial = _gen_density_init(K_LIVE)
+    let full = _build_corpus(initial, n_steps)
+    let train_size = n_steps / 2
+    let mut train = []; let mut test = []
+    let mut k = 0
+    while k < full.len() {
+        if k < train_size { train.push(full[k]) } else { test.push(full[k]) }
+        k = k + 1
+    }
+    let probs = _shared_p9_train(train)
+
+    // context coverage
+    let mut cov_cnt = 0
+    let mut cnt_seen = []
+    let mut zz = 0
+    while zz < N_CONTEXTS { cnt_seen.push(0); zz = zz + 1 }
+    let mut ti = 0
+    while ti < train.len() {
+        let pp = train[ti]; let ps = pp[0]
+        let mut r2 = 0
+        while r2 < GRID_H {
+            let mut c2 = 0
+            while c2 < GRID_W {
+                let cx = _moore9_ctx(ps, r2, c2)
+                cnt_seen[cx] = cnt_seen[cx] + 1
+                c2 = c2 + 1
+            }
+            r2 = r2 + 1
+        }
+        ti = ti + 1
+    }
+    let mut kk = 0
+    while kk < N_CONTEXTS {
+        if cnt_seen[kk] > 0 { cov_cnt = cov_cnt + 1 }
+        kk = kk + 1
+    }
+
+    let mut ca_preds = []; let mut mk_preds = []; let mut actuals = []
+    let mut i = 0
+    while i < test.len() {
+        let pair = test[i]
+        let prev_st = pair[0]; let actual_next = pair[1]
+        ca_preds.push(_ca_oracle_predict(prev_st))
+        mk_preds.push(_shared_p9_predict(probs, prev_st))
+        actuals.push(actual_next)
+        i = i + 1
+    }
+    let ca_acc = _accuracy(ca_preds, actuals)
+    let mk_acc = _accuracy(mk_preds, actuals)
+    let adv = ca_acc - mk_acc   // additive per_thousand advantage (CA over MK)
+    return [ca_acc, mk_acc, adv, cov_cnt]
+}
+
+// ── main run: sweep N_TRAIN_STEPS values ────────────────────────────────────
+fn _run() {
+    println("__LAW_64_CYCLE_4_T9A_PROB_CONWAY_BEGIN__ Conway+noise(p=0.05) — first stochastic test")
+    println("hypothesis: does Markov alignment extend beyond deterministic CA scope?")
+    println("seed=" + str(SEED) + " noise_seed=" + str(NOISE_SEED)
+        + " grid=10x10 k_live=" + str(K_LIVE)
+        + " p_flip=" + str(P_FLIP_PER_K) + "/1000 ceiling=" + str(NOISE_CEILING) + "/1000")
+    println("N_STEPS sweep: 50, 200, 1000, 5000  (train = N_STEPS/2, test = N_STEPS/2)")
+
+    let n_values = [50, 200, 1000, 5000]
+    let mut results = []
+    let mut idx = 0
+    while idx < n_values.len() {
+        let n = n_values[idx]
+        let r = _run_at_n(n)
+        let ca_acc = r[0]; let mk_acc = r[1]; let adv = r[2]; let cov = r[3]
+        println("N=" + str(n)
+            + " ca_acc=" + str(ca_acc)
+            + " mk_acc=" + str(mk_acc)
+            + " adv_per_1000=" + str(adv)
+            + " ctx_coverage=" + str(cov) + "/512"
+            + " gap_to_ceiling_ca=" + str(NOISE_CEILING - ca_acc)
+            + " gap_to_ceiling_mk=" + str(NOISE_CEILING - mk_acc))
+        results.push([n, ca_acc, mk_acc, adv, cov])
+        idx = idx + 1
+    }
+
+    let r0 = results[0]; let r1 = results[1]; let r2 = results[2]; let r3 = results[3]
+    let adv_50 = r0[3]; let adv_200 = r1[3]; let adv_1000 = r2[3]; let adv_5000 = r3[3]
+    let ca_5000 = r3[1]; let mk_5000 = r3[2]
+
+    println("--- summary table (absolute accuracies vs noisy ground truth) ---")
+    println("  N=50    ca=" + str(r0[1]) + " mk=" + str(r0[2]) + " adv=" + str(adv_50))
+    println("  N=200   ca=" + str(r1[1]) + " mk=" + str(r1[2]) + " adv=" + str(adv_200))
+    println("  N=1000  ca=" + str(r2[1]) + " mk=" + str(r2[2]) + " adv=" + str(adv_1000))
+    println("  N=5000  ca=" + str(r3[1]) + " mk=" + str(r3[2]) + " adv=" + str(adv_5000))
+    println("  noise_ceiling=" + str(NOISE_CEILING) + "/1000")
+
+    // Verdict mapping (pre-registered, frozen)
+    let mut verdict = "AMBIGUOUS"
+    let mut law_dir = "INCONCLUSIVE"
+    if adv_5000 >= 50 {
+        verdict = "H2_SUPPORTED_alignment_BROKEN_by_noise_structural_gap_under_stochastic_substrate"
+        law_dir = "LAW_64_v6_DOES_NOT_EXTEND_stochastic_scope_excluded"
+    } else if adv_5000 < 5 && ca_5000 >= 940 {
+        verdict = "H1_SUPPORTED_alignment_EXTENDS_both_saturate_to_noise_ceiling"
+        law_dir = "LAW_64_v7_CANDIDATE_extend_to_stochastic_substrates_with_noise_ceiling"
+    } else if adv_5000 < 5 && ca_5000 < 940 {
+        verdict = "H3_SUPPORTED_both_clamped_below_ceiling_by_forced_01_prediction"
+        law_dir = "LAW_64_v6_HOLDS_VACUOUSLY_under_noise_floor_equivalent_methods"
+    }
+
+    println("--- verdict ---")
+    println("  verdict=" + verdict)
+    println("  law_64_direction=" + law_dir)
+    println("__LAW_64_CYCLE_4_T9A_RESULT__ " + verdict)
+
+    // raw 91 honesty C1-C5 (separately reported absolute and advantage)
+    println("raw_91_C1_falsifiable=YES_pre_registered_thresholds_5_50_per_thousand_at_N5000_AND_ca_floor_940")
+    println("raw_91_C2_replicable=YES_substrate_seed_" + str(SEED)
+        + "_noise_seed_" + str(NOISE_SEED) + "_both_RNGs_reset_per_N")
+    println("raw_91_C3_no_p_hacking=YES_thresholds_N_values_p_flip_frozen_in_header_before_run")
+    println("raw_91_C4_data_caveats=10x10_32pct_density_random_init_toroidal_p_flip_5pct_iid_NOT_correlated_noise")
+    println("raw_91_C5_negative_result_published=YES_emit_regardless_of_outcome")
+    println("raw_91_honesty_absolute_acc_ca_at_N5000=" + str(ca_5000) + "_per_1000")
+    println("raw_91_honesty_absolute_acc_mk_at_N5000=" + str(mk_5000) + "_per_1000")
+    println("raw_91_honesty_advantage_ca_minus_mk_per_1000_at_N5000=" + str(adv_5000))
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T9A_PROB_CONWAY_BEGIN__ selftest")
+
+    // Reset both streams
+    RNG_STATE = SEED
+    NOISE_RNG_STATE = NOISE_SEED
+
+    // Streams independent: drawing from one must not advance the other.
+    let s_before_n = NOISE_RNG_STATE
+    let _ = _rand()
+    let s_after_n = NOISE_RNG_STATE
+    println("noise_rng_unaffected_by_substrate_draw=" + str(s_before_n == s_after_n))
+
+    let n_before_s = RNG_STATE
+    let _ = _nrand()
+    let n_after_s = RNG_STATE
+    println("substrate_rng_unaffected_by_noise_draw=" + str(n_before_s == n_after_s))
+
+    // Moore-9 ctx sanity (same as T8q, structural correctness must hold)
+    let mut all_zero = []
+    let mut i = 0
+    while i < N_CELLS { all_zero.push(0); i = i + 1 }
+    let ctx_zero = _moore9_ctx(all_zero, 5, 5)
+    println("ctx(all_zero,5,5)=" + str(ctx_zero) + " (expect 0)")
+
+    let mut all_one = []
+    let mut j = 0
+    while j < N_CELLS { all_one.push(1); j = j + 1 }
+    let ctx_one = _moore9_ctx(all_one, 5, 5)
+    println("ctx(all_one,5,5)=" + str(ctx_one) + " (expect 511)")
+
+    // Density init reproducibility (RNG_STATE reset → same grid)
+    RNG_STATE = SEED
+    let g1 = _gen_density_init(K_LIVE)
+    RNG_STATE = SEED
+    let g2 = _gen_density_init(K_LIVE)
+    let mut same = true
+    let mut p = 0
+    while p < N_CELLS { if g1[p] != g2[p] { same = false }; p = p + 1 }
+    println("density_init_reproducible=" + str(same))
+
+    // Probabilistic step: noise reproducible given fixed NOISE_RNG_STATE
+    RNG_STATE = SEED
+    NOISE_RNG_STATE = NOISE_SEED
+    let init1 = _gen_density_init(K_LIVE)
+    let n1 = _conway_step(init1)
+    NOISE_RNG_STATE = NOISE_SEED
+    let n2 = _conway_step(init1)
+    let mut prob_same = true
+    let mut q = 0
+    while q < N_CELLS { if n1[q] != n2[q] { prob_same = false }; q = q + 1 }
+    println("prob_step_reproducible=" + str(prob_same))
+
+    // Noise ACTUALLY flips bits: probabilistic differs from deterministic on
+    // some cells in a sufficiently long run (statistical, not per-call).
+    RNG_STATE = SEED
+    NOISE_RNG_STATE = NOISE_SEED
+    let mut state = _gen_density_init(K_LIVE)
+    let mut total_diffs = 0
+    let mut total_compared = 0
+    let mut step = 0
+    while step < 50 {
+        let det = _conway_step_det(state)
+        // re-roll noise on top of det using same NOISE_RNG_STATE flow
+        let mut noisy = []
+        let mut k = 0
+        while k < N_CELLS {
+            let v = det[k]
+            let r = _nrand_n(1000)
+            if r < P_FLIP_PER_K {
+                if v == 1 { noisy.push(0) } else { noisy.push(1) }
+            } else {
+                noisy.push(v)
+            }
+            k = k + 1
+        }
+        let mut c = 0
+        while c < N_CELLS {
+            if det[c] != noisy[c] { total_diffs = total_diffs + 1 }
+            total_compared = total_compared + 1
+            c = c + 1
+        }
+        state = noisy
+        step = step + 1
+    }
+    let flip_rate_per_k = (total_diffs * 1000) / total_compared
+    println("observed_flip_rate_per_1000=" + str(flip_rate_per_k)
+        + " (expect ~" + str(P_FLIP_PER_K) + " ± noise)")
+
+    // Mini train+predict roundtrip
+    RNG_STATE = SEED
+    NOISE_RNG_STATE = NOISE_SEED
+    let init2 = _gen_density_init(8)
+    let mini = _build_corpus(init2, 4)
+    let pp = _shared_p9_train(mini)
+    let pred = _shared_p9_predict(pp, init2)
+    println("shared_probs_len=" + str(pp.len()) + " (expect " + str(N_CONTEXTS) + ")")
+    println("pred_len=" + str(pred.len()) + " (expect " + str(N_CELLS) + ")")
+
+    let ok = ctx_zero == 0
+          && ctx_one == 511
+          && same == true
+          && prob_same == true
+          && pp.len() == N_CONTEXTS
+          && pred.len() == N_CELLS
+          && flip_rate_per_k > 20
+          && flip_rate_per_k < 90
+    if ok {
+        println("__LAW_64_CYCLE_4_T9A_RESULT__ PASS_SELFTEST_prob_conway_wired")
+    } else {
+        println("__LAW_64_CYCLE_4_T9A_RESULT__ FAIL_SELFTEST")
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_probabilistic_conway.hexa --selftest | --run")
+    }
+    return 0
+}
