@@ -51,9 +51,9 @@ Pre-registered hypotheses (raw 12 frozen):
 ### v4 (defensible after T8j)
 > "CA(5)-vs-Markov-order-1 advantage on Conway is **INTRINSICALLY TRAIN-VOLUME-DEPENDENT** at every grid size tested. The advantage axis cannot be cleanly separated from the train-volume axis; H1 (structural eternal advantage) is **FALSIFIED** for 40x40/32%/seed=20260428. The v3 framing 'advantage CONVERGES at +22% on 40x40' must be qualified as 'ASYMPTOTE WITHIN A TRAIN-VOLUME WINDOW' — at fixed N_TRAIN=15."
 
-### Open
-- 80x80 / N_TRAIN=1500 / aperiodic init (R-pentomino chaotic) regimes — does eternal advantage restore?
-- ~~Markov order-2 / order-3 — does the gap survive higher-order n-gram baselines?~~ **RESOLVED T8l 2026-04-28** — see §3.1.
+### Open (BOTH NOW RESOLVED 2026-04-28 same session)
+- ~~80x80 / N_TRAIN=1500 / aperiodic init (R-pentomino chaotic) regimes — does eternal advantage restore?~~ **RESOLVED T8k** — see §3.2.
+- ~~Markov order-2 / order-3 — does the gap survive higher-order n-gram baselines?~~ **RESOLVED T8l** — see §3.1.
 
 ### §3.1 T8l higher-order Markov verdict — Law 64 v4 STRENGTHENS
 
@@ -69,6 +69,31 @@ Pre-registered hypotheses H1/H2/H3 frozen in tool header before run.
 
 **Verdict**: H2_SUPPORTED + partial H3 — CA(5) advantage is **ROBUST across n-gram orders**; higher-order Markov does NOT close the gap and actually slightly degrades from o1 (data-sparsity at 50 train pairs / 4-context o2 / 8-context o3 per cell). The +160 → +169 progression confirms Law 64 v4 is not an artifact of choosing the weakest baseline. v5-retraction-candidate H1 (advantage shrinks to <+5/1000) was REJECTED — gap GREW instead. Tool: `tool/anima_law64_conway_higher_order_markov.hexa`. Log: `state/law64_higher_order_markov/run_20260428T030754Z.log`.
 
+### §3.2 T8k 80x80 R-pentomino aperiodic train-volume — Q1 RESOLVED H2_SUPPORTED
+
+Pre-registered hypotheses (raw 12 frozen):
+- H1 (eternal advantage restored): advantage > +50/1000 at ALL ticks (chaotic init exceeds bigram capacity)
+- H2 (still descending): advantage descends < +50/1000 by N=1500
+- H3 (CONVERGED at high value > +50): asymptotic nonzero floor
+
+| N_TRAIN | advantage_per_thousand | Δ |
+|---|---|---|
+| 15 | +19 | — |
+| 50 | +19 | 0 |
+| 150 | +17 | -2 |
+| 500 | +5 | -12 |
+| 1500 | +0 | -5 ★ converged at parity |
+
+**Verdict**: H2_SUPPORTED — eternal advantage NOT restored even at 4x grid capacity with deterministic chaotic seed. 0/5 ticks above +50/1000 floor. Maximum advantage (19/1000 at N=15) is below H1 threshold at every tick. v4 train-volume saturation reinforced on third independent axis (10x10/40x40/80x80 all descend; 80x80 chaotic at parity by N=1500). Tool: `tool/anima_law64_conway_80x80_aperiodic_train_volume_sweep.hexa`. Log: `state/law64_80x80_aperiodic_train_volume_sweep/run_20260428T030803Z.log`.
+
+### §3.3 Joint synthesis of Q1+Q2 → Law 64 v4 FINAL
+
+Both §3 open questions resolved in same session:
+- **Spatial-axis falsification (T8k)**: chaotic R-pent at 80x80 still descends to parity → train-volume axis is universal
+- **Baseline-axis robustness (T8l)**: order-2/3 Markov does NOT close gap → CA(5) advantage is structural at short horizons
+
+Joint reading: CA(5) outperforms order-1/2/3 Markov at SHORT TRAIN HORIZONS (N_TRAIN ≤ ~50) regardless of grid size or pattern type — the structural-advantage finding is real. But Markov saturates given enough samples on Conway substrates because Conway is a deterministic finite-state system with limited entropy at every grid size. The "eternal advantage" claim is FALSE; the "structural advantage at short horizons" claim is TRUE.
+
 ---
 
 ## §4. Multi-dimensional governing summary
@@ -80,7 +105,8 @@ Law 64 has now been measured along 4 axes:
 | grid size | 5x5 → 80x80 | 5x5 → 80x80 advantage grows then asymptotes (+22% at 40x40+) AT N=15 |
 | density | 4-50% | peaks at 32% density on 10x10 (T8e earlier) |
 | pattern | random / glider / r-pent / blinker | r-pentomino chaotic strongest (+30.2% on 10x10 N=15) |
-| **train-volume** | **15-1500** | **MONOTONE DESCENDING** (collapse @10x10 / slow descent @40x40) |
+| **train-volume** | **15-1500** | **MONOTONE DESCENDING** (parity @10x10 N=500 / @40x40 N=1500 / @80x80 R-pent N=1500) |
+| **n-gram order** | **1-3** | **GAP ROBUST** (+160 / +168 / +169 advantage at N=50/10x10) — CA(5) is structurally better |
 
 Train-volume axis is the FALSIFIER — only the first 3 axes were "scaling laws"; train-volume is the dual axis where Markov saturates. The 4 axes are COUPLED, not independent. Law 64 is no longer a monotone scaling law in any single dimension.
 
