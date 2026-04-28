@@ -1,0 +1,623 @@
+// tool/anima_law64_rule30_higher_order_markov.hexa — F1 cycle 4 T8r rule-30 higher-order Markov
+// ─────────────────────────────────────────────────────────────────────────────
+// QUESTION (raw 12 frozen, declared BEFORE running):
+//   Law 64 v6 (43d40ea3) declared the BASELINE-AXIS ALIGNMENT PRINCIPLE: when
+//   the Markov n-gram order ≥ rule's neighborhood width, perfect saturation is
+//   expected (mk_acc → ca_acc, advantage → 0). T8o (3a5982f8) demonstrated this
+//   on rule-110 (class-4 universality, single_cell init): order-3 = 0/1000 gap
+//   at N=500+. T8p (e07397fa) showed rule 30 (class-3 chaos) at order-1 has
+//   the STRONGEST persistence of the 4-rule sweep: density_32pct +1178 at
+//   N=1500, single_cell +953 at N=1500.
+//
+//   Open question: does v6 alignment principle hold for class-3 chaos? Rule 30
+//   has the SAME 3-cell rule width as rule-110, so v6 predicts order-3 will
+//   saturate equally on rule 30 — REGARDLESS of init regime (single_cell or
+//   density_32pct). If chaotic dynamics resist matched-context saturation in
+//   one or both init regimes, v6 needs correction.
+//
+// SUBSTRATE: 1D length=128 toroidal rule-30, two inits tested in parallel:
+//   - single_cell:    deterministic, chaotic spreading from g[64]=1
+//   - density_32pct:  K_LIVE=41 random placements (T8p showed this gives the
+//                     strongest order-1 persistence on rule 30: +1178 at N=1500)
+//
+// ORACLE: CA(5) — 5-cell-window subsumes rule-30's 3-cell window (perfect
+//         ceiling, identical to T8o/T8p).
+//
+// FOUR MARKOV BASELINES (all per-cell, parallel to T8o discipline):
+//   - Order-1: P(next | self)                 — 2 contexts/cell
+//   - Order-2: P(next | self, left)           — 4 contexts/cell
+//   - Order-3: P(next | self, left, right)    — 8 contexts/cell  ← matches rule-30 neighborhood EXACTLY
+//   - Order-5: P(next | l2, l, self, r, r2)   — 32 contexts/cell ← matches CA(5) window
+//
+// N_TRAIN ANCHORS: 50, 500, 1500 (3 anchors, identical to T8o)
+// N_TEST: 15 (held constant, identical to T8o/T8p)
+//
+// PRE-REGISTERED HYPOTHESES (raw 12 frozen):
+//   H1 (v6 universal — alignment principle holds):
+//     order-3 saturates to <+5 advantage at N>=500 on BOTH single_cell AND
+//     density_32pct inits. Rule 30 shares rule-110's 3-cell width, so v6
+//     predicts identical saturation behavior. Class-3 chaos is irrelevant —
+//     what matters is rule width vs Markov context width.
+//     → Law 64 v6 STRENGTHENS: alignment principle is universal across
+//        elementary CA classes (class-3 chaos saturates as cleanly as class-4
+//        universality given matched context width).
+//
+//   H2 (rule-30 special — chaotic dynamics resist saturation):
+//     order-3 STILL has gap > +200 advantage at N=1500 on at least one init
+//     (likely density_32pct given T8p's +1178 strength). Chaotic dynamics
+//     produce a per-cell context distribution where some 3-cell contexts are
+//     so rare that they remain unlearned even at N=1500.
+//     → Law 64 v6 CORRECTION: alignment principle requires class-conditioning
+//        — class-3 chaos breaks v6 even with matched context width.
+//
+//   H3 (init-conditional — single_cell saturates, density does NOT):
+//     order-3 saturates on single_cell (<+5 at N>=500) but NOT on
+//     density_32pct (>+50 at N=1500). The deterministic single-cell init
+//     produces a cleaner per-cell context distribution; density randomness
+//     amplifies rare-context starvation under chaos.
+//     → Law 64 v6 NUANCE: alignment principle is init-conditional under
+//        chaotic rules; density init exposes a baseline-data-volume
+//        bottleneck that single_cell deterministic init does not.
+//
+// VERDICT MAPPING (frozen, no post-hoc tuning):
+//   adv_o3_n1500_single  = advantage_per_thousand at order=3, N_TRAIN=1500, init=single_cell
+//   adv_o3_n1500_density = advantage_per_thousand at order=3, N_TRAIN=1500, init=density_32pct
+//   adv_o3_n500_single   = advantage at order=3, N_TRAIN=500,  init=single_cell
+//   adv_o3_n500_density  = advantage at order=3, N_TRAIN=500,  init=density_32pct
+//
+//   if abs(adv_o3_n500_single)  < 5 && abs(adv_o3_n500_density)  < 5
+//      && abs(adv_o3_n1500_single) < 5 && abs(adv_o3_n1500_density) < 5:
+//        H1_SUPPORTED  (v6 universal: full saturation on both inits)
+//   elif adv_o3_n1500_single >= 200 || adv_o3_n1500_density >= 200:
+//        H2_SUPPORTED  (rule-30 chaos genuinely resists saturation at matched width)
+//   elif abs(adv_o3_n1500_single) < 5 && adv_o3_n1500_density >= 50:
+//        H3_SUPPORTED  (init-conditional: single saturates, density does not)
+//   else:
+//        AMBIGUOUS / MIXED — report raw, no v6 update.
+//
+// raw 9 hexa-only · raw 12 frozen pre-registration · raw 91 honest finding
+// raw 42 caveat: 4 orders × 3 N_TRAIN × 2 inits = 24 cells × ~10s on Mac CPU ≈ 4min wallclock.
+// raw 91 caveat: single seed (20260428), single density placement (deterministic
+//   from SEED). Multi-seed forward step if H2 or H3 fires.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let LEN = 128
+let RULE = 30
+let SEED = 20260428
+let N_TEST = 15
+let K_LIVE = 41   // ~32% of 128 (matches T8p density_32pct)
+
+let mut RNG_STATE = SEED
+fn _rand() -> int { RNG_STATE = (RNG_STATE * 1103515245 + 12345) % 2147483648; return RNG_STATE }
+fn _rand_n(n: int) -> int { let x = _rand(); return x % n }
+fn _rng_reset() { RNG_STATE = SEED }
+
+// ── rule-30 1D step (toroidal) ──────────────────────────────────────────────
+fn _rule30_step(state: array) -> array {
+    let mut next = []
+    let mut i = 0
+    while i < LEN {
+        let li = (i + LEN - 1) % LEN
+        let ri = (i + 1) % LEN
+        let l = state[li]; let c = state[i]; let r = state[ri]
+        let pidx = 4*l + 2*c + r
+        let bit = (RULE / (1 << pidx)) % 2
+        next.push(bit)
+        i = i + 1
+    }
+    return next
+}
+
+fn _ca5_predict(prev: array) -> array { return _rule30_step(prev) }
+
+fn _init_single_cell() -> array {
+    let mut g = []
+    let mut i = 0
+    while i < LEN { g.push(0); i = i + 1 }
+    g[LEN / 2] = 1
+    return g
+}
+
+fn _init_density() -> array {
+    let mut g = []
+    let mut i = 0
+    while i < LEN { g.push(0); i = i + 1 }
+    let mut placed = 0
+    let mut tries = 0
+    while placed < K_LIVE && tries < 10000 {
+        let pos = _rand_n(LEN)
+        if g[pos] == 0 { g[pos] = 1; placed = placed + 1 }
+        tries = tries + 1
+    }
+    return g
+}
+
+// ── neighbor index helpers (1D toroidal) ────────────────────────────────────
+fn _l1(c: int) -> int { return (c + LEN - 1) % LEN }
+fn _r1(c: int) -> int { return (c + 1) % LEN }
+fn _l2(c: int) -> int { return (c + LEN - 2) % LEN }
+fn _r2(c: int) -> int { return (c + 2) % LEN }
+
+// ── Markov ORDER-1: P(next | self) — 2 ctx/cell ────────────────────────────
+fn _train_o1(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < LEN {
+        let mut cnt1 = [0, 0]
+        let mut cntT = [0, 0]
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev = pair[0]; let nxt = pair[1]
+            let ctx = prev[c]
+            cntT[ctx] = cntT[ctx] + 1
+            if nxt[c] == 1 { cnt1[ctx] = cnt1[ctx] + 1 }
+            idx = idx + 1
+        }
+        let mut k = 0
+        while k < 2 {
+            let p = if cntT[k] > 0 { (cnt1[k]*1000) / cntT[k] } else { 500 }
+            probs.push(p)
+            k = k + 1
+        }
+        c = c + 1
+    }
+    return probs
+}
+fn _predict_o1(probs: array, prev: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < LEN {
+        let ctx = prev[c]
+        let p = probs[2*c + ctx]
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+// ── Markov ORDER-2: P(next | self, left) — 4 ctx/cell ──────────────────────
+fn _train_o2(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < LEN {
+        let mut cnt1 = [0, 0, 0, 0]
+        let mut cntT = [0, 0, 0, 0]
+        let li = _l1(c)
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev = pair[0]; let nxt = pair[1]
+            let ctx = 2*prev[c] + prev[li]
+            cntT[ctx] = cntT[ctx] + 1
+            if nxt[c] == 1 { cnt1[ctx] = cnt1[ctx] + 1 }
+            idx = idx + 1
+        }
+        let mut k = 0
+        while k < 4 {
+            let p = if cntT[k] > 0 { (cnt1[k]*1000) / cntT[k] } else { 500 }
+            probs.push(p)
+            k = k + 1
+        }
+        c = c + 1
+    }
+    return probs
+}
+fn _predict_o2(probs: array, prev: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < LEN {
+        let ctx = 2*prev[c] + prev[_l1(c)]
+        let p = probs[4*c + ctx]
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+// ── Markov ORDER-3: P(next | self, left, right) — 8 ctx/cell ───────────────
+// ctx = 4*self + 2*left + right (matches rule-30 neighborhood exactly)
+fn _train_o3(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < LEN {
+        let mut cnt1 = [0, 0, 0, 0, 0, 0, 0, 0]
+        let mut cntT = [0, 0, 0, 0, 0, 0, 0, 0]
+        let li = _l1(c); let ri = _r1(c)
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev = pair[0]; let nxt = pair[1]
+            let ctx = 4*prev[c] + 2*prev[li] + prev[ri]
+            cntT[ctx] = cntT[ctx] + 1
+            if nxt[c] == 1 { cnt1[ctx] = cnt1[ctx] + 1 }
+            idx = idx + 1
+        }
+        let mut k = 0
+        while k < 8 {
+            let p = if cntT[k] > 0 { (cnt1[k]*1000) / cntT[k] } else { 500 }
+            probs.push(p)
+            k = k + 1
+        }
+        c = c + 1
+    }
+    return probs
+}
+fn _predict_o3(probs: array, prev: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < LEN {
+        let ctx = 4*prev[c] + 2*prev[_l1(c)] + prev[_r1(c)]
+        let p = probs[8*c + ctx]
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+// ── Markov ORDER-5: P(next | l2, l, self, r, r2) — 32 ctx/cell ─────────────
+// ctx = 16*l2 + 8*l + 4*self + 2*r + r2 (matches CA(5) window)
+fn _train_o5(corpus: array) -> array {
+    let mut probs = []
+    let mut c = 0
+    while c < LEN {
+        let mut cnt1 = []
+        let mut cntT = []
+        let mut z = 0
+        while z < 32 { cnt1.push(0); cntT.push(0); z = z + 1 }
+        let l2i = _l2(c); let li = _l1(c); let ri = _r1(c); let r2i = _r2(c)
+        let mut idx = 0
+        while idx < corpus.len() {
+            let pair = corpus[idx]
+            let prev = pair[0]; let nxt = pair[1]
+            let ctx = 16*prev[l2i] + 8*prev[li] + 4*prev[c] + 2*prev[ri] + prev[r2i]
+            cntT[ctx] = cntT[ctx] + 1
+            if nxt[c] == 1 { cnt1[ctx] = cnt1[ctx] + 1 }
+            idx = idx + 1
+        }
+        let mut k = 0
+        while k < 32 {
+            let p = if cntT[k] > 0 { (cnt1[k]*1000) / cntT[k] } else { 500 }
+            probs.push(p)
+            k = k + 1
+        }
+        c = c + 1
+    }
+    return probs
+}
+fn _predict_o5(probs: array, prev: array) -> array {
+    let mut next = []
+    let mut c = 0
+    while c < LEN {
+        let l2i = _l2(c); let li = _l1(c); let ri = _r1(c); let r2i = _r2(c)
+        let ctx = 16*prev[l2i] + 8*prev[li] + 4*prev[c] + 2*prev[ri] + prev[r2i]
+        let p = probs[32*c + ctx]
+        if p > 500 { next.push(1) } else { next.push(0) }
+        c = c + 1
+    }
+    return next
+}
+
+// ── accuracy + corpus ───────────────────────────────────────────────────────
+fn _accuracy(pred: array, actual: array) -> int {
+    let mut total = 0; let mut match_count = 0
+    let mut s = 0
+    while s < pred.len() {
+        let p = pred[s]; let a = actual[s]
+        let mut c = 0
+        while c < LEN {
+            if p[c] == a[c] { match_count = match_count + 1 }
+            total = total + 1; c = c + 1
+        }
+        s = s + 1
+    }
+    if total == 0 { return 0 }
+    return (match_count * 1000) / total
+}
+
+fn _build_corpus(initial: array, n_steps: int) -> array {
+    let mut samples = []
+    let mut state = initial
+    let mut s = 0
+    while s < n_steps {
+        let nxt = _rule30_step(state)
+        samples.push([state, nxt])
+        state = nxt
+        s = s + 1
+    }
+    return samples
+}
+
+// ── single (order, init, n_train) evaluation ────────────────────────────────
+fn _eval(order: int, init_label: string, n_train: int, max_train: int, init_state: array) -> array {
+    let total_steps = max_train + N_TEST
+    let full = _build_corpus(init_state, total_steps)
+    let mut train = []; let mut test = []
+    let mut k = 0
+    while k < full.len() {
+        if k < n_train { train.push(full[k]) }
+        if k >= max_train { test.push(full[k]) }
+        k = k + 1
+    }
+
+    let mut ca_preds = []; let mut mk_preds = []; let mut actuals = []
+
+    if order == 1 {
+        let probs = _train_o1(train)
+        let mut i = 0
+        while i < test.len() {
+            let pair = test[i]; let ps = pair[0]; let an = pair[1]
+            ca_preds.push(_ca5_predict(ps))
+            mk_preds.push(_predict_o1(probs, ps))
+            actuals.push(an)
+            i = i + 1
+        }
+    }
+    if order == 2 {
+        let probs = _train_o2(train)
+        let mut i = 0
+        while i < test.len() {
+            let pair = test[i]; let ps = pair[0]; let an = pair[1]
+            ca_preds.push(_ca5_predict(ps))
+            mk_preds.push(_predict_o2(probs, ps))
+            actuals.push(an)
+            i = i + 1
+        }
+    }
+    if order == 3 {
+        let probs = _train_o3(train)
+        let mut i = 0
+        while i < test.len() {
+            let pair = test[i]; let ps = pair[0]; let an = pair[1]
+            ca_preds.push(_ca5_predict(ps))
+            mk_preds.push(_predict_o3(probs, ps))
+            actuals.push(an)
+            i = i + 1
+        }
+    }
+    if order == 5 {
+        let probs = _train_o5(train)
+        let mut i = 0
+        while i < test.len() {
+            let pair = test[i]; let ps = pair[0]; let an = pair[1]
+            ca_preds.push(_ca5_predict(ps))
+            mk_preds.push(_predict_o5(probs, ps))
+            actuals.push(an)
+            i = i + 1
+        }
+    }
+
+    let ca_acc = _accuracy(ca_preds, actuals)
+    let mk_acc = _accuracy(mk_preds, actuals)
+    let advantage = if mk_acc > 0 { ((ca_acc * 1000) / mk_acc) - 1000 } else { 999 }
+    println("  init=" + init_label + " order=" + str(order) + " n_train=" + str(n_train) + " ca_acc=" + str(ca_acc) + " markov_acc=" + str(mk_acc) + " advantage_per_thousand=" + str(advantage))
+    return [order, n_train, ca_acc, mk_acc, advantage]
+}
+
+fn _abs(x: int) -> int { if x < 0 { return 0 - x } return x }
+
+fn _run() {
+    println("__LAW_64_CYCLE_4_T8R_RULE30_HIGHER_ORDER_BEGIN__ rule-30 higher-order Markov saturation test (v6 universality probe)")
+    println("hypothesis H1 (v6 universal): order-3 |adv| <+5 at N>=500 on BOTH inits — alignment principle holds for class-3 chaos")
+    println("hypothesis H2 (chaos special): order-3 adv >=+200 at N=1500 on >=1 init — chaotic dynamics resist matched-context saturation")
+    println("hypothesis H3 (init-conditional): order-3 saturates on single_cell but NOT density_32pct — chaos amplifies rare-context starvation under random init")
+    println("seed=" + str(SEED) + " len=" + str(LEN) + " rule=" + str(RULE) + " N_TEST=" + str(N_TEST) + " K_LIVE=" + str(K_LIVE))
+
+    // ── single_cell init ────────────────────────────────────────────────────
+    _rng_reset()
+    let init_s = _init_single_cell()
+    let mut alive_s = 0
+    let mut ai = 0
+    while ai < LEN { alive_s = alive_s + init_s[ai]; ai = ai + 1 }
+    println("init_single_cell_alive=" + str(alive_s) + " (expect 1)")
+
+    // ── density_32pct init (rng_reset to make placement deterministic) ──────
+    _rng_reset()
+    let init_d = _init_density()
+    let mut alive_d = 0
+    let mut bi = 0
+    while bi < LEN { alive_d = alive_d + init_d[bi]; bi = bi + 1 }
+    println("init_density_alive=" + str(alive_d) + " (expect " + str(K_LIVE) + ")")
+
+    let max_train = 1500
+
+    println("=== INIT=single_cell ===")
+
+    println("--- order=1 (P(next|self), 2 ctx/cell) ---")
+    let s_o1_n50   = _eval(1, "single_cell", 50,   max_train, init_s)
+    let s_o1_n500  = _eval(1, "single_cell", 500,  max_train, init_s)
+    let s_o1_n1500 = _eval(1, "single_cell", 1500, max_train, init_s)
+
+    println("--- order=2 (P(next|self,left), 4 ctx/cell) ---")
+    let s_o2_n50   = _eval(2, "single_cell", 50,   max_train, init_s)
+    let s_o2_n500  = _eval(2, "single_cell", 500,  max_train, init_s)
+    let s_o2_n1500 = _eval(2, "single_cell", 1500, max_train, init_s)
+
+    println("--- order=3 (P(next|self,left,right), 8 ctx/cell — matches rule-30 neighborhood) ---")
+    let s_o3_n50   = _eval(3, "single_cell", 50,   max_train, init_s)
+    let s_o3_n500  = _eval(3, "single_cell", 500,  max_train, init_s)
+    let s_o3_n1500 = _eval(3, "single_cell", 1500, max_train, init_s)
+
+    println("--- order=5 (P(next|l2,l,self,r,r2), 32 ctx/cell — matches CA(5) window) ---")
+    let s_o5_n50   = _eval(5, "single_cell", 50,   max_train, init_s)
+    let s_o5_n500  = _eval(5, "single_cell", 500,  max_train, init_s)
+    let s_o5_n1500 = _eval(5, "single_cell", 1500, max_train, init_s)
+
+    println("=== INIT=density_32pct ===")
+
+    println("--- order=1 (P(next|self), 2 ctx/cell) ---")
+    let d_o1_n50   = _eval(1, "density_32pct", 50,   max_train, init_d)
+    let d_o1_n500  = _eval(1, "density_32pct", 500,  max_train, init_d)
+    let d_o1_n1500 = _eval(1, "density_32pct", 1500, max_train, init_d)
+
+    println("--- order=2 (P(next|self,left), 4 ctx/cell) ---")
+    let d_o2_n50   = _eval(2, "density_32pct", 50,   max_train, init_d)
+    let d_o2_n500  = _eval(2, "density_32pct", 500,  max_train, init_d)
+    let d_o2_n1500 = _eval(2, "density_32pct", 1500, max_train, init_d)
+
+    println("--- order=3 (P(next|self,left,right), 8 ctx/cell — matches rule-30 neighborhood) ---")
+    let d_o3_n50   = _eval(3, "density_32pct", 50,   max_train, init_d)
+    let d_o3_n500  = _eval(3, "density_32pct", 500,  max_train, init_d)
+    let d_o3_n1500 = _eval(3, "density_32pct", 1500, max_train, init_d)
+
+    println("--- order=5 (P(next|l2,l,self,r,r2), 32 ctx/cell — matches CA(5) window) ---")
+    let d_o5_n50   = _eval(5, "density_32pct", 50,   max_train, init_d)
+    let d_o5_n500  = _eval(5, "density_32pct", 500,  max_train, init_d)
+    let d_o5_n1500 = _eval(5, "density_32pct", 1500, max_train, init_d)
+
+    // ── Aggregate ───────────────────────────────────────────────────────────
+    let s_adv_o3_500  = s_o3_n500[4]
+    let s_adv_o3_1500 = s_o3_n1500[4]
+    let d_adv_o3_500  = d_o3_n500[4]
+    let d_adv_o3_1500 = d_o3_n1500[4]
+    let s_adv_o5_1500 = s_o5_n1500[4]
+    let d_adv_o5_1500 = d_o5_n1500[4]
+
+    println("--- aggregate (advantage_per_thousand at order=3) ---")
+    println("single_cell:    adv_o3_n500=" + str(s_adv_o3_500) + " adv_o3_n1500=" + str(s_adv_o3_1500))
+    println("density_32pct:  adv_o3_n500=" + str(d_adv_o3_500) + " adv_o3_n1500=" + str(d_adv_o3_1500))
+    println("o5_closure:     single_adv_o5_n1500=" + str(s_adv_o5_1500) + " density_adv_o5_n1500=" + str(d_adv_o5_1500))
+
+    // Verdict mapping (pre-registered, frozen)
+    let abs_s500  = _abs(s_adv_o3_500)
+    let abs_s1500 = _abs(s_adv_o3_1500)
+    let abs_d500  = _abs(d_adv_o3_500)
+    let abs_d1500 = _abs(d_adv_o3_1500)
+
+    let mut verdict = "AMBIGUOUS"
+    let mut law_dir = "INCONCLUSIVE"
+
+    if abs_s500 < 5 && abs_d500 < 5 && abs_s1500 < 5 && abs_d1500 < 5 {
+        verdict = "H1_SUPPORTED_v6_universal_alignment_principle_holds_for_class3_chaos_order3_saturates_both_inits"
+        law_dir = "LAW_64_v6_STRENGTHENS_alignment_principle_universal_across_elementary_CA_classes_class3_chaos_saturates_as_cleanly_as_class4_universality_given_matched_context_width"
+    } else {
+        if s_adv_o3_1500 >= 200 || d_adv_o3_1500 >= 200 {
+            verdict = "H2_SUPPORTED_rule30_chaos_resists_saturation_at_matched_width_order3_gap_persists"
+            law_dir = "LAW_64_v6_CORRECTION_alignment_principle_requires_class_conditioning_class3_chaos_breaks_v6_even_with_matched_context_width"
+        } else {
+            if abs_s1500 < 5 && d_adv_o3_1500 >= 50 {
+                verdict = "H3_SUPPORTED_init_conditional_single_cell_saturates_density_does_not_chaos_amplifies_rare_context_starvation_under_random_init"
+                law_dir = "LAW_64_v6_NUANCE_alignment_principle_init_conditional_under_chaotic_rules_density_init_exposes_baseline_data_volume_bottleneck"
+            } else {
+                verdict = "AMBIGUOUS_pattern_does_not_match_H1_H2_or_H3_thresholds_report_raw_no_v6_update"
+                law_dir = "LAW_64_v6_INCONCLUSIVE_pattern_outside_pre_reg_thresholds"
+            }
+        }
+    }
+
+    println("--- verdict ---")
+    println("verdict=" + verdict)
+    println("law_64_v6_direction=" + law_dir)
+
+    println("__LAW_64_CYCLE_4_T8R_RESULT__ " + verdict)
+
+    // raw 91 honesty triad C1-C5
+    println("raw_91_C1_falsifiable=YES_pre_registered_thresholds_5_50_200_at_N500_and_N1500_order3_both_inits_frozen")
+    println("raw_91_C2_replicable=YES_seed_" + str(SEED) + "_deterministic_LCG_rule30_canonical_single_cell_AND_density_K_LIVE_" + str(K_LIVE))
+    println("raw_91_C3_no_p_hacking=YES_thresholds_orders_anchors_and_inits_frozen_in_header_before_run")
+    println("raw_91_C4_data_caveats=length_128_toroidal_single_seed_single_density_placement_no_multi_seed_robustness")
+    println("raw_91_C5_negative_result_published=YES_emit_regardless_of_outcome_per_raw_71")
+    println("raw_91_caveat=order-3_exactly_matches_rule30_3-cell_neighborhood_test_is_whether_data_volume_at_N=1500_suffices_for_o3_to_learn_true_rule_under_chaos")
+    println("raw_91_caveat=multi_seed_density_placement_is_forward_step_if_H2_or_H3_fires")
+}
+
+fn _selftest() {
+    println("__LAW_64_CYCLE_4_T8R_RULE30_HIGHER_ORDER_BEGIN__ selftest")
+
+    // Verify rule-30 lookup on canonical single-cell expansion (one step):
+    // Rule 30 = 0b00011110 → patterns 1,2,3,4 → 1; patterns 0,5,6,7 → 0
+    // From single 1 at idx 64 (zeros elsewhere), neighborhoods at next step:
+    //   idx 63: l=0,c=0,r=1 → pidx=1 → 1
+    //   idx 64: l=0,c=1,r=0 → pidx=2 → 1
+    //   idx 65: l=1,c=0,r=0 → pidx=4 → 1
+    //   all other indices: l=c=r=0 → pidx=0 → 0
+    let ic = _init_single_cell()
+    let nxt = _rule30_step(ic)
+    println("rule30_single_cell_next_[63..65]=[" + str(nxt[63]) + "," + str(nxt[64]) + "," + str(nxt[65]) + "] (expect [1,1,1])")
+    println("rule30_single_cell_next_[62]=" + str(nxt[62]) + " next_[66]=" + str(nxt[66]) + " (expect [0,0])")
+
+    // Verify single_cell init
+    let mut ic_alive = 0
+    let mut k = 0
+    while k < LEN { ic_alive = ic_alive + ic[k]; k = k + 1 }
+    println("single_cell_init_alive=" + str(ic_alive) + " (expect 1)")
+    println("single_cell_init_at_idx_" + str(LEN/2) + "=" + str(ic[LEN/2]) + " (expect 1)")
+
+    // Verify density init
+    _rng_reset()
+    let id = _init_density()
+    let mut id_alive = 0
+    let mut z = 0
+    while z < LEN { id_alive = id_alive + id[z]; z = z + 1 }
+    println("density_init_alive=" + str(id_alive) + " (expect " + str(K_LIVE) + ")")
+
+    // Verify neighbor index helpers (LEN=128, so wrap at 0/127)
+    let l1_0 = _l1(0)   // expect 127
+    let r1_0 = _r1(0)   // expect 1
+    let l2_0 = _l2(0)   // expect 126
+    let r2_0 = _r2(0)   // expect 2
+    let l1_127 = _l1(127) // expect 126
+    let r1_127 = _r1(127) // expect 0
+    println("l1(0)=" + str(l1_0) + " r1(0)=" + str(r1_0) + " l2(0)=" + str(l2_0) + " r2(0)=" + str(r2_0))
+    println("l1(127)=" + str(l1_127) + " r1(127)=" + str(r1_127))
+
+    // Verify train+predict pipelines on tiny corpus
+    let mini = _build_corpus(ic, 4)
+    let p1 = _train_o1(mini); let pred1 = _predict_o1(p1, ic)
+    let p2 = _train_o2(mini); let pred2 = _predict_o2(p2, ic)
+    let p3 = _train_o3(mini); let pred3 = _predict_o3(p3, ic)
+    let p5 = _train_o5(mini); let pred5 = _predict_o5(p5, ic)
+
+    println("p1_len=" + str(p1.len()) + " (expect " + str(2*LEN) + ")")
+    println("p2_len=" + str(p2.len()) + " (expect " + str(4*LEN) + ")")
+    println("p3_len=" + str(p3.len()) + " (expect " + str(8*LEN) + ")")
+    println("p5_len=" + str(p5.len()) + " (expect " + str(32*LEN) + ")")
+    println("pred1_len=" + str(pred1.len()) + " pred2_len=" + str(pred2.len()) + " pred3_len=" + str(pred3.len()) + " pred5_len=" + str(pred5.len()))
+
+    // Verify CA(5) oracle is perfect on rule-30 corpus
+    let mut ca_preds = []; let mut actuals = []
+    let mut mi = 0
+    while mi < mini.len() {
+        let pair = mini[mi]
+        let pst = pair[0]; let act = pair[1]
+        ca_preds.push(_ca5_predict(pst)); actuals.push(act)
+        mi = mi + 1
+    }
+    let ca_acc = _accuracy(ca_preds, actuals)
+    println("ca5_oracle_acc_on_rule30=" + str(ca_acc) + " (expect 1000=100%)")
+
+    // _abs sanity
+    let a_neg = _abs(0 - 7)
+    let a_pos = _abs(7)
+    println("abs(-7)=" + str(a_neg) + " abs(7)=" + str(a_pos) + " (expect 7,7)")
+
+    let pat_ok = nxt[63] == 1 && nxt[64] == 1 && nxt[65] == 1 && nxt[62] == 0 && nxt[66] == 0
+    let idx_ok = l1_0 == 127 && r1_0 == 1 && l2_0 == 126 && r2_0 == 2 && l1_127 == 126 && r1_127 == 0
+    let ok = pat_ok && ic_alive == 1 && ic[LEN/2] == 1 && id_alive == K_LIVE && idx_ok
+            && p1.len() == 2*LEN && p2.len() == 4*LEN && p3.len() == 8*LEN && p5.len() == 32*LEN
+            && pred1.len() == LEN && pred2.len() == LEN && pred3.len() == LEN && pred5.len() == LEN
+            && ca_acc == 1000 && a_neg == 7 && a_pos == 7
+    if ok {
+        println("__LAW_64_CYCLE_4_T8R_RESULT__ PASS_SELFTEST_rule30_step_indices_inits_markov_o1_o2_o3_o5_and_oracle_correct")
+    } else {
+        println("__LAW_64_CYCLE_4_T8R_RESULT__ FAIL_SELFTEST")
+    }
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_run = false
+    let mut k = 0
+    while k < av.len() {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "--run" { has_run = true }
+        k = k + 1
+    }
+    if has_selftest { _selftest() }
+    else if has_run { _run() }
+    else {
+        println("usage: hexa run tool/anima_law64_rule30_higher_order_markov.hexa --selftest | --run")
+    }
+    return 0
+}
